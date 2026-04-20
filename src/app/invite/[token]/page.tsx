@@ -4,10 +4,18 @@ import { candidateHashes } from '@/lib/invite-tokens';
 
 export default async function InviteLandingPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ token: string }>;
+  searchParams: Promise<{ unavailable?: string }>;
 }) {
   const { token } = await params;
+  const sp = await searchParams;
+  if (sp.unavailable === '1') {
+    return renderError(
+      "This invite can't be claimed from this account. Check that you signed in with the same email the invite was sent to.",
+    );
+  }
   const hashes = candidateHashes(token);
   if (hashes.length === 0) return renderError('Invite system not configured.');
 
