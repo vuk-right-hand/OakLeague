@@ -27,5 +27,7 @@ function scrub(event: Sentry.ErrorEvent): Sentry.ErrorEvent {
 }
 
 function redactInvitePath(s: string): string {
-  return s.replace(/\/invite\/[^/?#]+/g, '/invite/[redacted]');
+  return s
+    .replace(/\/invite\/[^/?#]+/g, '/invite/[redacted]')
+    .replace(/([?&])access_token=[^&#]+/g, '$1access_token=[redacted]');
 }
