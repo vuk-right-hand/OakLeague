@@ -60,11 +60,13 @@ const PROXY_URL = process.env.NEXT_PUBLIC_VOICE_PROXY_URL || 'wss://oakleague-vo
 
 function sleep(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
 
-async function fetchTicket(signal: AbortSignal): Promise<{ ticket: string }> {
+export type CreatorOption = { id: string; handle: string; displayName: string };
+
+async function fetchTicket(signal: AbortSignal, creatorId: string): Promise<{ ticket: string }> {
   const r = await fetch('/api/voice/spike-a/ticket', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: '{}',
+    body: JSON.stringify({ creatorId }),
     signal,
   });
   if (!r.ok) throw new Error(`ticket_http_${r.status}`);
@@ -95,8 +97,9 @@ function pct(xs: number[], p: number): number | null {
   return Math.round(s[lo] + (s[hi] - s[lo]) * (i - lo));
 }
 
-export default function ProxyClient() {
+export default function ProxyClient({ creators }: { creators: CreatorOption[] }) {
   const [model, setModel] = useState<ModelId>('gemini-2.5-flash-native-audio-preview-12-2025');
+  const [creatorId, setCreatorId] = useState<string>(creators[0]?.id ?? '');
   const [running, setRunning] = useState(false);
   const [sessions, setSessions] = useState<SessionResult[]>([]);
   const [log, setLog] = useState<string[]>([]);
@@ -123,7 +126,7 @@ export default function ProxyClient() {
     try {
       const ac = new AbortController();
       const to = setTimeout(() => ac.abort('ticket_timeout'), TICKET_TIMEOUT_MS);
-      ticket = (await fetchTicket(ac.signal)).ticket;
+      ticket = (await fetchTicket(ac.signal, creatorId)).ticket;
       clearTimeout(to);
     } catch (e) {
       result.aborted = 'ticket_' + (e as Error).message;
@@ -242,6 +245,12 @@ export default function ProxyClient() {
         pending.turnCompleteReject = rej;
         setTimeout(() => rej(new Error('turn_complete_timeout')), FIRST_CHUNK_TIMEOUT_MS + TURN_COMPLETE_TIMEOUT_MS);
       });
+      // Suppress unhandled-rejection overlay when we `break` on firstAudio
+      // timeout and never await turnCompleteP — the ws.close(1000) at session
+      // end calls abortPending which rejects both. The real `await` below
+      // still sees the rejection on the happy path.
+      firstAudioP.catch(() => {});
+      turnCompleteP.catch(() => {});
 
       try {
         ws.send(JSON.stringify({ type: 'turn_start' }));
@@ -280,7 +289,7 @@ export default function ProxyClient() {
 
     try { ws.close(1000, 'session_done'); } catch {}
     return result;
-  }, [model, append]);
+  }, [model, creatorId, append]);
 
   const onRun = useCallback(async () => {
     if (!cannedRef.current) return;
@@ -318,12 +327,24 @@ export default function ProxyClient() {
       </section>
 
       <section style={{ marginBottom: 16 }}>
+        <div style={{ marginBottom: 8 }}>
+          <label style={{ marginRight: 8 }}>Creator:</label>
+          {creators.length === 0 ? (
+            <span style={{ color: 'crimson' }}>no creators — complete invite → application → approval first</span>
+          ) : (
+            <select value={creatorId} onChange={(e) => setCreatorId(e.target.value)} disabled={running}>
+              {creators.map((c) => (
+                <option key={c.id} value={c.id}>{c.displayName} (@{c.handle})</option>
+              ))}
+            </select>
+          )}
+        </div>
         <label style={{ marginRight: 8 }}>Model:</label>
         <select value={model} onChange={(e) => setModel(e.target.value as ModelId)} disabled={running}>
           <option value="gemini-2.5-flash-native-audio-preview-12-2025">2.5 native-audio (v1alpha, preview-12-2025)</option>
           <option value="gemini-3.1-flash-live-preview">3.1 Flash Live (preview)</option>
         </select>
-        <button style={{ marginLeft: 12 }} onClick={onRun} disabled={running}>
+        <button style={{ marginLeft: 12 }} onClick={onRun} disabled={running || !creatorId}>
           {running ? 'Running…' : `Run ${SESSIONS_PER_CELL}×${TURNS_PER_SESSION} cell`}
         </button>
         <button style={{ marginLeft: 8 }} onClick={copyJson} disabled={!sessions.length}>Copy JSON</button>
