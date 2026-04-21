@@ -8,7 +8,7 @@ export const dynamic = 'force-dynamic';
 
 const ALLOWED_MODELS = new Set([
   'gemini-3.1-flash-live-preview',
-  'gemini-live-2.5-flash-native-audio',
+  'gemini-2.5-flash-native-audio-preview-12-2025',
 ]);
 
 // AI Studio pricing (Gemini Live audio, 2026-04-21 docs):
@@ -31,10 +31,20 @@ function json(status: number, body: unknown) {
   });
 }
 
-function expectedOrigin(): string | null {
-  const site = process.env.NEXT_PUBLIC_SITE_URL;
-  if (!site) return null;
-  try { return new URL(site).origin; } catch { return null; }
+// Same-origin check, honoring x-forwarded-host for TLS-terminating tunnels
+// (ngrok in dev, any reverse proxy in prod). See .claude_learnings.md
+// 2026-04-21 "ngrok HTTPS → Next dev HTTP".
+function isSameOrigin(req: NextRequest): boolean {
+  const origin = req.headers.get('origin');
+  if (!origin) return false;
+  try {
+    const originHost = new URL(origin).host;
+    const forwardedHost = req.headers.get('x-forwarded-host');
+    const reqHost = forwardedHost ?? req.nextUrl.host;
+    return originHost === reqHost;
+  } catch {
+    return false;
+  }
 }
 
 type Body = {
@@ -51,7 +61,7 @@ function num(v: unknown): number | null {
 }
 
 export async function POST(req: NextRequest) {
-  if (req.headers.get('origin') !== expectedOrigin()) return json(403, { error: 'bad_origin' });
+  if (!isSameOrigin(req)) return json(403, { error: 'bad_origin' });
 
   let session;
   try {
@@ -74,21 +84,25 @@ export async function POST(req: NextRequest) {
   const device = typeof body.device === 'string' ? body.device.slice(0, 64) : 'unknown';
   const ua     = typeof body.ua === 'string' ? body.ua.slice(0, 256) : '';
 
+  // Operation names must match the proxy's cogs_insert_turn RPC so spike and
+  // production rows aggregate under the same key in the COGS log viewer.
   const admin = supabaseAdmin();
   const rows = [
     {
       user_id: session.userId, session_id: null,
-      service: 'gemini', operation: 'spike_a_live_audio_input_seconds',
+      service: 'gemini', operation: 'voice_audio_input_seconds',
       units: Number(inSec.toFixed(4)), unit_label: 'seconds',
       cost_usd: Number((inSec * PRICE_USD_PER_SEC.input).toFixed(6)),
-      metadata: { source: 'spike_a', model, device, ua },
+      environment: 'spike_a',
+      metadata: { source: 'spike_a_harness', model, device, ua, direction: 'input' },
     },
     {
       user_id: session.userId, session_id: null,
-      service: 'gemini', operation: 'spike_a_live_audio_output_seconds',
+      service: 'gemini', operation: 'voice_audio_output_seconds',
       units: Number(outSec.toFixed(4)), unit_label: 'seconds',
       cost_usd: Number((outSec * PRICE_USD_PER_SEC.output).toFixed(6)),
-      metadata: { source: 'spike_a', model, device, ua },
+      environment: 'spike_a',
+      metadata: { source: 'spike_a_harness', model, device, ua, direction: 'output' },
     },
   ];
   const { error } = await admin.from('cogs_log').insert(rows);
