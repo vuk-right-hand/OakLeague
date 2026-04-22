@@ -14,6 +14,9 @@ type Profile = {
   timezone: string;
   created_at: string;
   onboarded_at: string | null;
+  voice_daily_cap_seconds: number;
+  voice_weekly_cap_seconds: number | null;
+  voice_monthly_cap_seconds: number | null;
 };
 
 type SessionRow = {
@@ -59,7 +62,7 @@ export default async function AdminUserDetail({
 
   const [{ data: profile }, { data: sessions }, { data: quotas }, { data: profileAudit }] = await Promise.all([
     sb.from('profiles')
-      .select('id, handle, display_name, email, tier, timezone, created_at, onboarded_at')
+      .select('id, handle, display_name, email, tier, timezone, created_at, onboarded_at, voice_daily_cap_seconds, voice_weekly_cap_seconds, voice_monthly_cap_seconds')
       .eq('id', id)
       .maybeSingle<Profile>(),
     sb.from('sessions')
@@ -114,11 +117,16 @@ export default async function AdminUserDetail({
       </div>
 
       <section style={{ marginBottom: 32 }}>
-        <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>Tier</h2>
+        <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>Tier &amp; voice caps</h2>
         <UserDetailClient
           userId={profile.id}
           currentTier={profile.tier}
           activeSessions={activeSessions.map((s) => ({ id: s.id, started_at: s.started_at, tier: s.tier_at_session, model: s.model_used }))}
+          currentCaps={{
+            daily: profile.voice_daily_cap_seconds,
+            weekly: profile.voice_weekly_cap_seconds,
+            monthly: profile.voice_monthly_cap_seconds,
+          }}
         />
       </section>
 

@@ -70,6 +70,14 @@ export function mapPgError(e: unknown): { status: number; body: { error: string;
   if (code === 'P0001' && /kill_switch_fired/i.test(msg)) {
     return { status: 429, body: { error: 'kill_switch_fired' } };
   }
+  // 22003 is raised by admin_set_user_voice_caps with one of three distinct
+  // messages — surface the per-field code so the UI can attach the error to
+  // the right input instead of a generic "out of range" banner.
+  if (code === '22003') {
+    if (/bad_daily_cap/i.test(msg)) return { status: 400, body: { error: 'bad_daily_cap' } };
+    if (/bad_weekly_cap/i.test(msg)) return { status: 400, body: { error: 'bad_weekly_cap' } };
+    if (/bad_monthly_cap/i.test(msg)) return { status: 400, body: { error: 'bad_monthly_cap' } };
+  }
   const mapped = ERRCODE_TO_ENVELOPE[code];
   if (mapped) return { status: mapped.status, body: { error: mapped.error } };
 
