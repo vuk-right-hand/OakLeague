@@ -187,7 +187,11 @@ export async function POST(req: NextRequest) {
     return json(500, { error: 'map_lookup_failed' });
   }
   const map = (priorRows?.[0] as ClipPairRow | undefined)?.side_provider_map;
-  if (!map || (map.left !== 'simli' && map.left !== 'tavus')) {
+  if (
+    !map ||
+    (map.left !== 'simli' && map.left !== 'tavus') ||
+    (map.right !== 'simli' && map.right !== 'tavus')
+  ) {
     return json(400, { error: 'unknown_clip_pair' });
   }
 
