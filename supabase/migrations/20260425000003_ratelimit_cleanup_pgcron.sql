@@ -18,14 +18,14 @@
 -- we don't fail if the job doesn't exist yet.
 DO $$
 BEGIN
-  PERFORM extensions.cron.unschedule('rate_limit_log_purge');
+  PERFORM cron.unschedule('rate_limit_log_purge');
 EXCEPTION WHEN OTHERS THEN
   -- Job didn't exist or pg_cron not installed; ignore and proceed.
   NULL;
 END;
 $$;
 
-SELECT extensions.cron.schedule(
+SELECT cron.schedule(
   'rate_limit_log_purge',
   '17 3 * * *',
   $$ DELETE FROM public.rate_limit_log
