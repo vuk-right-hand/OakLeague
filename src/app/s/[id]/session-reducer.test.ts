@@ -1,0 +1,248 @@
+import { describe, it, expect } from 'vitest';
+import {
+  initialState,
+  reduce,
+  isPipeWarm,
+  shouldShowReconnectOverlay,
+  type SessionState,
+} from './session-reducer';
+
+function boot(): SessionState {
+  let s = reduce(initialState, { kind: 'boot_started' });
+  s = reduce(s, {
+    kind: 'boot_envelope',
+    sessionId: 'sess-1',
+    tier: 'free',
+    avatarStatus: 'pending',
+    maxSessionSeconds: 900,
+  });
+  return s;
+}
+
+describe('session-reducer — opening gate', () => {
+  it('starts idle', () => {
+    expect(initialState.phase).toBe('idle');
+  });
+
+  it('boot_started transitions idle → opening', () => {
+    const s = reduce(initialState, { kind: 'boot_started' });
+    expect(s.phase).toBe('opening');
+    expect(s.errorMessage).toBeNull();
+  });
+
+  it('boot_started is a no-op when not idle', () => {
+    const s1 = reduce(initialState, { kind: 'boot_started' });
+    const s2 = reduce(s1, { kind: 'boot_started' });
+    expect(s2).toBe(s1);
+  });
+
+  it('needs BOTH gemini_setup_complete AND avatar_ready to reach ready', () => {
+    let s = boot();
+    s = reduce(s, { kind: 'gemini_setup_complete' });
+    expect(s.phase).toBe('opening'); // still waiting for avatar
+    s = reduce(s, { kind: 'avatar_ready' });
+    expect(s.phase).toBe('ready');
+    expect(s.avatarStatus).toBe('minted');
+  });
+
+  it('avatar_not_expected satisfies the avatar side of the gate', () => {
+    let s = boot();
+    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'avatar_not_expected' });
+    expect(s.phase).toBe('ready');
+  });
+
+  it('avatar_ready alone does not transition to ready', () => {
+    let s = boot();
+    s = reduce(s, { kind: 'avatar_ready' });
+    expect(s.phase).toBe('opening');
+  });
+});
+
+describe('session-reducer — turn lifecycle', () => {
+  function ready(): SessionState {
+    let s = boot();
+    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'avatar_ready' });
+    return s;
+  }
+
+  it('mic_started: ready → listening', () => {
+    const s = reduce(ready(), { kind: 'mic_started' });
+    expect(s.phase).toBe('listening');
+  });
+
+  it('gemini_audio_chunk: listening → speaking', () => {
+    let s = reduce(ready(), { kind: 'mic_started' });
+    s = reduce(s, { kind: 'gemini_audio_chunk' });
+    expect(s.phase).toBe('speaking');
+  });
+
+  it('gemini_turn_complete: speaking → ready', () => {
+    let s = reduce(ready(), { kind: 'mic_started' });
+    s = reduce(s, { kind: 'gemini_audio_chunk' });
+    s = reduce(s, { kind: 'gemini_turn_complete' });
+    expect(s.phase).toBe('ready');
+  });
+
+  it('gemini_interrupted does NOT change phase (barge-in keeps pipe warm)', () => {
+    let s = reduce(ready(), { kind: 'mic_started' });
+    s = reduce(s, { kind: 'gemini_audio_chunk' });
+    const before = s.phase;
+    s = reduce(s, { kind: 'gemini_interrupted' });
+    expect(s.phase).toBe(before);
+    // isPipeWarm invariant holds across barge-in
+    expect(isPipeWarm(s)).toBe(true);
+  });
+});
+
+describe('session-reducer — visibility', () => {
+  function ready(): SessionState {
+    let s = boot();
+    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'avatar_ready' });
+    return s;
+  }
+
+  it('hidden: ready → paused, stamps pausedAtMs', () => {
+    const s = reduce(ready(), { kind: 'visibility_hidden' });
+    expect(s.phase).toBe('paused');
+    expect(s.pausedAtMs).not.toBeNull();
+  });
+
+  it('visible: paused → ready, clears pausedAtMs', () => {
+    let s = reduce(ready(), { kind: 'visibility_hidden' });
+    s = reduce(s, { kind: 'visibility_visible' });
+    expect(s.phase).toBe('ready');
+    expect(s.pausedAtMs).toBeNull();
+  });
+
+  it('double-hidden is idempotent', () => {
+    const s1 = reduce(ready(), { kind: 'visibility_hidden' });
+    const s2 = reduce(s1, { kind: 'visibility_hidden' });
+    expect(s2).toBe(s1);
+  });
+});
+
+describe('session-reducer — reconnection', () => {
+  function ready(): SessionState {
+    let s = boot();
+    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'avatar_ready' });
+    return s;
+  }
+
+  it('pc_degraded → reconnecting, increments prompt count', () => {
+    const s = reduce(ready(), { kind: 'pc_degraded' });
+    expect(s.phase).toBe('reconnecting');
+    expect(s.reconnectPromptCount).toBe(1);
+    expect(shouldShowReconnectOverlay(s)).toBe(true);
+  });
+
+  it('ws_closed → reconnecting', () => {
+    const s = reduce(ready(), { kind: 'ws_closed', wasClean: false });
+    expect(s.phase).toBe('reconnecting');
+  });
+
+  it('audio_context_failed → reconnecting (iOS R3-M4)', () => {
+    const s = reduce(ready(), { kind: 'audio_context_failed' });
+    expect(s.phase).toBe('reconnecting');
+  });
+});
+
+describe('session-reducer — rollover (15-min cap)', () => {
+  function ready(): SessionState {
+    let s = boot();
+    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'avatar_ready' });
+    return s;
+  }
+
+  it('rollover_complete resets readiness and phase to opening', () => {
+    let s = ready();
+    expect(s.phase).toBe('ready');
+    s = reduce(s, {
+      kind: 'rollover_complete',
+      newSessionId: 'sess-2',
+      tier: 'free',
+      avatarStatus: 'minted',
+      maxSessionSeconds: 900,
+    });
+    expect(s.phase).toBe('opening');
+    expect(s.sessionId).toBe('sess-2');
+    expect(s.geminiReady).toBe(false);
+    expect(s.avatarReady).toBe(false);
+  });
+
+  it('rollover_complete with avatar_status=skipped_tier does not block ready-gate', () => {
+    let s = ready();
+    s = reduce(s, {
+      kind: 'rollover_complete',
+      newSessionId: 'sess-2',
+      tier: 'free',
+      avatarStatus: 'skipped_tier',
+      maxSessionSeconds: 900,
+    });
+    expect(s.avatarReady).toBe(true);
+    // Gemini still needs to re-setup.
+    s = reduce(s, { kind: 'gemini_setup_complete' });
+    expect(s.phase).toBe('ready');
+  });
+
+  it('rollover_failed closes the session with error message', () => {
+    const s = reduce(ready(), { kind: 'rollover_failed', message: 'gemini_rollover_failed' });
+    expect(s.phase).toBe('closed');
+    expect(s.errorMessage).toBe('gemini_rollover_failed');
+  });
+});
+
+describe('session-reducer — close', () => {
+  function ready(): SessionState {
+    let s = boot();
+    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'avatar_ready' });
+    return s;
+  }
+
+  it('user_close → closing → closed_ack → closed', () => {
+    let s = reduce(ready(), { kind: 'user_close' });
+    expect(s.phase).toBe('closing');
+    s = reduce(s, { kind: 'closed_ack' });
+    expect(s.phase).toBe('closed');
+  });
+
+  it('fatal_error → closed with message', () => {
+    const s = reduce(ready(), { kind: 'fatal_error', message: 'boom' });
+    expect(s.phase).toBe('closed');
+    expect(s.errorMessage).toBe('boom');
+  });
+
+  it('all events after closed are no-ops', () => {
+    let s = reduce(ready(), { kind: 'fatal_error', message: 'boom' });
+    const before = s;
+    s = reduce(s, { kind: 'gemini_setup_complete' });
+    expect(s.phase).toBe('closed');
+    s = reduce(s, { kind: 'visibility_hidden' });
+    expect(s.phase).toBe('closed');
+    s = reduce(s, { kind: 'pc_degraded' });
+    expect(s.phase).toBe('closed');
+    // errorMessage preserved
+    expect(s.errorMessage).toBe(before.errorMessage);
+  });
+});
+
+describe('session-reducer — invariants', () => {
+  it('isPipeWarm holds for ready/listening/speaking/paused, false for opening/reconnecting/closed', () => {
+    let s = boot();
+    expect(isPipeWarm(s)).toBe(false); // opening
+    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'avatar_ready' });
+    expect(isPipeWarm(s)).toBe(true); // ready
+    s = reduce(s, { kind: 'mic_started' });
+    expect(isPipeWarm(s)).toBe(true); // listening
+    s = reduce(s, { kind: 'gemini_audio_chunk' });
+    expect(isPipeWarm(s)).toBe(true); // speaking
+    s = reduce(s, { kind: 'pc_degraded' });
+    expect(isPipeWarm(s)).toBe(false); // reconnecting
+  });
+});

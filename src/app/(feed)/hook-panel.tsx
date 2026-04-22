@@ -1,8 +1,14 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import MuxPlayer from '@mux/mux-player-react';
 import type { FeedItem, VideoGroup } from './feed-types';
+import { envelopeStorageKey } from '@/app/s/[id]/session-client';
+
+// Default wire-form model. Kept in sync with src/lib/voice/model-map.ts.
+// If this changes, update isAllowedWireModel() to accept the new string.
+const DEFAULT_VOICE_MODEL = 'gemini-3.1-flash-live-preview';
 
 type Props = {
   hook: FeedItem;
@@ -67,6 +73,9 @@ export function HookPanel({
   const [unmuted, unmute] = useUnmutePreference();
   const deviceId = useDeviceId();
   const viewStartFiredRef = useRef(false);
+  const router = useRouter();
+  const [asking, setAsking] = useState(false);
+  const [askError, setAskError] = useState<string | null>(null);
   // Audit S2: tap-to-pause after the unmute gesture (TikTok expectation).
   const playerRef = useRef<HTMLVideoElement | null>(null);
   const [paused, setPaused] = useState(false);
@@ -216,19 +225,59 @@ export function HookPanel({
         ))}
       </div>
 
-      {/* Ask button (stubbed — real voice session lands Day 8) */}
+      {/* Ask button — opens a voice session and routes to /s/[id].
+          router.push() is correct per CLAUDE.md: the hard-rule requirement
+          for window.location.href applies to login/signup/role/tier change;
+          session creation is none of those. (R3-S9) */}
       <button
         type="button"
-        onClick={(e) => {
+        disabled={asking}
+        onClick={async (e) => {
           e.stopPropagation();
+          if (asking) return;
+          setAsking(true);
+          setAskError(null);
           try {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             (window as any).posthog?.capture?.('hook_ask_clicked', {
               hook_id: hook.hook_id,
               creator_id: hook.creator_id,
             });
+          } catch { /* noop */ }
+          try {
+            const r = await fetch('/api/sessions/open', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                creator_id: hook.creator_id,
+                hook_id: hook.hook_id,
+                model: DEFAULT_VOICE_MODEL,
+              }),
+            });
+            if (!r.ok) {
+              const body = (await r.json().catch(() => ({}))) as { error?: string };
+              if (r.status === 401) { router.push('/login'); return; }
+              setAskError(body?.error ?? `error_${r.status}`);
+              return;
+            }
+            const env = (await r.json()) as {
+              session_id: string;
+              tier: string;
+              avatar: unknown;
+              avatar_status: string;
+              gemini: { token: string; model: string };
+              max_duration_s: number;
+              max_session_s: number;
+            };
+            try {
+              sessionStorage.setItem(envelopeStorageKey(env.session_id), JSON.stringify(env));
+            } catch { /* sessionStorage blocked — next page shows "expired" */ }
+            router.push(`/s/${env.session_id}`);
           } catch {
-            /* noop */
+            setAskError('network');
+          } finally {
+            setAsking(false);
           }
         }}
         style={{
@@ -243,11 +292,30 @@ export function HookPanel({
           color: '#fff',
           fontSize: 12,
           fontWeight: 600,
+          opacity: asking ? 0.6 : 1,
         }}
         aria-label="Ask this creator"
       >
-        Ask
+        {asking ? '…' : 'Ask'}
       </button>
+      {askError && (
+        <div
+          role="alert"
+          style={{
+            position: 'absolute',
+            right: 16,
+            bottom: 156,
+            background: 'rgba(255,255,255,0.95)',
+            color: '#111',
+            fontSize: 11,
+            padding: '6px 10px',
+            borderRadius: 10,
+            maxWidth: 200,
+          }}
+        >
+          Couldn&apos;t start session: {askError === 'kill_switch_fired' ? 'Daily limit reached' : askError}
+        </div>
+      )}
 
       {/* Unmute hint */}
       {!unmuted && shouldPlay && (

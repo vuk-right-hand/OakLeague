@@ -18,7 +18,9 @@ export default async function AdminLayout({ children }: { children: React.ReactN
     <div style={{ maxWidth: 960, margin: '4vh auto', padding: 24 }}>
       <header style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 24 }}>
         <strong>OakLeague Admin</strong>
-        <nav style={{ display: 'flex', gap: 16, fontSize: 14 }}>
+        <nav style={{ display: 'flex', gap: 16, fontSize: 14, flexWrap: 'wrap' }}>
+          <a href="/admin/cogs">COGS</a>
+          <a href="/admin/users">Users</a>
           <a href="/admin/invites/new">New invite</a>
           <a href="/admin/applications">Applications</a>
           <a href="/admin/content/videos">Videos</a>

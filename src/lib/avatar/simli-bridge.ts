@@ -73,6 +73,8 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
   let closed = false;
   let ready = false;
   let firstAudioFired = false;
+  let firstAudioAtMs = 0;
+  let lipsyncLatencyFired = false;
 
   function detachOwnedElements(): void {
     if (ownedVideoEl && videoEl?.parentNode) videoEl.parentNode.removeChild(videoEl);
@@ -97,35 +99,47 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
       fail(e); throw e;
     }
 
-    // Mint session token via our server. The route enforces the kill-switch.
-    let boot: SimliSessionBoot;
-    try {
-      const res = await fetch('/api/spike-b/session', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'content-type': 'application/json' },
-        signal: opts.signal,
-        body: JSON.stringify({ provider: 'simli', replica_id: opts.replicaId }),
-      });
-      if (!res.ok) {
-        const code =
-          res.status === 429 ? 'quota_exceeded' :
-          res.status === 401 || res.status === 403 ? 'token_expired' :
-          res.status === 404 ? 'replica_not_found' :
-          res.status === 409 ? 'replica_not_ready' : 'connect_timeout';
-        const err: AvatarError = { code, message: `simli session mint ${res.status}`, recoverable: false };
+    // Production path: session token was pre-minted by /api/sessions/open and
+    // passed down. Fallback path (Spike-B harness): mint via /api/spike-b/session.
+    //
+    // Error-mapping: the fallback path can surface upstream 429 (our own
+    // kill-switch fired — 'session_killed') distinct from Simli's own 429
+    // rate-limit ('quota_exceeded'). Production never hits this branch —
+    // kill-switch 429s surface at /api/sessions/open and never reach here.
+    let sessionToken: string;
+    if (opts.preMintedSessionToken) {
+      sessionToken = opts.preMintedSessionToken;
+    } else {
+      let boot: SimliSessionBoot;
+      try {
+        const res = await fetch('/api/spike-b/session', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/json' },
+          signal: opts.signal,
+          body: JSON.stringify({ provider: 'simli', replica_id: opts.replicaId }),
+        });
+        if (!res.ok) {
+          const code =
+            res.status === 429 ? 'quota_exceeded' :
+            res.status === 401 || res.status === 403 ? 'token_expired' :
+            res.status === 404 ? 'replica_not_found' :
+            res.status === 409 ? 'replica_not_ready' : 'connect_timeout';
+          const err: AvatarError = { code, message: `simli session mint ${res.status}`, recoverable: false };
+          fail(err); throw err;
+        }
+        boot = (await res.json()) as SimliSessionBoot;
+      } catch (e) {
+        if ((e as AvatarError).code) throw e;
+        const err: AvatarError = {
+          code: 'connect_timeout',
+          message: 'simli session mint network error',
+          recoverable: true,
+          cause: { provider, raw: e },
+        };
         fail(err); throw err;
       }
-      boot = (await res.json()) as SimliSessionBoot;
-    } catch (e) {
-      if ((e as AvatarError).code) throw e;
-      const err: AvatarError = {
-        code: 'connect_timeout',
-        message: 'simli session mint network error',
-        recoverable: true,
-        cause: { provider, raw: e },
-      };
-      fail(err); throw err;
+      sessionToken = boot.session_token;
     }
 
     // Dynamic import so TS compilation does not require simli-client installed.
@@ -177,7 +191,7 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
     // LogLevel 2 = ERROR only — suppresses SDK debug noise in console.
     try {
       client = new mod.SimliClient(
-        boot.session_token,
+        sessionToken,
         videoEl,
         audioEl,
         null,       // iceServers — not needed for livekit transport
@@ -219,6 +233,12 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
         const track = stream?.getVideoTracks()[0] ?? null;
         if (track) handlers.onVideoTrack?.(track);
       } catch { /* no track available */ }
+      // First-frame arrival: if audio has already been dispatched, emit latency.
+      if (!lipsyncLatencyFired && firstAudioAtMs > 0) {
+        lipsyncLatencyFired = true;
+        const ms = Math.max(0, Math.round(performance.now() - firstAudioAtMs));
+        try { handlers.onLipsyncLatency?.(ms); } catch { /* callback threw */ }
+      }
     }, { once: true });
 
     // Audio track — same pattern. The SDK sets audioEl.srcObject via LiveKit.
@@ -254,7 +274,15 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
     if (!client || !ready || closed) return;
     if (!firstAudioFired) {
       firstAudioFired = true;
+      firstAudioAtMs = performance.now();
       try { handlers.onFirstAudioSent?.(); } catch { /* callback threw */ }
+      // Edge case: video loadedmetadata may have already fired BEFORE first
+      // audio was dispatched (pipe-warm scenario post-rollover). If ready is
+      // already true, emit latency immediately (≈0ms is valid data).
+      if (ready && !lipsyncLatencyFired) {
+        lipsyncLatencyFired = true;
+        try { handlers.onLipsyncLatency?.(0); } catch { /* callback threw */ }
+      }
     }
     try {
       client.sendAudioData(new Uint8Array(pcm16le16k));

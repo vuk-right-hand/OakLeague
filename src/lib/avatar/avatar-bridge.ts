@@ -21,6 +21,10 @@ export const AVATAR_ERROR_CODES = [
   'app_message_too_large',
   'session_idle_killed',
   'session_ttl_expired',
+  // 'session_killed' is fallback-path-only — production uses preMintedSessionToken
+  // and mint 429s surface at /api/sessions/open, not here. Do NOT wire this code
+  // into the production error map. (R4-S2, R3-S1)
+  'session_killed',
   'other',
 ] as const;
 
@@ -45,6 +49,10 @@ export type AvatarOpenOptions = {
   // them to body so loadedmetadata fires; caller is responsible for display.
   videoEl?: HTMLVideoElement;
   audioEl?: HTMLAudioElement;
+  // Pre-minted Simli compose token from /api/sessions/open envelope. When
+  // present, SimliBridge SKIPS the /api/spike-b/session fetch (R3-C2/P0-5).
+  // Ignored by TavusBridge.
+  preMintedSessionToken?: string;
 };
 
 export type AvatarError = {
@@ -76,6 +84,10 @@ export type AvatarBridgeHandlers = {
   // Fires exactly once: the first time sendAudio() actually dispatches a chunk.
   // Used by the spike harness to capture t1 (t0→t1 = buffering, t1→t2 = handshake).
   onFirstAudioSent?: () => void;
+  // Fires once: ms elapsed from first sendAudio() dispatch (t1) to first
+  // provider video frame arriving (via loadedmetadata / srcObject populated).
+  // Production session client logs this to PostHog as `simli_lipsync_latency_ms`.
+  onLipsyncLatency?: (ms: number) => void;
 };
 
 export interface AvatarBridge {

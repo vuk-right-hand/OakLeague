@@ -1,0 +1,209 @@
+// POST /api/sessions/open — production session lifecycle entry point.
+//
+// Flow:
+//   1. Same-origin + getCallerUserId (NOT admin — regular user cookie).
+//   2. Per-user rate-limit: 10/min on scope='sessions_open' (R5-M4). Blocks
+//      open→close churn that would burn Simli/Gemini mint budget.
+//   3. Parse body (creator_id, hook_id, model wire-form). Translate model
+//      wire → enum via WIRE_TO_ENUM BEFORE calling the RPC (R3-C3).
+//   4. Call session_open RPC. Tier snapshot + kill-switch check + quota
+//      upsert happen in the BEFORE trigger.
+//   5. Mint Simli FIRST (R3-M2). If FORCE_AVATAR_REQUIRED=1 and mint fails,
+//      close the freshly-created session row via session_close(…,
+//      'force_required_mint_failed') BEFORE returning 503 (R4-C2) — otherwise
+//      the one-active-per-user partial-unique index blocks the user's
+//      immediate retry until the reaper runs 60s later.
+//   6. Mint Gemini ephemeral token via mintEphemeral() lib (NOT the
+//      admin-gated Spike-A route — R3-C1). mintEphemeral writes the COGS
+//      audit row internally (R4-M1). mintSimli writes its own audit row
+//      symmetrically (R5-S4).
+//   7. Return envelope with avatar.session_token (consumed client-side via
+//      SimliBridge.preMintedSessionToken option — R3-C2/P0-5).
+
+import 'server-only';
+import { type NextRequest } from 'next/server';
+import * as Sentry from '@sentry/nextjs';
+import { supabaseServer } from '@/lib/supabase/server';
+import { supabaseAdmin } from '@/lib/supabase/admin';
+import { getCallerUserId } from '@/lib/auth-guards';
+import { json, isSameOrigin, mapPgError } from '@/lib/session/http-helpers';
+import { isAllowedWireModel, WIRE_TO_ENUM } from '@/lib/voice/model-map';
+import { mintEphemeral, MintError } from '@/lib/voice/mint-ephemeral';
+import { mintSimliSessionToken, SimliMintError } from '@/lib/avatar/mint-simli';
+
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Hard cap: Gemini Live 15-min audio-only session cap. Client advances to
+// rollover when it sees this value in the ticker.
+const GEMINI_MAX_SESSION_S = 900;
+
+type Body = {
+  creator_id?: unknown;
+  hook_id?: unknown;
+  model?: unknown;
+};
+
+export async function POST(req: NextRequest) {
+  if (!isSameOrigin(req)) return json(403, { error: 'bad_origin' });
+
+  const callerUserId = await getCallerUserId();
+  if (!callerUserId) return json(401, { error: 'unauthorized' });
+
+  // R5-M4: per-user rate-limit BEFORE the paid provider mints. Normal use is
+  // <1 open per 5min (session length). 10/min is >10× headroom but caps a
+  // run-away client loop at ~$0.05/min of Simli mint spend per attacker.
+  const admin = supabaseAdmin();
+  const { data: allowed, error: rlErr } = await admin.rpc('rate_limit_hit', {
+    p_scope: 'sessions_open',
+    p_key: callerUserId,
+    p_window: '1 minute',
+    p_limit: 10,
+  });
+  if (rlErr) return json(500, { error: 'rate_limit_failed' });
+  if (allowed === false) return json(429, { error: 'rate_limited' });
+
+  let body: Body;
+  try {
+    body = (await req.json()) as Body;
+  } catch {
+    return json(400, { error: 'bad_json' });
+  }
+
+  const creatorId = typeof body.creator_id === 'string' && UUID_RE.test(body.creator_id) ? body.creator_id : null;
+  if (!creatorId) return json(400, { error: 'bad_creator_id' });
+
+  // hook_id is nullable in the schema (ON DELETE SET NULL) but we require it
+  // from the feed flow. null path is reserved for explicit "open directly"
+  // links which don't exist in v1.
+  const hookId = typeof body.hook_id === 'string' && UUID_RE.test(body.hook_id) ? body.hook_id : null;
+  if (!hookId) return json(400, { error: 'bad_hook_id' });
+
+  const wireModel = typeof body.model === 'string' ? body.model : '';
+  if (!isAllowedWireModel(wireModel)) return json(400, { error: 'model_not_allowed' });
+  const enumModel = WIRE_TO_ENUM[wireModel];
+
+  // Resolve the creator's simli_face_id before opening the session. No row →
+  // 404 early. We read with the service-role client because `creators` public
+  // SELECT is "published only" — drafts still need to route (admin preview).
+  const { data: creatorRow, error: creatorErr } = await admin
+    .from('creators')
+    .select('id, simli_face_id, published_at')
+    .eq('id', creatorId)
+    .maybeSingle<{ id: string; simli_face_id: string | null; published_at: string | null }>();
+  if (creatorErr) return json(500, { error: 'creator_lookup_failed' });
+  if (!creatorRow) return json(404, { error: 'creator_not_found' });
+  if (!creatorRow.simli_face_id) return json(409, { error: 'creator_not_ready' });
+
+  // RPC under the cookie-bound client so auth.uid() resolves to the caller.
+  const sb = await supabaseServer();
+  const { data: openRows, error: openErr } = await sb.rpc('session_open', {
+    p_creator_id: creatorId,
+    p_hook_id: hookId,
+    p_model: enumModel,
+  });
+  if (openErr) {
+    const { status, body: errBody } = mapPgError(openErr);
+    return json(status, errBody);
+  }
+  const openRow = Array.isArray(openRows) ? openRows[0] : openRows;
+  if (!openRow?.session_id) return json(500, { error: 'session_open_empty' });
+  const sessionId = openRow.session_id as string;
+  const tier = openRow.tier as 'free' | 'premium' | 'boardroom';
+  const dailyLimitRemaining = (openRow.daily_limit_remaining_s as number) ?? 0;
+
+  // ── Mint Simli FIRST (R3-M2) ────────────────────────────────────────────
+  // Session length clamped to min(15min, remaining daily quota, 600s) so the
+  // Simli pipe TTL ≤ Gemini audio cap. Any clamp below 60s is a bug — the
+  // user already crossed kill-switch threshold; session_open should have
+  // raised. Still defensively floor at 60s for sanity.
+  const maxAvatarSeconds = Math.max(60, Math.min(GEMINI_MAX_SESSION_S, dailyLimitRemaining, 600));
+
+  let avatar: { session_token: string; expires_at: string; face_id: string } | null = null;
+  let avatarStatus: 'minted' | 'failed_mint' = 'failed_mint';
+  let avatarError: string | null = null;
+  try {
+    const result = await mintSimliSessionToken({
+      faceId: creatorRow.simli_face_id,
+      maxSessionLength: maxAvatarSeconds,
+      audit: {
+        userId: callerUserId,
+        sessionId,
+        env: 'production',
+        ua: req.headers.get('user-agent'),
+      },
+    });
+    avatar = {
+      session_token: result.sessionToken,
+      expires_at: result.expiresAt,
+      face_id: result.faceId,
+    };
+    avatarStatus = 'minted';
+  } catch (e) {
+    Sentry.captureException(e, { extra: { op: 'sessions_open_simli_mint', session_id: sessionId } });
+    avatarError = e instanceof SimliMintError ? e.code : 'simli_unknown';
+  }
+
+  // Persist the avatar_status transition. Non-fatal on failure — we prefer
+  // to continue with voice-only rather than 500 the user.
+  try {
+    await sb.rpc('session_set_avatar_status', {
+      p_session_id: sessionId,
+      p_status: avatarStatus,
+    });
+  } catch (e) {
+    Sentry.captureException(e, { extra: { op: 'sessions_open_avatar_status', session_id: sessionId } });
+  }
+
+  const forceRequired = process.env.FORCE_AVATAR_REQUIRED === '1';
+  if (forceRequired && avatarStatus !== 'minted') {
+    // R4-C2: close the freshly-opened session BEFORE returning 503 — otherwise
+    // the one-active-per-user partial-unique index blocks retry until the
+    // reaper runs 60s later.
+    try {
+      await sb.rpc('session_close', {
+        p_session_id: sessionId,
+        p_end_reason: 'force_required_mint_failed',
+      });
+    } catch (e) {
+      Sentry.captureException(e, { extra: { op: 'sessions_open_force_close_after_mint_fail', session_id: sessionId } });
+    }
+    return json(503, { error: 'avatar_unavailable', detail: avatarError ?? 'mint_failed' });
+  }
+
+  // ── Mint Gemini ephemeral (after Simli path so cost ordering is clear) ──
+  let token: { token: string; model: string };
+  try {
+    const result = await mintEphemeral({
+      wireModel,
+      callerUserId,
+      sessionId,
+      env: 'production',
+      ua: req.headers.get('user-agent'),
+    });
+    token = { token: result.token, model: result.model };
+  } catch (e) {
+    Sentry.captureException(e, { extra: { op: 'sessions_open_gemini_mint', session_id: sessionId } });
+    // Gemini is non-recoverable for this session — close it. The client will
+    // show "Voice unavailable, try again" and tap to start a new one.
+    try {
+      await sb.rpc('session_close', {
+        p_session_id: sessionId,
+        p_end_reason: 'gemini_mint_failed',
+      });
+    } catch { /* already logged */ }
+    if (e instanceof MintError) return json(e.httpStatus, { error: e.code });
+    return json(502, { error: 'gemini_mint_failed' });
+  }
+
+  return json(200, {
+    session_id: sessionId,
+    tier,
+    avatar,
+    avatar_status: avatarStatus,
+    gemini: { token: token.token, model: token.model },
+    max_duration_s: dailyLimitRemaining,
+    max_session_s: GEMINI_MAX_SESSION_S,
+  });
+}

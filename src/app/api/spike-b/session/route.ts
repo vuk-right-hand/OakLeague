@@ -5,6 +5,7 @@ import { assertAdminFromSession, AuthGuardError } from '@/lib/auth-guards';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import { ceilingUsdPerMin, estimatedRunCostUsd } from '@/lib/avatar/cost';
 import type { AvatarProvider } from '@/lib/avatar/avatar-bridge';
+import { mintSimliSessionToken, SimliMintError } from '@/lib/avatar/mint-simli';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -108,11 +109,32 @@ export async function POST(req: NextRequest) {
   // verbatim — callers get taxonomy codes the bridge understands.
   try {
     if (provider === 'simli') {
-      return json(200, await mintSimli(replicaId));
+      const result = await mintSimliSessionToken({
+        faceId: replicaId,
+        audit: {
+          userId: session.userId,
+          sessionId: null, // spike-b does not write to public.sessions
+          env: 'spike_b',
+          ua: req.headers.get('user-agent'),
+        },
+      });
+      return json(200, {
+        provider: 'simli' as const,
+        session_token: result.sessionToken,
+        expires_at: result.expiresAt,
+      });
     }
     return json(200, await mintTavus(replicaId));
   } catch (e) {
     Sentry.captureException(e, { extra: { op: 'spike_b_session_mint', provider } });
+    if (e instanceof SimliMintError) {
+      const status = [401, 403, 404, 409, 429].includes(e.httpStatus) ? e.httpStatus : 502;
+      return json(status, {
+        error: e.code,
+        ceiling_rate: ceilingUsdPerMin(provider as AvatarProvider),
+        admin_user: session.userId,
+      });
+    }
     const status = (e as { status?: number }).status ?? 502;
     const err = (e as { code?: string }).code ?? 'provider_mint_failed';
     return json(status === 404 || status === 409 || status === 401 || status === 403 ? status : 502, {
@@ -133,43 +155,6 @@ class ProviderError extends Error {
     this.status = status;
     this.code = code;
   }
-}
-
-async function mintSimli(replicaId: string) {
-  const apiKey = process.env.SIMLI_API_KEY;
-  if (!apiKey) throw new ProviderError(500, 'simli_api_key_missing', 'SIMLI_API_KEY not set');
-
-  // simli-client v3 token endpoint. Auth via x-simli-api-key header (not body).
-  // Body shape is SimliSessionRequest: { faceId, handleSilence, maxSessionLength, maxIdleTime }.
-  // Returns { session_token } which the client passes directly to the SimliClient constructor.
-  const res = await fetch('https://api.simli.ai/compose/token', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-simli-api-key': apiKey },
-    body: JSON.stringify({
-      faceId: replicaId,
-      handleSilence: true,
-      maxSessionLength: 600,
-      maxIdleTime: 120,
-    }),
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new ProviderError(
-      res.status,
-      res.status === 404 ? 'replica_not_found' :
-        res.status === 409 ? 'replica_not_ready' :
-          res.status === 401 || res.status === 403 ? 'token_expired' : 'simli_mint_failed',
-      `simli ${res.status}: ${text.slice(0, 200)}`,
-    );
-  }
-  const body = (await res.json()) as { session_token?: string };
-  if (!body.session_token) throw new ProviderError(502, 'simli_mint_no_token', 'missing session_token');
-
-  return {
-    provider: 'simli' as const,
-    session_token: body.session_token,
-    expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
-  };
 }
 
 async function mintTavus(replicaId: string) {
