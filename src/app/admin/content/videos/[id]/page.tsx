@@ -61,9 +61,9 @@ export default async function VideoDetailPage({
       .maybeSingle<CreatorRow>(),
     admin
       .from('creator_topics')
-      .select('slug, label')
+      .select('slug, label:title')
       .eq('creator_id', video.creator_id)
-      .order('label', { ascending: true }),
+      .order('title', { ascending: true }),
   ]);
 
   const hooks = (hooksRaw ?? []) as HookRow[];
