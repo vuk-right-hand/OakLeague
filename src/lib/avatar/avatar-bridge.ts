@@ -68,6 +68,10 @@ export type AvatarError = {
 export type AvatarBridgeHandlers = {
   onReady?: () => void;
   onVideoTrack?: (track: MediaStreamTrack) => void;
+  // Audio track from the provider's LiveKit/WebRTC pipe. Fired once when the
+  // SDK populates the audio element's srcObject. Harness uses it to mix
+  // video+audio into a single MediaRecorder stream for rater clips.
+  onAudioTrack?: (track: MediaStreamTrack) => void;
   onError?: (err: AvatarError) => void;
   // Fires exactly once: the first time sendAudio() actually dispatches a chunk.
   // Used by the spike harness to capture t1 (t0→t1 = buffering, t1→t2 = handshake).

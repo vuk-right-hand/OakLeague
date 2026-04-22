@@ -221,6 +221,17 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
       } catch { /* no track available */ }
     }, { once: true });
 
+    // Audio track — same pattern. The SDK sets audioEl.srcObject via LiveKit.
+    // Harness uses it to combine video+audio into a MediaRecorder stream.
+    audioEl.addEventListener('loadedmetadata', () => {
+      if (closed) return;
+      try {
+        const stream = audioEl!.srcObject instanceof MediaStream ? audioEl!.srcObject : null;
+        const track = stream?.getAudioTracks()[0] ?? null;
+        if (track) handlers.onAudioTrack?.(track);
+      } catch { /* no audio track */ }
+    }, { once: true });
+
     try {
       await client.start();
     } catch (e) {
