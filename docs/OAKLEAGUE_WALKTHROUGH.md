@@ -38,7 +38,7 @@ Free tier: 10 minutes/day of Answer Time (the conversational leg), reset at user
 
 **Realtime transport:** LiveKit Cloud as WebRTC pipe + global TURN. Not LiveKit Agents framework.
 
-**Voice brain:** Direct WebSocket to Gemini Live. Default `gemini-3.1-flash-live-preview` (pinned via `VOICE_MODEL` env). Fallback `gemini-live-2.5-flash-native-audio` — one env-swap. Browser audio worklets per `docs/VOICER_VOICE_GUIDE.md` §4–§7.
+**Voice brain:** Direct WebSocket to Gemini Live. Default `gemini-3.1-flash-live-preview` (pinned via `VOICE_MODEL_PRIMARY` env). Fallback `gemini-2.5-flash-native-audio-preview-12-2025` (pinned via `VOICE_MODEL_SECONDARY`) — one env-swap recovery. Browser audio worklets per `docs/VOICER_VOICE_GUIDE.md` §4–§7.
 
 **Per-session model selection:** When session opens, we choose Flash Live (free) or Pro pipeline (premium/boardroom) based on user tier. Session is locked to that choice for its full duration. `sessions.tier_at_session` snapshots for audit.
 
@@ -204,6 +204,8 @@ If results are inconclusive, default to hypothesized winner and document open qu
 
 **Days 6-7 (Apr 25-26) — Feed.** Mux account. Upload tooling. `videos` + `hooks` populated with founder content (recorded in parallel days 2-5). Vertical feed with gesture handling. Welcome hook on first open. **Deliverable:** stranger can scroll on physical phone.
 
+**Day 5 inherited from Spike A audit (2026-04-21):** (1) redesign or delete `public/worklets/mic-processor.js` — the current carry-logic drops sample 0 and the file is unused by the spike harness; (2) iOS TTS playback via MediaSource/SourceBuffer Opus/webm (Spike A accepted Web Audio AEC regression); (3) implement Priming Window primitive — must use canned audio or seeded text, NOT silent PCM (empirically invalidated Phase 0). Full hand-off: `docs/SPIKE_A_V2_PLAN.md` § Deferred items.
+
 **Days 8-12 (Apr 27 - May 1) — Voice pipeline.** Build in Voicer §13 order strictly:
 1. Hello-world WS to Gemini 3.1 Live, canned text, response received
 2. Mic worklet → 16kHz PCM → WS → live transcript (via `send_realtime_input`)
@@ -215,6 +217,8 @@ If results are inconclusive, default to hypothesized winner and document open qu
 8. Ephemeral token refresh
 
 Per-session model selection by user tier. Cartesia voice cloned. Daily quota enforcement. `cogs_log` writes on every call. **Deliverable:** tap "Ask" → conversation → quota decrements → barge-in works.
+
+**Day 8 inherited from Spike A audit (2026-04-21):** (1) heartbeat write amplification — aggregate per-session in memory, flush every N seconds instead of one `session_turns` row per turn; (2) add `daily_quotas.day_utc` GENERATED column + composite `(user_id, day_utc)` index; (3) tighten ghost-session reaper from spike's ~150s to <30s; (4) migrate COGS pricing from seconds-times-`$PRICE_USD_PER_SEC` folklore to real `usageMetadata` tokens once Gemini Live surfaces them reliably. Full hand-off: `docs/SPIKE_A_V2_PLAN.md` § Deferred items.
 
 **Days 13-14 (May 2-3) — Avatar + admin + polish.** Simli (or Tavus) layer with pipe-stays-warm logic. Local nodding MP4 pre-rendered. Lip-sync timing tuned. Camera permission pre-prompt. Hook → session transition. Resume-session for iOS backgrounding. **Admin console:** creator application queue, creator brain-status visibility, manual tier flip (free / premium / boardroom), **COGS log viewer** (real-time per-session cost, kill-switch visibility). Landing page with thesis + waitlist + demo video embed. Loading skeletons. Modal dismissal patterns. **Deliverable:** stranger uses end-to-end without guidance on physical iOS Safari + Android Chrome. Admin can demo tier-flip live (Vuk's own account → premium → Pro pipeline visible).
 

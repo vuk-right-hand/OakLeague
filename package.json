@@ -13,8 +13,12 @@
     "db:diff": "supabase db diff"
   },
   "dependencies": {
+    "@daily-co/daily-js": "^0.89.1",
     "@google/genai": "^1.50.1",
     "@hookform/resolvers": "^3.10.0",
+    "@mux/mux-node": "^12.8.1",
+    "@mux/mux-player-react": "^3.11.8",
+    "@mux/mux-uploader-react": "^1.4.1",
     "@radix-ui/react-label": "^2.1.0",
     "@radix-ui/react-slot": "^1.1.0",
     "@radix-ui/react-toast": "^1.2.4",
@@ -31,6 +35,7 @@
     "react-dom": "^19.0.0",
     "react-hook-form": "^7.54.0",
     "resend": "^6.9.0",
+    "simli-client": "^3.0.1",
     "tailwind-merge": "^2.5.0",
     "zod": "^3.24.0"
   },

@@ -32,18 +32,32 @@ Interactive video with voice Q&A:
 
 **Default:** `gemini-3.1-flash-live-preview` (released 2026-03-26). Native audio-to-audio, single model, no transcribe-think-synthesize pipeline. Best-in-class for conversational back-and-forth.
 
-**Fallback (one env-swap):** `gemini-live-2.5-flash-native-audio` (GA on Vertex).
+**Fallback (one env-swap):** `gemini-2.5-flash-native-audio-preview-12-2025` (Phase 0 2026-04-21 confirmed reachable on AI Studio v1alpha — no Vertex branch needed).
 
 **Why 3.1 over 2.5 at this moment:** 3.1 has better tonal understanding, thinking modes (`thinkingLevel`), 2x conversation context, and improved handling of user frustration/confusion. Pricing is the same tier.
 
 **Why a Spike-A gate exists:** On 2026-04-18 Voicer reported a 15-20s end-to-end latency regression on 3.1 in PWA on real phones. Google's blog claims 3.1 is faster. Real-world disagreed. Day 4 Spike A must measure real-device PWA latency for both 3.1 and 2.5. If 3.1 regression confirms, flip `VOICE_MODEL` → 2.5, zero code change.
+
+**Spike-A result (2026-04-21, gate CLEARED):** 3.1 pin holds. Measured TTFA through Fly-deployed WS proxy → @google/genai Live v1alpha, 3×5 cells, single canned PCM turn per iteration:
+
+| Surface | 3.1 p50 | 3.1 p90 | 2.5 p50 (reference) |
+|---|---|---|---|
+| Desktop Chrome | 2554ms | 3707ms | 5022ms |
+| Pixel 7 Pro WiFi | 2920–3189ms | ~4000–7000ms | 4933ms |
+| Pixel 7 Pro LTE | 2994ms | 4288ms | — |
+| iPhone 11 WiFi | 3387ms | 4512ms | — |
+| iPhone 11 LTE (hotspot) | 3083ms | 4715ms | — |
+
+**Voicer's 15-20s regression did not reproduce on any surface.** 3.1 is consistently ~2× faster than 2.5 across desktop, Pixel, and iPhone 11 (both WiFi and cellular). iOS Safari WebKit audio path shows no model-specific degradation. p90 outliers (8–10s spikes) correlate with `session_already_active` code 4002 under burst testing — a Gemini preview-tier concurrency throttle, not a production user-path concern.
+
+No per-platform model routing needed. Single pin, one COGS profile.
 
 ### Hard rule — model pinning
 
 **Pin a specific version string.** Banned: `-latest`, bare `-preview` with no version.
 
 ```bash
-VOICE_MODEL=gemini-3.1-flash-live-preview  # or gemini-live-2.5-flash-native-audio
+VOICE_MODEL=gemini-3.1-flash-live-preview  # fallback: gemini-2.5-flash-native-audio-preview-12-2025
 ```
 
 Real-API gated test (`RUN_REAL_API_TESTS=1`) catches silent model deprecation.

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { GoogleGenAI, Modality, type LiveServerMessage, type Session } from '@google/genai';
 
-type ModelId = 'gemini-3.1-flash-live-preview' | 'gemini-live-2.5-flash-native-audio';
+type ModelId = 'gemini-3.1-flash-live-preview' | 'gemini-2.5-flash-native-audio-preview-12-2025';
 
 type Status = 'DONE' | 'ERROR' | 'TIMEOUT' | 'INVALID';
 
@@ -12,7 +12,6 @@ type TurnRow = {
   tokenMs?: number;
   wsMs?: number;
   setupMs?: number;
-  bufferedAtT4?: number;
   ttfaMs?: number;
   totalMs?: number;
   status: Status;
@@ -31,10 +30,11 @@ const TOKEN_TIMEOUT_MS = 10_000;
 const WS_OPEN_TIMEOUT_MS = 10_000;
 const SETUP_COMPLETE_TIMEOUT_MS = 10_000;
 const FIRST_CHUNK_TIMEOUT_MS = 15_000;
+const TURN_COMPLETE_TIMEOUT_MS = 8_000;
+const INTER_SESSION_DELAY_MS = 1_000;
 const TURNS_PER_SESSION = 5;
 const SESSIONS_PER_CELL = 3;
 const MAX_CONSECUTIVE_INVALID = 3;
-const BUFFERED_SUSPECT_THRESHOLD = 4096;
 const CHUNK_SAMPLES = 16_000;         // ~1s @ 16kHz
 const CHUNK_BYTES = CHUNK_SAMPLES * 2;
 
@@ -42,11 +42,11 @@ function isoDuration(pcmBytes: number) {
   return pcmBytes / 2 / 16000;
 }
 
+// For loop avoids spread-arg stack overflow on iOS Safari with large Uint8Arrays.
 function base64FromBytes(b: Uint8Array): string {
   let s = '';
-  const CHUNK = 0x8000;
-  for (let i = 0; i < b.length; i += CHUNK) {
-    s += String.fromCharCode(...b.subarray(i, Math.min(i + CHUNK, b.length)));
+  for (let i = 0; i < b.length; i++) {
+    s += String.fromCharCode(b[i]);
   }
   return btoa(s);
 }
@@ -138,7 +138,7 @@ export default function SpikeClient() {
     setLog((prev) => [...prev.slice(-99), `[${new Date().toISOString().slice(11, 23)}] ${s}`]);
   }, []);
 
-  // Preflight: /api/me + canned audio fetch + standalone mode hint
+  // Preflight: /api/me (includes profile existence check) + canned audio fetch
   useEffect(() => {
     (async () => {
       setRunState('preflight');
@@ -211,10 +211,10 @@ export default function SpikeClient() {
       let currentTurnFirstChunkResolver: ((ms: number) => void) | null = null;
       let currentTurnFirstChunkRejecter: ((e: Error) => void) | null = null;
       let activityEndAtMs = 0;
-      let bufferedAtT4 = 0;
       let t4Recorded = false;
       let t3Recorded = false;
       let hasTurnFinished = false;
+      let totalOutputBytes = 0;
 
       const onMessage = (m: LiveServerMessage) => {
         if (m.setupComplete && !t3Recorded) {
@@ -237,7 +237,7 @@ export default function SpikeClient() {
             }
           }
         }
-        void audioBytes;
+        totalOutputBytes += audioBytes;
         if (m.serverContent?.turnComplete) hasTurnFinished = true;
       };
 
@@ -307,7 +307,11 @@ export default function SpikeClient() {
         }
 
         t4Recorded = false;
+        activityEndAtMs = 0;
         hasTurnFinished = false;
+        // Defensive: clear any stale resolver/rejecter from prior turn.
+        currentTurnFirstChunkResolver = null;
+        currentTurnFirstChunkRejecter = null;
 
         const turnPromise = new Promise<number>((res, rej) => {
           currentTurnFirstChunkResolver = res;
@@ -326,7 +330,7 @@ export default function SpikeClient() {
           for (let off = 0; off < canned.length; off += CHUNK_BYTES) {
             const slice = canned.subarray(off, Math.min(off + CHUNK_BYTES, canned.length));
             session.sendRealtimeInput({
-              media: {
+              audio: {
                 data: base64FromBytes(slice),
                 mimeType: 'audio/pcm;rate=16000',
               },
@@ -339,20 +343,18 @@ export default function SpikeClient() {
           break;
         }
 
-        // Snapshot backpressure + send activityEnd
-        try {
-          const ws = (session as unknown as { conn?: { bufferedAmount?: number } }).conn;
-          bufferedAtT4 = ws?.bufferedAmount ?? 0;
-        } catch { bufferedAtT4 = -1; }
-
+        // Mark t4 BEFORE sending activityEnd — avoids race where first audio chunk arrives
+        // in the microtask gap between sendRealtimeInput() and setting t4Recorded.
+        activityEndAtMs = performance.now();
+        t4Recorded = true;
         try {
           session.sendRealtimeInput({ activityEnd: {} });
         } catch (e) {
+          t4Recorded = false;
+          activityEndAtMs = 0;
           result.turns.push({ turn, status: 'ERROR', reason: 'activityEnd_' + (e as Error).message });
           break;
         }
-        t4Recorded = true;
-        activityEndAtMs = performance.now();
 
         let ttfaMs: number | undefined;
         try {
@@ -365,16 +367,21 @@ export default function SpikeClient() {
           break;
         }
 
-        // Wait briefly for turn to complete so subsequent activityStart has clean state
-        const turnDoneDeadline = performance.now() + 10_000;
+        // Hard wait for turnComplete before next turn's activityStart.
+        // If server never sends turnComplete, turn state is poisoned — abort session rather than
+        // racing next activityStart against stale audio (caused turn-5 1007 invalid_argument).
+        const turnDoneDeadline = performance.now() + TURN_COMPLETE_TIMEOUT_MS;
         while (!hasTurnFinished && performance.now() < turnDoneDeadline) await sleep(50);
+        if (!hasTurnFinished) {
+          result.turns.push({ turn, status: 'ERROR', reason: 'turn_complete_timeout' });
+          break;
+        }
 
         result.turns.push({
           turn,
           tokenMs: Math.round(t1 - t0),
           wsMs:    Math.round(t2 - t1),
           setupMs: Math.round(t3 - t2),
-          bufferedAtT4,
           ttfaMs:  Math.round(ttfaMs),
           totalMs: Math.round(performance.now() - t0),
           status: 'DONE',
@@ -383,9 +390,14 @@ export default function SpikeClient() {
 
       try { session.close(); } catch {}
 
-      // Record COGS (approximate — input = canned duration × turns; output we don't measure here)
-      const inSec = isoDuration(canned.length) * result.turns.filter((t) => t.status === 'DONE').length;
-      await recordCogs(model, inSec, 0, device);
+      // Record COGS — output bytes accumulated from all audio parts received in onMessage.
+      // Skip zero-duration sessions so we don't insert 0-unit noise rows.
+      const doneTurns = result.turns.filter((t) => t.status === 'DONE').length;
+      if (doneTurns > 0 || totalOutputBytes > 0) {
+        const inSec = isoDuration(canned.length) * doneTurns;
+        const outSec = totalOutputBytes / 2 / 16000;
+        await recordCogs(model, inSec, outSec, device);
+      }
 
       return result;
     },
@@ -415,6 +427,10 @@ export default function SpikeClient() {
       const allInvalid = r.aborted || r.turns.length === 0 || r.turns.every((t) => t.status !== 'DONE');
       if (allInvalid) consecutiveInvalid += 1; else consecutiveInvalid = 0;
       appendLog(`session ${i} done: ${r.turns.length} turns, aborted=${r.aborted ?? 'no'}`);
+      // Let SDK + server fully tear down the prior WS before next live.connect().
+      // Without this, sessions 2+ sometimes see "setup must be the first message and only" (1007)
+      // — suggests SDK/server state leakage when sessions are opened back-to-back.
+      if (i < SESSIONS_PER_CELL) await sleep(INTER_SESSION_DELAY_MS);
     }
     setRunState('done');
   }, [model, preflightOk, runOneSession, appendLog]);
@@ -469,7 +485,7 @@ export default function SpikeClient() {
           disabled={runState === 'running'}
         >
           <option value="gemini-3.1-flash-live-preview">3.1 Flash Live (preview)</option>
-          <option value="gemini-live-2.5-flash-native-audio">2.5 Flash Native Audio (GA)</option>
+          <option value="gemini-2.5-flash-native-audio-preview-12-2025">2.5 Flash Native Audio (preview 12-2025)</option>
         </select>
         <button
           style={{ marginLeft: 12 }}
@@ -500,14 +516,13 @@ export default function SpikeClient() {
             <table style={{ borderCollapse: 'collapse', fontSize: 13 }}>
               <thead>
                 <tr>
-                  {['turn', 'token_ms', 'ws_ms', 'setup_ms', 'buffered_at_t4', 'ttfa_ms', 'total_ms', 'status'].map((h) => (
+                  {['turn', 'token_ms', 'ws_ms', 'setup_ms', 'ttfa_ms', 'total_ms', 'status'].map((h) => (
                     <th key={h} style={{ border: '1px solid #ccc', padding: '2px 8px', textAlign: 'left' }}>{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
                 {s.turns.map((t) => {
-                  const suspect = typeof t.bufferedAtT4 === 'number' && t.bufferedAtT4 > BUFFERED_SUSPECT_THRESHOLD;
                   const isT2 = t.turn === 2;
                   return (
                     <tr key={t.turn} style={{ background: isT2 ? '#fffbcc' : undefined, textDecoration: t.status === 'INVALID' ? 'line-through' : undefined }}>
@@ -515,9 +530,6 @@ export default function SpikeClient() {
                       <td style={{ border: '1px solid #ccc', padding: '2px 8px' }}>{t.tokenMs ?? '—'}</td>
                       <td style={{ border: '1px solid #ccc', padding: '2px 8px' }}>{t.wsMs ?? '—'}</td>
                       <td style={{ border: '1px solid #ccc', padding: '2px 8px' }}>{t.setupMs ?? '—'}</td>
-                      <td style={{ border: '1px solid #ccc', padding: '2px 8px', color: suspect ? 'crimson' : undefined }}>
-                        {t.bufferedAtT4 ?? '—'}{suspect ? ' ⚠' : ''}
-                      </td>
                       <td style={{ border: '1px solid #ccc', padding: '2px 8px', fontWeight: isT2 ? 600 : 400 }}>{t.ttfaMs ?? '—'}</td>
                       <td style={{ border: '1px solid #ccc', padding: '2px 8px' }}>{t.totalMs ?? '—'}</td>
                       <td style={{ border: '1px solid #ccc', padding: '2px 8px' }}>

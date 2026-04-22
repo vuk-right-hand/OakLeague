@@ -7,10 +7,12 @@ const config: NextConfig = {
   // from user input (next=<path>, /invite/<token>/claim) and the ergonomics
   // of RouteImpl casting every call site isn't worth it yet.
   typedRoutes: false,
+  allowedDevOrigins: ['*.ngrok-free.dev', '*.ngrok-free.app'],
   images: {
     remotePatterns: [
       { protocol: 'https', hostname: '*.mux.com' },
       { protocol: 'https', hostname: 'image.mux.com' },
+      { protocol: 'https', hostname: 'stream.mux.com' },
     ],
   },
 };

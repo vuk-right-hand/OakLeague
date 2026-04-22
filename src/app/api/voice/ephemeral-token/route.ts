@@ -9,7 +9,7 @@ export const dynamic = 'force-dynamic';
 
 const ALLOWED_MODELS = new Set([
   'gemini-3.1-flash-live-preview',
-  'gemini-live-2.5-flash-native-audio',
+  'gemini-2.5-flash-native-audio-preview-12-2025',
 ]);
 
 const MINT_TIMEOUT_MS = 10_000;
@@ -25,18 +25,24 @@ function json(status: number, body: unknown) {
   });
 }
 
-function expectedOrigin(): string | null {
-  const site = process.env.NEXT_PUBLIC_SITE_URL;
-  if (!site) return null;
-  try { return new URL(site).origin; } catch { return null; }
+// Same-origin check, honoring x-forwarded-host for TLS-terminating tunnels
+// (ngrok in dev, any reverse proxy in prod). See .claude_learnings.md
+// 2026-04-21 "ngrok HTTPS → Next dev HTTP".
+function isSameOrigin(req: NextRequest): boolean {
+  const origin = req.headers.get('origin');
+  if (!origin) return false;
+  try {
+    const originHost = new URL(origin).host;
+    const forwardedHost = req.headers.get('x-forwarded-host');
+    const reqHost = forwardedHost ?? req.nextUrl.host;
+    return originHost === reqHost;
+  } catch {
+    return false;
+  }
 }
 
 export async function POST(req: NextRequest) {
-  const origin = req.headers.get('origin');
-  const expected = expectedOrigin();
-  if (!expected || origin !== expected) {
-    return json(403, { error: 'bad_origin' });
-  }
+  if (!isSameOrigin(req)) return json(403, { error: 'bad_origin' });
 
   let session;
   try {
@@ -60,24 +66,24 @@ export async function POST(req: NextRequest) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return json(500, { error: 'gemini_key_missing' });
 
-  const client = new GoogleGenAI({ apiKey, httpOptions: { apiVersion: 'v1alpha' } });
-
-  const mintPromise = client.authTokens.create({
-    config: {
-      uses: 1,
-      liveConnectConstraints: {
-        model,
-        config: {
-          responseModalities: [Modality.AUDIO],
-          systemInstruction: 'You are a helpful mentor. Answer in one concise sentence.',
-          realtimeInputConfig: { automaticActivityDetection: { disabled: true } },
-        },
-      },
-    },
-  });
-
   let token;
   try {
+    const client = new GoogleGenAI({ apiKey, httpOptions: { apiVersion: 'v1alpha' } });
+    const mintPromise = client.authTokens.create({
+      config: {
+        uses: 1,
+        liveConnectConstraints: {
+          model,
+          config: {
+            responseModalities: [Modality.AUDIO],
+            systemInstruction: 'You are a helpful mentor. Answer in one concise sentence.',
+            realtimeInputConfig: { automaticActivityDetection: { disabled: true } },
+          },
+        },
+      },
+    });
+    // Suppress unhandled rejection if the timeout leg wins the race.
+    mintPromise.catch(() => {});
     token = await Promise.race<unknown>([
       mintPromise,
       new Promise((_, reject) => setTimeout(() => reject(new Error('mint_timeout')), MINT_TIMEOUT_MS)),
@@ -95,11 +101,12 @@ export async function POST(req: NextRequest) {
     user_id: session.userId,
     session_id: null,
     service: 'gemini',
-    operation: 'spike_a_ephemeral_mint',
+    operation: 'voice_ephemeral_token_mint',
     units: 1,
     unit_label: 'token',
     cost_usd: 0,
-    metadata: { source: 'spike_a', model, ua: ua.slice(0, 256) },
+    environment: 'spike_a',
+    metadata: { source: 'spike_a_harness', model, ua: ua.slice(0, 256) },
   });
 
   return json(200, { token: token.name });

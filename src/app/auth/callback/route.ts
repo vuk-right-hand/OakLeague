@@ -7,6 +7,15 @@ function safeNext(next: string | null): string {
   return next;
 }
 
+function publicUrl(req: NextRequest, path: string): URL {
+  const forwardedHost = req.headers.get('x-forwarded-host');
+  const forwardedProto = req.headers.get('x-forwarded-proto');
+  if (forwardedHost) {
+    return new URL(path, `${forwardedProto ?? 'https'}://${forwardedHost}`);
+  }
+  return new URL(path, req.url);
+}
+
 export async function GET(req: NextRequest) {
   const url = new URL(req.url);
   const error = url.searchParams.get('error');
@@ -14,20 +23,20 @@ export async function GET(req: NextRequest) {
   const claim = url.searchParams.get('claim');
   const next = safeNext(url.searchParams.get('next'));
 
-  if (error) return NextResponse.redirect(new URL(`/login?error=${error}`, url));
-  if (!code) return NextResponse.redirect(new URL('/login?error=no_code', url));
+  if (error) return NextResponse.redirect(publicUrl(req, `/login?error=${error}`));
+  if (!code) return NextResponse.redirect(publicUrl(req, '/login?error=no_code'));
 
   const supabase = await supabaseServer();
   try {
     const { error: exErr } = await supabase.auth.exchangeCodeForSession(code);
-    if (exErr) return NextResponse.redirect(new URL('/login?error=exchange_failed', url));
+    if (exErr) return NextResponse.redirect(publicUrl(req, '/login?error=exchange_failed'));
   } catch {
-    return NextResponse.redirect(new URL('/login?error=exchange_failed', url));
+    return NextResponse.redirect(publicUrl(req, '/login?error=exchange_failed'));
   }
 
   const { data: userData } = await supabase.auth.getUser();
   const user = userData.user;
-  if (!user) return NextResponse.redirect(new URL('/login?error=no_user', url));
+  if (!user) return NextResponse.redirect(publicUrl(req, '/login?error=no_user'));
 
   // Consume email-signup claim nonce (idempotent; zero-rows == silent ignore).
   if (claim && user.email) {
@@ -51,11 +60,9 @@ export async function GET(req: NextRequest) {
       .eq('id', user.id)
       .maybeSingle<{ onboarded_at: string | null }>();
     if (!profile?.onboarded_at) {
-      return NextResponse.redirect(
-        new URL(`/onboarding?next=${encodeURIComponent(next)}`, url),
-      );
+      return NextResponse.redirect(publicUrl(req, `/onboarding?next=${encodeURIComponent(next)}`));
     }
   }
 
-  return NextResponse.redirect(new URL(next, url));
+  return NextResponse.redirect(publicUrl(req, next));
 }

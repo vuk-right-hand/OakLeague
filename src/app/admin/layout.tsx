@@ -21,6 +21,8 @@ export default async function AdminLayout({ children }: { children: React.ReactN
         <nav style={{ display: 'flex', gap: 16, fontSize: 14 }}>
           <a href="/admin/invites/new">New invite</a>
           <a href="/admin/applications">Applications</a>
+          <a href="/admin/content/videos">Videos</a>
+          <a href="/admin/content/welcome">Welcome</a>
         </nav>
       </header>
       {children}

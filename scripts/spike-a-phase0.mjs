@@ -18,7 +18,7 @@ if (!apiKey) { console.error('GEMINI_API_KEY missing'); process.exit(1); }
 const findings = {
   runAt: new Date().toISOString(),
   gemini31: { model: 'gemini-3.1-flash-live-preview' },
-  gemini25: { model: 'gemini-live-2.5-flash-native-audio' },
+  gemini25: { model: 'gemini-2.5-flash-native-audio-preview-12-2025' },
   sdkVersion: null,
   mintShapeVerified: false,
   setupFrameRequired: null,

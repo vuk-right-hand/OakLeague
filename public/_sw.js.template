@@ -1,0 +1,32 @@
+/* OakLeague service worker — TEMPLATE, not live infra.
+ *
+ * Rename to /public/sw.js AND register it from a client module (e.g.
+ * navigator.serviceWorker.register('/sw.js')) before shipping PWA
+ * install. Until then this file is inert — the .template suffix keeps
+ * it out of the build's public surface so a half-registered SW can't
+ * intercept live traffic.
+ *
+ * Mux streaming/thumbnail hosts must NOT be cached by the SW. Adaptive
+ * HLS segments rotate fast; an intermediate cache will serve stale
+ * quality levels and occasionally break playback.
+ */
+
+const MUX_HOSTS = new Set([
+  'stream.mux.com',
+  'image.mux.com',
+  'cdn.mux.com',
+  'inferred.litix.io',
+]);
+
+self.addEventListener('fetch', (event) => {
+  try {
+    const url = new URL(event.request.url);
+    if (MUX_HOSTS.has(url.hostname)) {
+      event.respondWith(fetch(event.request));
+      return;
+    }
+  } catch {
+    /* noop */
+  }
+  // Fall through to default browser handling.
+});

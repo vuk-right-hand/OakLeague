@@ -1,0 +1,49 @@
+What Fly.io Is (and Why You Need It)
+In the architecture we just locked in, Vercel hosts the beautiful Next.js frontend, and LiveKit handles the WebRTC video pipe. But you still need a place to run the actual "Brain" — the Python code (using Pipecat) that listens to the user, queries your database, and talks to Gemini and Simli.
+
+You cannot run that Python script on Vercel. Vercel uses "Serverless Functions," which physically kill themselves after 10 to 60 seconds to save money. If a user is interrogating the AI for 90 minutes, Vercel will hang up on them in the first minute.
+
+Fly.io is where your long-running backend lives. It takes your Python Docker container and runs it on a persistent server close to your users.
+
+Why You Almost Burned the Free Tier in One Day
+Fly.io's billing is calculated by the second, but the Free Tier is a very specific trap.
+
+The Free Tier gives you three shared-cpu-1x machines with exactly 256MB of RAM.
+Running a modern Python application orchestrating live WebRTC streams and LLM APIs usually idles at around 300MB to 500MB of RAM. If you spun up a machine with 1GB or 2GB of RAM just to get your test script to run without crashing, you instantly stepped outside the free tier, and the meter started ticking.
+
+The Actual Math (In Minutes and Hours)
+Fly.io charges for two main things: the CPU and the RAM. You do not pay a flat $500 monthly fee. You only pay for the exact seconds the machine is powered on.
+
+Here is what it actually costs to run a dedicated backend server for your AI:
+
+The "Testing" Machine (Shared CPU, 1GB RAM)
+
+Per Hour: ~$0.0079
+
+Per Minute: ~$0.00013
+
+If you leave it running 24/7 for a month: ~$5.70
+
+The "Production" Machine (Dedicated Performance CPU, 2GB RAM)
+(This is what you will likely need to handle multiple simultaneous WebRTC Pipecat streams without audio jitter).
+
+Per Hour: ~$0.043
+
+Per Minute: ~$0.0007
+
+If you leave it running 24/7 for a month: ~$31.40
+
+To hit a $500 bill on Fly.io, you would have to leave 16 production-grade servers running 24 hours a day, 7 days a week, for an entire month.
+
+Here is a calculator to simulate exactly what your testing and production costs will look like based on how many hours the machines are actually awake.
+
+
+Show me the visualization
+
+
+The Ultimate Cost Hack: Scale to Zero
+Because Fly.io charges by the second, the secret to keeping your cloud bill near zero during testing (and profitable during production) is configuring the machines to Scale to Zero.
+
+You configure your Fly.toml file so that the server automatically turns itself off when no one is talking to the AI. When a user clicks the [Interrogate] button on your Vercel frontend, Fly.io wakes the machine up in about 300 milliseconds. The meter ticks for the 15 minutes they are consulting, and when they hang up, the machine powers down, and the billing stops.
+
+Do you want me to outline the exact configuration settings needed to force that Pipecat backend to scale to zero so your testing costs drop back down to pennies?
