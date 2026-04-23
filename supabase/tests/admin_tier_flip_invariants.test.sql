@@ -5,8 +5,18 @@
 --   4. Downgrade after seconds_used > 0 → P0003 downgrade_blocked_until_tomorrow
 --   5. Happy path: tier flipped, daily_quotas row updated (preserves seconds_used),
 --      audit row written.
+--
+-- Assertions use `throws_ok(query, sqlstate)` — matches on the custom SQLSTATE
+-- the RPC RAISEs, not LIKE patterns on SQLERRM. LIKE patterns were unreliable
+-- on messages containing `_` (wildcards) under SECURITY DEFINER, and SQLSTATE
+-- is the stable contract the API layer actually branches on.
+--
+-- RLS note: sessions/profiles/daily_quotas/admin_audit_log all gate reads+writes
+-- on auth.uid() or have zero client policies. Data setup and assertion reads
+-- run as postgres (tests.reset_role); only throws_ok wraps the RPC call in
+-- the authenticated role so auth.uid() returns the caller.
 BEGIN;
-SELECT plan(7);
+SELECT plan(8);
 
 CREATE FUNCTION pg_temp.run() RETURNS SETOF text LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -28,32 +38,39 @@ BEGIN
     VALUES (v_cuid, 'TFC', 'tfc', 'ready', now())
     RETURNING id INTO v_cid;
 
-  -- 1. Non-admin rejected.
+  -- 1. Non-admin rejected (42501).
   PERFORM tests.set_authenticated(v_other);
-  RETURN NEXT throws_like(
+  RETURN NEXT throws_ok(
     format('SELECT public.admin_set_profile_tier(%L, %L)', v_user, 'premium'),
-    '%admin not authorized%',
-    '1: non-admin caller rejected'
+    '42501',
+    NULL,
+    '1: non-admin caller rejected (42501)'
   );
+  PERFORM tests.reset_role();
 
   -- 2. Missing target → P0002.
   PERFORM tests.set_authenticated(v_admin);
-  RETURN NEXT throws_like(
+  RETURN NEXT throws_ok(
     format('SELECT public.admin_set_profile_tier(%L, %L)', gen_random_uuid(), 'premium'),
-    '%not found%',
+    'P0002',
+    NULL,
     '2: missing target rejected (P0002)'
   );
+  PERFORM tests.reset_role();
 
   -- 3. Active session → P0004.
   INSERT INTO public.sessions (user_id, creator_id, model_used, tier_at_session)
     VALUES (v_user, v_cid, 'gemini_3_1_flash_live_preview', 'free')
     RETURNING id INTO v_sid;
 
-  RETURN NEXT throws_like(
+  PERFORM tests.set_authenticated(v_admin);
+  RETURN NEXT throws_ok(
     format('SELECT public.admin_set_profile_tier(%L, %L)', v_user, 'premium'),
-    '%has_active_session%',
+    'P0004',
+    NULL,
     '3: active session blocks tier flip (P0004)'
   );
+  PERFORM tests.reset_role();
 
   -- Close session, add 120s used today.
   UPDATE public.sessions SET ended_at = now(), status = 'ended' WHERE id = v_sid;
@@ -61,19 +78,22 @@ BEGIN
   UPDATE public.daily_quotas SET seconds_used = 120
    WHERE user_id = v_user AND quota_date = v_qdate;
 
-  -- 4. Downgrade blocked with logged seconds.
+  -- 4. Downgrade blocked with logged seconds (P0003).
   UPDATE public.profiles SET tier = 'premium' WHERE id = v_user;
   UPDATE public.daily_quotas SET tier_snapshot = 'premium', daily_limit_s = 3600
    WHERE user_id = v_user AND quota_date = v_qdate;
 
-  RETURN NEXT throws_like(
+  PERFORM tests.set_authenticated(v_admin);
+  RETURN NEXT throws_ok(
     format('SELECT public.admin_set_profile_tier(%L, %L)', v_user, 'free'),
-    '%downgrade_blocked_until_tomorrow%',
+    'P0003',
+    NULL,
     '4: downgrade blocked after seconds used (P0003)'
   );
 
-  -- 5. Upgrade succeeds, audit row written, seconds_used preserved.
+  -- 5. Upgrade succeeds (still authenticated as v_admin so RPC sees admin uid).
   PERFORM public.admin_set_profile_tier(v_user, 'boardroom');
+  PERFORM tests.reset_role();
 
   RETURN NEXT is(
     (SELECT tier FROM public.profiles WHERE id = v_user),
@@ -97,8 +117,6 @@ BEGIN
      AND action = 'tier_flip'
      AND target_id = v_user;
   RETURN NEXT is(v_audit_count, 1, '5d: admin_audit_log row written');
-
-  PERFORM tests.reset_role();
 END;
 $fn$;
 

@@ -3,7 +3,16 @@
 BEGIN;
 SELECT plan(2);
 
-INSERT INTO public.admin_roles (email, role) VALUES ('jr-admin@test', 'reviewer');
+-- admin_roles.user_id is NOT NULL since migration 20260420000025. Create a
+-- real auth.users row (FK target) and reuse its uuid.
+DO $$
+DECLARE
+  v_uid uuid := tests.create_auth_user('jr-admin@test');
+BEGIN
+  INSERT INTO public.admin_roles (user_id, email, role)
+    VALUES (v_uid, 'jr-admin@test', 'reviewer');
+END;
+$$;
 
 SELECT is(
   (SELECT count(*)::int FROM public.admin_roles
