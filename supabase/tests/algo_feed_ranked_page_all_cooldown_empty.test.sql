@@ -11,6 +11,7 @@ DECLARE
   v_creator_id uuid;
   v_video_id   uuid;
   v_hook_id    uuid;
+  v_session_id uuid;
   v_count      int;
 BEGIN
   UPDATE public.profiles SET handle = 'coolallc' WHERE id = v_creator_u;
@@ -30,11 +31,18 @@ BEGIN
     RETURNING id INTO v_hook_id;
   UPDATE public.videos SET published_at = now() WHERE id = v_video_id;
 
-  -- 30-day cooldown via mic_tap + session_opened.
+  -- 30-day cooldown via mic_tap + session_opened. R-M5: the cooldown CTE
+  -- requires session_id IS NOT NULL so this test also seeds a real session
+  -- row (otherwise the forged event is now correctly ignored).
+  INSERT INTO public.sessions (user_id, creator_id, model_used, tier_at_session)
+    VALUES (v_user, v_creator_id, 'gemini_3_1_flash_live_preview', 'free')
+    RETURNING id INTO v_session_id;
+
   INSERT INTO public.feed_events_raw
-    (user_id, hook_id, video_id, creator_id, event_name, idempotency_key, payload)
+    (user_id, hook_id, video_id, creator_id, session_id,
+     event_name, idempotency_key, payload)
     VALUES (
-      v_user, v_hook_id, v_video_id, v_creator_id,
+      v_user, v_hook_id, v_video_id, v_creator_id, v_session_id,
       'mic_tap', gen_random_uuid(),
       jsonb_build_object('mic_tap_outcome', 'session_opened')
     );

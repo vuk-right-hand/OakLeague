@@ -1,21 +1,32 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { FeedCursor, FeedItem, VideoGroup, WelcomeHook } from './feed-types';
+import type { FeedItem, VideoGroup, WelcomeHook } from './feed-types';
 import { groupByVideo } from './feed-types';
 import { VideoRow } from './video-row';
 import { WelcomeOverlay } from './welcome-overlay';
+import { FeedImpressionProvider } from './feed-impression-context';
+import type { FeedPageResponse } from '@/types/feed';
 
 type Props = {
   initialItems: FeedItem[];
-  initialCursor: FeedCursor | null;
+  initialCursorEpoch: number | null;
   initialHasMore: boolean;
   welcome: WelcomeHook | null;
 };
 
-export function FeedContainer({ initialItems, initialCursor, initialHasMore, welcome }: Props) {
+const EXCLUDE_WINDOW = 50;
+
+export function FeedContainer({
+  initialItems,
+  initialCursorEpoch,
+  initialHasMore,
+  welcome,
+}: Props) {
   const [items, setItems] = useState<FeedItem[]>(initialItems);
-  const [cursor, setCursor] = useState<FeedCursor | null>(initialCursor);
+  const [cursorEpoch, setCursorEpoch] = useState<number | null>(
+    initialCursorEpoch,
+  );
   const [hasMore, setHasMore] = useState<boolean>(initialHasMore);
   const [activeIdx, setActiveIdx] = useState(0);
   // Welcome open: lifted into FeedContainer so arrow-key nav can ignore
@@ -27,32 +38,41 @@ export function FeedContainer({ initialItems, initialCursor, initialHasMore, wel
   const groups = useMemo<VideoGroup[]>(() => groupByVideo(items), [items]);
 
   const loadMore = useCallback(async () => {
-    if (loadingRef.current || !hasMore || !cursor) return;
+    if (loadingRef.current || !hasMore) return;
     loadingRef.current = true;
     try {
-      const res = await fetch(
-        `/api/feed?cursor_created_at=${encodeURIComponent(cursor.cursor_created_at)}&cursor_id=${encodeURIComponent(cursor.cursor_id)}&limit=10`,
-        { cache: 'no-store' },
-      );
-      // Audit M2: a transient 429 or 5xx must NOT permanently disable
-      // load-more. We keep cursor + hasMore intact so the next scroll
-      // re-attempts; hasMore only flips to false on a clean 2xx with
-      // nextCursor === null.
-      if (!res.ok) return;
-      const json = (await res.json()) as {
-        items: FeedItem[];
-        nextCursor: FeedCursor | null;
-      };
-      setItems((prev) => [...prev, ...json.items]);
-      if (json.nextCursor) {
-        setCursor(json.nextCursor);
-      } else {
-        setHasMore(false);
+      // Only the most recent EXCLUDE_WINDOW hook_ids need to be excluded —
+      // the RPC caps at 50 anyway, and older items are already filtered by
+      // the 30-day cooldown CTE (auth) or recency ordering (anon).
+      const excludeIds = items
+        .slice(-EXCLUDE_WINDOW)
+        .map((i) => i.hook_id)
+        .join(',');
+      const params = new URLSearchParams({ limit: '10' });
+      if (cursorEpoch !== null) {
+        params.set('cursor_epoch', String(cursorEpoch));
       }
+      if (excludeIds) {
+        params.set('exclude', excludeIds);
+      }
+      const res = await fetch(`/api/feed?${params.toString()}`, {
+        cache: 'no-store',
+      });
+      // Transient 429 / 5xx: keep cursor + hasMore intact so the next scroll
+      // retries. hasMore only flips to false on a clean 2xx with has_more=false.
+      if (!res.ok) return;
+      const json = (await res.json()) as FeedPageResponse;
+      setItems((prev) => {
+        const seen = new Set(prev.map((p) => p.hook_id));
+        const fresh = json.items.filter((it) => !seen.has(it.hook_id));
+        return [...prev, ...fresh];
+      });
+      setCursorEpoch(json.cursor_epoch);
+      setHasMore(json.has_more);
     } finally {
       loadingRef.current = false;
     }
-  }, [cursor, hasMore]);
+  }, [cursorEpoch, hasMore, items]);
 
   // IntersectionObserver on each video row to track the active panel.
   useEffect(() => {
@@ -82,6 +102,11 @@ export function FeedContainer({ initialItems, initialCursor, initialHasMore, wel
     if (groups.length === 0) return;
     if (activeIdx >= groups.length - 2) loadMore();
   }, [activeIdx, groups.length, loadMore]);
+
+  // Impression emission lives in HookPanel (shouldPlay-driven) so each
+  // horizontal lesson fires its own hook_impression — not just lesson 0 of
+  // each video group. Lessons 2-N would otherwise have impressions=0
+  // forever and rank by recency alone.
 
   // Arrow-up / arrow-down between vertical panels (desktop keyboard nav, F5).
   useEffect(() => {
@@ -124,7 +149,7 @@ export function FeedContainer({ initialItems, initialCursor, initialHasMore, wel
   }
 
   return (
-    <>
+    <FeedImpressionProvider>
       {welcome && (
         <WelcomeOverlay
           welcome={welcome}
@@ -154,6 +179,6 @@ export function FeedContainer({ initialItems, initialCursor, initialHasMore, wel
           />
         ))}
       </div>
-    </>
+    </FeedImpressionProvider>
   );
 }

@@ -1,24 +1,6 @@
-export type FeedItem = {
-  hook_id: string;
-  video_id: string;
-  creator_id: string;
-  creator_handle: string;
-  creator_name: string;
-  creator_avatar: string | null;
-  video_title: string;
-  lesson_number: number;
-  hook_title: string | null;
-  hook_caption: string | null;
-  hook_transcript: string | null;
-  topic_tags: string[];
-  mux_playback_id: string;
-  mux_aspect_ratio: string | null;
-  mux_duration_ms: number | null;
-  duration_seconds: number | null;
-  opening_prompt: string | null;
-  question_seeds: unknown;
-  hook_created_at: string;
-};
+import type { FeedHook } from '@/types/feed';
+
+export type FeedItem = FeedHook;
 
 export type WelcomeHook = {
   id: string;
@@ -30,11 +12,6 @@ export type WelcomeHook = {
   duration_seconds: number | null;
   transcript: string | null;
   active: boolean;
-};
-
-export type FeedCursor = {
-  cursor_created_at: string;
-  cursor_id: string;
 };
 
 export type VideoGroup = {

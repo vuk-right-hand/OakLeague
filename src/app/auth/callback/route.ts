@@ -1,6 +1,9 @@
 import { NextResponse, type NextRequest } from 'next/server';
+import { cookies } from 'next/headers';
+import * as Sentry from '@sentry/nextjs';
 import { supabaseServer } from '@/lib/supabase/server';
 import { supabaseAdmin } from '@/lib/supabase/admin';
+import { ANON_ID_COOKIE, readAnonId } from '@/lib/feed/anon-id';
 
 function safeNext(next: string | null): string {
   if (!next || !next.startsWith('/') || next.startsWith('//')) return '/';
@@ -37,6 +40,43 @@ export async function GET(req: NextRequest) {
   const { data: userData } = await supabase.auth.getUser();
   const user = userData.user;
   if (!user) return NextResponse.redirect(publicUrl(req, '/login?error=no_user'));
+
+  // Merge pre-signup anon affinity into the authenticated user's rollup.
+  // merge_anon_feed_state is idempotent and DELETEs the anon_feed_sessions
+  // row on success — we clear the cookie regardless of outcome so a stale
+  // anon_id doesn't linger past the first sign-in. Failure here is logged
+  // but non-fatal: losing the anon signal is a worse UX than blocking auth.
+  //
+  // N3: report to Sentry on failure. At launch a spike here means every
+  // new sign-up is losing their anon affinity — we want that paging, not
+  // buried in Vercel logs.
+  const anonId = await readAnonId();
+  if (anonId) {
+    const admin = supabaseAdmin();
+    try {
+      const { error: mergeErr } = await admin.rpc('merge_anon_feed_state', {
+        p_anon_id: anonId,
+        p_user_id: user.id,
+      });
+      if (mergeErr) {
+        Sentry.captureException(mergeErr, {
+          extra: {
+            op: 'auth_callback_merge_anon_feed_state',
+            user_id: user.id,
+            code: mergeErr.code,
+          },
+        });
+        console.error('[auth/callback] merge_anon_feed_state failed', mergeErr);
+      }
+    } catch (e) {
+      Sentry.captureException(e, {
+        extra: { op: 'auth_callback_merge_anon_feed_state_throw', user_id: user.id },
+      });
+      console.error('[auth/callback] merge_anon_feed_state threw', e);
+    }
+    const jar = await cookies();
+    jar.delete(ANON_ID_COOKIE);
+  }
 
   // Consume email-signup claim nonce (idempotent; zero-rows == silent ignore).
   if (claim && user.email) {

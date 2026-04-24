@@ -5,6 +5,8 @@ import { useRouter } from 'next/navigation';
 import MuxPlayer from '@mux/mux-player-react';
 import type { FeedItem, VideoGroup } from './feed-types';
 import { envelopeStorageKey } from '@/app/s/[id]/session-client';
+import { recordFeedEvent } from '@/lib/feed/client-events';
+import { useFeedImpressionTracker } from './feed-impression-context';
 
 // Default wire-form model. Kept in sync with src/lib/voice/model-map.ts.
 // If this changes, update isAllowedWireModel() to accept the new string.
@@ -73,6 +75,7 @@ export function HookPanel({
   const [unmuted, unmute] = useUnmutePreference();
   const deviceId = useDeviceId();
   const viewStartFiredRef = useRef(false);
+  const impressionTracker = useFeedImpressionTracker();
   const router = useRouter();
   const [asking, setAsking] = useState(false);
   const [askError, setAskError] = useState<string | null>(null);
@@ -107,7 +110,29 @@ export function HookPanel({
     } catch {
       /* noop */
     }
-  }, [shouldPlay, hook.hook_id, hook.video_id, hook.creator_id, hook.lesson_number]);
+    // Feed event — one hook_impression per hook becoming the active lesson.
+    // viewStartFiredRef guards within the HookPanel instance; the container-
+    // level tracker (N1) guards against remount-and-refire if React
+    // reconciliation blows the instance away mid-scroll. The RPC's
+    // (user_id, event_name, idempotency_key) UNIQUE is the last safety net.
+    if (impressionTracker.markIfNew(hook.hook_id)) {
+      recordFeedEvent({
+        event_name: 'hook_impression',
+        hook_id: hook.hook_id,
+        video_id: hook.video_id,
+        creator_id: hook.creator_id,
+        payload: { served_rank: hook.served_rank, lesson_number: hook.lesson_number },
+      });
+    }
+  }, [
+    shouldPlay,
+    hook.hook_id,
+    hook.video_id,
+    hook.creator_id,
+    hook.lesson_number,
+    hook.served_rank,
+    impressionTracker,
+  ]);
 
   const handleTap = () => {
     if (!unmuted) {
@@ -258,6 +283,15 @@ export function HookPanel({
             if (!r.ok) {
               const body = (await r.json().catch(() => ({}))) as { error?: string };
               if (r.status === 401) { router.push('/login'); return; }
+              recordFeedEvent({
+                event_name: 'mic_tap',
+                hook_id: hook.hook_id,
+                video_id: hook.video_id,
+                creator_id: hook.creator_id,
+                payload: {
+                  mic_tap_outcome: r.status === 429 ? 'kill_switch_blocked' : 'unknown_error',
+                },
+              });
               setAskError(body?.error ?? `error_${r.status}`);
               return;
             }
@@ -270,6 +304,14 @@ export function HookPanel({
               max_duration_s: number;
               max_session_s: number;
             };
+            recordFeedEvent({
+              event_name: 'mic_tap',
+              hook_id: hook.hook_id,
+              video_id: hook.video_id,
+              creator_id: hook.creator_id,
+              session_id_if_opened: env.session_id,
+              payload: { mic_tap_outcome: 'session_opened' },
+            });
             try {
               sessionStorage.setItem(envelopeStorageKey(env.session_id), JSON.stringify(env));
             } catch { /* sessionStorage blocked — next page shows "expired" */ }
