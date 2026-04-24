@@ -5,13 +5,13 @@ SELECT plan(2);
 
 SELECT ok(
   NOT has_function_privilege('authenticated',
-    'public.feed_ranked_anon_page(uuid, int, bigint)', 'EXECUTE'),
+    'public.feed_ranked_anon_page(uuid, int, bigint, uuid[])', 'EXECUTE'),
   '1: authenticated role cannot EXECUTE feed_ranked_anon_page'
 );
 
 SELECT ok(
   NOT has_function_privilege('anon',
-    'public.feed_ranked_anon_page(uuid, int, bigint)', 'EXECUTE'),
+    'public.feed_ranked_anon_page(uuid, int, bigint, uuid[])', 'EXECUTE'),
   '2: anon role cannot EXECUTE feed_ranked_anon_page'
 );
 
