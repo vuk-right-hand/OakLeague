@@ -1,5 +1,5 @@
--- T-D3-4: p_limit is clamped: p_limit=0 returns exactly 1 row (minimum clamp),
--- and p_limit=1 with 2 published hooks returns exactly 1 row.
+-- T-D3-4: p_limit behaviour: p_limit=0 returns 0 rows (empty page, not clamped),
+-- and p_limit=1 with 3 published hooks returns exactly 1 row.
 BEGIN;
 SELECT plan(2);
 
@@ -40,8 +40,8 @@ BEGIN
     FROM public.feed_ranked_page(1, NULL, '{}'::uuid[]);
 
   RETURN NEXT ok(
-    v_count_0 = 1,
-    format('1: p_limit=0 clamped to 1, returns 1 row (got %s)', v_count_0)
+    v_count_0 = 0,
+    format('1: p_limit=0 returns empty page (got %s)', v_count_0)
   );
   RETURN NEXT ok(
     v_count_1 = 1,
