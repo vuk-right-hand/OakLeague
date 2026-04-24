@@ -21,7 +21,9 @@ BEGIN
     (v_user, v_creator_id, 'gemini_3_1_flash_live_preview', 'free', 'active', 20)
     RETURNING id INTO v_session_id;
 
-  UPDATE public.sessions SET status = 'ended', active_seconds = 20
+  -- Match prod session-close pattern (sets ended_at alongside status).
+  UPDATE public.sessions
+     SET status = 'ended', active_seconds = 20, ended_at = now()
    WHERE id = v_session_id;
 
   RETURN NEXT is(

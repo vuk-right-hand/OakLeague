@@ -58,7 +58,11 @@ END;$$;
 
 REVOKE EXECUTE ON FUNCTION public.rate_limit_hit(text, text, interval, int)
   FROM PUBLIC, anon, authenticated;
--- Service-role only; called from the API route via supabaseAdmin().
+-- Direct EXECUTE is service-role only (called from API routes via
+-- supabaseAdmin()). Note: migration 9 adds an in-RPC call from
+-- ingest_feed_events (SECURITY DEFINER, granted to authenticated) so the
+-- rate-limit counter is transitively writable by authenticated callers
+-- through that one entry point — the RPC cannot be called directly by them.
 
 -- ---- ingest_feed_events — authenticated batch write --------------------
 

@@ -23,8 +23,11 @@ BEGIN
     (v_user, v_creator_id, 'gemini_3_1_flash_live_preview', 'free', 'active', 300)
     RETURNING id INTO v_session_id;
 
+  -- Match prod session-close pattern: every real path (session_close,
+  -- reap_stale_sessions, admin_force_close, etc.) sets ended_at alongside
+  -- status. The M2 OLD.ended_at guard requires this for idempotency.
   UPDATE public.sessions
-     SET status = 'ended', active_seconds = 300
+     SET status = 'ended', active_seconds = 300, ended_at = now()
    WHERE id = v_session_id;
 
   SELECT affinity_score, total_session_seconds

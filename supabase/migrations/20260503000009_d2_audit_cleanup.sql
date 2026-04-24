@@ -1,27 +1,44 @@
--- 0503-09 — D2 audit cleanup (H1 + M1 + M2 + M4 + M5)
+-- 0503-09 — D2 audit cleanup (H1 + M1 + M2 + M4 + M5 + round-5 fixes)
 --
 -- Rewrites 4 functions and adds 1 column. No modifications to shipped
 -- migrations 6/7/8 — everything here uses ALTER / CREATE OR REPLACE so
 -- environments that applied D2 before this cleanup upgrade cleanly.
 --
 -- H1 — ingest_feed_events auto-exposes at /rest/v1/rpc/ via PostgREST since
---      it's granted to authenticated. The route-layer rate limit in
---      /api/events/feed-batch is bypassable. Move the per-user limit INSIDE
---      the RPC as the structural backstop. Route-layer per-IP limit stays as
---      first line of defense.
+--      it's granted to authenticated. The planned /api/events/feed-batch
+--      route (D4) will rate-limit at the HTTP layer, but that limit is
+--      bypassable by direct PostgREST calls. Move the per-user limit INSIDE
+--      the RPC as the structural backstop. Route-layer per-IP limit stays
+--      as first line of defense when the route ships.
 -- M1 — hook_global_stats.avg_completion_pct divided by g.impressions instead
 --      of by dwell_end count. First dwell_end on a hook with 50 impressions
 --      would compute 0.8/51 ≈ 0.016 instead of 0.8. Visible in admin
 --      score_breakdown; fix before the admin surface ships (D6).
+-- M1-clamp (round-5) — v_completion_pct now clamped to [0, 1]. A malformed
+--      client payload with completion_pct > 1 would otherwise produce an
+--      avg_completion_pct > 1, trip the BETWEEN 0 AND 1 CHECK on
+--      hook_global_stats, and abort the entire 50-event batch in the
+--      ingest RPC (exception handler catches only unique_violation).
 -- M2 — sessions_creator_affinity_on_close guards on OLD.status, which can
 --      regress (admin rollback, buggy write) and re-fire. OLD.ended_at is
 --      monotonic-forward and the stronger invariant.
 -- M4 — Decay anchor used now() instead of NEW.ended_at; inconsistent with
---      rollup trigger's "event time, not trigger time" convention.
--- M5 — rate_limit_hit accepted p_window but silently ignored it. Next caller
---      passing '5 minutes' gets 1-minute buckets and trips 5x too fast.
---      Raise on any value other than '1 minute' until true variable-window
---      support lands.
+--      the rollup trigger's "use the row's own event-clock field, not
+--      now()" convention (rollup uses NEW.created_at, session-close uses
+--      NEW.ended_at).
+-- M4-order (round-5) — ingest_feed_events now validates payload shape and
+--      batch size BEFORE the rate-limit counter increments. Malformed
+--      requests no longer consume the victim's quota.
+-- M5 — rate_limit_hit accepted p_window but silently ignored it. Next
+--      caller passing '5 minutes' gets 1-minute buckets and trips 5x too
+--      fast. Raise on any value other than '1 minute' until true variable-
+--      window support lands.
+-- Round-5 H1 backfill — dwell_ends NOT NULL DEFAULT 0 on an existing table
+--      means any hooks with pre-fix avg_completion_pct > 0 get their
+--      history discarded on the next dwell_end ((avg * 0 + new) / 1 = new).
+--      Reset those rows to avg=0 so the first post-upgrade dwell_end seeds
+--      cleanly. Lossy for historical avg, but the pre-fix avg was divided
+--      by impressions — i.e., wrong anyway. Better to start clean.
 
 -- ---- M1: add dwell_ends column ----------------------------------------
 
@@ -30,6 +47,16 @@ ALTER TABLE public.hook_global_stats
 
 COMMENT ON COLUMN public.hook_global_stats.dwell_ends IS
   'Count of hook_dwell_end events seen for this hook. Denominator for avg_completion_pct running mean (M1 fix).';
+
+-- Round-5 H1 backfill: reset stale avg_completion_pct on rows that already
+-- existed before the dwell_ends column landed. With dwell_ends=0 and a
+-- pre-fix avg > 0, the first dwell_end would execute (avg * 0 + new) / 1
+-- = new — silently discarding the historical value. Reset to 0 so the
+-- first post-upgrade dwell seeds the running mean correctly.
+UPDATE public.hook_global_stats
+   SET avg_completion_pct = 0
+ WHERE dwell_ends = 0
+   AND avg_completion_pct > 0;
 
 -- ---- M1: rollup trigger with dwell_ends counter + corrected avg formula
 
@@ -59,7 +86,12 @@ BEGIN
   END IF;
 
   v_weight := public.compute_event_weight(NEW.event_name::text, NEW.payload);
-  v_completion_pct := COALESCE((NEW.payload->>'completion_pct')::real, 0);
+  -- M1-clamp (round-5): a malformed client payload with completion_pct > 1
+  -- would push avg_completion_pct above the BETWEEN 0 AND 1 CHECK and
+  -- abort the whole ingest batch. Clamp defensively.
+  v_completion_pct := LEAST(1.0, GREATEST(0.0,
+    COALESCE((NEW.payload->>'completion_pct')::real, 0)
+  ));
 
   -- Per-topic affinity (unchanged from migration 6).
   IF v_hook_topic_tags IS NOT NULL THEN
@@ -139,15 +171,18 @@ BEGIN
        global_quality, last_event_at, updated_at, dwell_ends)
     VALUES (
       NEW.hook_id,
-      CASE WHEN NEW.event_name = 'hook_impression' THEN 1 ELSE 0 END,
-      CASE WHEN NEW.event_name = 'full_video_open' THEN 1 ELSE 0 END,
-      CASE WHEN NEW.event_name = 'mic_tap'
-            AND NEW.payload->>'mic_tap_outcome' = 'session_opened' THEN 1 ELSE 0 END,
+      /* impressions        */ CASE WHEN NEW.event_name = 'hook_impression' THEN 1 ELSE 0 END,
+      /* full_opens         */ CASE WHEN NEW.event_name = 'full_video_open' THEN 1 ELSE 0 END,
+      /* mic_taps           */ CASE WHEN NEW.event_name = 'mic_tap'
+                                     AND NEW.payload->>'mic_tap_outcome' = 'session_opened'
+                                    THEN 1 ELSE 0 END,
       -- First event case: if it's a dwell_end, seed the average with this
       -- completion; else 0 (running mean starts empty).
-      CASE WHEN NEW.event_name = 'hook_dwell_end' THEN v_completion_pct ELSE 0 END,
-      0, NEW.created_at, NEW.created_at,
-      CASE WHEN NEW.event_name = 'hook_dwell_end' THEN 1 ELSE 0 END
+      /* avg_completion_pct */ CASE WHEN NEW.event_name = 'hook_dwell_end' THEN v_completion_pct ELSE 0 END,
+      /* global_quality     */ 0,
+      /* last_event_at      */ NEW.created_at,
+      /* updated_at         */ NEW.created_at,
+      /* dwell_ends         */ CASE WHEN NEW.event_name = 'hook_dwell_end' THEN 1 ELSE 0 END
     )
     ON CONFLICT (hook_id) DO UPDATE SET
       impressions = g.impressions + EXCLUDED.impressions,
@@ -211,19 +246,24 @@ BEGIN
     RAISE EXCEPTION 'auth_required' USING ERRCODE = '28000';
   END IF;
 
-  -- H1: in-RPC per-user rate limit, survives PostgREST /rest/v1/rpc direct
-  -- calls that bypass the Next.js route. SQLSTATE 54000 (program_limit_exceeded)
-  -- maps to HTTP 429 at the API layer.
-  IF NOT public.rate_limit_hit('feed_events_user', v_caller::text,
-                                '1 minute', PER_USER_LIMIT_PER_MIN) THEN
-    RAISE EXCEPTION 'rate_limited' USING ERRCODE = '54000';
-  END IF;
-
+  -- M4-order (round-5): payload shape + batch size checked BEFORE the
+  -- rate-limit increment. Malformed requests should raise 22023 (400) and
+  -- NOT burn the user's minute quota — otherwise an attacker could use a
+  -- victim's session to spam malformed batches and exhaust the quota at
+  -- zero DB-write cost.
   IF jsonb_typeof(p_events) <> 'array' THEN
     RAISE EXCEPTION 'p_events must be a jsonb array' USING ERRCODE = '22023';
   END IF;
   IF jsonb_array_length(p_events) > 50 THEN
     RAISE EXCEPTION 'batch too large (max 50)' USING ERRCODE = '22023';
+  END IF;
+
+  -- H1: in-RPC per-user rate limit, survives PostgREST /rest/v1/rpc direct
+  -- calls that bypass the (planned D4) Next.js route. SQLSTATE 54000
+  -- (program_limit_exceeded) maps to HTTP 429 at the API layer.
+  IF NOT public.rate_limit_hit('feed_events_user', v_caller::text,
+                                '1 minute', PER_USER_LIMIT_PER_MIN) THEN
+    RAISE EXCEPTION 'rate_limited' USING ERRCODE = '54000';
   END IF;
 
   FOR v_evt IN SELECT * FROM jsonb_array_elements(p_events) LOOP
@@ -311,7 +351,9 @@ BEGIN
       * MAX_BOOST;
 
   -- M4: anchor decay on when the session actually ended, not when the
-  -- trigger fires. Matches the rollup trigger's event-time convention.
+  -- trigger fires. Follows the convention of using the row's own event-
+  -- clock field — the rollup trigger uses NEW.created_at (feed_events_raw
+  -- insert time); this trigger uses NEW.ended_at (session close time).
   v_decay_anchor := COALESCE(NEW.ended_at, now());
 
   INSERT INTO public.user_creator_affinity AS t
