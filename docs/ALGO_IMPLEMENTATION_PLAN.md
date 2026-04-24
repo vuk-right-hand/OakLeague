@@ -1705,18 +1705,19 @@ Prereq: **Tier 1 test debt (V1_POLISH_ROADMAP.md) must be 40/40 green** before a
 ## 14. Appendix B — file index
 
 **New files**
-- `supabase/migrations/20260503000000_anon_feed_identity.sql`
-- `supabase/migrations/20260503000001_algo_enums_and_interest_slugs.sql`
-- `supabase/migrations/20260503000002_feed_events_raw.sql`
-- `supabase/migrations/20260503000003_user_topic_affinity.sql`
-- `supabase/migrations/20260503000004_user_creator_affinity.sql`
-- `supabase/migrations/20260503000005_hook_global_stats.sql`
-- `supabase/migrations/20260503000006_feed_events_rollup_trigger.sql`
-- `supabase/migrations/20260503000007_ingest_feed_events_rpc.sql`
-- `supabase/migrations/20260503000007b_session_close_affinity_trigger.sql`
-- `supabase/migrations/20260503000008_feed_ranked_page_rpc.sql`
-- `supabase/migrations/20260503000009_admin_algo_inspect_rpcs.sql`
-- `supabase/migrations/20260503000010_feed_events_retention_pgcron.sql`
+- `supabase/migrations/20260503000000_anon_feed_identity.sql` (D1)
+- `supabase/migrations/20260503000001_algo_enums_and_interest_slugs.sql` (D1)
+- `supabase/migrations/20260503000002_feed_events_raw.sql` (D1)
+- `supabase/migrations/20260503000003_user_topic_affinity.sql` (D1)
+- `supabase/migrations/20260503000004_user_creator_affinity.sql` (D1)
+- `supabase/migrations/20260503000005_hook_global_stats.sql` (D1)
+- `supabase/migrations/20260503000006_feed_events_rollup_trigger.sql` (D2)
+- `supabase/migrations/20260503000007_ingest_feed_events_rpc.sql` (D2)
+- `supabase/migrations/20260503000008_session_close_affinity_trigger.sql` (D2; renumbered from plan's 7b — Supabase CLI version parser requires purely numeric prefix)
+- `supabase/migrations/20260503000009_d2_audit_cleanup.sql` (D2-cleanup; H1 in-RPC rate limit, M1 avg_completion_pct fix, M2 session-close ended_at guard, M4 decay anchor, M5 rate_limit_hit window enforcement)
+- `supabase/migrations/20260503000010_feed_ranked_page_rpc.sql` (D3; formerly migration 8 in plan map)
+- `supabase/migrations/20260503000011_admin_algo_inspect_rpcs.sql` (D6; formerly migration 9)
+- `supabase/migrations/20260503000012_feed_events_retention_pgcron.sql` (D7; formerly migration 10)
 - `supabase/tests/algo/*.test.sql` (52+ files — includes §9.8 Round 2 coverage)
 - `src/lib/feed-events/queue.ts`
 - `src/lib/feed-events/types.ts`

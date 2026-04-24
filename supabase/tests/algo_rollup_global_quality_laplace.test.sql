@@ -9,7 +9,7 @@
 -- impressions. Here we seed with 1 impression + 1 full_open:
 --   quality = (1 + 1 + 0) / (10 + 1) = 2/11 ≈ 0.1818
 BEGIN;
-SELECT plan(3);
+SELECT plan(5);
 
 CREATE FUNCTION pg_temp.run() RETURNS SETOF text LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -21,6 +21,8 @@ DECLARE
   v_quality real;
   v_impressions bigint;
   v_full_opens bigint;
+  v_avg_completion real;
+  v_dwell_ends bigint;
 BEGIN
   UPDATE public.profiles SET handle = 'lapc' WHERE id = v_creator_u;
   INSERT INTO public.creators (user_id, display_name, handle, brain_status)
@@ -52,6 +54,25 @@ BEGIN
   RETURN NEXT ok(
     abs(v_quality - (2.0/11.0)) < 1e-4,
     format('3: quality = (1+1+0)/(10+1) ≈ 0.1818 (got %s)', v_quality)
+  );
+
+  -- Audit M1 fix: avg_completion_pct uses dwell_ends as denominator, not
+  -- impressions. Fire one hook_dwell_end with completion=0.8; first dwell
+  -- on the hook → avg should be exactly 0.8 (not 0.8/2=0.4 as in the pre-fix
+  -- formula that divided by impressions).
+  INSERT INTO public.feed_events_raw
+    (user_id, event_name, hook_id, idempotency_key, payload)
+    VALUES (v_user, 'hook_dwell_end', v_hook_id, gen_random_uuid(),
+            jsonb_build_object('dwell_ms', 24000, 'completion_pct', 0.8));
+
+  SELECT avg_completion_pct, dwell_ends
+    INTO v_avg_completion, v_dwell_ends
+    FROM public.hook_global_stats WHERE hook_id = v_hook_id;
+
+  RETURN NEXT is(v_dwell_ends::int, 1, '4: dwell_ends counter bumps on hook_dwell_end');
+  RETURN NEXT ok(
+    abs(v_avg_completion - 0.8) < 1e-4,
+    format('5: M1 fix — avg_completion_pct = 0.8 (got %s)', v_avg_completion)
   );
 END;
 $fn$;
