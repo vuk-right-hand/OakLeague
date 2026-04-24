@@ -1,9 +1,11 @@
--- T-D3-6 / M-3: when p_limit < 3, all explore slot positions (2-4, 6-8) fall
--- outside the page window; every returned hook must be slot_type='exploit'.
--- This verifies the CASE guard in top_explore: explore_slot_1 ∈ {2,3,4} ≥ 2 =
--- v_limit, so the condition `v_explore_slot_1 < v_limit` is always FALSE.
+-- T-D3-6 / M-3: slot-guard is limit-sensitive.
+-- Test 1: p_limit=2 → explore_slot_1 ∈ {2,3,4} ≥ 2 = v_limit → no explore slots fit;
+--   all returned hooks must be slot_type='exploit'.
+-- Test 2: p_limit=10 → explore_slot_1 < 10 AND explore_slot_2 < 10 → both hooks go
+--   into explore slots, confirming the same hooks ARE explore-eligible at a larger limit
+--   (distinguishes "slot suppressed" from "no explore candidates").
 BEGIN;
-SELECT plan(1);
+SELECT plan(2);
 
 CREATE FUNCTION pg_temp.run() RETURNS SETOF text LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -11,8 +13,9 @@ DECLARE
   v_creator_u  uuid := tests.create_auth_user('algo-smalllim-c@test');
   v_creator_id uuid;
   v_video_id   uuid;
-  v_exploit_count int;
-  i            int;
+  v_exploit_count  int;
+  v_explore_count  int;
+  i                int;
 BEGIN
   UPDATE public.profiles SET handle = 'smalllimc' WHERE id = v_creator_u;
   INSERT INTO public.creators (user_id, display_name, handle, brain_status, published_at)
@@ -48,6 +51,17 @@ BEGIN
   RETURN NEXT ok(
     v_exploit_count = 2,
     format('1: p_limit=2 suppresses all explore slots → 2 exploit hooks (got %s)', v_exploit_count)
+  );
+
+  -- Test 2: p_limit=10 → both explore slots fit (slot_1 ∈ {2,3,4} < 10, slot_2 ∈ {6,7,8} < 10).
+  -- With only 2 hooks both explore-eligible, they both land in explore slots; top_exploit empty.
+  SELECT COUNT(*)::int INTO v_explore_count
+    FROM public.feed_ranked_page(10, NULL, '{}'::uuid[])
+   WHERE score_breakdown->>'slot_type' = 'explore';
+
+  RETURN NEXT ok(
+    v_explore_count = 2,
+    format('2: p_limit=10 allows both explore slots → 2 explore hooks (got %s)', v_explore_count)
   );
 
   PERFORM tests.reset_role();
