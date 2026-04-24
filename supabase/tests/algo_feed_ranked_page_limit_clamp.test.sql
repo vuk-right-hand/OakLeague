@@ -1,7 +1,9 @@
--- T-D3-4: p_limit behaviour: p_limit=0 returns 0 rows (empty page, not clamped),
--- and p_limit=1 with 3 published hooks returns exactly 1 row.
+-- T-D3-4: p_limit behaviour:
+-- 1. p_limit=0 returns 0 rows (empty page, not clamped to 1).
+-- 2. p_limit=1 with 3 published hooks returns exactly 1 row.
+-- 3. p_limit=100 is clamped to 50; with 3 hooks returns 3 (not 100).
 BEGIN;
-SELECT plan(2);
+SELECT plan(3);
 
 CREATE FUNCTION pg_temp.run() RETURNS SETOF text LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -11,6 +13,7 @@ DECLARE
   v_video_id   uuid;
   v_count_0    int;
   v_count_1    int;
+  v_count_100  int;
   i            int;
 BEGIN
   UPDATE public.profiles SET handle = 'clampc' WHERE id = v_creator_u;
@@ -39,6 +42,9 @@ BEGIN
   SELECT COUNT(*)::int INTO v_count_1
     FROM public.feed_ranked_page(1, NULL, '{}'::uuid[]);
 
+  SELECT COUNT(*)::int INTO v_count_100
+    FROM public.feed_ranked_page(100, NULL, '{}'::uuid[]);
+
   RETURN NEXT ok(
     v_count_0 = 0,
     format('1: p_limit=0 returns empty page (got %s)', v_count_0)
@@ -46,6 +52,10 @@ BEGIN
   RETURN NEXT ok(
     v_count_1 = 1,
     format('2: p_limit=1 returns exactly 1 row (got %s)', v_count_1)
+  );
+  RETURN NEXT ok(
+    v_count_100 <= 50,
+    format('3: p_limit=100 clamped to ≤50 (got %s with 3 hooks)', v_count_100)
   );
 
   PERFORM tests.reset_role();
