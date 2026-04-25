@@ -60,7 +60,8 @@ BEGIN
       'event_name', 'hook_swipe',
       'hook_id',    v_hook_id::text,
       'payload',    jsonb_build_object(
-        'direction',              'up',
+        -- D5 H1: 'down' is the dead-zone-eligible direction now.
+        'direction',              'down',
         'seconds_to_decision_ms', 800,
         'completion_pct',         0.05
       )

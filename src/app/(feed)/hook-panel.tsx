@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import MuxPlayer from '@mux/mux-player-react';
 import type { FeedItem, VideoGroup } from './feed-types';
@@ -83,6 +83,24 @@ export function HookPanel({
   const playerRef = useRef<HTMLVideoElement | null>(null);
   const [paused, setPaused] = useState(false);
 
+  // D5: keep the most recent (currentTime, duration) so dwell_end has a
+  // completion_pct even if the MuxPlayer has already unmounted by the time
+  // the cleanup runs (shouldMount window narrows to ±1 lesson, so a
+  // 2-step horizontal swipe blanks the player before deactivation fires).
+  // M1: also push the latest pct into the container-scope tracker so
+  // VideoRow / FeedContainer can read it when emitting hook_swipe payloads
+  // (otherwise the dead-zone classifier sees completion_pct=0 and misfires).
+  const lastTimeRef = useRef<{ time: number; duration: number } | null>(null);
+  const handleTimeUpdate = useCallback(() => {
+    const el = playerRef.current;
+    if (!el) return;
+    const duration = Number.isFinite(el.duration) ? el.duration : 0;
+    if (duration > 0) {
+      lastTimeRef.current = { time: el.currentTime, duration };
+      impressionTracker.recordCompletion(hook.hook_id, el.currentTime / duration);
+    }
+  }, [impressionTracker, hook.hook_id]);
+
   // Audit M4: if the viewer prefers reduced motion, don't autoplay.
   // Require an explicit tap to start the video.
   const reduceMotionRef = useRef(false);
@@ -124,6 +142,10 @@ export function HookPanel({
         payload: { served_rank: hook.served_rank, lesson_number: hook.lesson_number },
       });
     }
+    // D5: stamp activation time so a subsequent hook_swipe (fired from
+    // VideoRow / FeedContainer when nav happens) can compute
+    // seconds_to_decision_ms — needed for the dead-zone classifier.
+    impressionTracker.markActivated(hook.hook_id);
   }, [
     shouldPlay,
     hook.hook_id,
@@ -133,6 +155,42 @@ export function HookPanel({
     hook.served_rank,
     impressionTracker,
   ]);
+
+  // D5: hook_dwell_end on deactivation. Fires symmetrically to the
+  // impression effect — once when shouldPlay flips back to false (or the
+  // panel unmounts entirely). Reads completion_pct from the cached
+  // (currentTime, duration) so a fast horizontal swipe past this lesson
+  // (which can blank the player before the cleanup runs) still emits
+  // a usable signal.
+  useEffect(() => {
+    if (!shouldPlay) return;
+    const startMs = Date.now();
+    return () => {
+      const cached = lastTimeRef.current;
+      // S1: lastTimeRef is null if MuxPlayer never fired onTimeUpdate (user
+      // fast-scrolled past before the player buffered). completion_pct=0 is
+      // the right answer there — they didn't dwell — and the rollup weight
+      // for hook_dwell_end is COALESCE(...,0), which yields 0.0 (no
+      // affinity move). No correctness issue.
+      const completionPct = cached && cached.duration > 0
+        ? Math.max(0, Math.min(1, cached.time / cached.duration))
+        : 0;
+      // C1: dwell_ms is the field the rollup trigger reads — not
+      // seconds_visible. Without it, user_topic_affinity.dwell_ms_total
+      // increments by 0 forever.
+      recordFeedEvent({
+        event_name: 'hook_dwell_end',
+        hook_id: hook.hook_id,
+        video_id: hook.video_id,
+        creator_id: hook.creator_id,
+        payload: {
+          completion_pct: Number(completionPct.toFixed(3)),
+          dwell_ms: Date.now() - startMs,
+          lesson_number: hook.lesson_number,
+        },
+      });
+    };
+  }, [shouldPlay, hook.hook_id, hook.video_id, hook.creator_id, hook.lesson_number]);
 
   const handleTap = () => {
     if (!unmuted) {
@@ -185,6 +243,7 @@ export function HookPanel({
             objectFit: 'cover',
           }}
           onClick={handleTap}
+          onTimeUpdate={handleTimeUpdate}
         />
       ) : (
         <div style={{ width: '100%', height: '100%', background: '#111' }} />

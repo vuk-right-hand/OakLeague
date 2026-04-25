@@ -6,29 +6,34 @@
 
 ---
 
-## Tier 1 — Test debt cleanup (in progress)
+## Tier 1 — Test debt cleanup ✅ DONE (verified 2026-04-25)
 
-- [ ] `quota_tier_flip_same_day.test.sql` — swap dropped `gemini_pro_audio_v2` enum for a live voice_model value
-- [ ] `admin_roles_revoked_denied.test.sql` — add `user_id` to admin_roles insert (NOT NULL since 0025)
-- [ ] `admin_tier_flip_invariants.test.sql` — fixture role/JWT so RLS allows `sessions` insert
-- [ ] `admin_force_close_session.test.sql` — align tests 4-6 with current RPC (prefixed reason, idempotent noop audit row)
-- [ ] `admin_roles_service_role_delete_blocked.test.sql` — reconcile test 2 with current delete-trigger behavior
-- [ ] NEW `admin_set_user_voice_caps.test.sql` — coverage for the rc1 RPC: admin guard, 3 range errors w/ SQLSTATE+message, audit log triple, FOR UPDATE lock
-- [ ] Re-run `supabase test db` — must be 40/40 green before Tier 2 starts
+All six tests fixed and the new one created during the rc1 → D4 window. Suite at **105 files / 249 tests / Result: PASS**.
+
+- [x] `quota_tier_flip_same_day.test.sql` — uses `gemini_3_1_flash_live_preview` (Pipeline α' single-model). `plan(2)`.
+- [x] `admin_roles_revoked_denied.test.sql` — inserts `user_id` from `tests.create_auth_user`. `plan(2)`.
+- [x] `admin_tier_flip_invariants.test.sql` — `plan(8)`.
+- [x] `admin_force_close_session.test.sql` — `plan(6)`.
+- [x] `admin_roles_service_role_delete_blocked.test.sql` — `plan(2)`.
+- [x] NEW `admin_set_user_voice_caps.test.sql` — `plan(11)` covers admin guard (42501), missing user (P0002), all 3 range errors (22003 daily/weekly/monthly), happy path, audit log triple, NULL weekly/monthly disabling caps.
+- [x] Re-run `supabase test db` — 249/249 green, 3-second wallclock.
 
 ---
 
-## Between Tier 1 and Tier 2 — Feed algorithm instrumentation
+## Between Tier 1 and Tier 2 — Feed algorithm instrumentation ✅ DONE (D1–D4, 2026-04-25)
 
-Schema-level plumbing that **must** be in v1 because behavioral data can't be retrofitted. Scoring intelligence can lag; the event bus cannot.
+Schema-level plumbing landed in algo plan migrations 0503-00 → 0503-16 + client wire-up. Scoring intelligence can lag; the event bus is in place.
 
-- [ ] Pop vibecodershq, surface the algorithm plan (schemas, event taxonomy, scoring sketch) — align before writing code
-- [ ] Event tables: `feed_impressions`, `feed_swipes`, `video_watch_events` (quartiles + completion), `hook_engagement_events`
-- [ ] Per-user taste vector table: topic tags × weights, updated via trigger on watch/swipe events
-- [ ] Per-video tagging: topic_tags[] already exist on sample_content; ensure videos inherit via creator_topics join
-- [ ] Admin console: read-only feed-algo diagnostics (per-user top-5 topics, exploit/explore split, swipe-after-Ns histogram)
-- [ ] Naive scoring function v1: recent-first with 20% random exploration — shipped, instrumented, measurable
-- [ ] RLS: every event table write-locked to the caller's own user_id; service-role-only for aggregation rollups
+- [x] Algorithm plan surfaced ([docs/ALGO_IMPLEMENTATION_PLAN.md](ALGO_IMPLEMENTATION_PLAN.md)) — schemas, event taxonomy, scoring sketch.
+- [x] Event tables: `feed_events_raw` (single append-only stream, supersedes the per-event-type table sketch). `user_topic_affinity`, `user_creator_affinity`, `hook_global_stats` rollups.
+- [x] Per-user taste vector: `user_topic_affinity` (topic × signed EMA), updated via `feed_events_rollup` trigger on every raw insert.
+- [x] Per-video tagging: hooks carry `topic_tags[]`; creator_topics drives the cold-start S_cold component.
+- [x] Naive scoring function v1: dual-scored exploit + explore via `compute_hook_score`; deterministic explore-slot interleaving (`feed_ranked_page` migration 0503-16).
+- [x] RLS: all event tables locked to caller; service-role-only for rollup writes; SECURITY DEFINER ingest RPCs at the edges.
+- [x] D4 client wire-up: `/api/feed`, `/api/feed/events`, anon cookie, batched event emitter (commit 2290c9a).
+- [ ] **D5 — broader event emission** (dwell, swipe, full_video, creator carousel) — in progress.
+- [ ] **D6 — admin algo inspector** (`admin_algo_inspect_rpcs` + `/admin/algo/<user_id>`) — pending, ALGO_IMPLEMENTATION_PLAN §7.
+- [ ] **D7 — retention pg_cron** (90-day GC of `feed_events_raw` + orphan `anon_feed_sessions`) — pending.
 
 ---
 

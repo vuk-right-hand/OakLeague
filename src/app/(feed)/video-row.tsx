@@ -1,8 +1,10 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { VideoGroup } from './feed-types';
 import { HookPanel } from './hook-panel';
+import { recordFeedEvent } from '@/lib/feed/client-events';
+import { useFeedImpressionTracker } from './feed-impression-context';
 
 type Props = {
   group: VideoGroup;
@@ -13,6 +15,63 @@ type Props = {
 export function VideoRow({ group, index, isActive }: Props) {
   const [lessonIdx, setLessonIdx] = useState(0);
   const stripRef = useRef<HTMLDivElement | null>(null);
+  const tracker = useFeedImpressionTracker();
+  const lastLessonIdxRef = useRef<number>(0);
+
+  // D5: emit hook_swipe for the OUTGOING lesson when horizontal nav happens.
+  // Direction is from the user's swipe gesture, not the hook's identity:
+  // tapping ArrowRight (or swiping right-to-left to reveal the next lesson)
+  // is `direction='right'`, matching the swipe_direction enum (migration
+  // 0503-01) and what compute_event_weight rewards as +0.5.
+  const emitHorizontalSwipe = useCallback(
+    (fromIdx: number, toIdx: number) => {
+      if (fromIdx === toIdx) return;
+      const fromHook = group.items[fromIdx];
+      if (!fromHook) return;
+      const direction: 'left' | 'right' = toIdx > fromIdx ? 'right' : 'left';
+      const ms = tracker.peekActivation(fromHook.hook_id);
+      const completionPct = tracker.getCompletion(fromHook.hook_id);
+      recordFeedEvent({
+        event_name: 'hook_swipe',
+        hook_id: fromHook.hook_id,
+        video_id: fromHook.video_id,
+        creator_id: fromHook.creator_id,
+        payload: {
+          direction,
+          // ms === null means we never saw activation for this hook (e.g.,
+          // user scrolled too fast for the impression effect to land).
+          // Omit rather than emit -1 / 0 — the rollup's dead-zone branch
+          // keys off `< 500` and would mis-classify.
+          ...(ms !== null ? { seconds_to_decision_ms: ms } : {}),
+          completion_pct: Number(completionPct.toFixed(3)),
+          lesson_number: fromHook.lesson_number,
+        },
+      });
+    },
+    [group.items, tracker],
+  );
+
+  const setLessonIdxAndEmit = useCallback(
+    (next: number) => {
+      const prev = lastLessonIdxRef.current;
+      if (next === prev) return;
+      emitHorizontalSwipe(prev, next);
+      lastLessonIdxRef.current = next;
+      setLessonIdx(next);
+      const nextHook = group.items[next];
+      if (nextHook) {
+        tracker.setActiveLesson(group.videoId, nextHook.hook_id);
+      }
+    },
+    [emitHorizontalSwipe, group.items, group.videoId, tracker],
+  );
+
+  // Seed active-lesson on mount so a vertical swipe before the user touches
+  // this row still has a hook_id to attribute (lesson 0).
+  useEffect(() => {
+    const first = group.items[0];
+    if (first) tracker.setActiveLesson(group.videoId, first.hook_id);
+  }, [group.items, group.videoId, tracker]);
 
   // Arrow-left / arrow-right between lessons within the active row (F5).
   useEffect(() => {
@@ -20,30 +79,33 @@ export function VideoRow({ group, index, isActive }: Props) {
     const handler = (e: KeyboardEvent) => {
       if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
       e.preventDefault();
-      setLessonIdx((i) => {
-        const next = e.key === 'ArrowRight' ? i + 1 : i - 1;
-        if (next < 0 || next >= group.items.length) return i;
-        const strip = stripRef.current;
-        if (strip) {
-          const panel = strip.children[next] as HTMLElement | undefined;
-          // Audit M4: honor prefers-reduced-motion.
-          const reduceMotion =
-            typeof window !== 'undefined' &&
-            window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
-          panel?.scrollIntoView({
-            behavior: reduceMotion ? 'auto' : 'smooth',
-            inline: 'start',
-            block: 'nearest',
-          });
-        }
-        return next;
-      });
+      const i = lastLessonIdxRef.current;
+      const next = e.key === 'ArrowRight' ? i + 1 : i - 1;
+      if (next < 0 || next >= group.items.length) return;
+      const strip = stripRef.current;
+      if (strip) {
+        const panel = strip.children[next] as HTMLElement | undefined;
+        // Audit M4: honor prefers-reduced-motion.
+        const reduceMotion =
+          typeof window !== 'undefined' &&
+          window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+        panel?.scrollIntoView({
+          behavior: reduceMotion ? 'auto' : 'smooth',
+          inline: 'start',
+          block: 'nearest',
+        });
+      }
+      // The IntersectionObserver below will eventually fire setLessonIdxAndEmit
+      // once the snap settles, but we also call it directly so the swipe event
+      // emits immediately on keypress (instant feedback for the rollup).
+      setLessonIdxAndEmit(next);
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [isActive, group.items.length]);
+  }, [isActive, group.items.length, setLessonIdxAndEmit]);
 
-  // Observe which lesson is centered in the horizontal strip.
+  // Observe which lesson is centered in the horizontal strip (touch swipes
+  // hit this path; keyboard nav hits the handler above and this confirms).
   useEffect(() => {
     const strip = stripRef.current;
     if (!strip) return;
@@ -52,7 +114,7 @@ export function VideoRow({ group, index, isActive }: Props) {
         for (const e of entries) {
           if (e.isIntersecting && e.intersectionRatio >= 0.9) {
             const idx = Number((e.target as HTMLElement).dataset.lessonIndex);
-            if (!Number.isNaN(idx)) setLessonIdx(idx);
+            if (!Number.isNaN(idx)) setLessonIdxAndEmit(idx);
           }
         }
       },
@@ -60,7 +122,7 @@ export function VideoRow({ group, index, isActive }: Props) {
     );
     for (const p of Array.from(strip.querySelectorAll('[data-lesson-panel]'))) obs.observe(p);
     return () => obs.disconnect();
-  }, [group.items.length]);
+  }, [group.items.length, setLessonIdxAndEmit]);
 
   return (
     <section

@@ -1,6 +1,8 @@
--- §9.8 / NC1 + M6: a fast-dismiss swipe (direction=up, <2s, completion<0.2)
+-- §9.8 / NC1 + M6: a fast-dismiss swipe (direction=down, <2s, completion<0.2)
 -- drives the anon topic_affinity blob below zero. Parity with the authenticated
 -- rollup trigger's signed EMA.
+-- D5 H1: 'up' is now neutral (return-scroll); only 'down' (intentional
+-- next-video gesture) hits the dead-zone classifier.
 BEGIN;
 SELECT plan(2);
 
@@ -35,7 +37,7 @@ BEGIN
       'event_name', 'hook_swipe',
       'hook_id',    v_hook_id::text,
       'payload',    jsonb_build_object(
-        'direction',               'up',
+        'direction',               'down',
         'seconds_to_decision_ms',  800,
         'completion_pct',          0.05
       )

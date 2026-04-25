@@ -7,7 +7,7 @@
 -- Full authenticated/anon parity test lands in D2 once the rollup trigger
 -- can be fed the same event sequence.
 BEGIN;
-SELECT plan(13);
+SELECT plan(15);
 
 -- Base weights.
 SELECT ok(
@@ -45,17 +45,30 @@ SELECT ok(
         jsonb_build_object('direction', 'right')) - 0.5) < 1e-6,
   '7: hook_swipe right = 0.5'
 );
+-- D5 H1: vertical 'up' is a return-scroll, neutral like horizontal 'left'.
+-- Only 'down' (intentional next-video) falls into the dead-zone classifier.
 SELECT ok(
   abs(public.compute_event_weight('hook_swipe',
-        jsonb_build_object('direction', 'up',
+        jsonb_build_object('direction', 'down',
           'seconds_to_decision_ms', 800, 'completion_pct', 0.05)) - (-0.3)) < 1e-6,
-  '8: hook_swipe fast-dismiss (up, <2s, <20%) = -0.3'
+  '8: hook_swipe fast-dismiss (down, <2s, <20%) = -0.3 dead-zone'
+);
+SELECT ok(
+  abs(public.compute_event_weight('hook_swipe',
+        jsonb_build_object('direction', 'down',
+          'seconds_to_decision_ms', 5000, 'completion_pct', 0.5)) - (-0.05)) < 1e-6,
+  '9: hook_swipe slow dismiss (down) = -0.05 (weak negative)'
 );
 SELECT ok(
   abs(public.compute_event_weight('hook_swipe',
         jsonb_build_object('direction', 'up',
-          'seconds_to_decision_ms', 5000, 'completion_pct', 0.5)) - (-0.05)) < 1e-6,
-  '9: hook_swipe slow dismiss = -0.05 (weak negative)'
+          'seconds_to_decision_ms', 800, 'completion_pct', 0.05)) - 0.0) < 1e-6,
+  '14: hook_swipe up (return-scroll) = 0.0 even when fast — H1 fix'
+);
+SELECT ok(
+  abs(public.compute_event_weight('hook_swipe',
+        jsonb_build_object('direction', 'left')) - 0.0) < 1e-6,
+  '15: hook_swipe left (horizontal-back) = 0.0 — symmetric to up'
 );
 
 -- full_video_quartile.

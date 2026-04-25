@@ -5,7 +5,11 @@ import type { FeedItem, VideoGroup, WelcomeHook } from './feed-types';
 import { groupByVideo } from './feed-types';
 import { VideoRow } from './video-row';
 import { WelcomeOverlay } from './welcome-overlay';
-import { FeedImpressionProvider } from './feed-impression-context';
+import {
+  FeedImpressionProvider,
+  useFeedImpressionTracker,
+} from './feed-impression-context';
+import { recordFeedEvent } from '@/lib/feed/client-events';
 import type { FeedPageResponse } from '@/types/feed';
 
 type Props = {
@@ -17,7 +21,17 @@ type Props = {
 
 const EXCLUDE_WINDOW = 50;
 
-export function FeedContainer({
+// Outer component — owns the provider so the inner can call
+// useFeedImpressionTracker for vertical-swipe attribution.
+export function FeedContainer(props: Props) {
+  return (
+    <FeedImpressionProvider>
+      <FeedContainerInner {...props} />
+    </FeedImpressionProvider>
+  );
+}
+
+function FeedContainerInner({
   initialItems,
   initialCursorEpoch,
   initialHasMore,
@@ -34,6 +48,8 @@ export function FeedContainer({
   const [welcomeOpen, setWelcomeOpen] = useState<boolean>(!!welcome);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const loadingRef = useRef(false);
+  const lastActiveIdxRef = useRef<number>(0);
+  const tracker = useFeedImpressionTracker();
 
   const groups = useMemo<VideoGroup[]>(() => groupByVideo(items), [items]);
 
@@ -74,6 +90,51 @@ export function FeedContainer({
     }
   }, [cursorEpoch, hasMore, items]);
 
+  // D5: emit hook_swipe for the OUTGOING video group's currently-active
+  // lesson on every vertical nav. Direction maps to swipe_direction enum:
+  // 'down' = next-video gesture (the user pushed the feed up to reveal
+  // what's below), 'up' = previous-video gesture. Matches TikTok semantics
+  // and what compute_event_weight grades (right/down = positive).
+  const emitVerticalSwipe = useCallback(
+    (fromIdx: number, toIdx: number) => {
+      if (fromIdx === toIdx) return;
+      const fromGroup = groups[fromIdx];
+      if (!fromGroup) return;
+      const activeHookId = tracker.getActiveLesson(fromGroup.videoId);
+      const fromHook = activeHookId
+        ? fromGroup.items.find((h) => h.hook_id === activeHookId)
+        : fromGroup.items[0];
+      if (!fromHook) return;
+      const direction: 'up' | 'down' = toIdx > fromIdx ? 'down' : 'up';
+      const ms = tracker.peekActivation(fromHook.hook_id);
+      const completionPct = tracker.getCompletion(fromHook.hook_id);
+      recordFeedEvent({
+        event_name: 'hook_swipe',
+        hook_id: fromHook.hook_id,
+        video_id: fromHook.video_id,
+        creator_id: fromHook.creator_id,
+        payload: {
+          direction,
+          ...(ms !== null ? { seconds_to_decision_ms: ms } : {}),
+          completion_pct: Number(completionPct.toFixed(3)),
+          lesson_number: fromHook.lesson_number,
+        },
+      });
+    },
+    [groups, tracker],
+  );
+
+  const setActiveIdxAndEmit = useCallback(
+    (next: number) => {
+      const prev = lastActiveIdxRef.current;
+      if (next === prev) return;
+      emitVerticalSwipe(prev, next);
+      lastActiveIdxRef.current = next;
+      setActiveIdx(next);
+    },
+    [emitVerticalSwipe],
+  );
+
   // IntersectionObserver on each video row to track the active panel.
   useEffect(() => {
     const container = scrollRef.current;
@@ -86,7 +147,7 @@ export function FeedContainer({
         for (const entry of entries) {
           if (entry.isIntersecting && entry.intersectionRatio >= 0.9) {
             const idx = Number((entry.target as HTMLElement).dataset.videoIndex);
-            if (!Number.isNaN(idx)) setActiveIdx(idx);
+            if (!Number.isNaN(idx)) setActiveIdxAndEmit(idx);
           }
         }
       },
@@ -95,7 +156,7 @@ export function FeedContainer({
 
     for (const row of rows) observer.observe(row);
     return () => observer.disconnect();
-  }, [groups.length]);
+  }, [groups.length, setActiveIdxAndEmit]);
 
   // Load-more when we're within 2 rows of the end.
   useEffect(() => {
@@ -118,7 +179,9 @@ export function FeedContainer({
       // shouldn't scroll the feed underneath while it's visible.
       if (welcomeOpen) return;
       e.preventDefault();
-      const next = e.key === 'ArrowDown' ? activeIdx + 1 : activeIdx - 1;
+      const cur = lastActiveIdxRef.current;
+      const next = e.key === 'ArrowDown' ? cur + 1 : cur - 1;
+      if (next < 0 || next >= groups.length) return;
       const target = container.querySelector<HTMLElement>(
         `[data-video-row][data-video-index="${next}"]`,
       );
@@ -132,10 +195,14 @@ export function FeedContainer({
           block: 'start',
         });
       }
+      // IntersectionObserver also fires after the snap settles, but the
+      // setActiveIdxAndEmit dedupe (next === prev guard) makes the second
+      // call a no-op. Calling here gives instant swipe-event emission.
+      setActiveIdxAndEmit(next);
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [activeIdx, welcomeOpen]);
+  }, [welcomeOpen, groups.length, setActiveIdxAndEmit]);
 
   if (groups.length === 0) {
     return (
@@ -149,7 +216,7 @@ export function FeedContainer({
   }
 
   return (
-    <FeedImpressionProvider>
+    <>
       {welcome && (
         <WelcomeOverlay
           welcome={welcome}
@@ -179,6 +246,6 @@ export function FeedContainer({
           />
         ))}
       </div>
-    </FeedImpressionProvider>
+    </>
   );
 }

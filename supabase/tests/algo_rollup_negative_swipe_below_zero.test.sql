@@ -26,11 +26,13 @@ BEGIN
     VALUES (v_video_id, 1, 'mux_pb_neg', 30, ARRAY['saas_pricing'])
     RETURNING id INTO v_hook_id;
 
-  -- Fast-dismiss: direction up, 800ms, 5% completion → -0.3 weight.
+  -- Fast-dismiss: direction down, 800ms, 5% completion → -0.3 weight.
+  -- D5 H1: 'up' is now neutral (return-scroll, like 'left'); the dead-zone
+  -- classifier only fires for intentional next-video gestures ('down').
   INSERT INTO public.feed_events_raw
     (user_id, event_name, hook_id, idempotency_key, payload)
     VALUES (v_user, 'hook_swipe', v_hook_id, gen_random_uuid(),
-            jsonb_build_object('direction','up','seconds_to_decision_ms',800,
+            jsonb_build_object('direction','down','seconds_to_decision_ms',800,
                                'completion_pct',0.05));
 
   SELECT affinity_score INTO v_aff
