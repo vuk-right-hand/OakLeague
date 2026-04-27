@@ -19,6 +19,7 @@
     "@mux/mux-node": "^12.8.1",
     "@mux/mux-player-react": "^3.11.8",
     "@mux/mux-uploader-react": "^1.4.1",
+    "@mux/mux-video-react": "^0.30.7",
     "@radix-ui/react-label": "^2.1.0",
     "@radix-ui/react-slot": "^1.1.0",
     "@radix-ui/react-toast": "^1.2.4",

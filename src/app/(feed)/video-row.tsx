@@ -130,7 +130,7 @@ export function VideoRow({ group, index, isActive }: Props) {
       data-video-index={index}
       style={{
         scrollSnapAlign: 'start',
-        scrollSnapStop: 'normal',
+        scrollSnapStop: 'always',
         height: '100vh',
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         ...({ height: '100svh' } as any),
@@ -165,7 +165,7 @@ export function VideoRow({ group, index, isActive }: Props) {
                 width: '100vw',
                 height: '100%',
                 scrollSnapAlign: 'start',
-                scrollSnapStop: 'normal',
+                scrollSnapStop: 'always',
               }}
             >
               <HookPanel
@@ -180,6 +180,83 @@ export function VideoRow({ group, index, isActive }: Props) {
           );
         })}
       </div>
+
+      {/* Horizontal lesson chevrons. Desktop affordance for what touch
+          users get for free via swipe. Only render on multi-lesson rows
+          and only when this row is the active one. zIndex: 3 puts them
+          above the click-capture overlay (zIndex: 1) and the Ask button
+          (zIndex: 2). e.stopPropagation prevents the click from also
+          firing the unmute/play-pause handler underneath. */}
+      {isActive && group.items.length > 1 && lessonIdx > 0 && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            setLessonIdxAndEmit(lessonIdx - 1);
+            const strip = stripRef.current;
+            const panel = strip?.children[lessonIdx - 1] as HTMLElement | undefined;
+            const reduceMotion =
+              typeof window !== 'undefined' &&
+              window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+            panel?.scrollIntoView({
+              behavior: reduceMotion ? 'auto' : 'smooth',
+              inline: 'start',
+              block: 'nearest',
+            });
+          }}
+          aria-label="Previous lesson"
+          style={chevronStyle('left')}
+        >
+          ‹
+        </button>
+      )}
+      {isActive && group.items.length > 1 && lessonIdx < group.items.length - 1 && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            setLessonIdxAndEmit(lessonIdx + 1);
+            const strip = stripRef.current;
+            const panel = strip?.children[lessonIdx + 1] as HTMLElement | undefined;
+            const reduceMotion =
+              typeof window !== 'undefined' &&
+              window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+            panel?.scrollIntoView({
+              behavior: reduceMotion ? 'auto' : 'smooth',
+              inline: 'start',
+              block: 'nearest',
+            });
+          }}
+          aria-label="Next lesson"
+          style={chevronStyle('right')}
+        >
+          ›
+        </button>
+      )}
     </section>
   );
+}
+
+function chevronStyle(side: 'left' | 'right'): React.CSSProperties {
+  return {
+    position: 'absolute',
+    [side]: 16,
+    top: '50%',
+    transform: 'translateY(-50%)',
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    background: 'rgba(0,0,0,0.45)',
+    border: '1px solid rgba(255,255,255,0.25)',
+    color: '#fff',
+    fontSize: 28,
+    lineHeight: '40px',
+    fontWeight: 400,
+    cursor: 'pointer',
+    zIndex: 3,
+    padding: 0,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  };
 }

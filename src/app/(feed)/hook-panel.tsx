@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import MuxPlayer from '@mux/mux-player-react';
+import MuxVideo from '@mux/mux-video-react';
 import type { FeedItem, VideoGroup } from './feed-types';
 import { envelopeStorageKey } from '@/app/s/[id]/session-client';
 import { recordFeedEvent } from '@/lib/feed/client-events';
@@ -138,6 +138,50 @@ export function HookPanel({
   const autoPlayValue: 'muted' | false =
     shouldPlay && !reduceMotionRef.current ? 'muted' : false;
 
+  // Activation lifecycle (per Mux's "Autoplay Considered Harmful" blog).
+  //
+  // Pattern: video element ALWAYS starts muted via the `muted` attribute
+  // (rendered hardcoded in JSX below — never bound to React state). On
+  // activation, call play() in a useEffect; the muted-autoplay path is
+  // universally allowed by every browser. If the user has previously
+  // unmuted this session, flip muted=false imperatively on the next frame
+  // — the prior tap counts as page-level user activation, so this is
+  // permitted. On deactivation, pause.
+  //
+  // We do NOT track muted in React state because:
+  //   (a) The JSX `muted` attribute is set ONCE at mount; React never
+  //       re-applies it because it never changes. No prop-vs-imperative
+  //       race.
+  //   (b) Visible UI ("Tap to unmute" overlay) is driven by the
+  //       sessionStorage-backed `unmuted` preference, not the player's
+  //       current mute state.
+  //   (c) Without media-chrome (we use MuxVideo, not MuxPlayer), nothing
+  //       else can change the mute state behind our back.
+  useEffect(() => {
+    const el = playerRef.current;
+    if (!el) return;
+    if (!shouldPlay || reduceMotionRef.current) {
+      el.pause?.();
+      setPaused(false);
+      return;
+    }
+    el.muted = true;
+    el.play?.().catch((err) => {
+      // eslint-disable-next-line no-console
+      console.warn('[hook-panel] play() rejected', {
+        hook_id: hook.hook_id,
+        muted: el.muted,
+        error: String(err),
+      });
+    });
+    if (!unmuted) return;
+    const id = requestAnimationFrame(() => {
+      const cur = playerRef.current;
+      if (cur && unmuted) cur.muted = false;
+    });
+    return () => cancelAnimationFrame(id);
+  }, [shouldPlay, unmuted, hook.hook_id]);
+
   useEffect(() => {
     if (!shouldPlay || viewStartFiredRef.current) return;
     viewStartFiredRef.current = true;
@@ -254,17 +298,11 @@ export function HookPanel({
   const handleTap = () => {
     const el = playerRef.current;
     if (!unmuted) {
-      // Imperative unmute: flip the element's `muted` property directly
-      // INSIDE the click handler so the audio change happens within the
-      // user-gesture window the browser autoplay policy requires. Setting
-      // the React `muted` prop alone is unreliable here — MuxPlayer can
-      // treat its `muted` prop as a one-shot at mount, and React's render
-      // batching can defer the flush until after the gesture has expired,
-      // so audio never actually unmutes.
+      // First tap: unmute. Update both the DOM (synchronously, inside the
+      // user-gesture window) and the React state (so the next render
+      // doesn't re-mute via the prop). Persist the preference.
       if (el) {
         el.muted = false;
-        // Best-effort resume. If the player was already playing, this is
-        // a no-op; if Mux paused on the muted-prop change, this restores.
         void el.play?.().catch(() => {});
       }
       unmute();
@@ -293,24 +331,21 @@ export function HookPanel({
       }}
     >
       {shouldMount ? (
-        <MuxPlayer
+        <MuxVideo
           key={hook.hook_id}
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          ref={playerRef as any}
+          ref={playerRef}
           playbackId={hook.mux_playback_id}
           streamType="on-demand"
           autoPlay={autoPlayValue}
-          muted={!unmuted}
+          muted
           loop
           playsInline
-          nohotkeys
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          {...({ metadata: {
+          metadata={{
             video_id: hook.video_id,
             video_title: hook.video_title,
             player_name: 'oakleague-feed',
-            viewer_user_id: deviceId,
-          } } as any)}
+            viewer_user_id: deviceId ?? undefined,
+          }}
           style={{
             width: '100%',
             height: '100%',
@@ -322,11 +357,10 @@ export function HookPanel({
         <div style={{ width: '100%', height: '100%', background: '#111' }} />
       )}
 
-      {/* Click-capture overlay. Sits ABOVE MuxPlayer so taps reach our
-          handler before Mux's internal click-to-toggle. The Ask button
-          and other interactive overlays carry zIndex >= 2 to stay above
-          this. Decorative overlays (caption, pager, hints) keep
-          pointerEvents: 'none' and don't need a zIndex bump. */}
+      {/* Click-capture overlay. Plain <video> via MuxVideo has no shadow
+          DOM controls fighting us, so this overlay's onClick reliably
+          catches every tap. Ask button + askError pill at zIndex 2 stay
+          tappable above this. Decorative overlays use pointerEvents:'none'. */}
       <div
         onClick={handleTap}
         style={{
