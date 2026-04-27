@@ -83,21 +83,47 @@ export function HookPanel({
   const playerRef = useRef<HTMLVideoElement | null>(null);
   const [paused, setPaused] = useState(false);
 
-  // D5: keep the most recent (currentTime, duration) so dwell_end has a
-  // completion_pct even if the MuxPlayer has already unmounted by the time
-  // the cleanup runs (shouldMount window narrows to ±1 lesson, so a
-  // 2-step horizontal swipe blanks the player before deactivation fires).
-  // M1: also push the latest pct into the container-scope tracker so
-  // VideoRow / FeedContainer can read it when emitting hook_swipe payloads
-  // (otherwise the dead-zone classifier sees completion_pct=0 and misfires).
+  // D5+: track played-seconds, not snapshot position.
+  //
+  // Earlier version computed completion_pct = currentTime / duration at the
+  // moment of dwell-end. That gives wrong answers for two real cases:
+  //   (a) Looped playback. User watches the whole 30s hook, then 6s into
+  //       loop 2 swipes away. currentTime=6, duration=30 → 20% — but they
+  //       actually watched 120% of the video. Loop replay is a strong
+  //       satisfaction signal that was being thrown away.
+  //   (b) Doorbell-pause case. dwell_ms keeps ticking while the panel is
+  //       active, but if the user paused or the tab was backgrounded,
+  //       no progress was made. Snapshot completion_pct under-reads.
+  //
+  // Fix: sum forward time-deltas while the video is actually playing.
+  // Backwards jumps (loop boundary, manual scrub) reset the diff window
+  // but don't double-count what we've already credited. Pauses don't
+  // accumulate. Result: played_seconds / duration can exceed 1.0 for
+  // repeat watches; rollup clamps in compute_event_weight, cooldown
+  // logic (>= 0.8 → 3-day) routes loops correctly.
   const lastTimeRef = useRef<{ time: number; duration: number } | null>(null);
+  const playedSecondsRef = useRef(0);
+  const lastSampleTimeRef = useRef<number | null>(null);
   const handleTimeUpdate = useCallback(() => {
     const el = playerRef.current;
     if (!el) return;
+    const t = el.currentTime;
     const duration = Number.isFinite(el.duration) ? el.duration : 0;
     if (duration > 0) {
-      lastTimeRef.current = { time: el.currentTime, duration };
-      impressionTracker.recordCompletion(hook.hook_id, el.currentTime / duration);
+      lastTimeRef.current = { time: t, duration };
+    }
+    const last = lastSampleTimeRef.current;
+    // Accumulate only on a small forward step while playing. Cap at 1.5s
+    // delta to ignore loop-jumps (currentTime resets near 0) and seek-jumps.
+    if (last !== null && !el.paused && t > last && t - last < 1.5) {
+      playedSecondsRef.current += t - last;
+    }
+    lastSampleTimeRef.current = t;
+    if (duration > 0) {
+      impressionTracker.recordCompletion(
+        hook.hook_id,
+        playedSecondsRef.current / duration,
+      );
     }
   }, [impressionTracker, hook.hook_id]);
 
@@ -146,6 +172,10 @@ export function HookPanel({
     // VideoRow / FeedContainer when nav happens) can compute
     // seconds_to_decision_ms — needed for the dead-zone classifier.
     impressionTracker.markActivated(hook.hook_id);
+    // Fresh activation = fresh played-seconds counter. Same instance can
+    // reactivate (e.g., user swipes left back to a previous lesson).
+    playedSecondsRef.current = 0;
+    lastSampleTimeRef.current = null;
   }, [
     shouldPlay,
     hook.hook_id,
@@ -183,8 +213,13 @@ export function HookPanel({
       // the right answer there — they didn't dwell — and the rollup weight
       // for hook_dwell_end is COALESCE(...,0), which yields 0.0 (no
       // affinity move). No correctness issue.
+      //
+      // played-seconds-based completion. Can exceed 1.0 for loop replays
+      // (e.g. 1.4 = watched 1.4× the video). compute_event_weight clamps
+      // at 1.0 in the rollup, but we keep the raw value here so future
+      // tuning + analytics see the real signal.
       const completionPct = cached && cached.duration > 0
-        ? Math.max(0, Math.min(1, cached.time / cached.duration))
+        ? Math.max(0, playedSecondsRef.current / cached.duration)
         : 0;
       // C1: dwell_ms is the field the rollup trigger reads — not
       // seconds_visible. Without it, user_topic_affinity.dwell_ms_total
@@ -268,6 +303,7 @@ export function HookPanel({
           muted={!unmuted}
           loop
           playsInline
+          nohotkeys
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           {...({ metadata: {
             video_id: hook.video_id,
@@ -280,12 +316,27 @@ export function HookPanel({
             height: '100%',
             objectFit: 'cover',
           }}
-          onClick={handleTap}
           onTimeUpdate={handleTimeUpdate}
         />
       ) : (
         <div style={{ width: '100%', height: '100%', background: '#111' }} />
       )}
+
+      {/* Click-capture overlay. Sits ABOVE MuxPlayer so taps reach our
+          handler before Mux's internal click-to-toggle. The Ask button
+          and other interactive overlays carry zIndex >= 2 to stay above
+          this. Decorative overlays (caption, pager, hints) keep
+          pointerEvents: 'none' and don't need a zIndex bump. */}
+      <div
+        onClick={handleTap}
+        style={{
+          position: 'absolute',
+          inset: 0,
+          zIndex: 1,
+          background: 'transparent',
+          cursor: 'pointer',
+        }}
+      />
 
       {/* Caption overlay */}
       {hook.hook_caption && (
@@ -439,6 +490,7 @@ export function HookPanel({
           fontSize: 12,
           fontWeight: 600,
           opacity: asking ? 0.6 : 1,
+          zIndex: 2,
         }}
         aria-label="Ask this creator"
       >
@@ -457,6 +509,7 @@ export function HookPanel({
             padding: '6px 10px',
             borderRadius: 10,
             maxWidth: 200,
+            zIndex: 2,
           }}
         >
           Couldn&apos;t start session: {askError === 'kill_switch_fired' ? 'Daily limit reached' : askError}
