@@ -162,10 +162,21 @@ export function HookPanel({
   // (currentTime, duration) so a fast horizontal swipe past this lesson
   // (which can blank the player before the cleanup runs) still emits
   // a usable signal.
+  //
+  // Tab-close path (D5 prod-verify finding): React unmount cleanup is
+  // unreliable when the browser kills the page on tab close — the
+  // useEffect cleanup never runs and dwell_end is lost. The pagehide /
+  // visibilitychange listeners below close that gap by firing the same
+  // event synchronously into the queue, which client-events.ts then
+  // flushes via sendBeacon before the page dies.
+  const dwellFiredRef = useRef(false);
   useEffect(() => {
     if (!shouldPlay) return;
+    dwellFiredRef.current = false;
     const startMs = Date.now();
-    return () => {
+    const fireDwellEnd = () => {
+      if (dwellFiredRef.current) return;
+      dwellFiredRef.current = true;
       const cached = lastTimeRef.current;
       // S1: lastTimeRef is null if MuxPlayer never fired onTimeUpdate (user
       // fast-scrolled past before the player buffered). completion_pct=0 is
@@ -190,11 +201,31 @@ export function HookPanel({
         },
       });
     };
+    const handlePageHide = () => fireDwellEnd();
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') fireDwellEnd();
+    };
+    window.addEventListener('pagehide', handlePageHide);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      window.removeEventListener('pagehide', handlePageHide);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      // Normal React unmount path (lesson nav, row nav). Idempotent via
+      // dwellFiredRef so we never double-emit if pagehide already fired.
+      fireDwellEnd();
+    };
   }, [shouldPlay, hook.hook_id, hook.video_id, hook.creator_id, hook.lesson_number]);
 
   const handleTap = () => {
     if (!unmuted) {
       unmute();
+      // Force-resume playback. Browsers commonly stall a video the moment
+      // the muted prop flips false on autoplay — the tap IS the user
+      // gesture that satisfies the autoplay-with-audio policy, but
+      // MuxPlayer doesn't always re-issue play() automatically. Without
+      // this, the user reports "tap to unmute pauses instead of unmutes."
+      void playerRef.current?.play().catch(() => {});
+      setPaused(false);
       return;
     }
     // Audit S2: after the unmute gesture has landed, tap toggles play/pause.
@@ -341,16 +372,23 @@ export function HookPanel({
             });
             if (!r.ok) {
               const body = (await r.json().catch(() => ({}))) as { error?: string };
-              if (r.status === 401) { router.push('/login'); return; }
+              // Map response.body.error → mic_tap_outcome enum (migration
+              // 0503-01). Fire BEFORE the /login redirect so an
+              // auth_required outcome lands in the rollup too — otherwise
+              // every signed-out tap on Ask is invisible to the algo.
+              const outcome =
+                body?.error === 'creator_not_ready' ? 'creator_not_ready'
+                : body?.error === 'rate_limited' || r.status === 429 ? 'kill_switch_blocked'
+                : body?.error === 'unauthorized' || r.status === 401 ? 'auth_required'
+                : 'unknown_error';
               recordFeedEvent({
                 event_name: 'mic_tap',
                 hook_id: hook.hook_id,
                 video_id: hook.video_id,
                 creator_id: hook.creator_id,
-                payload: {
-                  mic_tap_outcome: r.status === 429 ? 'kill_switch_blocked' : 'unknown_error',
-                },
+                payload: { mic_tap_outcome: outcome },
               });
+              if (r.status === 401) { router.push('/login'); return; }
               setAskError(body?.error ?? `error_${r.status}`);
               return;
             }
