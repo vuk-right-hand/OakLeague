@@ -21,27 +21,31 @@ type Props = {
   totalLessons: number;
 };
 
-// Session-scoped unmute preference. First tap unmutes for the whole session.
-function useUnmutePreference(): [boolean, () => void] {
-  const [unmuted, setUnmuted] = useState<boolean>(false);
-
+// Session-scoped "user has chosen sound" flag. Set once on the first
+// tap-to-unmute. Read on every panel activation so even *fresh-mounted*
+// videos (the lesson-0 of a row the user just scrolled to vertically)
+// get unmuted right after play() resolves.
+//
+// Why this is needed even after the TikTok pattern: Chrome's "transient
+// user activation" expires ~5s after the last tap/keypress. A fresh
+// <video> element mounted past that window is treated as a new
+// autoplay-with-sound decision and Chrome SILENTLY mutes the play()
+// (promise still resolves; el.muted stays true). Persisting the user's
+// preference + re-asserting el.muted = false post-play sidesteps this.
+// Browsers permit toggling muted on an already-playing element without
+// fresh activation.
+function useSoundPreference(): [boolean, () => void] {
+  const [wantsSound, setWantsSound] = useState(false);
   useEffect(() => {
     try {
-      if (sessionStorage.getItem('oak_unmuted') === '1') setUnmuted(true);
-    } catch {
-      // sessionStorage blocked — stay muted.
-    }
+      if (sessionStorage.getItem('oak_wants_sound') === '1') setWantsSound(true);
+    } catch { /* sessionStorage blocked */ }
   }, []);
-
-  const unmute = () => {
-    setUnmuted(true);
-    try {
-      sessionStorage.setItem('oak_unmuted', '1');
-    } catch {
-      /* noop */
-    }
+  const grant = () => {
+    setWantsSound(true);
+    try { sessionStorage.setItem('oak_wants_sound', '1'); } catch { /* */ }
   };
-  return [unmuted, unmute];
+  return [wantsSound, grant];
 }
 
 // Audit S9: stable per-device id so Mux Data can bucket QoE by viewer
@@ -72,7 +76,11 @@ export function HookPanel({
   lessonIndex,
   totalLessons,
 }: Props) {
-  const [unmuted, unmute] = useUnmutePreference();
+  // Local UI state for the muted indicator. Starts true (every panel
+  // mounts muted-autoplay-friendly), flips false once unmuted play()
+  // succeeds. Drives the "Tap for sound" hint and nothing else.
+  const [muted, setMuted] = useState(true);
+  const [wantsSound, grantSound] = useSoundPreference();
   const deviceId = useDeviceId();
   const viewStartFiredRef = useRef(false);
   const impressionTracker = useFeedImpressionTracker();
@@ -127,16 +135,13 @@ export function HookPanel({
     }
   }, [impressionTracker, hook.hook_id]);
 
-  // Audit M4: if the viewer prefers reduced motion, don't autoplay.
-  // Require an explicit tap to start the video.
-  const reduceMotionRef = useRef(false);
-  useEffect(() => {
-    reduceMotionRef.current =
-      typeof window !== 'undefined' &&
-      !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
-  }, []);
-  const autoPlayValue: 'muted' | false =
-    shouldPlay && !reduceMotionRef.current ? 'muted' : false;
+  // prefers-reduced-motion is for ANIMATION accessibility (page
+  // transitions, smooth scrolling). It is NOT a signal to disable video
+  // autoplay — TikTok / Instagram Reels / YouTube Shorts all autoplay
+  // regardless. The earlier audit's "no autoplay on reduce-motion" was
+  // wrong and broke the feed for any user who has the OS setting on.
+  // Where it DOES apply (smooth-scroll → instant-scroll on arrow nav),
+  // those callsites still consult window.matchMedia inline.
 
   // Activation lifecycle (per Mux's "Autoplay Considered Harmful" blog).
   //
@@ -160,27 +165,59 @@ export function HookPanel({
   useEffect(() => {
     const el = playerRef.current;
     if (!el) return;
-    if (!shouldPlay || reduceMotionRef.current) {
+    if (!shouldPlay) {
       el.pause?.();
       setPaused(false);
       return;
     }
-    el.muted = true;
-    el.play?.().catch((err) => {
-      // eslint-disable-next-line no-console
-      console.warn('[hook-panel] play() rejected', {
-        hook_id: hook.hook_id,
-        muted: el.muted,
-        error: String(err),
-      });
-    });
-    if (!unmuted) return;
-    const id = requestAnimationFrame(() => {
-      const cur = playerRef.current;
-      if (cur && unmuted) cur.muted = false;
-    });
-    return () => cancelAnimationFrame(id);
-  }, [shouldPlay, unmuted, hook.hook_id]);
+    let cancelled = false;
+
+    // Restart from beginning on every fresh activation.
+    try { el.currentTime = 0; } catch { /* metadata not loaded yet */ }
+
+    // Set muted state IMPERATIVELY only — never call setMuted() before
+    // play() resolves. Calling setState mid-effect causes React to
+    // re-render and (in some Mux/HLS combinations) re-initiate the
+    // <video>'s load, which interrupts play() and leaves us muted.
+    // The previous attempt that did `setMuted(true)` at the top broke
+    // every direction's audio for exactly this reason.
+    el.muted = !wantsSound;
+
+    const start = async () => {
+      try {
+        await el.play?.();
+        if (cancelled) return;
+        // If wantsSound was true but Chrome silently re-muted us
+        // (fresh-mounted element + expired user activation), make one
+        // more attempt to unmute now that play has actually started.
+        // Browsers permit this without fresh activation — it's not
+        // "initiating audio," it's "unmuting an already-playing video."
+        if (wantsSound && el.muted) {
+          el.muted = false;
+        }
+        if (!cancelled) setMuted(el.muted);
+      } catch (err) {
+        const name = (err as { name?: string })?.name;
+        if (name === 'AbortError' || cancelled) return;
+        // Last-resort muted fallback if even the unmuted attempt threw.
+        el.muted = true;
+        try {
+          await el.play?.();
+          if (!cancelled) setMuted(true);
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.warn('[hook-panel] play() failed even muted', {
+            hook_id: hook.hook_id,
+            error: String(e),
+          });
+        }
+      }
+    };
+    void start();
+    return () => {
+      cancelled = true;
+    };
+  }, [shouldPlay, hook.hook_id, wantsSound]);
 
   useEffect(() => {
     if (!shouldPlay || viewStartFiredRef.current) return;
@@ -297,20 +334,19 @@ export function HookPanel({
 
   const handleTap = () => {
     const el = playerRef.current;
-    if (!unmuted) {
-      // First tap: unmute. Update both the DOM (synchronously, inside the
-      // user-gesture window) and the React state (so the next render
-      // doesn't re-mute via the prop). Persist the preference.
-      if (el) {
-        el.muted = false;
-        void el.play?.().catch(() => {});
-      }
-      unmute();
+    if (!el) return;
+    // First tap on a muted panel: unmute current + persist preference so
+    // every future activation (even fresh-mounted vertical-swipe panels)
+    // automatically unmutes after their muted-autoplay bootstrap.
+    if (el.muted) {
+      el.muted = false;
+      void el.play?.().catch(() => {});
+      setMuted(false);
       setPaused(false);
+      grantSound();
       return;
     }
-    // Audit S2: after the unmute gesture has landed, tap toggles play/pause.
-    if (!el) return;
+    // Already unmuted: toggle play/pause (TikTok body-tap behavior).
     if (el.paused) {
       void el.play();
       setPaused(false);
@@ -336,7 +372,7 @@ export function HookPanel({
           ref={playerRef}
           playbackId={hook.mux_playback_id}
           streamType="on-demand"
-          autoPlay={autoPlayValue}
+          autoPlay="muted"
           muted
           loop
           playsInline
@@ -349,7 +385,14 @@ export function HookPanel({
           style={{
             width: '100%',
             height: '100%',
-            objectFit: 'cover',
+            // `contain` letterboxes when the viewport aspect-ratio doesn't
+            // match the video (PC is 16:9 wide, hooks are 9:16 portrait,
+            // so cover would crop ~70% of the frame and feel zoomed-in).
+            // Mobile portrait viewers see the full frame; desktop sees
+            // pillarboxed video centered on a black background, which is
+            // the TikTok-on-PC norm.
+            objectFit: 'contain',
+            background: '#000',
           }}
           onTimeUpdate={handleTimeUpdate}
         />
@@ -550,8 +593,11 @@ export function HookPanel({
         </div>
       )}
 
-      {/* Unmute hint */}
-      {!unmuted && shouldPlay && (
+      {/* "Tap for sound" hint. Only shown when the browser refused
+          unmuted autoplay (typically just the very first panel before
+          any user interaction). Once `muted` flips false on a successful
+          unmuted play(), the hint disappears for good. */}
+      {muted && shouldPlay && (
         <div
           style={{
             position: 'absolute',
@@ -566,12 +612,12 @@ export function HookPanel({
             pointerEvents: 'none',
           }}
         >
-          Tap to unmute
+          Tap for sound
         </div>
       )}
 
       {/* Pause indicator — visible only when user has explicitly paused. */}
-      {paused && unmuted && shouldPlay && (
+      {paused && !muted && shouldPlay && (
         <div
           style={{
             position: 'absolute',
