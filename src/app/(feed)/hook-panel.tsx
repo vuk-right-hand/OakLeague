@@ -217,19 +217,26 @@ export function HookPanel({
   }, [shouldPlay, hook.hook_id, hook.video_id, hook.creator_id, hook.lesson_number]);
 
   const handleTap = () => {
+    const el = playerRef.current;
     if (!unmuted) {
+      // Imperative unmute: flip the element's `muted` property directly
+      // INSIDE the click handler so the audio change happens within the
+      // user-gesture window the browser autoplay policy requires. Setting
+      // the React `muted` prop alone is unreliable here — MuxPlayer can
+      // treat its `muted` prop as a one-shot at mount, and React's render
+      // batching can defer the flush until after the gesture has expired,
+      // so audio never actually unmutes.
+      if (el) {
+        el.muted = false;
+        // Best-effort resume. If the player was already playing, this is
+        // a no-op; if Mux paused on the muted-prop change, this restores.
+        void el.play?.().catch(() => {});
+      }
       unmute();
-      // Force-resume playback. Browsers commonly stall a video the moment
-      // the muted prop flips false on autoplay — the tap IS the user
-      // gesture that satisfies the autoplay-with-audio policy, but
-      // MuxPlayer doesn't always re-issue play() automatically. Without
-      // this, the user reports "tap to unmute pauses instead of unmutes."
-      void playerRef.current?.play().catch(() => {});
       setPaused(false);
       return;
     }
     // Audit S2: after the unmute gesture has landed, tap toggles play/pause.
-    const el = playerRef.current;
     if (!el) return;
     if (el.paused) {
       void el.play();
