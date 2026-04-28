@@ -10,9 +10,13 @@ type Props = {
   group: VideoGroup;
   index: number;
   isActive: boolean;
+  /** True when this row is within ±2 of the active row. Used to gate
+      lesson-0 pre-mount so audio policy carries across vertical swipes
+      without warming HLS decoders for the entire feed. */
+  nearActive: boolean;
 };
 
-export function VideoRow({ group, index, isActive }: Props) {
+export function VideoRow({ group, index, isActive, nearActive }: Props) {
   const [lessonIdx, setLessonIdx] = useState(0);
   const stripRef = useRef<HTMLDivElement | null>(null);
   const tracker = useFeedImpressionTracker();
@@ -151,24 +155,16 @@ export function VideoRow({ group, index, isActive }: Props) {
         }}
       >
         {group.items.map((hook, i) => {
-          // Keep the FIRST lesson of every row mounted continuously,
-          // regardless of whether the row is currently active. Reason:
-          // when the user vertically scrolls to a new row, the new
-          // row's first lesson activates. If that lesson's <video>
-          // element had to be freshly mounted at that moment, Chrome
-          // treats it as a brand-new autoplay decision and silently
-          // mutes the play() (the user's `wantsSound` preference
-          // can't override this without fresh user activation).
-          //
-          // Pre-mounting lesson 0 means the element exists from the
-          // moment the feed renders. By the time the user swipes to
-          // it, its autoplay state has already been established within
-          // the page's audio context. Audio policy carries.
-          //
-          // Other lessons (1..N) remain on the ±1 window — they only
-          // matter when the row is already active.
+          // Pre-mount lesson 0 of any row within ±2 of the active row
+          // (audit P1-C). Element pre-existing at the moment shouldPlay
+          // flips true is what lets audio policy carry across vertical
+          // swipes. Bounding to a halo (not "every row") caps mount
+          // cost at ~5 concurrent HLS decoders regardless of feed
+          // length. Other lessons (1..N) still mount on the
+          // active-row ±1 window because they only matter when the
+          // row is already on-screen.
           const distance = Math.abs(i - lessonIdx);
-          const shouldMount = i === 0 || (isActive && distance <= 1);
+          const shouldMount = (i === 0 && nearActive) || (isActive && distance <= 1);
           const shouldPlay = isActive && i === lessonIdx;
           return (
             <div

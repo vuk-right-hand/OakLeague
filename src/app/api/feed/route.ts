@@ -119,6 +119,14 @@ export async function GET(req: Request): Promise<Response> {
     hasMore = allRows.length === limit;
   }
 
+  // cursor_epoch is identical for every row in a page — it's not a
+  // "next item" cursor. The SQL function (feed_ranked_page migration
+  // 0503-16) sets v_cursor_epoch once at call time and returns it on
+  // every row to seed deterministic explore-slot positioning across
+  // load-more calls (audit P2-D). Pagination advances via
+  // p_exclude_hook_ids, not via the cursor. items[0] / items[N-1]
+  // both yield the same value; covered by pgTAP test
+  // algo_feed_ranked_page_cursor_epoch_stable.test.sql.
   const cursorOut = items.length > 0 ? items[0].cursor_epoch : cursorEpoch;
   const body: FeedPageResponse = {
     items,

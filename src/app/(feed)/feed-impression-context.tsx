@@ -60,19 +60,33 @@ export function FeedImpressionProvider({
 }: {
   children: React.ReactNode;
 }) {
+  // Audit P2-A: cap each tracker at MAX_ENTRIES with FIFO eviction.
+  // Without this, an infinite-scroll session accumulates one entry per
+  // hook ever seen; the maps grow unbounded. Insertion order preserves
+  // recency naturally (Map/Set both maintain insertion order in JS).
+  const MAX_ENTRIES = 500;
   const impressionsRef = useRef<Set<string>>(new Set());
   const activationsRef = useRef<Map<string, number>>(new Map());
   const activeLessonRef = useRef<Map<string, string>>(new Map());
   const completionRef = useRef<Map<string, number>>(new Map());
 
+  const evictIfFull = <T,>(coll: Set<T> | Map<T, unknown>) => {
+    if (coll.size <= MAX_ENTRIES) return;
+    // Oldest entry first via the iterator (insertion order).
+    const oldest = coll.keys().next().value as T | undefined;
+    if (oldest !== undefined) coll.delete(oldest);
+  };
+
   const markIfNew = useCallback((hookId: string) => {
     if (impressionsRef.current.has(hookId)) return false;
     impressionsRef.current.add(hookId);
+    evictIfFull(impressionsRef.current);
     return true;
   }, []);
 
   const markActivated = useCallback((hookId: string) => {
     activationsRef.current.set(hookId, Date.now());
+    evictIfFull(activationsRef.current);
   }, []);
 
   const peekActivation = useCallback((hookId: string) => {
@@ -83,6 +97,7 @@ export function FeedImpressionProvider({
 
   const setActiveLesson = useCallback((videoId: string, hookId: string) => {
     activeLessonRef.current.set(videoId, hookId);
+    evictIfFull(activeLessonRef.current);
   }, []);
 
   const getActiveLesson = useCallback((videoId: string) => {
@@ -90,8 +105,14 @@ export function FeedImpressionProvider({
   }, []);
 
   const recordCompletion = useCallback((hookId: string, pct: number) => {
-    if (Number.isFinite(pct)) {
-      completionRef.current.set(hookId, Math.max(0, Math.min(1, pct)));
+    // Store the RAW value, not clamped. Loop replays produce >1.0 which is
+    // a strong satisfaction signal (audit P1-A). The DB-side
+    // compute_event_weight clamps once at the rollup boundary; clamping
+    // here too drops the signal from hook_swipe payloads (which read this
+    // value and pipe it to the rollup) without any benefit.
+    if (Number.isFinite(pct) && pct >= 0) {
+      completionRef.current.set(hookId, pct);
+      evictIfFull(completionRef.current);
     }
   }, []);
 

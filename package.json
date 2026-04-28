@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "db:reset": "supabase db reset",
     "db:test": "supabase test db",
-    "db:diff": "supabase db diff"
+    "db:diff": "supabase db diff",
+    "seed:dev": "psql postgresql://postgres:postgres@127.0.0.1:54322/postgres -f supabase/seed_dev.sql"
   },
   "dependencies": {
     "@daily-co/daily-js": "^0.89.1",

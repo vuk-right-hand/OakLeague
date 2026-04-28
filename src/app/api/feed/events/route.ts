@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import { supabaseServer } from '@/lib/supabase/server';
 import { getClientIp } from '@/lib/ip';
-import { readAnonId, readOrMintAnonId } from '@/lib/feed/anon-id';
+import { readAnonId } from '@/lib/feed/anon-id';
 import {
   feedEventsRequestSchema,
   type FeedEventsResponse,
@@ -78,16 +78,17 @@ export async function POST(req: Request): Promise<Response> {
     return NextResponse.json(toResponse(data));
   }
 
-  // Anon path: cookie-bound. Read first; mint if absent so a brand-new
-  // visitor's first event still lands somewhere.
-  let anonId = await readAnonId();
+  // Anon path: cookie-bound. ONLY read — never mint here (audit P2-F).
+  // sendBeacon-flushed batches at pagehide can't carry Set-Cookie back
+  // (browsers ignore Set-Cookie response headers on beacon responses),
+  // so a mint on this path produces an orphan anon_feed_sessions row
+  // and the next visit re-mints, fragmenting attribution. The cookie
+  // is always minted on the GET /api/feed read path, which IS allowed
+  // to set cookies. If we see a beacon event before any GET has
+  // landed (very rare race: open + immediate close), we silently drop.
+  const anonId = await readAnonId();
   if (!anonId) {
-    try {
-      anonId = await readOrMintAnonId();
-    } catch (e) {
-      console.error('[feed/events] anon_id mint failed', e);
-      return NextResponse.json({ error: 'anon_init_failed' }, { status: 500 });
-    }
+    return NextResponse.json({ inserted: 0, deduped: 0, dead_zoned: 0 });
   }
 
   const { data, error } = await admin.rpc('ingest_feed_events_anon', {

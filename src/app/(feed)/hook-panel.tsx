@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import * as Sentry from '@sentry/nextjs';
 import MuxVideo from '@mux/mux-video-react';
 import type { FeedItem, VideoGroup } from './feed-types';
 import { envelopeStorageKey } from '@/app/s/[id]/session-client';
@@ -34,13 +35,25 @@ type Props = {
 // preference + re-asserting el.muted = false post-play sidesteps this.
 // Browsers permit toggling muted on an already-playing element without
 // fresh activation.
+function readSoundPreferenceSync(): boolean {
+  // SSR: window absent, return false. Client: read sessionStorage
+  // synchronously so the very first render sees the right value.
+  if (typeof window === 'undefined') return false;
+  try {
+    return sessionStorage.getItem('oak_wants_sound') === '1';
+  } catch {
+    return false;
+  }
+}
+
 function useSoundPreference(): [boolean, () => void] {
-  const [wantsSound, setWantsSound] = useState(false);
-  useEffect(() => {
-    try {
-      if (sessionStorage.getItem('oak_wants_sound') === '1') setWantsSound(true);
-    } catch { /* sessionStorage blocked */ }
-  }, []);
+  // useState lazy initializer: runs once on mount, reads sessionStorage
+  // synchronously. Eliminates the first-render race the previous
+  // useEffect-based version had — the activation effect now sees the
+  // correct wantsSound on the very first run, no second-commit catch-up
+  // via mute-sync needed for the common "user previously chose sound"
+  // path.
+  const [wantsSound, setWantsSound] = useState(readSoundPreferenceSync);
   const grant = () => {
     setWantsSound(true);
     try { sessionStorage.setItem('oak_wants_sound', '1'); } catch { /* */ }
@@ -162,6 +175,19 @@ export function HookPanel({
   //       current mute state.
   //   (c) Without media-chrome (we use MuxVideo, not MuxPlayer), nothing
   //       else can change the mute state behind our back.
+  // Read wantsSound through a ref inside the activation effect so the
+  // effect doesn't depend on it (audit P1-B). Without this split, the
+  // first tap-to-unmute (which calls grantSound) caused wantsSound to
+  // flip true, which re-ran the activation effect, which reset
+  // currentTime to 0 — visibly rewinding the video. Also caused two
+  // hook_view_start fires per panel skewing Mux Data QoE.
+  const wantsSoundRef = useRef(wantsSound);
+  useEffect(() => {
+    wantsSoundRef.current = wantsSound;
+  }, [wantsSound]);
+
+  // Activation effect: play/pause + currentTime reset. Reads wantsSound
+  // via the ref, so it does NOT re-run on preference change.
   useEffect(() => {
     const el = playerRef.current;
     if (!el) return;
@@ -172,39 +198,32 @@ export function HookPanel({
     }
     let cancelled = false;
 
-    // Restart from beginning on every fresh activation.
     try { el.currentTime = 0; } catch { /* metadata not loaded yet */ }
-
-    // Set muted state IMPERATIVELY only — never call setMuted() before
-    // play() resolves. Calling setState mid-effect causes React to
-    // re-render and (in some Mux/HLS combinations) re-initiate the
-    // <video>'s load, which interrupts play() and leaves us muted.
-    // The previous attempt that did `setMuted(true)` at the top broke
-    // every direction's audio for exactly this reason.
-    el.muted = !wantsSound;
+    el.muted = !wantsSoundRef.current;
 
     const start = async () => {
       try {
         await el.play?.();
         if (cancelled) return;
-        // If wantsSound was true but Chrome silently re-muted us
-        // (fresh-mounted element + expired user activation), make one
-        // more attempt to unmute now that play has actually started.
-        // Browsers permit this without fresh activation — it's not
-        // "initiating audio," it's "unmuting an already-playing video."
-        if (wantsSound && el.muted) {
+        if (wantsSoundRef.current && el.muted) {
           el.muted = false;
         }
         if (!cancelled) setMuted(el.muted);
       } catch (err) {
         const name = (err as { name?: string })?.name;
         if (name === 'AbortError' || cancelled) return;
-        // Last-resort muted fallback if even the unmuted attempt threw.
         el.muted = true;
         try {
           await el.play?.();
           if (!cancelled) setMuted(true);
         } catch (e) {
+          if (cancelled) return;
+          Sentry.captureException(e, {
+            extra: {
+              op: 'hook_panel_play_failed_muted',
+              hook_id: hook.hook_id,
+            },
+          });
           // eslint-disable-next-line no-console
           console.warn('[hook-panel] play() failed even muted', {
             hook_id: hook.hook_id,
@@ -217,7 +236,20 @@ export function HookPanel({
     return () => {
       cancelled = true;
     };
-  }, [shouldPlay, hook.hook_id, wantsSound]);
+  }, [shouldPlay, hook.hook_id]);
+
+  // Mute-sync effect (audit P1-B). When `wantsSound` flips true while a
+  // panel is already playing (handleTap → grantSound, or sessionStorage
+  // hydration on first paint), unmute imperatively WITHOUT touching
+  // currentTime. The activation effect doesn't see this dep, so the
+  // video keeps playing from where it was.
+  useEffect(() => {
+    if (!shouldPlay || !wantsSound) return;
+    const el = playerRef.current;
+    if (!el || !el.muted) return;
+    el.muted = false;
+    setMuted(false);
+  }, [wantsSound, shouldPlay]);
 
   useEffect(() => {
     if (!shouldPlay || viewStartFiredRef.current) return;
@@ -372,7 +404,15 @@ export function HookPanel({
           ref={playerRef}
           playbackId={hook.mux_playback_id}
           streamType="on-demand"
-          autoPlay="muted"
+          // No `autoPlay` attribute. Why: the HTML autoplay attribute
+          // fires the moment the <video> element mounts, BEFORE our
+          // activation effect can run pause() on a non-active panel
+          // (shouldPlay=false). On Android Chrome we observed inactive
+          // pre-mounted lessons quietly playing in the background for
+          // 4-5 seconds before our pause() landed, leading to "first
+          // swipe right → next lesson starts mid-playback." We drive
+          // play() entirely from the activation effect now, so autoplay
+          // is redundant for active panels and harmful for inactive ones.
           muted
           loop
           playsInline

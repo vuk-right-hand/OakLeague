@@ -243,6 +243,14 @@ function FeedContainerInner({
             group={g}
             index={i}
             isActive={i === activeIdx}
+            // Audit P1-C: cap pre-mount cost. Lesson 0 of every row was
+            // mounting unconditionally to keep audio policy carrying
+            // across vertical swipes; that scaled badly at 50+ rows
+            // (every lesson 0 spins up an HLS decoder + records a
+            // bogus Mux Data view_start). Limit pre-mount to a 2-row
+            // halo around the active idx — covers swipe-back + swipe-
+            // forward without warming the entire feed.
+            nearActive={Math.abs(i - activeIdx) <= 2}
           />
         ))}
       </div>
