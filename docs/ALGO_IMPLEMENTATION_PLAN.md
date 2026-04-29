@@ -1017,6 +1017,27 @@ REVOKE EXECUTE ON FUNCTION public.feed_ranked_anon_page(uuid, int, bigint) FROM 
 
 **Migration 9 — admin RPCs (C2, C3, C7)**
 
+> **D6 implementation note** (post-3-round audit, see `docs/_planning/ADMIN_ALGO_INSPECTOR.md`):
+> the canonical implementation in `supabase/migrations/20260504000006_admin_algo_inspect_rpcs.sql`
+> deviates from the prose below in three load-bearing ways. The prose is preserved
+> for historical context but **the canonical truth is in the migration + ADMIN_ALGO_INSPECTOR.md**:
+>
+> 1. **`admin_audit_log` shape:** the table has columns `(admin_user_id, action, target_kind,
+>    target_id, before, after, created_at)` — there is no `metadata` column. Use
+>    `target_kind='profile'` and stash request metadata in `after` jsonb.
+> 2. **`served_rank` is `slot_idx`** in `feed_ranked_page` (the on-screen 0-indexed slot
+>    after explore-interleave), not the scorer rank. Narrative says
+>    `'Shown in slot #%s'` with `(slot_idx + 1)` for human readability — never `'Ranked #N'`.
+> 3. **Standalone `admin_algo_score_explain_narrative` RPC was cut.** The single
+>    `admin_algo_score_explain` RPC returns `{breakdown, narrative, ...}` in one envelope.
+>    A private `_admin_algo_narrative_from_breakdown` SQL helper formats the text — the
+>    only consumer is `admin_algo_score_explain` itself.
+>
+> The narrative ALSO reconstructs the consecutive-creator streak from `feed_events_raw`
+> (matches `feed_ranked_page` exactly via `array_agg(... ORDER BY created_at DESC)`) and
+> appends a regime-label tail clause for A/B users — surfacing that v1 scorer is
+> regime-agnostic ([compute_hook_score:51,187](../supabase/migrations/20260503000010_feed_ranked_page_rpc.sql#L51)).
+
 Admin guard canonical predicate (C3) — used in every admin_algo_* function:
 
 ```sql
@@ -1030,84 +1051,37 @@ IF NOT EXISTS (
 END IF;
 ```
 
-Audit log on every call (C2) — written before returning results:
+Audit log on every call (C2) — written after the action completes (matches
+`admin_set_profile_tier:115` codebase pattern; failed actions roll back the audit row):
 
 ```sql
+-- Real schema. No `metadata` column — use `after` jsonb.
 INSERT INTO public.admin_audit_log
-  (admin_user_id, action, target_id, metadata)
+  (admin_user_id, action, target_kind, target_id, before, after)
 VALUES (
-  auth.uid(), 'algo_profile_viewed', p_user_id,
+  auth.uid(), 'algo_profile_viewed', 'profile', p_user_id, NULL,
   jsonb_build_object('rpc', 'admin_algo_user_summary', 'ts', now())
 );
 ```
 
 `admin_audit_log` table already exists from migration `20260502000004_admin_audit_and_tier_flip.sql`.
 
-**Natural-language narrative RPC (C7):**
+**Narrative templating (C7) — superseded by D6 implementation.** See
+`docs/_planning/ADMIN_ALGO_INSPECTOR.md §1.10` for the canonical helper signature
+(`_admin_algo_narrative_from_breakdown(p_breakdown, p_served_slot_zero, p_streak,
+p_regime_label) returns text`, LANGUAGE sql IMMUTABLE, service_role-only). The
+templating clauses below remain accurate; only the lead clause changed:
 
-```sql
-CREATE OR REPLACE FUNCTION public.admin_algo_score_explain_narrative(
-  p_user_id uuid, p_hook_id uuid
-) RETURNS text LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
-DECLARE
-  v_breakdown jsonb;
-  v_top_topic text;
-  v_s_topic real;
-  v_s_creator real;
-  v_s_recency real;
-  v_age_days real;
-  v_narrative text;
-BEGIN
-  -- Admin guard (C3 predicate — see canonical template above).
-  ...
+- **Lead:** `'Shown in slot #%s — '` with `(p_served_slot_zero + 1)`, never `'Ranked #N'`.
+- **Topic / creator / recency clauses:** unchanged from the original spec.
+- **Empty-state fallback:** `S_topic ≤ 0.05 AND S_creator ≤ 0.05` →
+  "score driven by global quality + recency only — no affinity history yet."
+- **Streak tail:** `streak >= 2` → ` Repeat-creator penalty applied (streak N).`
+- **Regime tail:** `regime IN ('A','B')` → informational note that v1 scorer is regime-agnostic.
 
-  -- Audit log (C2).
-  INSERT INTO public.admin_audit_log (admin_user_id, action, target_id, metadata)
-  VALUES (auth.uid(), 'algo_score_explain', p_user_id,
-          jsonb_build_object('hook_id', p_hook_id));
-
-  -- Get breakdown from the shared scorer function.
-  SELECT public.compute_hook_score(p_user_id, p_hook_id) INTO v_breakdown;
-
-  v_top_topic  := v_breakdown->>'top_topic';
-  v_s_topic    := (v_breakdown->'components'->>'S_topic')::real;
-  v_s_creator  := (v_breakdown->'components'->>'S_creator')::real;
-  v_s_recency  := (v_breakdown->'components'->>'S_recency')::real;
-  v_age_days   := (v_breakdown->>'age_days')::real;
-
-  -- Template a 1–2 sentence plain-English explanation.
-  v_narrative := format(
-    'Ranked #%s — %s%s%s',
-    v_breakdown->>'served_rank',
-    -- Topic signal sentence.
-    CASE
-      WHEN v_s_topic > 0.5 THEN
-        format('strong match on your top topic "%s" (affinity %.2f)', v_top_topic, v_s_topic)
-      WHEN v_s_topic > 0.1 THEN
-        format('moderate match on "%s"', v_top_topic)
-      WHEN v_s_topic < 0 THEN
-        format('you''ve dismissed "%s" content before — served as exploration', v_top_topic)
-      ELSE 'new topic you haven''t seen yet — served to expand your taste'
-    END,
-    -- Creator signal addition.
-    CASE
-      WHEN v_s_creator > 0.3 THEN format(', creator you''ve engaged with (affinity %.2f)', v_s_creator)
-      WHEN v_s_creator < -0.1 THEN ', creator you tend to skip'
-      ELSE ''
-    END,
-    -- Recency note.
-    CASE
-      WHEN v_age_days < 2   THEN '. Just published.'
-      WHEN v_s_recency < 0.3 THEN format('. Recency score reduced (%s days old).', ROUND(v_age_days))
-      ELSE '.'
-    END
-  );
-
-  RETURN v_narrative;
-END;$$;
-```
-
-The admin UI renders this sentence in a styled callout above the component breakdown table. No extra network call — the same `admin_algo_score_explain` response returns both `breakdown` and `narrative` in one envelope.
+The admin UI renders this sentence in a styled callout above the component breakdown table.
+No extra network call — the same `admin_algo_score_explain` response returns both
+`breakdown` and `narrative` in one envelope.
 
 ---
 
