@@ -78,6 +78,7 @@ export default async function RootPage() {
       initialCursorEpoch={initialCursorEpoch}
       initialHasMore={hasMore}
       welcome={welcome}
+      isAuthenticated={!!user}
     />
   );
 }

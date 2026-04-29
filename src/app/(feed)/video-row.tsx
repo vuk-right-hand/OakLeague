@@ -14,9 +14,10 @@ type Props = {
       lesson-0 pre-mount so audio policy carries across vertical swipes
       without warming HLS decoders for the entire feed. */
   nearActive: boolean;
+  isAuthenticated: boolean;
 };
 
-export function VideoRow({ group, index, isActive, nearActive }: Props) {
+export function VideoRow({ group, index, isActive, nearActive, isAuthenticated }: Props) {
   const [lessonIdx, setLessonIdx] = useState(0);
   const stripRef = useRef<HTMLDivElement | null>(null);
   const tracker = useFeedImpressionTracker();
@@ -186,6 +187,7 @@ export function VideoRow({ group, index, isActive, nearActive }: Props) {
                 shouldPlay={shouldPlay}
                 lessonIndex={i}
                 totalLessons={group.items.length}
+                isAuthenticated={isAuthenticated}
               />
             </div>
           );

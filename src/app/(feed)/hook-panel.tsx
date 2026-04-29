@@ -7,6 +7,8 @@ import MuxVideo from '@mux/mux-video-react';
 import type { FeedItem, VideoGroup } from './feed-types';
 import { envelopeStorageKey } from '@/app/s/[id]/session-client';
 import { recordFeedEvent } from '@/lib/feed/client-events';
+import { useDeviceId } from '@/lib/feed/device-id';
+import { AskErrorPill } from '@/lib/feed/ask-error-pill';
 import { useFeedImpressionTracker } from './feed-impression-context';
 
 // Default wire-form model. Kept in sync with src/lib/voice/model-map.ts.
@@ -20,6 +22,7 @@ type Props = {
   shouldPlay: boolean;
   lessonIndex: number;
   totalLessons: number;
+  isAuthenticated: boolean;
 };
 
 // Session-scoped "user has chosen sound" flag. Set once on the first
@@ -61,26 +64,6 @@ function useSoundPreference(): [boolean, () => void] {
   return [wantsSound, grant];
 }
 
-// Audit S9: stable per-device id so Mux Data can bucket QoE by viewer
-// instead of lumping every anon viewer into one id. Persists across
-// sessions; scope is the browser profile.
-function useDeviceId(): string | null {
-  const [id, setId] = useState<string | null>(null);
-  useEffect(() => {
-    try {
-      let existing = localStorage.getItem('oak_device_id');
-      if (!existing) {
-        existing = `anon_${crypto.randomUUID()}`;
-        localStorage.setItem('oak_device_id', existing);
-      }
-      setId(existing);
-    } catch {
-      setId(null);
-    }
-  }, []);
-  return id;
-}
-
 export function HookPanel({
   hook,
   group,
@@ -88,6 +71,7 @@ export function HookPanel({
   shouldPlay,
   lessonIndex,
   totalLessons,
+  isAuthenticated,
 }: Props) {
   // Local UI state for the muted indicator. Starts true (every panel
   // mounts muted-autoplay-friendly), flips false once unmuted play()
@@ -515,25 +499,80 @@ export function HookPanel({
         ))}
       </div>
 
+      {/* Long-form pill — only renders when the parent video has a ready +
+          published long-form asset (long_form_available is computed in
+          feed_ranked_page from videos.long_form_*). Hook-only videos
+          never show the pill. router.push() is correct: this is in-app
+          navigation, not an auth-affecting transition. */}
+      {hook.long_form_available && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            router.push(`/v/${hook.video_id}?from=${hook.hook_id}`);
+          }}
+          style={{
+            position: 'absolute',
+            right: 16,
+            bottom: 156,
+            padding: '8px 12px',
+            borderRadius: 16,
+            background: 'rgba(255,255,255,0.12)',
+            border: '1px solid rgba(255,255,255,0.3)',
+            color: '#fff',
+            fontSize: 12,
+            fontWeight: 500,
+            zIndex: 2,
+            cursor: 'pointer',
+          }}
+          aria-label={`Chat with @${group.creator.handle} — full lesson`}
+        >
+          Chat with @{group.creator.handle}
+        </button>
+      )}
+
       {/* Ask button — opens a voice session and routes to /s/[id].
-          router.push() is correct per CLAUDE.md: the hard-rule requirement
-          for window.location.href applies to login/signup/role/tier change;
-          session creation is none of those. (R3-S9) */}
+          Hidden when anon AND long_form_available: the long-form pill
+          above ("Chat with @handle") is the singular CTA in that state,
+          and conversion to /login happens inside the long-form viewer's
+          own Ask. For anon WITHOUT long-form, this button shows "Sign up
+          to chat with @handle" → window.location.href = '/login' (no API
+          round-trip). For auth, this hits /api/sessions/open; on 401 we
+          use window.location.href (CLAUDE.md hard rule). The /s/[id]
+          success path stays on router.push (not auth-affecting). */}
+      {(isAuthenticated || !hook.long_form_available) && (
       <button
         type="button"
         disabled={asking}
         onClick={async (e) => {
           e.stopPropagation();
           if (asking) return;
-          setAsking(true);
-          setAskError(null);
           try {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             (window as any).posthog?.capture?.('hook_ask_clicked', {
               hook_id: hook.hook_id,
               creator_id: hook.creator_id,
+              authenticated: isAuthenticated,
             });
           } catch { /* noop */ }
+
+          // Anon path: skip the API entirely. Record the auth_required
+          // mic_tap so the algo sees signed-out interest, then full-page
+          // reload to /login (hard-rule).
+          if (!isAuthenticated) {
+            recordFeedEvent({
+              event_name: 'mic_tap',
+              hook_id: hook.hook_id,
+              video_id: hook.video_id,
+              creator_id: hook.creator_id,
+              payload: { mic_tap_outcome: 'auth_required' },
+            });
+            window.location.href = '/login';
+            return;
+          }
+
+          setAsking(true);
+          setAskError(null);
           try {
             const r = await fetch('/api/sessions/open', {
               method: 'POST',
@@ -547,10 +586,6 @@ export function HookPanel({
             });
             if (!r.ok) {
               const body = (await r.json().catch(() => ({}))) as { error?: string };
-              // Map response.body.error → mic_tap_outcome enum (migration
-              // 0503-01). Fire BEFORE the /login redirect so an
-              // auth_required outcome lands in the rollup too — otherwise
-              // every signed-out tap on Ask is invisible to the algo.
               const outcome =
                 body?.error === 'creator_not_ready' ? 'creator_not_ready'
                 : body?.error === 'rate_limited' || r.status === 429 ? 'kill_switch_blocked'
@@ -563,7 +598,9 @@ export function HookPanel({
                 creator_id: hook.creator_id,
                 payload: { mic_tap_outcome: outcome },
               });
-              if (r.status === 401) { router.push('/login'); return; }
+              // CLAUDE.md hard rule: auth-affecting nav must full-page reload.
+              // Cookie state can be stale post-login otherwise.
+              if (r.status === 401) { window.location.href = '/login'; return; }
               setAskError(body?.error ?? `error_${r.status}`);
               return;
             }
@@ -598,40 +635,39 @@ export function HookPanel({
           position: 'absolute',
           right: 16,
           bottom: 90,
-          width: 56,
+          width: isAuthenticated ? 56 : undefined,
           height: 56,
+          minWidth: isAuthenticated ? undefined : 0,
+          padding: isAuthenticated ? 0 : '0 16px',
           borderRadius: 28,
           background: 'rgba(255,255,255,0.15)',
           border: '1px solid rgba(255,255,255,0.4)',
           color: '#fff',
-          fontSize: 12,
+          fontSize: isAuthenticated ? 12 : 13,
           fontWeight: 600,
           opacity: asking ? 0.6 : 1,
           zIndex: 2,
+          whiteSpace: 'nowrap',
         }}
-        aria-label="Ask this creator"
+        aria-label={
+          isAuthenticated
+            ? 'Ask this creator'
+            : `Sign up to chat with @${group.creator.handle}`
+        }
       >
-        {asking ? '…' : 'Ask'}
+        {asking ? '…' : isAuthenticated ? 'Ask' : `Sign up to chat with @${group.creator.handle}`}
       </button>
-      {askError && (
-        <div
-          role="alert"
-          style={{
-            position: 'absolute',
-            right: 16,
-            bottom: 156,
-            background: 'rgba(255,255,255,0.95)',
-            color: '#111',
-            fontSize: 11,
-            padding: '6px 10px',
-            borderRadius: 10,
-            maxWidth: 200,
-            zIndex: 2,
-          }}
-        >
-          Couldn&apos;t start session: {askError === 'kill_switch_fired' ? 'Daily limit reached' : askError}
-        </div>
       )}
+      <div
+        style={{
+          position: 'absolute',
+          right: 16,
+          bottom: hook.long_form_available ? 200 : 156,
+          zIndex: 2,
+        }}
+      >
+        <AskErrorPill error={askError} />
+      </div>
 
       {/* "Tap for sound" hint. Only shown when the browser refused
           unmuted autoplay (typically just the very first panel before

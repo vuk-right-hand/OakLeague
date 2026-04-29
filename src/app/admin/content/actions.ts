@@ -208,6 +208,166 @@ export async function createWelcomeHook(
   return { ok: true, welcomeHookId: data.id };
 }
 
+// ── Long-form viewer (videos.long_form_*) ────────────────────────────────────
+
+const PublishLongForm = z.object({ videoId: z.string().uuid() });
+
+type PublishLongFormError =
+  | 'invalid_input'
+  | 'not_found'
+  | 'not_ready'
+  | 'duration_out_of_range'
+  | 'aspect_ratio_unsupported'
+  | 'aspect_ratio_missing'
+  | string; // db errors fall through
+
+// First-publish-wins (audit M4): re-running publishLongForm on an already-
+// published row is a no-op rather than bumping long_form_published_at.
+// The duration + aspect-ratio gates are the policy boundary; the DB CHECK
+// is intentionally loose 60–3600 to avoid bricking the webhook UPDATE on
+// CEIL-rounding edge cases.
+export async function publishLongForm(
+  input: unknown,
+): Promise<ActionResult & { error?: PublishLongFormError }> {
+  await assertAdminFromSession();
+  const parsed = PublishLongForm.safeParse(input);
+  if (!parsed.success) return { ok: false, error: 'invalid_input' };
+
+  const admin = supabaseAdmin();
+  const { data: row, error: readErr } = await admin
+    .from('videos')
+    .select(
+      'id, long_form_mux_status, long_form_mux_aspect_ratio, long_form_mux_duration_ms',
+    )
+    .eq('id', parsed.data.videoId)
+    .maybeSingle<{
+      id: string;
+      long_form_mux_status: string;
+      long_form_mux_aspect_ratio: string | null;
+      long_form_mux_duration_ms: number | null;
+    }>();
+  if (readErr || !row) return { ok: false, error: 'not_found' };
+
+  if (row.long_form_mux_status !== 'ready') {
+    return { ok: false, error: 'not_ready' };
+  }
+
+  // Audit M9: aspect-ratio enforcement at publish, not at webhook. We let
+  // the asset reach 'ready' so the creator can preview before re-uploading.
+  // Differentiate missing (Mux didn't send it) vs unsupported (≠ '16:9') so
+  // the UI can show a more accurate error.
+  if (row.long_form_mux_aspect_ratio === null) {
+    return { ok: false, error: 'aspect_ratio_missing' };
+  }
+  if (row.long_form_mux_aspect_ratio !== '16:9') {
+    return { ok: false, error: 'aspect_ratio_unsupported' };
+  }
+
+  // Audit M10: float-compare duration. long_form_mux_duration_ms is
+  // authoritative (Mux reports float seconds; we store ms). The strict
+  // 5–55 min user-facing rule is enforced here, not in the DB CHECK
+  // which is loose 60–3600.
+  if (row.long_form_mux_duration_ms === null) {
+    return { ok: false, error: 'not_ready' };
+  }
+  const seconds = row.long_form_mux_duration_ms / 1000.0;
+  if (seconds < 300 || seconds > 3300) {
+    return { ok: false, error: 'duration_out_of_range' };
+  }
+
+  // First-publish-wins idempotency (audit M4). The .is('long_form_published_at', null)
+  // filter means a re-run on an already-published row matches zero rows
+  // and is a silent no-op. UI re-fetches and sees the original timestamp.
+  const { error: updErr } = await admin
+    .from('videos')
+    .update({ long_form_published_at: new Date().toISOString() })
+    .eq('id', parsed.data.videoId)
+    .is('long_form_published_at', null);
+  if (updErr) return { ok: false, error: updErr.message };
+
+  revalidatePath(`/admin/content/videos/${parsed.data.videoId}`);
+  return { ok: true };
+}
+
+const UnpublishLongForm = z.object({ videoId: z.string().uuid() });
+
+export async function unpublishLongForm(input: unknown): Promise<ActionResult> {
+  await assertAdminFromSession();
+  const parsed = UnpublishLongForm.safeParse(input);
+  if (!parsed.success) return { ok: false, error: 'invalid_input' };
+
+  const admin = supabaseAdmin();
+  const { error } = await admin
+    .from('videos')
+    .update({ long_form_published_at: null })
+    .eq('id', parsed.data.videoId);
+  if (error) return { ok: false, error: error.message };
+  revalidatePath(`/admin/content/videos/${parsed.data.videoId}`);
+  return { ok: true };
+}
+
+const ResetLongForm = z.object({ videoId: z.string().uuid() });
+
+// Mirrors replaceHookTake: deletes any existing Mux asset, regenerates the
+// passthrough UUID so late webhooks for the old asset can't dispatch to the
+// fresh take, clears all long_form_mux_* columns. Required to mint a new
+// upload after an existing asset has reached ready/processing/uploading.
+export async function resetLongForm(input: unknown): Promise<ActionResult> {
+  await assertAdminFromSession();
+  const parsed = ResetLongForm.safeParse(input);
+  if (!parsed.success) return { ok: false, error: 'invalid_input' };
+
+  const admin = supabaseAdmin();
+  const { data: row, error: readErr } = await admin
+    .from('videos')
+    .select('id, long_form_mux_asset_id')
+    .eq('id', parsed.data.videoId)
+    .maybeSingle<{ id: string; long_form_mux_asset_id: string | null }>();
+  if (readErr || !row) return { ok: false, error: 'not_found' };
+
+  if (row.long_form_mux_asset_id) {
+    try {
+      await deleteMuxAsset(row.long_form_mux_asset_id);
+    } catch (e) {
+      console.error('[resetLongForm] Mux delete failed', e);
+      await admin.from('cogs_log').insert({
+        service: 'mux',
+        operation: 'asset.delete',
+        units: 0,
+        unit_label: 'seconds_encoded',
+        cost_usd: 0,
+        metadata: {
+          orphaned_asset_id: row.long_form_mux_asset_id,
+          reason: 'delete_failed',
+          video_id: parsed.data.videoId,
+          target: 'video_long_form',
+          error: e instanceof Error ? e.message : String(e),
+        },
+      });
+    }
+  }
+
+  const { error: updErr } = await admin
+    .from('videos')
+    .update({
+      long_form_mux_asset_id: null,
+      long_form_mux_upload_id: null,
+      long_form_mux_playback_id: null,
+      long_form_mux_status: 'pending',
+      long_form_mux_aspect_ratio: null,
+      long_form_mux_duration_ms: null,
+      long_form_duration_seconds: null,
+      long_form_processing_error: null,
+      long_form_mux_passthrough: crypto.randomUUID(),
+      long_form_published_at: null,
+    })
+    .eq('id', parsed.data.videoId);
+  if (updErr) return { ok: false, error: updErr.message };
+
+  revalidatePath(`/admin/content/videos/${parsed.data.videoId}`);
+  return { ok: true };
+}
+
 const ActivateWelcome = z.object({ welcomeHookId: z.string().uuid() });
 
 export async function activateWelcomeHook(input: unknown): Promise<ActionResult> {

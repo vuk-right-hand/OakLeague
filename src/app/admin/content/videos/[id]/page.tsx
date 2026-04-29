@@ -12,6 +12,12 @@ type VideoRow = {
   published_at: string | null;
   lesson_count: number;
   status: string;
+  long_form_mux_status: string;
+  long_form_mux_playback_id: string | null;
+  long_form_mux_aspect_ratio: string | null;
+  long_form_mux_duration_ms: number | null;
+  long_form_processing_error: string | null;
+  long_form_published_at: string | null;
 };
 
 type HookRow = {
@@ -43,7 +49,11 @@ export default async function VideoDetailPage({
 
   const { data: video } = await admin
     .from('videos')
-    .select('id, title, description, creator_id, published_at, lesson_count, status')
+    .select(
+      'id, title, description, creator_id, published_at, lesson_count, status, ' +
+        'long_form_mux_status, long_form_mux_playback_id, long_form_mux_aspect_ratio, ' +
+        'long_form_mux_duration_ms, long_form_processing_error, long_form_published_at',
+    )
     .eq('id', id)
     .maybeSingle<VideoRow>();
   if (!video) notFound();

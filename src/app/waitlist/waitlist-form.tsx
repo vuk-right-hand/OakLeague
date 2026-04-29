@@ -12,7 +12,13 @@ declare global {
   }
 }
 
-export function WaitlistForm() {
+type Props = {
+  /** Marks where the signup originated. 'cap_hit' = bumped into a daily
+      cap and clicked the upgrade link. Default 'landing'. */
+  source?: 'landing' | 'cap_hit';
+};
+
+export function WaitlistForm({ source = 'landing' }: Props = {}) {
   const [email, setEmail] = useState('');
   const [token, setToken] = useState('');
   const [done, setDone] = useState(false);
@@ -56,7 +62,7 @@ export function WaitlistForm() {
           return;
         }
         startTransition(async () => {
-          const res = await joinWaitlist({ email, turnstile_token: token });
+          const res = await joinWaitlist({ email, turnstile_token: token, source });
           if (!res.ok) {
             setErr(humanize(res.error));
             window.turnstile?.reset(widgetId.current ?? undefined);

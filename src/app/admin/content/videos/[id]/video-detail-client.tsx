@@ -2,7 +2,15 @@
 
 import { useState, useTransition } from 'react';
 import MuxUploader from '@mux/mux-uploader-react';
-import { createHook, setVideoPublished, replaceHookTake, resetFailedHook } from '../../actions';
+import {
+  createHook,
+  setVideoPublished,
+  replaceHookTake,
+  resetFailedHook,
+  publishLongForm,
+  unpublishLongForm,
+  resetLongForm,
+} from '../../actions';
 
 type Video = {
   id: string;
@@ -11,6 +19,12 @@ type Video = {
   published_at: string | null;
   lesson_count: number;
   creator_id: string;
+  long_form_mux_status: string;
+  long_form_mux_playback_id: string | null;
+  long_form_mux_aspect_ratio: string | null;
+  long_form_mux_duration_ms: number | null;
+  long_form_processing_error: string | null;
+  long_form_published_at: string | null;
 };
 
 type Hook = {
@@ -86,9 +100,168 @@ export function VideoDetailClient({ video, hooks, creator, topics }: Props) {
         />
       )}
 
+      <hr style={{ margin: '24px 0', borderColor: '#333' }} />
+
+      <LongFormPanel video={video} />
+
       {err && <div role="alert" style={{ color: 'salmon', marginTop: 12 }}>{err}</div>}
     </section>
   );
+}
+
+function LongFormPanel({ video }: { video: Video }) {
+  const [pending, start] = useTransition();
+  const [err, setErr] = useState<string | null>(null);
+  const [, setUploadUrl] = useState<string | null>(null);
+
+  const status = video.long_form_mux_status;
+  const isReady = status === 'ready';
+  const isPublished = video.long_form_published_at != null;
+  const aspect = video.long_form_mux_aspect_ratio;
+  const durationS =
+    video.long_form_mux_duration_ms != null
+      ? video.long_form_mux_duration_ms / 1000.0
+      : null;
+  const canMint = status === 'pending' || status === 'failed';
+
+  const resolveEndpoint = async (): Promise<string> => {
+    const res = await fetch('/api/admin/mux-upload', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target: 'video_long_form', id: video.id }),
+    });
+    if (!res.ok) {
+      const body = (await res
+        .json()
+        .catch(() => ({ error: 'upload_failed' }))) as { error?: string };
+      throw new Error(body.error ?? 'upload_failed');
+    }
+    const json = (await res.json()) as { uploadUrl: string };
+    setUploadUrl(json.uploadUrl);
+    return json.uploadUrl;
+  };
+
+  const onPublish = () => {
+    setErr(null);
+    start(async () => {
+      const res = await publishLongForm({ videoId: video.id });
+      if (!res.ok) setErr(longFormErrorLabel(res.error ?? 'unknown'));
+    });
+  };
+
+  const onUnpublish = () => {
+    setErr(null);
+    start(async () => {
+      const res = await unpublishLongForm({ videoId: video.id });
+      if (!res.ok) setErr(res.error);
+    });
+  };
+
+  const onReset = () => {
+    if (!confirm('Reset long-form? This deletes the current Mux asset.')) return;
+    setErr(null);
+    start(async () => {
+      const res = await resetLongForm({ videoId: video.id });
+      if (!res.ok) setErr(res.error);
+    });
+  };
+
+  return (
+    <section>
+      <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 4 }}>
+        Full lesson (optional)
+      </h2>
+      <div style={{ fontSize: 13, opacity: 0.65, marginBottom: 12 }}>
+        16:9, between 5 and 55 minutes. Users tap &quot;Chat with @handle&quot;
+        on a hook in the feed to enter this surface and ask the avatar
+        questions while watching.
+      </div>
+
+      <div style={{ display: 'flex', gap: 12, alignItems: 'baseline', marginBottom: 12 }}>
+        <span style={{ fontSize: 13 }}>
+          Status: <strong>{status}</strong>
+          {isPublished && <span style={{ marginLeft: 8, color: '#5cb85c' }}>· published</span>}
+        </span>
+        {aspect && (
+          <span style={{ fontSize: 12, opacity: 0.6 }}>
+            aspect {aspect}
+          </span>
+        )}
+        {durationS != null && (
+          <span style={{ fontSize: 12, opacity: 0.6 }}>
+            {Math.floor(durationS / 60)}:
+            {Math.floor(durationS % 60).toString().padStart(2, '0')}
+          </span>
+        )}
+      </div>
+
+      {video.long_form_processing_error && (
+        <div style={{ fontSize: 12, color: 'salmon', marginBottom: 8 }}>
+          {video.long_form_processing_error}
+        </div>
+      )}
+
+      {canMint && (
+        <div style={{ marginTop: 8 }}>
+          <MuxUploader
+            endpoint={resolveEndpoint}
+            onSuccess={() => setUploadUrl(null)}
+            onUploadError={(e: Event | CustomEvent) => {
+              const detail = (e as CustomEvent).detail as { message?: string } | undefined;
+              setErr(detail?.message ?? 'upload_error');
+            }}
+          />
+        </div>
+      )}
+
+      {isReady && video.long_form_mux_playback_id && (
+        <div style={{ marginTop: 8, fontSize: 12, opacity: 0.6 }}>
+          Playback ID: <code>{video.long_form_mux_playback_id}</code>
+        </div>
+      )}
+
+      <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        {isReady && !isPublished && (
+          <button type="button" onClick={onPublish} disabled={pending}>
+            {pending ? 'Publishing…' : 'Publish long-form'}
+          </button>
+        )}
+        {isPublished && (
+          <button type="button" onClick={onUnpublish} disabled={pending}>
+            {pending ? 'Unpublishing…' : 'Unpublish long-form'}
+          </button>
+        )}
+        {!canMint && (
+          <button type="button" onClick={onReset} disabled={pending}>
+            {pending ? 'Resetting…' : 'Reset long-form'}
+          </button>
+        )}
+      </div>
+
+      {err && (
+        <div role="alert" style={{ color: 'salmon', fontSize: 13, marginTop: 8 }}>
+          {err}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function longFormErrorLabel(err: string): string {
+  switch (err) {
+    case 'not_ready':
+      return 'Long-form is still processing. Wait until status is ready.';
+    case 'duration_out_of_range':
+      return 'Long-form must be between 5 and 55 minutes. Re-upload.';
+    case 'aspect_ratio_unsupported':
+      return 'Long-form must be 16:9. Re-upload landscape.';
+    case 'aspect_ratio_missing':
+      return 'Mux did not report an aspect ratio. Re-upload or contact support.';
+    case 'not_found':
+      return 'Video not found.';
+    default:
+      return err;
+  }
 }
 
 function HookCard({ hook, videoId }: { hook: Hook; videoId: string }) {

@@ -4,9 +4,15 @@ import { z } from 'zod';
 import { headers } from 'next/headers';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 
+// Source enum mirrored at the boundary. waitlist.source is plain text;
+// keeping the allow-list here means the upgrade-from-cap-hit route can't
+// be used to write arbitrary marketing UTM-style strings into the table.
+const SOURCES = ['landing', 'cap_hit'] as const;
+
 const Input = z.object({
   email: z.string().email().max(200),
   turnstile_token: z.string().max(2048).optional().default(''),
+  source: z.enum(SOURCES).optional().default('landing'),
 });
 
 async function verifyTurnstile(token: string, remoteIp: string): Promise<boolean> {
@@ -37,11 +43,15 @@ export async function joinWaitlist(
 
   const sb = supabaseAdmin();
 
+  // rate_limit_hit RPC enforces the window must be '1 minute' (per-minute
+  // bucketed table). 3 attempts/min/IP is tight enough to deter scripted
+  // signups and loose enough for fat-fingered legit users retrying after
+  // a captcha or email-format error.
   const { data: allowed, error: rlErr } = await sb.rpc('rate_limit_hit', {
     p_scope: 'waitlist',
     p_key: ip,
-    p_window: '1 hour',
-    p_limit: 10,
+    p_window: '1 minute',
+    p_limit: 3,
   });
   if (rlErr) return { ok: false, error: 'rate_check_failed' };
   if (allowed === false) return { ok: false, error: 'rate_limited' };
@@ -53,7 +63,7 @@ export async function joinWaitlist(
     .from('waitlist')
     .insert({
       email: parsed.data.email,
-      source: 'landing',
+      source: parsed.data.source,
       created_ip: ip === 'dev-local' ? null : ip,
     });
 

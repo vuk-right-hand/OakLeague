@@ -17,6 +17,7 @@ type Props = {
   initialCursorEpoch: number | null;
   initialHasMore: boolean;
   welcome: WelcomeHook | null;
+  isAuthenticated: boolean;
 };
 
 const EXCLUDE_WINDOW = 50;
@@ -36,6 +37,7 @@ function FeedContainerInner({
   initialCursorEpoch,
   initialHasMore,
   welcome,
+  isAuthenticated,
 }: Props) {
   const [items, setItems] = useState<FeedItem[]>(initialItems);
   const [cursorEpoch, setCursorEpoch] = useState<number | null>(
@@ -251,6 +253,7 @@ function FeedContainerInner({
             // halo around the active idx — covers swipe-back + swipe-
             // forward without warming the entire feed.
             nearActive={Math.abs(i - activeIdx) <= 2}
+            isAuthenticated={isAuthenticated}
           />
         ))}
       </div>

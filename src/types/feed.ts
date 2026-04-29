@@ -33,6 +33,10 @@ export const feedHookSchema = z.object({
   score_breakdown: z.record(z.unknown()).nullable(),
   served_rank: z.number(),
   cursor_epoch: z.number(),
+  // Long-form viewer (plan §1.3 / §1.4). True iff the parent video has a
+  // ready + published long-form asset. Drives the "Chat with @handle"
+  // pill render in the feed; hook-only videos never show the pill.
+  long_form_available: z.boolean(),
 });
 
 export type FeedHook = z.infer<typeof feedHookSchema>;
@@ -91,6 +95,25 @@ export const MIC_TAP_OUTCOMES = [
   'unknown_error',
 ] as const;
 
+// Long-form viewer event payload validation. The DB has a
+// full_video_open_source enum (migration 0503-01) but feed_events_raw.payload
+// is plain jsonb with no column-level enum check — zod is the contract.
+// 'pill' is the new long-form viewer entry point.
+export const FULL_VIDEO_OPEN_SOURCES = [
+  'swipe',
+  'carousel_hook',
+  'creator_profile',
+  'pill',
+] as const;
+
+// Quartile crossings emitted by <LongFormPlayer>. The cooldown CTE in
+// 20260504000003 keys on (payload->>'quartile')::int — accepting anything
+// other than these four values would either silently no-op (q!=25/50/75/100)
+// or, in the case of bare q=25 within 60s of full_video_open, incorrectly
+// suppress the 24h cooldown. Enforce here so a malformed client write
+// never reaches Postgres's int coercion.
+export const FULL_VIDEO_QUARTILES = [25, 50, 75, 100] as const;
+
 const uuidString = z.string().uuid();
 
 export const feedEventSchema = z
@@ -105,16 +128,43 @@ export const feedEventSchema = z
     payload: z.record(z.unknown()).optional(),
   })
   .superRefine((val, ctx) => {
-    if (val.event_name !== 'mic_tap') return;
-    const outcome = val.payload?.mic_tap_outcome;
-    if (outcome === undefined) return;
-    if (typeof outcome !== 'string'
-        || !(MIC_TAP_OUTCOMES as readonly string[]).includes(outcome)) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['payload', 'mic_tap_outcome'],
-        message: `mic_tap_outcome must be one of ${MIC_TAP_OUTCOMES.join('|')}`,
-      });
+    if (val.event_name === 'mic_tap') {
+      const outcome = val.payload?.mic_tap_outcome;
+      if (outcome === undefined) return;
+      if (typeof outcome !== 'string'
+          || !(MIC_TAP_OUTCOMES as readonly string[]).includes(outcome)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['payload', 'mic_tap_outcome'],
+          message: `mic_tap_outcome must be one of ${MIC_TAP_OUTCOMES.join('|')}`,
+        });
+      }
+      return;
+    }
+    if (val.event_name === 'full_video_open') {
+      const source = val.payload?.source;
+      if (source === undefined) return;
+      if (typeof source !== 'string'
+          || !(FULL_VIDEO_OPEN_SOURCES as readonly string[]).includes(source)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['payload', 'source'],
+          message: `full_video_open.source must be one of ${FULL_VIDEO_OPEN_SOURCES.join('|')}`,
+        });
+      }
+      return;
+    }
+    if (val.event_name === 'full_video_quartile') {
+      const q = val.payload?.quartile;
+      if (typeof q !== 'number'
+          || !(FULL_VIDEO_QUARTILES as readonly number[]).includes(q)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['payload', 'quartile'],
+          message: `full_video_quartile.quartile must be one of ${FULL_VIDEO_QUARTILES.join('|')}`,
+        });
+      }
+      return;
     }
   });
 
