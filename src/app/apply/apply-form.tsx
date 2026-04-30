@@ -2,6 +2,7 @@
 
 import { useState, useTransition } from 'react';
 import { submitCreatorApplication } from './actions';
+import { CREATOR_TERMS_VERSION } from '@/lib/legal/creator-terms-version';
 
 type Topic = { slug: string; title: string; description: string };
 
@@ -13,6 +14,7 @@ export function ApplyForm() {
   const [youtubeUrl, setYoutubeUrl] = useState('');
   const [twitterUrl, setTwitterUrl] = useState('');
   const [website, setWebsite] = useState('');
+  const [duetConsent, setDuetConsent] = useState(false);
   const [pending, startTransition] = useTransition();
   const [err, setErr] = useState<string | null>(null);
 
@@ -37,9 +39,19 @@ export function ApplyForm() {
             bio,
             topics,
             proof,
+            duet_consent: duetConsent,
           });
-          if (!res.ok) setErr(humanize(res.error));
-          else window.location.href = '/apply/submitted';
+          if (!res.ok) {
+            // Stale-client: server received a request shape from an
+            // old bundle (no duet_consent field). Force a hard reload
+            // so the user gets the new form with the consent checkbox.
+            // (audit R2 M1)
+            if (res.error === 'stale_client') {
+              window.location.reload();
+              return;
+            }
+            setErr(humanize(res.error));
+          } else window.location.href = '/apply/submitted';
         });
       }}
     >
@@ -157,14 +169,44 @@ export function ApplyForm() {
         </label>
       </fieldset>
 
+      <fieldset style={{ border: '1px solid #333', padding: 12 }}>
+        <legend>Duet recording consent</legend>
+        <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={duetConsent}
+            onChange={(e) => setDuetConsent(e.target.checked)}
+            disabled={pending}
+            style={{ marginTop: 4 }}
+          />
+          <span>
+            I understand that users may record and share duet videos that include
+            my AI-cloned voice and avatar likeness as part of natural conversations
+            on OakLeague, as described in the{' '}
+            <a
+              href="/legal/creator-terms"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ textDecoration: 'underline' }}
+            >
+              Creator Terms ({CREATOR_TERMS_VERSION})
+            </a>
+            .
+          </span>
+        </label>
+      </fieldset>
+
       {err && <div role="alert" style={{ color: 'salmon' }}>{err}</div>}
-      <button type="submit" disabled={pending}>
+      <button type="submit" disabled={pending || !duetConsent}>
         Submit application
       </button>
     </form>
   );
 }
 
+// Note: 'stale_client' is intentionally NOT humanized here — the
+// submit handler short-circuits to window.location.reload() before
+// reaching this map.
 function humanize(code: string): string {
   switch (code) {
     case 'handle_taken': return 'That handle is already taken. Try another.';
@@ -172,6 +214,8 @@ function humanize(code: string): string {
     case 'invite_claim_invalid': return 'Your invite session expired. Open the invite email again.';
     case 'invite_unavailable': return 'This invite is no longer valid.';
     case 'needs_invite': return 'You need an active invite to apply.';
+    case 'duet_consent_required': return 'You must consent to user duet recordings to apply.';
+    case 'duet_consent_terms_version_invalid': return 'Terms version mismatch. Refresh and try again.';
     default: return 'Submission failed. Try again.';
   }
 }

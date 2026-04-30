@@ -14,6 +14,8 @@ type AppDetail = {
   submitted_at: string;
   invitation_id: string | null;
   internal_notes: string | null;
+  duet_consent_at: string | null;
+  duet_consent_terms_version: string | null;
 };
 
 export default async function ApplicationDetailPage({
@@ -25,7 +27,7 @@ export default async function ApplicationDetailPage({
   const sb = supabaseAdmin();
   const { data } = await sb
     .from('creator_applications')
-    .select('id, user_id, handle, display_name, bio, topics, proof, status, submitted_at, invitation_id, internal_notes')
+    .select('id, user_id, handle, display_name, bio, topics, proof, status, submitted_at, invitation_id, internal_notes, duet_consent_at, duet_consent_terms_version')
     .eq('id', id)
     .maybeSingle<AppDetail>();
 
@@ -41,6 +43,20 @@ export default async function ApplicationDetailPage({
       <section style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
         <div><strong>Status:</strong> {data.status}</div>
         <div><strong>Submitted:</strong> {new Date(data.submitted_at).toLocaleString()}</div>
+        <div>
+          <strong>Duet consent:</strong>{' '}
+          {data.duet_consent_at ? (
+            <span style={{ color: '#7ee787' }}>
+              ✓ recorded {new Date(data.duet_consent_at).toLocaleString()}
+              {data.duet_consent_terms_version &&
+                ` (terms ${data.duet_consent_terms_version})`}
+            </span>
+          ) : (
+            <span style={{ color: 'salmon' }}>
+              ⚠ MISSING — DB blocks approval until backfilled
+            </span>
+          )}
+        </div>
         <div>
           <strong>Bio:</strong>
           <p style={{ whiteSpace: 'pre-wrap' }}>{data.bio ?? '—'}</p>
@@ -60,7 +76,7 @@ export default async function ApplicationDetailPage({
       </section>
 
       {(data.status === 'submitted' || data.status === 'under_review') && (
-        <ReviewActions id={data.id} />
+        <ReviewActions id={data.id} duetConsentAt={data.duet_consent_at} />
       )}
     </main>
   );

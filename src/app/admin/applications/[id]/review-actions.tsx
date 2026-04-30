@@ -3,17 +3,28 @@
 import { useState, useTransition } from 'react';
 import { approveApplication, rejectApplication } from '../actions';
 
-export function ReviewActions({ id }: { id: string }) {
+type Props = {
+  id: string;
+  /** Null means consent missing — Approve is disabled. The DB CHECK
+   * + RPC guard would reject anyway; this is the audit R2 M4
+   * client-side guard that prevents the user from seeing the error. */
+  duetConsentAt: string | null;
+};
+
+export function ReviewActions({ id, duetConsentAt }: Props) {
   const [reason, setReason] = useState('');
   const [notes, setNotes] = useState('');
   const [err, setErr] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
 
+  const consentMissing = duetConsentAt === null;
+
   return (
     <section style={{ marginTop: 32, display: 'flex', flexDirection: 'column', gap: 16 }}>
       <button
         type="button"
-        disabled={pending}
+        disabled={pending || consentMissing}
+        title={consentMissing ? 'Cannot approve: duet consent not recorded.' : undefined}
         onClick={() => {
           setErr(null);
           startTransition(async () => {
@@ -25,6 +36,12 @@ export function ReviewActions({ id }: { id: string }) {
       >
         Approve
       </button>
+      {consentMissing && (
+        <div style={{ fontSize: 13, opacity: 0.8 }}>
+          Consent missing — approval blocked at DB layer. Contact engineering
+          to backfill the consent timestamp, or reject this application.
+        </div>
+      )}
 
       <details>
         <summary>Reject</summary>

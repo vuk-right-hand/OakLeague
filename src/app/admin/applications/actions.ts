@@ -22,7 +22,13 @@ export async function approveApplication(
   });
 
   if (error) {
-    if (error.code === '23503' || error.message.includes('not_pending')) {
+    if (error.message.includes('duet_consent_missing')) {
+      return { ok: false, error: 'duet_consent_missing' };
+    }
+    if (error.message.includes('not_pending')) {
+      return { ok: false, error: 'application_already_approved' };
+    }
+    if (error.code === '23503') {
       return { ok: false, error: 'application_already_approved' };
     }
     return { ok: false, error: 'approve_failed' };
