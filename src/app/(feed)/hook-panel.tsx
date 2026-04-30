@@ -388,6 +388,16 @@ export function HookPanel({
           ref={playerRef}
           playbackId={hook.mux_playback_id}
           streamType="on-demand"
+          // Gated cross-origin attribute. When the React/duet capture
+          // feature flag is on, the underlying <video> fetches HLS in
+          // CORS mode so a downstream <canvas>.drawImage(video) does
+          // NOT taint the canvas (a tainted canvas silently produces
+          // empty MediaRecorder blobs). Default off — bundle is byte-
+          // equivalent to today until env flip + redeploy.
+          // REACT_DUET_PLAN.md §23.9 / R3-M4.
+          crossOrigin={
+            process.env.NEXT_PUBLIC_REACT_CAPTURE_ENABLED === '1' ? ('anonymous' as const) : undefined
+          }
           // No `autoPlay` attribute. Why: the HTML autoplay attribute
           // fires the moment the <video> element mounts, BEFORE our
           // activation effect can run pause() on a non-active panel

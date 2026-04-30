@@ -377,6 +377,11 @@ export function LongFormPlayer({
           controls
           playsInline
           preload="auto"
+          // Gated cross-origin attribute. See hook-panel.tsx for rationale.
+          // REACT_DUET_PLAN.md §23.9 / R3-M4.
+          crossOrigin={
+            process.env.NEXT_PUBLIC_REACT_CAPTURE_ENABLED === '1' ? ('anonymous' as const) : undefined
+          }
           metadata={{
             video_id: videoId,
             video_title: videoTitle,
