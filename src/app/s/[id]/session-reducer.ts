@@ -75,7 +75,10 @@ export type Action =
   | { kind: 'rollover_failed'; message: string }
   | { kind: 'user_close' }
   | { kind: 'closed_ack' }
-  | { kind: 'fatal_error'; message: string };
+  | { kind: 'fatal_error'; message: string }
+  // Proxy closed WS with 1011 reason=cogs_rpc_failed. Distinct from
+  // fatal_error so analytics can count it; surfaces a retry-friendly copy.
+  | { kind: 'cogs_failed' };
 
 export const initialState: SessionState = {
   phase: 'idle',
@@ -232,6 +235,13 @@ export function reduce(state: SessionState, action: Action): SessionState {
 
     case 'fatal_error':
       return { ...state, phase: 'closed', errorMessage: action.message };
+
+    case 'cogs_failed':
+      return {
+        ...state,
+        phase: 'closed',
+        errorMessage: 'Cost accounting is unavailable. Please retry in a moment.',
+      };
   }
 }
 

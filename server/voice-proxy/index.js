@@ -30,6 +30,7 @@ import { WebSocketServer } from 'ws';
 import { createClient } from '@supabase/supabase-js';
 import { GeminiBridge } from './gemini-bridge.js';
 import { decideQuotaGate } from './quota-gate.js';
+import { makeLogTurnCogs, installReaper } from './proxy-handlers.js';
 
 const PORT = Number(process.env.PORT || 8080);
 const BUILD = process.env.FLY_MACHINE_ID || 'local';
@@ -50,10 +51,8 @@ const MODEL_TO_ENUM = {
   'gemini-2.5-flash-native-audio-preview-12-2025':  'gemini_live_2_5_flash_native_audio',
 };
 
-// Pricing in USD per audio-second. Derived from AI Studio rate card
-// (input $0.30/M tokens, output $1.08/M tokens, ~50 tokens/sec audio).
-// Precise rates are a Day-8 concern; spike COGS is near-zero.
-const PRICE_USD_PER_SEC = { input: 0.005 / 60, output: 0.018 / 60 };
+// Pricing constants moved to proxy-handlers.js (PRICING_QUOTED_AT etc.) —
+// see SPIKE_A_DEFERRED_FIXUP_PLAN.md §1A.
 
 function requireEnv(name) {
   const v = process.env[name];
@@ -157,40 +156,9 @@ async function endSession(sessionId, reason) {
   }
 }
 
-async function logTurnCogs({ userId, sessionId, model, inputSeconds, outputSeconds, usageMetadata }) {
-  const inputCost  = inputSeconds  * PRICE_USD_PER_SEC.input;
-  const outputCost = outputSeconds * PRICE_USD_PER_SEC.output;
-  // usageMetadata may be null (no metadata in any message) or an object with
-  // possibly-null counts. Gate on "any count is a finite number" so a legit
-  // zero-response turn (interrupted early) still records usage.
-  const hasUsage = usageMetadata && (
-    Number.isFinite(usageMetadata.promptTokenCount) ||
-    Number.isFinite(usageMetadata.responseTokenCount) ||
-    Number.isFinite(usageMetadata.totalTokenCount)
-  );
-  const usageMeta = hasUsage ? { usage: usageMetadata } : {};
-  try {
-    const { error } = await supabase.rpc('cogs_insert_turn', {
-      p_user_id: userId,
-      p_session_id: sessionId,
-      p_service: 'gemini',
-      p_model: model,
-      p_input_seconds: Number(inputSeconds.toFixed(4)),
-      p_output_seconds: Number(outputSeconds.toFixed(4)),
-      p_input_cost: Number(inputCost.toFixed(6)),
-      p_output_cost: Number(outputCost.toFixed(6)),
-      p_environment: 'spike_a',
-      p_metadata: { source: 'spike_a', ...usageMeta },
-    });
-    if (error) {
-      console.error('[cogs_insert_turn]', error);
-      captureException(error, { op: 'cogs_insert_turn', sessionId, userId });
-    }
-  } catch (e) {
-    console.error('[cogs_insert_turn] exception', e);
-    captureException(e, { op: 'cogs_insert_turn', sessionId, userId });
-  }
-}
+// logTurnCogs moved to proxy-handlers.js (factory makeLogTurnCogs) — see plan
+// §1A.0. Wiring: factory instantiated below after closeWs / sessionToWs are
+// defined, so the consecutive-failure callback can close the right WS.
 
 // Quota enforcement — plan §Kill-switch. Returns { ok, reason } where ok=false
 // means the proxy must close the WS with 1008 quota_exceeded. Called at
@@ -278,21 +246,8 @@ async function accumulateSeconds(sessionId, seconds) {
   }
 }
 
-// Periodic ghost-session reaper. Called at startup + every 60s per plan.
-async function runReaper() {
-  try {
-    const { data, error } = await supabase.rpc('reap_stale_sessions', { p_threshold_seconds: 90 });
-    if (error) {
-      console.error('[reaper]', error);
-      captureException(error, { op: 'reaper' });
-      return;
-    }
-    if (data?.length) console.log(`[reaper] closed ${data.length} stale sessions`);
-  } catch (e) {
-    console.error('[reaper] exception', e);
-    captureException(e, { op: 'reaper' });
-  }
-}
+// runReaper moved to proxy-handlers.js (makeRunReaper / installReaper) — see
+// plan §1A.0. Wiring is in the server.listen callback below.
 
 // ── WS server ────────────────────────────────────────────────────────────
 
@@ -301,6 +256,20 @@ const wss = new WebSocketServer({ server, path: '/voice/spike-a' });
 function closeWs(ws, code, reason) {
   try { ws.close(code, reason); } catch {}
 }
+
+// sessionId → ws. Maintained on connection-open, removed on teardown. Used by
+// the cogs-failure callback to close the right WS after 3 consecutive failures
+// (plan §1A.2). See SPIKE_A_DEFERRED_FIXUP_PLAN.md §1A.0 C-C fix.
+const sessionToWs = new Map();
+
+const { logTurnCogs, dropSession: dropCogsSession } = makeLogTurnCogs({
+  supabase,
+  env: 'spike_a',
+  onConsecutiveFailure: (sessionId) => {
+    const ws = sessionToWs.get(sessionId);
+    if (ws) closeWs(ws, 1011, 'cogs_rpc_failed');
+  },
+});
 
 wss.on('connection', async (ws, req) => {
   ws.binaryType = 'nodebuffer';
@@ -329,17 +298,25 @@ wss.on('connection', async (ws, req) => {
   if (sess.err === 'upstream_error')         return closeWs(ws, 4005, 'upstream_error');
   const sessionId = sess.sessionId;
   console.log(`[ws ${connId}] session ok id=${sessionId.slice(0,8)}`);
+  sessionToWs.set(sessionId, ws);
 
   let bridge = null;
   let closed = false;
   let lastHeartbeatAt = Date.now();
   let heartbeatInterval = null;
+  // Per-session monotonic turn counter for cogs_insert_turn_voice idempotency
+  // key (session_id, turn_number, service, operation). Increments on each
+  // turn_start; the same value is passed to logTurnCogs at the matching
+  // turn_end.
+  let turnNumber = 0;
 
   const teardown = async (reason) => {
     if (closed) return;
     closed = true;
     clearInterval(heartbeatInterval);
     quotaCache.delete(sessionId);
+    sessionToWs.delete(sessionId);
+    dropCogsSession(sessionId);
     try { await bridge?.close(); } catch {}
     await endSession(sessionId, reason);
   };
@@ -435,12 +412,13 @@ wss.on('connection', async (ws, req) => {
           const closeCode = gate.fatal ? 4006 : 1008;
           return closeWs(ws, closeCode, gate.reason);
         }
+        turnNumber += 1;
         bridge.turnStart();
       } else if (msg.type === 'turn_end') {
         const metrics = await bridge.turnEnd({ timeoutMs: msg.timeoutMs || 30_000 });
         ws.send(JSON.stringify({ type: 'turn_end_ack', metrics }));
         logTurnCogs({
-          userId, sessionId, model: modelWire,
+          userId, sessionId, turnNumber,
           inputSeconds: metrics.inputSeconds,
           outputSeconds: metrics.outputSeconds,
           usageMetadata: metrics.usageMetadata,
@@ -479,11 +457,25 @@ wss.on('connection', async (ws, req) => {
 
 // ── Start ────────────────────────────────────────────────────────────────
 
+let reaperHandle = null;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`voice-proxy listening on :${PORT} (build=${BUILD})`);
-  runReaper().catch((e) => console.error('[reaper-init]', e));
-  setInterval(() => runReaper().catch(() => {}), 60_000);
+  // Reaper: 20s cadence + 60s threshold (RPC default). Fires once at boot for
+  // proxy-crash recovery, then every 20s. See plan §1B.
+  reaperHandle = installReaper({ supabase }).handle;
 });
+
+// Graceful shutdown — stop the reaper interval so node exits cleanly when the
+// http server's connections drain. SIGTERM is what Fly sends on deploy.
+function shutdown(signal) {
+  console.log(`[shutdown] ${signal} — clearing reaper`);
+  if (reaperHandle) clearInterval(reaperHandle);
+  server.close(() => process.exit(0));
+  // Hard-exit after 5s if connections won't drain.
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
 
 process.on('unhandledRejection', (e) => {
   console.error('[unhandledRejection]', e);

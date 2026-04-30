@@ -194,8 +194,9 @@ Web research overturns REV 1's D5: Gemini Live exposes a documented **session re
 - [ ] **Quota-remaining UI.** Fetch `daily_quotas.seconds_used / daily_limit_s` on session open + on every `turn_end_ack`. Display chip that drains in real time. At 90%: warning. At 100%: session ends cleanly, modal CTA.
 - [ ] **Heartbeat + reaper budget (auditor C5).** Tightened-but-safe:
   - Heartbeat aggregate: pong → in-memory touch.
-  - Flush interval: **every 10s** (not 20s) so two flushes always land before the reaper threshold.
-  - Reaper threshold: 60s (not 30s). Gives 6× flush-interval safety margin against proxy restart / transient Supabase latency.
+  - **CORRECTION (2026-04-30, SPIKE_A_DEFERRED_FIXUP_PLAN.md REV 5 §1B):** the planned 10s flush cadence was never shipped; actual proxy ping cadence is 20s ([voice-proxy/index.js:405](../../server/voice-proxy/index.js#L405)). The "6× flush-interval" arithmetic below is stale. The real argument for threshold=60s is structural: live sessions are protected by per-pong `last_heartbeat_at` updates + the proxy's own 90s self-close ([voice-proxy/index.js:400](../../server/voice-proxy/index.js#L400)). Reaper threshold 60s + cadence 20s = max ghost life ~80s; threshold higher buys nothing.
+  - ~~Flush interval: **every 10s** (not 20s) so two flushes always land before the reaper threshold.~~ (stale — actual is 20s ping)
+  - Reaper threshold: 60s (not 30s). ~~Gives 6× flush-interval safety margin~~ Justification re-anchored on proxy-self-close-at-90s + boot-time `runReaper()` for crash recovery.
   - Reaper additionally checks: `last_heartbeat_at < now() - 60s AND (status = 'active' OR status = 'starting')`. No false positives from already-ended rows.
   - Multi-proxy safety: wrap reaper in `SELECT pg_try_advisory_lock(hashtext('voice_reaper'))`; only lock-winner runs the UPDATE.
 - [ ] **`daily_quotas.day_utc` generated col + index** (inherited Day-8 item). Migration adds `day_utc date GENERATED ALWAYS AS ((quota_date at time zone 'UTC')::date) STORED` + composite `(user_id, day_utc)` index. Kill-switch client lookup switches from rolling 24h window → equality match.

@@ -1,0 +1,24 @@
+name: scaling-guard
+
+# OAKLEAGUE-SCALING-GUARD enforcer. Fails on PRs that touch scaling fields in
+# server/voice-proxy/fly.toml without a `# scaling-approved: <issue#>` annotation.
+# Rationale: SPIKE_A_DEFERRED_FIXUP_PLAN.md §3D — the proxy holds per-session
+# in-memory state; horizontal scaling without an explicit decision drops turns.
+
+on:
+  pull_request:
+    paths:
+      - 'server/voice-proxy/fly.toml'
+      - 'scripts/check-fly-scaling-guard.sh'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run scaling-guard check
+        run: bash scripts/check-fly-scaling-guard.sh
+        env:
+          BASE_REF: ${{ github.base_ref }}

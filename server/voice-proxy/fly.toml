@@ -2,6 +2,15 @@
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
+# OAKLEAGUE-SCALING-GUARD: This proxy holds per-session in-memory state
+# (cogs failure counters, quota cache, sessionToWs Map). Horizontal scaling
+# beyond 1 machine requires revisiting SPIKE_A_DEFERRED_FIXUP_PLAN.md §1A.2 +
+# adding session-affinity routing or moving state to Redis. Before changing
+# `min_machines_running` above 0, increasing `fly scale count` above 1, or
+# adding additional [[vm]] blocks, leave a comment '# scaling-approved: <issue#>'
+# next to the change. The CI workflow .github/workflows/scaling-guard.yml
+# enforces this on PRs.
+#
 
 app = 'oakleague-voice-proxy'
 primary_region = 'iad'

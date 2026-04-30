@@ -34,6 +34,9 @@ yarn-error.log*
 !.vscode/extensions.json
 .idea/
 
+# Claude Code per-machine settings (permissions, hooks). Not portable.
+.claude/settings.local.json
+
 # OS
 .DS_Store
 Thumbs.db

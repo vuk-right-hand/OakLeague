@@ -20,6 +20,11 @@ import { type NextRequest } from 'next/server';
 import { assertAdminFromSession, AuthGuardError } from '@/lib/auth-guards';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import { json, mapAuthGuardStatus } from '@/lib/session/http-helpers';
+import {
+  aggregateLiveSessions,
+  fallbackRate,
+  type CogsLiveRow,
+} from '@/lib/admin/cogs-aggregations';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -40,9 +45,19 @@ type LiveSession = {
   tier_at_session: string;
   active_seconds: number;
   environment: string | null;
-  voice_cost_usd: number;
+  // Headline cost = truth-only sum (rows where metadata->>'fallback' IS NULL).
+  // Fallback cost is reported separately so admins see the imprecision.
+  voice_cost_usd: number;          // truth-only — render as the headline number
+  voice_cost_usd_fallback: number; // seconds-derived rows; render as a badge
   voice_tts_audio_seconds: number;
-  turn_rows: number;
+  // turn_rows was renamed to cogs_rows for honesty: each turn writes 4 cogs
+  // rows. cartesia_pending_rows counts the leg-3/4 placeholders we write while
+  // Pipeline α' isn't wired (CLAUDE.md §Voice).
+  cogs_rows: number;
+  cartesia_pending_rows: number;
+  // count(fallback) / count(leg-2 rows). >0 = some leg-2 rows were
+  // seconds-derived; >0.05 surfaces a Sentry breadcrumb (handled in dashboard).
+  fallback_rate: number;
   user_handle: string | null;
   user_email: string | null;
 };
@@ -57,7 +72,7 @@ type SessionRow = {
   active_seconds: number;
   environment: string | null;
 };
-type CogsRow = { session_id: string; service: string; operation: string; units: string | number; cost_usd: string | number };
+type CogsRow = CogsLiveRow;
 type ProfileRow = { id: string; handle: string | null; email: string | null };
 
 export async function GET(_req: NextRequest) {
@@ -89,7 +104,7 @@ export async function GET(_req: NextRequest) {
 
   const [{ data: cogsRows, error: cogsErr }, { data: profileRows, error: profErr }] = await Promise.all([
     sb.from('cogs_log')
-      .select('session_id, service, operation, units, cost_usd')
+      .select('session_id, service, operation, units, cost_usd, metadata')
       .in('session_id', sessionIds)
       .in('operation', VOICE_OPS as unknown as string[]),
     sb.from('profiles')
@@ -99,17 +114,7 @@ export async function GET(_req: NextRequest) {
   if (cogsErr) return json(500, { error: 'cogs_query_failed', detail: cogsErr.message.slice(0, 200) });
   if (profErr) return json(500, { error: 'profiles_query_failed', detail: profErr.message.slice(0, 200) });
 
-  type Agg = { cost_usd: number; tts_seconds: number; turn_rows: number };
-  const byId = new Map<string, Agg>();
-  for (const r of (cogsRows ?? []) as CogsRow[]) {
-    const cur = byId.get(r.session_id) ?? { cost_usd: 0, tts_seconds: 0, turn_rows: 0 };
-    cur.cost_usd += Number(r.cost_usd) || 0;
-    if (r.operation === 'voice_tts_audio_seconds') {
-      cur.tts_seconds += Number(r.units) || 0;
-    }
-    cur.turn_rows += 1;
-    byId.set(r.session_id, cur);
-  }
+  const byId = aggregateLiveSessions((cogsRows ?? []) as CogsRow[]);
 
   const profileById = new Map<string, ProfileRow>(
     ((profileRows ?? []) as ProfileRow[]).map((p) => [p.id, p]),
@@ -118,6 +123,7 @@ export async function GET(_req: NextRequest) {
   const out: LiveSession[] = sessions.map((s) => {
     const agg = byId.get(s.id);
     const prof = profileById.get(s.user_id);
+    const fbRate = agg ? fallbackRate(agg) : 0;
     return {
       id: s.id,
       user_id: s.user_id,
@@ -127,9 +133,12 @@ export async function GET(_req: NextRequest) {
       tier_at_session: s.tier_at_session,
       active_seconds: s.active_seconds,
       environment: s.environment,
-      voice_cost_usd: Number((agg?.cost_usd ?? 0).toFixed(6)),
+      voice_cost_usd: Number((agg?.cost_usd_truth ?? 0).toFixed(6)),
+      voice_cost_usd_fallback: Number((agg?.cost_usd_fallback ?? 0).toFixed(6)),
       voice_tts_audio_seconds: Number((agg?.tts_seconds ?? 0).toFixed(2)),
-      turn_rows: agg?.turn_rows ?? 0,
+      cogs_rows: agg?.cogs_rows ?? 0,
+      cartesia_pending_rows: agg?.cartesia_pending_rows ?? 0,
+      fallback_rate: Number(fbRate.toFixed(3)),
       user_handle: prof?.handle ?? null,
       user_email: prof?.email ?? null,
     };

@@ -24,6 +24,7 @@ import { assertAdminFromSession, AuthGuardError } from '@/lib/auth-guards';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import { json, mapAuthGuardStatus } from '@/lib/session/http-helpers';
 import { ALLOWED_COGS_SERVICES_SET, ALLOWED_COGS_OPERATIONS_SET } from '@/lib/admin/cogs-operations';
+import { aggregateHistoricalSummary, type CogsSummaryRow } from '@/lib/admin/cogs-aggregations';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -46,7 +47,7 @@ type CogsRow = {
   cost_usd: string | number;
   environment: string;
 };
-type SummaryRow = { service: string; operation: string; units: string | number; cost_usd: string | number };
+type SummaryRow = CogsSummaryRow;
 
 function isoOrNull(v: string | null): string | null {
   if (!v) return null;
@@ -119,7 +120,7 @@ export async function GET(req: NextRequest) {
   // when we hit the cap. At rc1 scale this is effectively unbounded.
   let summaryQ = sb
     .from('cogs_log')
-    .select('service, operation, units, cost_usd')
+    .select('service, operation, units, cost_usd, metadata')
     .gte('created_at', sinceIso)
     .lt('created_at', untilIso)
     .order('created_at', { ascending: false })
@@ -157,26 +158,19 @@ export async function GET(req: NextRequest) {
   const summaryRows = (summaryData ?? []) as SummaryRow[];
   const summary_truncated = summaryRows.length >= MAX_SUMMARY_ROWS;
 
-  type Agg = { service: string; operation: string; cost_usd: number; units: number; row_count: number };
-  const byOp = new Map<string, Agg>();
-  let total_usd = 0;
-  for (const r of summaryRows) {
-    const cost = Number(r.cost_usd) || 0;
-    const units = Number(r.units) || 0;
-    total_usd += cost;
-    const key = `${r.service}|${r.operation}`;
-    const cur = byOp.get(key);
-    if (cur) {
-      cur.cost_usd += cost;
-      cur.units += units;
-      cur.row_count += 1;
-    } else {
-      byOp.set(key, { service: r.service, operation: r.operation, cost_usd: cost, units, row_count: 1 });
-    }
-  }
-  const by_operation = Array.from(byOp.values())
-    .map((x) => ({ ...x, cost_usd: Number(x.cost_usd.toFixed(6)), units: Number(x.units.toFixed(4)) }))
-    .sort((a, b) => b.cost_usd - a.cost_usd);
+  const { byOperation: byOpRaw, totalUsdTruth, totalUsdFallback } =
+    aggregateHistoricalSummary(summaryRows);
+  const total_usd_truth = totalUsdTruth;
+  const total_usd_fallback = totalUsdFallback;
+  const by_operation = byOpRaw.map((x) => ({
+    service: x.service,
+    operation: x.operation,
+    cost_usd_truth: Number(x.cost_usd_truth.toFixed(6)),
+    cost_usd_fallback: Number(x.cost_usd_fallback.toFixed(6)),
+    units: Number(x.units.toFixed(4)),
+    row_count: x.row_count,
+    fallback_count: x.fallback_count,
+  }));
 
   const rows = (rowsData ?? []) as CogsRow[];
   const hasMore = rows.length > limit;
@@ -187,7 +181,13 @@ export async function GET(req: NextRequest) {
   return json(200, {
     range_start: since.toISOString(),
     range_end: until.toISOString(),
-    total_usd: Number(total_usd.toFixed(6)),
+    // Truth = headline number. Fallback = badge/footnote. Combined is what
+    // we'd have shown pre-α'. Old `total_usd` field preserved as the sum so
+    // historical-charts code that hasn't been updated still gets the same
+    // number it used to (just no longer "truth" — it's truth+fallback).
+    total_usd: Number((total_usd_truth + total_usd_fallback).toFixed(6)),
+    total_usd_truth: Number(total_usd_truth.toFixed(6)),
+    total_usd_fallback: Number(total_usd_fallback.toFixed(6)),
     by_operation,
     rows: page.map((r) => ({ ...r, cost_usd: Number(r.cost_usd), units: Number(r.units) })),
     next_cursor,

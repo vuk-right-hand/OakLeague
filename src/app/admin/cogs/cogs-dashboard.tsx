@@ -22,15 +22,26 @@ type LiveSession = {
   tier_at_session: string;
   active_seconds: number;
   environment: string | null;
-  voice_cost_usd: number;
+  voice_cost_usd: number;             // truth-only headline number
+  voice_cost_usd_fallback: number;    // seconds-derived (Gemini didn't ship token counts)
   voice_tts_audio_seconds: number;
-  turn_rows: number;
+  cogs_rows: number;                  // renamed from turn_rows; each turn = 4 cogs rows
+  cartesia_pending_rows: number;
+  fallback_rate: number;              // 0..1, leg-2 fallback proportion
   user_handle: string | null;
   user_email: string | null;
 };
 type LivePayload = { sessions: LiveSession[] };
 
-type ByOp = { service: string; operation: string; cost_usd: number; units: number; row_count: number };
+type ByOp = {
+  service: string;
+  operation: string;
+  cost_usd_truth: number;
+  cost_usd_fallback: number;
+  units: number;
+  row_count: number;
+  fallback_count: number;
+};
 type HistRow = {
   id: string;
   created_at: string;
@@ -46,7 +57,9 @@ type HistRow = {
 type HistPayload = {
   range_start: string;
   range_end: string;
-  total_usd: number;
+  total_usd: number;            // truth + fallback (legacy combined)
+  total_usd_truth: number;      // headline number — render this prominently
+  total_usd_fallback: number;   // badge / footnote
   by_operation: ByOp[];
   rows: HistRow[];
   next_cursor: string | null;
@@ -145,12 +158,22 @@ function LiveTab() {
     };
   }, []);
 
-  const totalVoice = (data?.sessions ?? []).reduce((n, s) => n + s.voice_cost_usd, 0);
+  // Truth-only headline. Fallback is summed separately so admins see imprecision.
+  const totalVoiceTruth    = (data?.sessions ?? []).reduce((n, s) => n + s.voice_cost_usd, 0);
+  const totalVoiceFallback = (data?.sessions ?? []).reduce((n, s) => n + s.voice_cost_usd_fallback, 0);
 
   return (
     <div>
       <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginBottom: 12 }}>
-        <div style={{ fontSize: 24, fontWeight: 700 }}>${totalVoice.toFixed(4)}</div>
+        <div style={{ fontSize: 24, fontWeight: 700 }}>${totalVoiceTruth.toFixed(4)}</div>
+        {totalVoiceFallback > 0 && (
+          <div
+            title="Estimated from seconds because Gemini didn't ship token counts for these turns"
+            style={{ fontSize: 11, padding: '2px 6px', borderRadius: 4, background: '#3a2a00', color: '#ffc66d' }}
+          >
+            +${totalVoiceFallback.toFixed(4)} est
+          </div>
+        )}
         <div style={{ fontSize: 12, opacity: 0.6 }}>
           running cost · {data?.sessions.length ?? 0} live · {loading ? 'refreshing…' : 'every 15s'}
         </div>
@@ -170,7 +193,7 @@ function LiveTab() {
                 <th align="right">Active (s)</th>
                 <th align="right">TTS (s)</th>
                 <th align="right">Voice cost</th>
-                <th align="right">Turns</th>
+                <th align="right">Cogs rows</th>
                 <th align="left">Model</th>
               </tr>
             </thead>
@@ -186,8 +209,29 @@ function LiveTab() {
                   <td style={{ opacity: 0.8 }}>{new Date(s.started_at).toLocaleTimeString()}</td>
                   <td align="right">{s.active_seconds}</td>
                   <td align="right">{s.voice_tts_audio_seconds.toFixed(1)}</td>
-                  <td align="right">${s.voice_cost_usd.toFixed(6)}</td>
-                  <td align="right">{s.turn_rows}</td>
+                  <td align="right">
+                    ${s.voice_cost_usd.toFixed(6)}
+                    {s.voice_cost_usd_fallback > 0 && (
+                      <span
+                        title={`+$${s.voice_cost_usd_fallback.toFixed(6)} est. from seconds (fallback rate ${(s.fallback_rate * 100).toFixed(1)}%)`}
+                        style={{
+                          fontSize: 10, marginLeft: 6, padding: '1px 4px', borderRadius: 3,
+                          background: s.fallback_rate > 0.05 ? '#5a1a1a' : '#3a2a00',
+                          color: s.fallback_rate > 0.05 ? '#ff9b9b' : '#ffc66d',
+                        }}
+                      >
+                        +${s.voice_cost_usd_fallback.toFixed(4)} est
+                      </span>
+                    )}
+                  </td>
+                  <td align="right" title={s.cartesia_pending_rows > 0 ? `${s.cartesia_pending_rows} pending Cartesia` : undefined}>
+                    {s.cogs_rows}
+                    {s.cartesia_pending_rows > 0 && (
+                      <span style={{ fontSize: 10, opacity: 0.6, marginLeft: 4 }}>
+                        ({s.cartesia_pending_rows}p)
+                      </span>
+                    )}
+                  </td>
                   <td style={{ opacity: 0.7 }}>{s.model_used ?? '—'}</td>
                 </tr>
               ))}
@@ -330,18 +374,27 @@ function HistoricalTab() {
 
       {summary && (
         <>
-          <div
-            style={{
-              fontSize: 32,
-              fontWeight: 700,
-              marginBottom: 4,
-              // Grey the number out when the summary was capped at 10k rows —
-              // the figure is a floor, not a total, and the bold white rendering
-              // implied authority it doesn't have.
-              opacity: summary.summary_truncated ? 0.45 : 1,
-            }}
-          >
-            {summary.summary_truncated ? '≥' : ''}${summary.total_usd.toFixed(4)}
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, marginBottom: 4 }}>
+            <div
+              style={{
+                fontSize: 32,
+                fontWeight: 700,
+                // Grey the number out when the summary was capped at 10k rows —
+                // the figure is a floor, not a total, and the bold white rendering
+                // implied authority it doesn't have.
+                opacity: summary.summary_truncated ? 0.45 : 1,
+              }}
+            >
+              {summary.summary_truncated ? '≥' : ''}${summary.total_usd_truth.toFixed(4)}
+            </div>
+            {summary.total_usd_fallback > 0 && (
+              <div
+                title="Estimated from seconds because Gemini didn't ship token counts for some turns"
+                style={{ fontSize: 13, padding: '2px 8px', borderRadius: 4, background: '#3a2a00', color: '#ffc66d' }}
+              >
+                +${summary.total_usd_fallback.toFixed(4)} est
+              </div>
+            )}
           </div>
           {summary.summary_truncated && (
             <div role="alert" style={{ color: 'salmon', fontSize: 12, marginBottom: 6 }}>
@@ -371,7 +424,20 @@ function HistoricalTab() {
                   <tr key={`${r.service}|${r.operation}`} style={{ borderTop: '1px solid #222' }}>
                     <td>{r.service}</td>
                     <td style={{ opacity: 0.8 }}>{r.operation}</td>
-                    <td align="right">${r.cost_usd.toFixed(6)}</td>
+                    <td align="right">
+                      ${r.cost_usd_truth.toFixed(6)}
+                      {r.cost_usd_fallback > 0 && (
+                        <span
+                          title={`+$${r.cost_usd_fallback.toFixed(6)} est. (${r.fallback_count}/${r.row_count} rows)`}
+                          style={{
+                            fontSize: 10, marginLeft: 6, padding: '1px 4px', borderRadius: 3,
+                            background: '#3a2a00', color: '#ffc66d',
+                          }}
+                        >
+                          +${r.cost_usd_fallback.toFixed(4)} est
+                        </span>
+                      )}
+                    </td>
                     <td align="right">{Number(r.units).toFixed(2)}</td>
                     <td align="right">{r.row_count}</td>
                   </tr>
