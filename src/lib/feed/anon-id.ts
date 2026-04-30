@@ -40,9 +40,23 @@ export async function readAnonId(): Promise<string | null> {
  */
 export async function readOrMintAnonId(): Promise<string> {
   const existing = await readAnonId();
-  if (existing) return existing;
-
   const admin = supabaseAdmin();
+
+  // D7 companion: a 30d-silent visitor returns with a cookie pointing at a
+  // now-purged anon_feed_sessions row. Without this existence check, every
+  // subsequent /api/feed/events POST would 401 (28000 anon_session_not_found)
+  // until the user manually cleared cookies. One PK lookup per cookieful
+  // mint-path call is cheap; on the orphaned-cookie unhappy path we self-heal.
+  if (existing) {
+    const { data: row } = await admin
+      .from('anon_feed_sessions')
+      .select('anon_id')
+      .eq('anon_id', existing)
+      .maybeSingle<{ anon_id: string }>();
+    if (row) return existing;
+    // Fall through to mint a fresh row + overwrite the stale cookie.
+  }
+
   const { data, error } = await admin
     .from('anon_feed_sessions')
     .insert({})
