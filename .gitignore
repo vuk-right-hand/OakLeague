@@ -60,3 +60,8 @@ supabase/.temp/
 # outputs. Large media, provider-identifying content. Shared via Supabase
 # Storage signed URLs (bucket `spike-b-clips`, 12h TTL), not git.
 artifacts/spike-b/
+
+# Local probe scripts and artifacts produced during development
+# (e.g. SQL probe files for manual schema verification, AirDropped iOS
+# capture spikes). Never committed.
+.spike-output/
