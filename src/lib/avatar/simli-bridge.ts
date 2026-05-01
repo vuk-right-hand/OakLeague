@@ -26,13 +26,24 @@
 
 'use client';
 
-import type {
-  AvatarBridge,
-  AvatarBridgeHandlers,
-  AvatarError,
-  AvatarOpenOptions,
-  AvatarProvider,
+import {
+  AVATAR_ERROR_CODES,
+  type AvatarBridge,
+  type AvatarBridgeHandlers,
+  type AvatarError,
+  type AvatarOpenOptions,
+  type AvatarProvider,
 } from './avatar-bridge';
+
+// Discriminate "this is one of our AvatarErrors" from "this is a DOMException
+// or other native error that happens to carry a `.code` field" (audit M3 —
+// AbortError.code === 20 would otherwise sneak through the prior `e.code`
+// truthy check and mask the connect_timeout map).
+function isAvatarError(e: unknown): e is AvatarError {
+  if (!e || typeof e !== 'object') return false;
+  const code = (e as { code?: unknown }).code;
+  return typeof code === 'string' && (AVATAR_ERROR_CODES as readonly string[]).includes(code);
+}
 
 // Minimal surface of simli-client v3 we rely on.
 type SimliClientLike = {
@@ -76,6 +87,83 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
   let firstAudioAtMs = 0;
   let lipsyncLatencyFired = false;
 
+  // Track cache for late subscribers + renegotiation re-fire (Plan §23.4, §25.5).
+  // Updated by refreshVideoTrack / refreshAudioTrack on initial loadedmetadata
+  // AND on every MediaStream 'addtrack' / track 'ended' (LiveKit ICE restart,
+  // WiFi↔LTE handoff, simulcast layer change). Consumers MUST handle re-fire.
+  let currentVideoTrack: MediaStreamTrack | null = null;
+  let currentAudioTrack: MediaStreamTrack | null = null;
+  // Bound stream refs + listeners — kept so we can detach when the SDK swaps
+  // srcObject to a new MediaStream on reconnect (audit C1/C2). Without this,
+  // the addtrack listener stays on the OLD stream and the new one is silent.
+  let videoStreamBound: MediaStream | null = null;
+  let audioStreamBound: MediaStream | null = null;
+  let intentionalClose = false;
+
+  // setLocalPlayback state. Default true (audible). When false, the consumer's
+  // AudioContext is the audible path and audioEl is silenced via volume=0.
+  // We use volume rather than muted because WebKit drops the underlying track
+  // on muted=true mid-WebRTC (verified spike #3).
+  let localPlaybackAudible = true;
+  function applyLocalPlayback(): void {
+    if (audioEl) audioEl.volume = localPlaybackAudible ? 1 : 0;
+  }
+
+  // Rebind the addtrack listener if the SDK swapped srcObject to a new
+  // MediaStream. Idempotent — same stream is a no-op.
+  function rebindVideoStream(stream: MediaStream | null): void {
+    if (videoStreamBound === stream) return;
+    if (videoStreamBound) videoStreamBound.removeEventListener('addtrack', refreshVideoTrack);
+    videoStreamBound = stream;
+    if (stream) stream.addEventListener('addtrack', refreshVideoTrack);
+  }
+  function rebindAudioStream(stream: MediaStream | null): void {
+    if (audioStreamBound === stream) return;
+    if (audioStreamBound) audioStreamBound.removeEventListener('addtrack', refreshAudioTrack);
+    audioStreamBound = stream;
+    if (stream) stream.addEventListener('addtrack', refreshAudioTrack);
+  }
+
+  function readVideoStream(): MediaStream | null {
+    if (!videoEl) return null;
+    if (videoEl.srcObject instanceof MediaStream) return videoEl.srcObject;
+    const cs = (videoEl as HTMLVideoElement & { captureStream?: () => MediaStream }).captureStream?.();
+    return cs ?? null;
+  }
+
+  function refreshVideoTrack(): void {
+    if (closed || !videoEl) return;
+    let stream = readVideoStream();
+    // Cross-element fallback (audit M2): only when our own srcObject is
+    // truly absent — some LiveKit setups put both tracks on a single
+    // MediaStream the SDK assigns to one element while leaving the other
+    // null. Falling back when the primary stream merely has no LIVE video
+    // would let stale streams shadow real renegotiation events.
+    if (!stream && audioEl?.srcObject instanceof MediaStream) {
+      stream = audioEl.srcObject;
+    }
+    rebindVideoStream(stream);
+    const track = stream?.getVideoTracks().find((t) => t.readyState === 'live') ?? null;
+    if (!track || track === currentVideoTrack) return;
+    currentVideoTrack = track;
+    track.addEventListener('ended', refreshVideoTrack, { once: true });
+    try { handlers.onVideoTrack?.(track); } catch { /* callback threw */ }
+  }
+
+  function refreshAudioTrack(): void {
+    if (closed || !audioEl) return;
+    let stream = audioEl.srcObject instanceof MediaStream ? audioEl.srcObject : null;
+    if (!stream && videoEl?.srcObject instanceof MediaStream) {
+      stream = videoEl.srcObject;
+    }
+    rebindAudioStream(stream);
+    const track = stream?.getAudioTracks().find((t) => t.readyState === 'live') ?? null;
+    if (!track || track === currentAudioTrack) return;
+    currentAudioTrack = track;
+    track.addEventListener('ended', refreshAudioTrack, { once: true });
+    try { handlers.onAudioTrack?.(track); } catch { /* callback threw */ }
+  }
+
   function detachOwnedElements(): void {
     if (ownedVideoEl && videoEl?.parentNode) videoEl.parentNode.removeChild(videoEl);
     if (ownedAudioEl && audioEl?.parentNode) audioEl.parentNode.removeChild(audioEl);
@@ -85,9 +173,12 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
 
   function fail(err: AvatarError): void {
     if (closed) return;
+    intentionalClose = true;
     closed = true;
     try { handlers.onError?.(err); } catch { /* callback threw, swallow */ }
     try { void client?.stop(); } catch { /* SDK already torn down */ }
+    rebindVideoStream(null);
+    rebindAudioStream(null);
     detachOwnedElements();
     client = null;
   }
@@ -130,7 +221,7 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
         }
         boot = (await res.json()) as SimliSessionBoot;
       } catch (e) {
-        if ((e as AvatarError).code) throw e;
+        if (isAvatarError(e)) throw e;
         const err: AvatarError = {
           code: 'connect_timeout',
           message: 'simli session mint network error',
@@ -186,6 +277,9 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
       document.body.appendChild(audioEl);
       ownedAudioEl = true;
     }
+    // Apply pre-open setLocalPlayback() immediately (audit M1) to shrink the
+    // window where audioEl exists at default volume after the caller opted out.
+    applyLocalPlayback();
 
     // v3: constructor takes all config. "livekit" transport = no ICE servers needed.
     // LogLevel 2 = ERROR only — suppresses SDK debug noise in console.
@@ -216,41 +310,39 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
       fail({ code: 'connect_timeout', message: 'simli startup_error', recoverable: false, cause: { provider, raw } });
     });
     client.on('stop', () => {
-      if (!closed) fail({ code: 'session_ttl_expired', message: 'simli session stopped', recoverable: false });
+      // intentionalClose flag (audit M6): differentiates our own close() —
+      // which calls client.stop() and may fire 'stop' synchronously back at
+      // us — from a TTL/session-ended event we should surface as an error.
+      if (!closed && !intentionalClose) {
+        fail({ code: 'session_ttl_expired', message: 'simli session stopped', recoverable: false });
+      }
     });
 
     // Video track arrives asynchronously via LiveKit after start() resolves.
-    // Use loadedmetadata on the videoEl the SDK populates. srcObject is set
-    // by the SDK (works on Safari); captureStream() is the Chrome fallback.
+    // loadedmetadata is NOT {once:true} (audit C1) — when the SDK swaps
+    // srcObject to a new MediaStream on reconnect, the element fires another
+    // loadedmetadata which we must process to rebind addtrack.
     videoEl.addEventListener('loadedmetadata', () => {
-      if (ready || closed) return;
+      if (closed) return;
+      const firstReady = !ready;
       ready = true;
-      try {
-        const stream =
-          videoEl!.srcObject instanceof MediaStream
-            ? videoEl!.srcObject
-            : (videoEl as HTMLVideoElement & { captureStream?: () => MediaStream }).captureStream?.();
-        const track = stream?.getVideoTracks()[0] ?? null;
-        if (track) handlers.onVideoTrack?.(track);
-      } catch { /* no track available */ }
-      // First-frame arrival: if audio has already been dispatched, emit latency.
-      if (!lipsyncLatencyFired && firstAudioAtMs > 0) {
+      refreshVideoTrack();
+      // Also drive audio refresh from the video metadata path (audit M5):
+      // Safari is unreliable about firing loadedmetadata on audio elements
+      // when the underlying stream's video track populates first. Without
+      // this, currentAudioTrack can stay null indefinitely.
+      refreshAudioTrack();
+      if (firstReady && !lipsyncLatencyFired && firstAudioAtMs > 0) {
         lipsyncLatencyFired = true;
         const ms = Math.max(0, Math.round(performance.now() - firstAudioAtMs));
         try { handlers.onLipsyncLatency?.(ms); } catch { /* callback threw */ }
       }
-    }, { once: true });
+    });
 
-    // Audio track — same pattern. The SDK sets audioEl.srcObject via LiveKit.
-    // Harness uses it to combine video+audio into a MediaRecorder stream.
     audioEl.addEventListener('loadedmetadata', () => {
       if (closed) return;
-      try {
-        const stream = audioEl!.srcObject instanceof MediaStream ? audioEl!.srcObject : null;
-        const track = stream?.getAudioTracks()[0] ?? null;
-        if (track) handlers.onAudioTrack?.(track);
-      } catch { /* no audio track */ }
-    }, { once: true });
+      refreshAudioTrack();
+    });
 
     try {
       await client.start();
@@ -303,13 +395,28 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
 
   function close(): void {
     if (closed) return;
+    intentionalClose = true;
     closed = true;
     try { void client?.stop(); } catch { /* already stopped */ }
+    // Detach addtrack listeners before nulling stream refs (audit M4 leak fix).
+    rebindVideoStream(null);
+    rebindAudioStream(null);
     detachOwnedElements();
     client = null;
     videoEl = null;
     audioEl = null;
+    currentVideoTrack = null;
+    currentAudioTrack = null;
   }
 
-  return { provider, open, sendAudio, cancel, close };
+  function getCurrentTracks(): { video: MediaStreamTrack | null; audio: MediaStreamTrack | null } {
+    return { video: currentVideoTrack, audio: currentAudioTrack };
+  }
+
+  function setLocalPlayback(audible: boolean): void {
+    localPlaybackAudible = audible;
+    applyLocalPlayback();
+  }
+
+  return { provider, open, sendAudio, cancel, close, getCurrentTracks, setLocalPlayback };
 }
