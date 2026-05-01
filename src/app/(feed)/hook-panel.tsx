@@ -10,6 +10,9 @@ import { recordFeedEvent } from '@/lib/feed/client-events';
 import { useDeviceId } from '@/lib/feed/device-id';
 import { AskErrorPill } from '@/lib/feed/ask-error-pill';
 import { useFeedImpressionTracker } from './feed-impression-context';
+import { ReactButton } from '@/components/recording/ReactButton';
+import { useRecordingController } from '@/lib/recording/recording-controller';
+import { isReactCaptureEnabled } from '@/components/recording/react-button-state';
 
 // Default wire-form model. Kept in sync with src/lib/voice/model-map.ts.
 // If this changes, update isAllowedWireModel() to accept the new string.
@@ -87,6 +90,20 @@ export function HookPanel({
   // Audit S2: tap-to-pause after the unmute gesture (TikTok expectation).
   const playerRef = useRef<HTMLVideoElement | null>(null);
   const [paused, setPaused] = useState(false);
+
+  // React/duet capture controller. Recording is gated by the flag at multiple
+  // layers (button null-renders, permission lib throws 'disabled'). Active
+  // surface only — `enabled` ties to shouldPlay so swiping away tears down.
+  // Hook mode = the bottom-half source is THIS hook's <video> ref. Long-form
+  // mode lives in long-form-player.tsx.
+  const recording = useRecordingController({
+    enabled: shouldPlay && shouldMount,
+    mode: 'hook',
+    // Ref-callback: controller reads at tap time (audit C1 day-2).
+    getSourceVideoEl: () => playerRef.current,
+    creatorHandle: group.creator.handle,
+    referralUrl: `oakl.gg/r/${hook.hook_id}`, // placeholder — Day-4 wires real referral mint
+  });
 
   // D5+: track played-seconds, not snapshot position.
   //
@@ -388,6 +405,14 @@ export function HookPanel({
           ref={playerRef}
           playbackId={hook.mux_playback_id}
           streamType="on-demand"
+          // Required for canvas.captureStream() to read pixels from the
+          // <video> without tainting the canvas. Mux's stream.mux.com
+          // serves CORS headers; without this attribute the duet recorder
+          // would produce a silent / black blob (Plan §4a). Flag-gated
+          // to match the Day-0 staged-rollout pattern.
+          crossOrigin={
+            isReactCaptureEnabled() ? ('anonymous' as const) : undefined
+          }
           // No `autoPlay` attribute. Why: the HTML autoplay attribute
           // fires the moment the <video> element mounts, BEFORE our
           // activation effect can run pause() on a non-active panel
@@ -658,6 +683,29 @@ export function HookPanel({
         {asking ? '…' : isAuthenticated ? 'Ask' : `Sign up to chat with @${group.creator.handle}`}
       </button>
       )}
+
+      {/* React/duet capture button. Null-renders when the kill-switch
+          (NEXT_PUBLIC_REACT_CAPTURE_ENABLED) is off. Positioned to the
+          left of Ask; same vertical band so the two siblings read as a
+          pair of CTAs. Gated on shouldPlay && shouldMount (audit C3
+          day-2) so off-screen scrolled-past panels don't render extra
+          tappable buttons that an event-delegation harness could trigger.
+          The controller's `enabled` watcher also handles swipe→TEARDOWN. */}
+      {isAuthenticated && shouldPlay && shouldMount && (
+        <div
+          style={{
+            position: 'absolute',
+            right: 76,
+            bottom: 100,
+            zIndex: 2,
+            display: 'flex',
+            alignItems: 'center',
+          }}
+        >
+          <ReactButton {...recording.buttonProps} />
+        </div>
+      )}
+
       <div
         style={{
           position: 'absolute',

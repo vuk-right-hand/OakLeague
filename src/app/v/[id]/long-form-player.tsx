@@ -8,6 +8,9 @@ import { recordFeedEvent } from '@/lib/feed/client-events';
 import { useDeviceId } from '@/lib/feed/device-id';
 import { AskErrorPill } from '@/lib/feed/ask-error-pill';
 import { envelopeStorageKey } from '@/app/s/[id]/session-client';
+import { ReactButton } from '@/components/recording/ReactButton';
+import { useRecordingController } from '@/lib/recording/recording-controller';
+import { isReactCaptureEnabled } from '@/components/recording/react-button-state';
 import {
   crossedQuartiles,
   takeBfcacheBaseline,
@@ -63,6 +66,20 @@ export function LongFormPlayer({
   const [asking, setAsking] = useState(false);
   const [askError, setAskError] = useState<string | null>(null);
   const [ended, setEnded] = useState(false);
+
+  // Long-form duet capture. Same pipeline as hook-mode; the source video
+  // is the long-form HLS stream. Only mounts when the user is authed +
+  // the kill-switch is on (button null-renders otherwise).
+  const recording = useRecordingController({
+    enabled: isAuthenticated,
+    mode: 'longform',
+    // Ref-callback so the controller reads videoRef.current at tap time
+    // (audit C1 day-2 — long-form viewer has no constant-rerender driver
+    // and the controller's onTap closure could otherwise lock to null).
+    getSourceVideoEl: () => videoRef.current,
+    creatorHandle,
+    referralUrl: `oakl.gg/r/${videoId}`, // Day-4 wires real referral mint
+  });
 
   // Quartile tracker (audit M3 + M5).
   // - firedRef: which quartiles have already been emitted in this mount.
@@ -377,6 +394,12 @@ export function LongFormPlayer({
           controls
           playsInline
           preload="auto"
+          // Required for canvas.captureStream() to read pixels without
+          // tainting the canvas (Plan §4a). Flag-gated to match the
+          // hook-panel staged-rollout pattern.
+          crossOrigin={
+            isReactCaptureEnabled() ? ('anonymous' as const) : undefined
+          }
           metadata={{
             video_id: videoId,
             video_title: videoTitle,
@@ -470,6 +493,24 @@ export function LongFormPlayer({
         >
           <AskErrorPill error={askError} />
         </div>
+
+        {/* React/duet capture — long-form mode. The source is the HLS
+            long-form video, mirrored across the bottom half of the
+            recording's 9:16 canvas. Null-renders when the kill-switch
+            is off; gated on isAuthenticated to match the hook-panel
+            pattern (audit M2 day-2). */}
+        {isAuthenticated && (
+          <div
+            style={{
+              position: 'absolute',
+              right: 84,
+              bottom: 90,
+              zIndex: 3,
+            }}
+          >
+            <ReactButton {...recording.buttonProps} />
+          </div>
+        )}
 
         {/* Back button — top-left, always visible. */}
         <button
