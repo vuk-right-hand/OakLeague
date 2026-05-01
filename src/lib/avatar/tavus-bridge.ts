@@ -27,13 +27,21 @@
 
 'use client';
 
-import type {
-  AvatarBridge,
-  AvatarBridgeHandlers,
-  AvatarError,
-  AvatarOpenOptions,
-  AvatarProvider,
+import {
+  AVATAR_ERROR_CODES,
+  type AvatarBridge,
+  type AvatarBridgeHandlers,
+  type AvatarError,
+  type AvatarOpenOptions,
+  type AvatarProvider,
 } from './avatar-bridge';
+
+// See SimliBridge isAvatarError — same DOMException.code masking guard.
+function isAvatarError(e: unknown): e is AvatarError {
+  if (!e || typeof e !== 'object') return false;
+  const code = (e as { code?: unknown }).code;
+  return typeof code === 'string' && (AVATAR_ERROR_CODES as readonly string[]).includes(code);
+}
 
 type DailyCallLike = {
   join(args: { url: string }): Promise<unknown>;
@@ -63,6 +71,8 @@ export function createTavusBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
   let closed = false;
   let ready = false;
   let firstAudioFired = false;
+  let currentVideoTrack: MediaStreamTrack | null = null;
+  let currentAudioTrack: MediaStreamTrack | null = null;
   // Custom audio track generator — populated when the platform supports it.
   // We keep a reference so sendAudio() can write PCM16 frames into it.
   let audioWriter: WritableStreamDefaultWriter<AudioData> | null = null;
@@ -104,7 +114,7 @@ export function createTavusBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
       }
       boot = (await res.json()) as TavusSessionBoot;
     } catch (e) {
-      if ((e as AvatarError).code) throw e;
+      if (isAvatarError(e)) throw e;
       const err: AvatarError = {
         code: 'connect_timeout',
         message: 'tavus session mint network error',
@@ -152,16 +162,26 @@ export function createTavusBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
 
     call
       .on('track-started', (evt: unknown) => {
-        // Remote video track from Tavus replica.
         const e = evt as { track?: MediaStreamTrack; participant?: { local?: boolean } };
-        if (e.track?.kind === 'video' && !e.participant?.local) {
+        if (!e.track || e.participant?.local) return;
+        if (e.track.kind === 'video') {
+          currentVideoTrack = e.track;
           handlers.onVideoTrack?.(e.track);
           if (!ready && !closed) {
             ready = true;
             handlers.onReady?.();
           }
+        } else if (e.track.kind === 'audio') {
+          currentAudioTrack = e.track;
+          handlers.onAudioTrack?.(e.track);
         }
       })
+      // No 'track-stopped' cache invalidation: the AvatarBridge contract says
+      // getCurrentTracks() returns the most recently *dispatched* track. We
+      // let track-started overwrite on renegotiation; the consumer reads
+      // track.readyState if they need liveness. Nulling on stop here would
+      // open a window between stop and the next start where late subscribers
+      // see {video:null, audio:null} mid-reneg.
       .on('error', (raw: unknown) => {
         fail({ code: 'rtc_ice_failed', message: 'daily error', recoverable: true, cause: { provider, raw } });
       })
@@ -271,5 +291,25 @@ export function createTavusBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
     call = null;
   }
 
-  return { provider, open, sendAudio, cancel, close };
+  function getCurrentTracks(): { video: MediaStreamTrack | null; audio: MediaStreamTrack | null } {
+    return { video: currentVideoTrack, audio: currentAudioTrack };
+  }
+
+  // Tavus path: daily-js does not expose a per-participant audio element we
+  // can volume-toggle. setLocalPlayback is a no-op here; consumers needing
+  // recording-time silence on Tavus must route via Web Audio destination.
+  // Tracked as post-YC follow-up — Tavus is scrapped pending re-evaluation.
+  // Warn once so a consumer relying on the silenced contract does not get
+  // double-route echo into a recording silently (audit C3).
+  let warnedSetLocalPlayback = false;
+  function setLocalPlayback(audible: boolean): void {
+    if (!audible && !warnedSetLocalPlayback) {
+      warnedSetLocalPlayback = true;
+      console.warn(
+        '[tavus-bridge] setLocalPlayback(false) is a no-op on Tavus — daily-js exposes no per-participant audio element. Route audio via Web Audio destination instead.',
+      );
+    }
+  }
+
+  return { provider, open, sendAudio, cancel, close, getCurrentTracks, setLocalPlayback };
 }

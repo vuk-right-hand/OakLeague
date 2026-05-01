@@ -69,16 +69,29 @@ export type AvatarError = {
 };
 
 // Event callbacks. Bridges invoke onReady exactly once (after handshake),
-// onVideoTrack zero or one time (some failures happen before a track exists),
 // onError zero or one time (terminal), and onFirstAudioSent once when the
 // first sendAudio() call is dispatched to the provider (t1 capture point).
 // After onError the bridge is dead — callers must create a new instance.
+//
+// Track callbacks (onVideoTrack / onAudioTrack) fire on the INITIAL track
+// AND again on every LiveKit renegotiation (ICE restart, WiFi↔LTE handoff,
+// simulcast layer change). Consumers MUST handle re-fire — e.g. recording
+// controller swaps the source ref in its compositor and re-mixes the audio
+// graph. The previous track instance becomes obsolete; subscribe to its
+// 'ended' event to detect the swap from the consumer side too.
+//
+// IMPORTANT: video and audio re-fires are NOT atomic. A joint renegotiation
+// surfaces as two sequential calls (onVideoTrack, then onAudioTrack) within
+// the same microtask group. A naive "rebuild MediaRecorder on track change"
+// will rebuild twice. Coalesce on the consumer side (e.g. defer rebuild via
+// queueMicrotask).
+// (Plan §25.5 — R4 §6 LiveKit renegotiation handler.)
 export type AvatarBridgeHandlers = {
   onReady?: () => void;
   onVideoTrack?: (track: MediaStreamTrack) => void;
-  // Audio track from the provider's LiveKit/WebRTC pipe. Fired once when the
-  // SDK populates the audio element's srcObject. Harness uses it to mix
-  // video+audio into a single MediaRecorder stream for rater clips.
+  // Audio track from the provider's LiveKit/WebRTC pipe. Fires on initial
+  // track and on every renegotiation. Harness uses it to mix video+audio
+  // into a single MediaRecorder stream for rater clips.
   onAudioTrack?: (track: MediaStreamTrack) => void;
   onError?: (err: AvatarError) => void;
   // Fires exactly once: the first time sendAudio() actually dispatches a chunk.
@@ -113,6 +126,23 @@ export interface AvatarBridge {
   // Tear down. Idempotent. Safe to call multiple times. Closes the RTC peer
   // connection and any associated control channels.
   close(): void;
+
+  // Returns the currently-active video + audio tracks if the session is past
+  // first-track arrival, else null. Allows late subscribers (e.g. recording
+  // controller spawned mid-session: user enters Ask → starts conversing →
+  // THEN taps React) to pick up tracks without waiting on an event re-fire.
+  // Returned MediaStreamTrack instances are the same as those most recently
+  // dispatched via onVideoTrack/onAudioTrack. After a renegotiation the cache
+  // updates to the new track; the prior instance is dead (track.readyState='ended').
+  getCurrentTracks(): { video: MediaStreamTrack | null; audio: MediaStreamTrack | null };
+
+  // Runtime audible-output toggle. When false, bridge ensures the provider's
+  // <audio> element is silenced so the consumer's AudioContext destination
+  // is the only audible path (avoids double-route echo during recording).
+  // Idempotent. Default true. Implemented via audioEl.volume rather than
+  // audioEl.muted: WebKit drops the underlying track on muted=true mid-WebRTC
+  // (verified in spike #3); volume=0 is the safe alternative.
+  setLocalPlayback(audible: boolean): void;
 }
 
 // Factory type for each provider. Phase 1 harness instantiates these directly;
