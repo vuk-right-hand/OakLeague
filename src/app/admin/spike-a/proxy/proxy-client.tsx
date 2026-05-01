@@ -23,7 +23,12 @@ type ModelId =
   | 'gemini-2.5-flash-native-audio-preview-12-2025'
   | 'gemini-3.1-flash-live-preview';
 
-type Status = 'DONE' | 'ERROR' | 'TIMEOUT' | 'INVALID';
+// EMPTY_RESPONSE = first_chunk_timeout but turn_complete arrived → Gemini
+// decided not to emit audio (model behavior). TIMEOUT = neither audio nor
+// turn_complete within budget → API-side silence (infrastructure/SLA).
+// Splits the ~22% timeout bucket so we can tell model regression apart from
+// API regression. See SPIKE_A_DEFERRED_FIXUP_PLAN.md "timeout diagnosis".
+type Status = 'DONE' | 'ERROR' | 'TIMEOUT' | 'EMPTY_RESPONSE' | 'INVALID';
 
 type TurnRow = {
   turn: number;
@@ -271,10 +276,51 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
       }
 
       let ttfaMs: number | undefined;
-      try { ttfaMs = await firstAudioP; } catch (e) {
-        result.turns.push({ turn, status: 'TIMEOUT', reason: (e as Error).message });
-        break;
+      let firstAudioErr: Error | null = null;
+      try { ttfaMs = await firstAudioP; } catch (e) { firstAudioErr = e as Error; }
+
+      if (firstAudioErr) {
+        // No audio frame within FIRST_CHUNK_TIMEOUT_MS. Race turn_complete
+        // (still has ~TURN_COMPLETE_TIMEOUT_MS budget remaining) to split:
+        //   turn_complete arrived  → EMPTY_RESPONSE (model emitted nothing)
+        //   turn_complete rejects via abortPending (ws close / proxy error)
+        //                         → ERROR with the real cause
+        //   turn_complete also missing → TIMEOUT (API-side silence)
+        try {
+          await turnCompleteP;
+          result.turns.push({
+            turn,
+            ticketMs: Math.round(t1 - t0),
+            wsMs:     Math.round(t2 - t1),
+            readyMs:  Math.round(t3 - t2),
+            totalMs:  Math.round(performance.now() - turnStart),
+            status: 'EMPTY_RESPONSE',
+            reason:  firstAudioErr.message,
+          });
+          continue;
+        } catch (e2) {
+          // If a proxy error or WS close interrupted the race, that's the
+          // real cause — don't bucket as API timeout.
+          if (state.proxyError) {
+            result.turns.push({ turn, status: 'ERROR', reason: state.proxyError });
+          } else if (state.closeInfo !== null) {
+            const ci = state.closeInfo as CloseInfo;
+            result.turns.push({
+              turn,
+              status: 'ERROR',
+              reason: `ws_closed_${ci.code ?? 'unknown'}`,
+            });
+          } else {
+            result.turns.push({
+              turn,
+              status: 'TIMEOUT',
+              reason: `${firstAudioErr.message}|${(e2 as Error).message}`,
+            });
+          }
+          break;
+        }
       }
+
       try { await turnCompleteP; } catch (e) {
         result.turns.push({ turn, status: 'ERROR', reason: (e as Error).message });
         break;
@@ -285,7 +331,7 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
         ticketMs: Math.round(t1 - t0),
         wsMs:     Math.round(t2 - t1),
         readyMs:  Math.round(t3 - t2),
-        ttfaMs:   Math.round(ttfaMs),
+        ttfaMs:   Math.round(ttfaMs!),
         totalMs:  Math.round(performance.now() - turnStart),
         status: 'DONE',
       });
@@ -313,6 +359,11 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
   }, [model, runOneSession, append]);
 
   const ttfas = useMemo(() => sessions.flatMap((s) => s.turns.filter((t) => t.status === 'DONE').map((t) => t.ttfaMs!)), [sessions]);
+  const statusCounts = useMemo(() => {
+    const c: Record<Status, number> = { DONE: 0, ERROR: 0, TIMEOUT: 0, EMPTY_RESPONSE: 0, INVALID: 0 };
+    for (const s of sessions) for (const t of s.turns) c[t.status]++;
+    return c;
+  }, [sessions]);
 
   const copyJson = useCallback(() => {
     navigator.clipboard?.writeText(JSON.stringify({
@@ -370,6 +421,9 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
       <section style={{ marginBottom: 16 }}>
         <h3>Aggregate TTFA</h3>
         <div>n={ttfas.length} · p50={pct(ttfas, 0.5) ?? '—'}ms · p90={pct(ttfas, 0.9) ?? '—'}ms</div>
+        <div style={{ marginTop: 4, fontSize: 13 }}>
+          DONE={statusCounts.DONE} · EMPTY_RESPONSE={statusCounts.EMPTY_RESPONSE} · TIMEOUT={statusCounts.TIMEOUT} · ERROR={statusCounts.ERROR} · INVALID={statusCounts.INVALID}
+        </div>
       </section>
 
       <section style={{ marginBottom: 16 }}>
