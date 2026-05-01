@@ -1,6 +1,21 @@
 // Proxy-side Sentry init. Mirrors sentry.server.config.ts scrub rules so the
 // ticket query param and Authorization headers never land in Sentry events.
 // If SENTRY_DSN is unset (e.g., local dev), init is a no-op.
+//
+// PRE-α'-CUTOVER GATE (2026-04-30, future agents read this):
+// SENTRY_DSN is currently UNSET on the Fly app oakleague-voice-proxy.
+// Acceptable today because the proxy only handles admin-gated Spike-A
+// traffic — the cogs-failure WS-close logic works without Sentry.
+//
+// BEFORE production user traffic flows through this proxy (i.e. before
+// Pipeline α' wires use-session-pipe.ts to forward Gemini transcript text
+// → Cartesia → Simli via this proxy instead of going Gemini-direct), run:
+//
+//   fly secrets set --app oakleague-voice-proxy SENTRY_DSN=<dsn>
+//
+// Otherwise the cogs RPC failure-rate alert rule (plan §1A.2) cannot fire
+// and you're flying blind on the "0055-style breakage in prod" scenario.
+// Reference: docs/_planning/SPIKE_A_DEFERRED_FIXUP_PLAN.md §1A.2.
 
 import * as Sentry from '@sentry/node';
 

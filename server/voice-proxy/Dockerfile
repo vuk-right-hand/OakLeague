@@ -14,7 +14,7 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm install --omit=dev --no-audit --no-fund
 
-COPY index.js gemini-bridge.js quota-gate.js sentry.js ./
+COPY index.js gemini-bridge.js quota-gate.js sentry.js proxy-handlers.js ./
 
 ENV NODE_ENV=production
 ENV PORT=8080

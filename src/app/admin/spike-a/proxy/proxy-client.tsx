@@ -42,7 +42,7 @@ type SessionResult = {
   aborted?: string;
 };
 
-const TURNS_PER_SESSION = 5;
+const DEFAULT_TURNS_PER_SESSION = 5;
 const SESSIONS_PER_CELL = 3;
 const CHUNK_BYTES = 32_000; // ~1s @ 16kHz LE mono PCM16
 const TICKET_TIMEOUT_MS = 5_000;
@@ -103,6 +103,10 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
   const [running, setRunning] = useState(false);
   const [sessions, setSessions] = useState<SessionResult[]>([]);
   const [log, setLog] = useState<string[]>([]);
+  // Configurable per-session turn count. Set to 1 to test cold-only turns
+  // (eliminates "model gets bored of identical input" degradation hypothesis
+  // — see SPIKE_A_DEFERRED_FIXUP_PLAN.md priming spike test).
+  const [turnsPerSession, setTurnsPerSession] = useState<number>(DEFAULT_TURNS_PER_SESSION);
   const cannedRef = useRef<Uint8Array | null>(null);
   const device = useMemo(detectDevice, []);
 
@@ -225,7 +229,7 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
     const t3 = performance.now();
 
     // 4. Run turns
-    for (let turn = 1; turn <= TURNS_PER_SESSION; turn++) {
+    for (let turn = 1; turn <= turnsPerSession; turn++) {
       if (state.closeInfo) {
         result.turns.push({ turn, status: 'INVALID', reason: `ws_closed_${state.closeInfo.code}` });
         break;
@@ -289,13 +293,13 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
 
     try { ws.close(1000, 'session_done'); } catch {}
     return result;
-  }, [model, creatorId, append]);
+  }, [model, creatorId, append, turnsPerSession]);
 
   const onRun = useCallback(async () => {
     if (!cannedRef.current) return;
     setRunning(true);
     setSessions([]);
-    append(`starting proxy cell: model=${model}, sessions=${SESSIONS_PER_CELL}, turns=${TURNS_PER_SESSION}`);
+    append(`starting proxy cell: model=${model}, sessions=${SESSIONS_PER_CELL}, turns=${turnsPerSession}`);
     const collected: SessionResult[] = [];
     for (let i = 1; i <= SESSIONS_PER_CELL; i++) {
       append(`session ${i} start`);
@@ -344,8 +348,21 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
           <option value="gemini-2.5-flash-native-audio-preview-12-2025">2.5 native-audio (v1alpha, preview-12-2025)</option>
           <option value="gemini-3.1-flash-live-preview">3.1 Flash Live (preview)</option>
         </select>
+        <label style={{ marginLeft: 12 }}>Turns/session:</label>
+        <input
+          type="number"
+          min={1}
+          max={20}
+          value={turnsPerSession}
+          onChange={(e) => {
+            const n = Math.max(1, Math.min(20, Math.floor(Number(e.target.value) || 1)));
+            setTurnsPerSession(n);
+          }}
+          disabled={running}
+          style={{ marginLeft: 6, width: 56 }}
+        />
         <button style={{ marginLeft: 12 }} onClick={onRun} disabled={running || !creatorId}>
-          {running ? 'Running…' : `Run ${SESSIONS_PER_CELL}×${TURNS_PER_SESSION} cell`}
+          {running ? 'Running…' : `Run ${SESSIONS_PER_CELL}×${turnsPerSession} cell`}
         </button>
         <button style={{ marginLeft: 8 }} onClick={copyJson} disabled={!sessions.length}>Copy JSON</button>
       </section>
