@@ -26,6 +26,14 @@ export const MAX_RECORDING_SECONDS = 60;
  * exposing it here lets the button short-circuit at the leaf rather than
  * threading conditional rendering through every surface (hook-panel,
  * long-form, Ask scene, lesson row).
+ *
+ * NOTE: NEXT_PUBLIC_* env vars are inlined by Next.js at BUILD time, so
+ * this function returns a value baked into the bundle. A Vercel runtime
+ * flip without redeploy will NOT take effect on already-shipped chunks —
+ * a redeploy is required. Reading this at render time (as ReactButton
+ * does) is fine because Next inlines `process.env.NEXT_PUBLIC_*` as a
+ * literal at build, not a runtime lookup. Don't poll it in useEffect
+ * expecting runtime flips (audit S3 integration).
  */
 export function isReactCaptureEnabled(): boolean {
   return process.env.NEXT_PUBLIC_REACT_CAPTURE_ENABLED === '1';

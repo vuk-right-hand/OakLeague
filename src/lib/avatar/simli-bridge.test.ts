@@ -275,6 +275,28 @@ describe('close()', () => {
     bridge.close();
     expect(() => bridge.setLocalPlayback(false)).not.toThrow();
   });
+
+  it('sendAudio post-close warns once in non-prod (audit C4 integration)', async () => {
+    // NODE_ENV is readonly under @types/node — cast through unknown to flip
+    // it for the duration of the test.
+    const env = process.env as unknown as { NODE_ENV: string | undefined };
+    const origNodeEnv = env.NODE_ENV;
+    env.NODE_ENV = 'development';
+    try {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { bridge } = await bootBridge();
+      bridge.close();
+      bridge.sendAudio(new ArrayBuffer(4));
+      bridge.sendAudio(new ArrayBuffer(4));
+      const warnings = warn.mock.calls.filter((c) =>
+        typeof c[0] === 'string' && c[0].includes('sendAudio called after close'),
+      );
+      expect(warnings.length).toBe(1);
+      warn.mockRestore();
+    } finally {
+      env.NODE_ENV = origNodeEnv;
+    }
+  });
 });
 
 describe('srcObject swap (LiveKit reconnect)', () => {

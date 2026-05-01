@@ -15,7 +15,13 @@ import {
 
 describe('isReactCaptureEnabled', () => {
   const original = process.env.NEXT_PUBLIC_REACT_CAPTURE_ENABLED;
-  afterEach(() => { process.env.NEXT_PUBLIC_REACT_CAPTURE_ENABLED = original; });
+  afterEach(() => {
+    // delete when original was unset — assigning `undefined` writes the
+    // literal string 'undefined' to the env which would poison subsequent
+    // `=== '1'` checks (audit S integration).
+    if (original === undefined) delete process.env.NEXT_PUBLIC_REACT_CAPTURE_ENABLED;
+    else process.env.NEXT_PUBLIC_REACT_CAPTURE_ENABLED = original;
+  });
 
   it('returns true only when env var is exactly "1"', () => {
     process.env.NEXT_PUBLIC_REACT_CAPTURE_ENABLED = '1';

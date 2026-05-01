@@ -50,6 +50,18 @@ afterEach(() => {
   teardownNavigator();
 });
 
+// requestMediaPermission gates on NEXT_PUBLIC_REACT_CAPTURE_ENABLED === '1'
+// (audit C3 integration). All requestMediaPermission tests need the flag
+// on; the explicit kill-switch test overrides locally.
+const _origFlag = process.env.NEXT_PUBLIC_REACT_CAPTURE_ENABLED;
+beforeEach(() => { process.env.NEXT_PUBLIC_REACT_CAPTURE_ENABLED = '1'; });
+afterEach(() => {
+  // Restore — but `env.X = undefined` writes the literal string 'undefined'
+  // to the env, not unset. Use delete to actually clear (audit S integration).
+  if (_origFlag === undefined) delete process.env.NEXT_PUBLIC_REACT_CAPTURE_ENABLED;
+  else process.env.NEXT_PUBLIC_REACT_CAPTURE_ENABLED = _origFlag;
+});
+
 describe('mapMediaError', () => {
   it('maps NotAllowedError to denied', () => {
     const e = mapMediaError({ name: 'NotAllowedError', message: 'no' });
@@ -183,6 +195,20 @@ describe('requestMediaPermission', () => {
   it('throws unsupported when getUserMedia is unavailable', async () => {
     Object.defineProperty(globalThis, 'navigator', { value: {}, configurable: true });
     await expect(requestMediaPermission()).rejects.toMatchObject({ code: 'unsupported' });
+  });
+
+  it('throws disabled when NEXT_PUBLIC_REACT_CAPTURE_ENABLED is off (audit C3)', async () => {
+    process.env.NEXT_PUBLIC_REACT_CAPTURE_ENABLED = '0';
+    // Even with a fully-functional navigator/getUserMedia, the kill-switch
+    // refuses BEFORE prompting — defense in depth around the ReactButton
+    // null-render UX gate.
+    const getUserMedia = vi.fn();
+    Object.defineProperty(globalThis, 'navigator', {
+      value: { mediaDevices: { getUserMedia } },
+      configurable: true,
+    });
+    await expect(requestMediaPermission()).rejects.toMatchObject({ code: 'disabled' });
+    expect(getUserMedia).not.toHaveBeenCalled();
   });
 
   it('returns the stream + writes granted=true to cache on success', async () => {

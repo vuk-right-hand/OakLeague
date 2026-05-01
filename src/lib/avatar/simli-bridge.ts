@@ -73,6 +73,18 @@ export type SimliSessionBoot = {
   expires_at: string;
 };
 
+// Module-scope so production-build const-folding kicks in (audit S
+// integration). LogLevel: ERROR (2) in prod — suppresses SDK debug noise.
+// WARN (1) in non-prod so a Spike-B-style 502 path that doesn't map
+// cleanly to our event taxonomy still leaves a console signal.
+const SDK_LOG_LEVEL: number = process.env.NODE_ENV === 'production' ? 2 : 1;
+
+// Bridge instances are SESSION-SCOPED (audit M5 integration). The
+// recording controller MUST create a fresh bridge per voice session and
+// call close() on session end. Caching across re-arms or replica swaps
+// would: (a) make the per-instance warn-once flags lose signal after the
+// first use, (b) leak the closed-state guard checks, (c) break track
+// caching since SDK closure resets DOM element bindings.
 export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge {
   const provider: AvatarProvider = 'simli';
 
@@ -282,14 +294,13 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
     applyLocalPlayback();
 
     // v3: constructor takes all config. "livekit" transport = no ICE servers needed.
-    // LogLevel 2 = ERROR only — suppresses SDK debug noise in console.
     try {
       client = new mod.SimliClient(
         sessionToken,
         videoEl,
         audioEl,
-        null,       // iceServers — not needed for livekit transport
-        2,          // LogLevel.ERROR
+        null,           // iceServers — not needed for livekit transport
+        SDK_LOG_LEVEL,
         'livekit',
       );
     } catch (e) {
@@ -362,8 +373,20 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
     }
   }
 
+  let warnedSendAudioPostClose = false;
   function sendAudio(pcm16le16k: ArrayBuffer): void {
-    if (!client || !ready || closed) return;
+    // Audit C4 (integration): silent no-op masked a real bug surface — a
+    // controller that re-uses a closed bridge ships zero lipsync latency
+    // telemetry from that point forward with no signal. Warn once per
+    // bridge instance in non-prod so the regression is visible.
+    if (closed) {
+      if (!warnedSendAudioPostClose && process.env.NODE_ENV !== 'production') {
+        warnedSendAudioPostClose = true;
+        console.warn('[simli-bridge] sendAudio called after close() — controller bug, dropping audio');
+      }
+      return;
+    }
+    if (!client || !ready) return;
     if (!firstAudioFired) {
       firstAudioFired = true;
       firstAudioAtMs = performance.now();

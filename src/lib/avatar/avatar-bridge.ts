@@ -9,6 +9,43 @@
 // gap analysis (see migration 20260422000001, outcome CHECK comment).
 //
 // SPIKE_B_PLAN.md Rev 5 §Architecture. CLAUDE.md §Provider-Agnostic.
+//
+// ── Recording stack lifecycle conventions (audit M1, M3, M4 integration) ──
+// The React/duet capture stack composes 4 modules: this bridge, audio-mixer,
+// composite-canvas, ReactButton + a future recording-controller. Verbs:
+//   • close()  = terminal teardown (this bridge, audio-mixer)
+//   • stop()   = pausable RAF loop only (composite-canvas)
+//   • cancel() = barge-in / clear-buffer; pipe stays warm (this bridge)
+//   • dispatch onTap → controller decides ARM vs STOP (ReactButton)
+//
+// STOP order the controller SHOULD follow (audit C2 integration):
+//   1. mediaRecorder.stop()       — finalize the blob first
+//   2. compositor.stop()          — stop drawing into a captureStream'd canvas
+//   3. mixer.disconnectAvatar()   — preferred BEFORE bridge.close().
+//                                    disconnectAvatar() actively inspects
+//                                    track.readyState and skips the disconnect
+//                                    on a dead track (Safari WebKit bug 217983).
+//                                    mixer.close() also wraps every disconnect
+//                                    in try/catch for catch-all safety, so an
+//                                    inverse order does not crash but loses
+//                                    the structured guard.
+//   4. bridge.close()             — ends the avatar tracks
+//   5. mixer.close()              — releases gain branches (try/catch wrapped)
+//   6. permission lib: releaseStream(stream) on caller's getUserMedia stream
+//                                    (calls track.stop() on each track)
+//   7. audioContext.close()       — caller-owned; lazy-create per ARM, not
+//                                    per surface mount (Chrome caps at ~6
+//                                    AudioContexts, feed scroll would break).
+//
+// Track ownership: bridge owns avatar audio/video tracks (LiveKit-derived);
+// recording controller owns getUserMedia mic+camera tracks. Mixer & video
+// elements are leaf consumers — they never call track.stop().
+//
+// Permission revoke watcher (audit M4): attachRevokeWatcher binds tracks
+// at first-attach. On audio-only fallback retry (camera denied + mic
+// granted → second getUserMedia({audio:true})), controller MUST re-attach
+// the watcher to the new stream — the original watcher does not see new
+// tracks added after binding.
 
 export const AVATAR_ERROR_CODES = [
   'connect_timeout',
@@ -134,6 +171,15 @@ export interface AvatarBridge {
   // Returned MediaStreamTrack instances are the same as those most recently
   // dispatched via onVideoTrack/onAudioTrack. After a renegotiation the cache
   // updates to the new track; the prior instance is dead (track.readyState='ended').
+  //
+  // IMPORTANT — cross-provider semantics differ on track liveness (audit
+  // M2 integration). Simli holds the previous LIVE track until a new live
+  // track replaces it (refreshVideoTrack filters readyState==='live').
+  // Tavus's daily-js cache survives across renegotiation but does NOT
+  // invalidate on `track-stopped`, so a brief mid-reneg gap can return a
+  // track in 'ended' state. Consumers MUST check `track.readyState ===
+  // 'live'` before piping into AudioMixer / MediaRecorder, regardless of
+  // tier. The recording-controller is the canonical place for that check.
   getCurrentTracks(): { video: MediaStreamTrack | null; audio: MediaStreamTrack | null };
 
   // Runtime audible-output toggle. When false, bridge ensures the provider's

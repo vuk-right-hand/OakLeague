@@ -35,6 +35,10 @@ export const RECORDING_PERMISSION_CODES = [
   'unsupported',    // navigator.mediaDevices.getUserMedia missing
   'aborted',        // AbortError — page navigation, user gesture interrupted
   'security',       // SecurityError — origin not trusted (insecure context)
+  'disabled',       // synthesized by requestMediaPermission only — the
+                    // NEXT_PUBLIC_REACT_CAPTURE_ENABLED kill-switch is off.
+                    // Never produced by mapMediaError (no DOMException maps
+                    // to this code).
   'unknown',
 ] as const;
 
@@ -115,6 +119,12 @@ export function clearPermissionMemory(): void {
 // audio-only fallback when camera is denied but mic is granted (audit R2 M1).
 // Safari returns 'unsupported' for both because permissions.query throws
 // TypeError on camera/microphone names (through 18.x).
+//
+// Audit S6 (integration): the union deliberately collapses
+// {camera:'unsupported', microphone:'unsupported'} into a single shape —
+// there is no way to express "Safari knows mic but not camera." That
+// hybrid case was non-existent on Safari at writing; if it ever ships,
+// extend the union (don't try to split the lib's branching).
 export type DetailedPermissionState =
   | { camera: 'granted' | 'denied' | 'prompt'; microphone: 'granted' | 'denied' | 'prompt' }
   | { camera: 'unsupported'; microphone: 'unsupported' };
@@ -171,6 +181,21 @@ export type RequestResult = {
 // Single entry point. Throws RecordingPermissionError on any failure so
 // callers can branch by code (.code === 'denied' → fallback CTA, etc).
 export async function requestMediaPermission(opts: RequestOptions = {}): Promise<RequestResult> {
+  // Kill-switch defense in depth (audit C3 integration). The ReactButton
+  // null-renders when the flag is off, but a future caller (Day-2
+  // controller, admin debug surface, Storybook entry, test harness) can
+  // import this lib directly. Refuse to fire the camera prompt under the
+  // off state — same flag that gates Mux crossOrigin (Plan §20.2 — flag
+  // is unified per R3 M5).
+  //
+  // Reads at runtime: in the browser this is the build-time-inlined
+  // literal (Next.js webpack DefinePlugin); on Node/SSR/server actions it
+  // reads live process.env (Next exposes NEXT_PUBLIC_* on the server too).
+  // Both surfaces produce the right kill-switch behavior. This lib is
+  // intended for CLIENT use; the only legitimate server import is tests.
+  if (process.env.NEXT_PUBLIC_REACT_CAPTURE_ENABLED !== '1') {
+    throw new RecordingPermissionError('disabled', 'recording feature disabled via NEXT_PUBLIC_REACT_CAPTURE_ENABLED');
+  }
   if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
     throw new RecordingPermissionError('unsupported', 'navigator.mediaDevices.getUserMedia is not available');
   }

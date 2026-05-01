@@ -22,6 +22,8 @@ export const COMPOSITE_HEIGHT = 960;
 export const HALF_HEIGHT = COMPOSITE_HEIGHT / 2;
 export const CROSSFADE_MS = 300;
 export const END_CARD_MS = 1500;
+// 25% per Plan §25 NM5 (raised from initial 12% in §7 / §20.12 — watermark
+// + end-card are the v1 attribution-funnel teeth after C2PA was cut from v1).
 export const WATERMARK_OPACITY = 0.25;
 export const WATERMARK_WIDTH_FRAC = 0.14;
 export const WATERMARK_PADDING = 12;

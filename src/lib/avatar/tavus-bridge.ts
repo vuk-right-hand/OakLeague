@@ -64,6 +64,7 @@ export type TavusSessionBoot = {
   expires_at: string;
 };
 
+// Bridge instances are SESSION-SCOPED — see simli-bridge.ts for rationale.
 export function createTavusBridge(handlers: AvatarBridgeHandlers): AvatarBridge {
   const provider: AvatarProvider = 'tavus';
 
@@ -303,7 +304,10 @@ export function createTavusBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
   // double-route echo into a recording silently (audit C3).
   let warnedSetLocalPlayback = false;
   function setLocalPlayback(audible: boolean): void {
-    if (!audible && !warnedSetLocalPlayback) {
+    // Gate the warn to non-prod (audit S1 integration). Production logs
+    // would otherwise carry this every session if Day-2 controller calls
+    // setLocalPlayback(false) uniformly across providers.
+    if (!audible && !warnedSetLocalPlayback && process.env.NODE_ENV !== 'production') {
       warnedSetLocalPlayback = true;
       console.warn(
         '[tavus-bridge] setLocalPlayback(false) is a no-op on Tavus — daily-js exposes no per-participant audio element. Route audio via Web Audio destination instead.',

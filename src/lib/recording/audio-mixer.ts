@@ -85,6 +85,15 @@ export interface AudioMixer {
   connectAvatar(track: MediaStreamTrack): void;
   disconnectAvatar(): void;
 
+  /** Ramp the source-video gain to a target value over `durationMs`.
+   *  Pass 0 to silence (e.g. mid-recording Ask-swap: the visual crossfade
+   *  in composite-canvas runs 300ms; call setSourceGain(0, 300) at the
+   *  same wall-clock moment so audio + video swap together). Pass back to
+   *  GAIN_SOURCE (0.7) to restore. durationMs<=0 is an instant set.
+   *  Audit C1 (integration) — without this, an Ask-swap leaves 300ms of
+   *  overlapping hook + avatar audio in the recording. */
+  setSourceGain(value: number, durationMs?: number): void;
+
   /** Tear down all gain nodes + sources. AudioContext lifecycle is the
    *  caller's — close() does NOT call audioContext.close(). */
   close(): void;
@@ -194,7 +203,58 @@ export function createAudioMixer(opts: AudioMixerOptions): AudioMixer {
     },
     disconnectAvatar(): void {
       ensureOpen();
+      // Audit C2 (integration): Safari (WebKit bug 217983) throws
+      // InvalidStateError on disconnect() when the underlying track is
+      // readyState='ended'. Defensively skip disconnect on a dead track —
+      // the gain node is GC'd by close() anyway. Preferred caller order
+      // is mixer.disconnectAvatar() BEFORE bridge.close(), but this guard
+      // makes the inverse safe too.
+      //
+      // The cast assumes inputId on the avatar branch is a MediaStreamTrack
+      // (only bindTrack writes there). The type union also permits
+      // HTMLMediaElement to satisfy connectSourceVideo, but the avatar
+      // branch never receives one. We duck-type via `'readyState' in x`
+      // rather than `instanceof MediaStreamTrack` because Node test env
+      // uses plain object stubs that don't extend the DOM constructor.
+      const candidate = avatarBranch.inputId;
+      const track =
+        candidate && typeof candidate === 'object' && 'readyState' in candidate
+          ? (candidate as MediaStreamTrack)
+          : null;
+      if (track && track.readyState === 'ended') {
+        avatarBranch.source = null;
+        avatarBranch.inputId = null;
+        avatarBranch.inputTrackId = null;
+        return;
+      }
       unbind(avatarBranch);
+    },
+
+    setSourceGain(value: number, durationMs?: number): void {
+      ensureOpen();
+      const param = sourceBranch.gain.gain;
+      const clamped = Math.max(0, Math.min(1, value));
+      if (!durationMs || durationMs <= 0) {
+        // Instant set — cancel any in-flight ramp first so a follow-up
+        // ramp doesn't fight a stale schedule.
+        try { param.cancelScheduledValues(ctx.currentTime); } catch { /* spec-tolerant */ }
+        param.value = clamped;
+        return;
+      }
+      // Linear ramp. setValueAtTime to anchor the starting point, otherwise
+      // linearRampToValueAtTime ramps from the LAST scheduled value, which
+      // can be in the future for a chained ramp.
+      //
+      // Mid-ramp follow-up note: per Web Audio spec, after cancelScheduled-
+      // Values the parameter holds the audio-thread-applied value, which
+      // lags currentTime by one render quantum (~3ms). Reading param.value
+      // and re-anchoring with setValueAtTime is correct for human-time
+      // (300ms+) ramps; sub-render-quantum chained ramps may produce a
+      // single-sample step. Acceptable for the Ask-swap use case.
+      const t0 = ctx.currentTime;
+      try { param.cancelScheduledValues(t0); } catch { /* spec-tolerant */ }
+      param.setValueAtTime(param.value, t0);
+      param.linearRampToValueAtTime(clamped, t0 + durationMs / 1000);
     },
 
     close(): void {

@@ -50,9 +50,32 @@ function makeFakeContext() {
   const destination = makeNode('destination');
   const ctx = {
     destination,
+    currentTime: 0,
     createGain(): object {
-      const node = makeNode('gain') as unknown as { gain: { value: number } };
-      node.gain = { value: 1 };
+      const node = makeNode('gain') as unknown as {
+        gain: {
+          value: number;
+          cancelScheduledValues: (t: number) => void;
+          setValueAtTime: (v: number, t: number) => void;
+          linearRampToValueAtTime: (v: number, t: number) => void;
+          _scheduled: Array<{ op: string; v?: number; t: number }>;
+        };
+      };
+      const scheduled: Array<{ op: string; v?: number; t: number }> = [];
+      node.gain = {
+        value: 1,
+        _scheduled: scheduled,
+        cancelScheduledValues: (t: number) => { scheduled.push({ op: 'cancel', t }); },
+        setValueAtTime: (v: number, t: number) => { scheduled.push({ op: 'set', v, t }); node.gain.value = v; },
+        // Real AudioParam updates .value continuously during a ramp. We
+        // approximate by jumping to the target value at the end-time
+        // (audit M6 integration — without this, a future "did the ramp
+        // land at the target?" test would silently false-green).
+        linearRampToValueAtTime: (v: number, t: number) => {
+          scheduled.push({ op: 'ramp', v, t });
+          node.gain.value = v;
+        },
+      };
       return node;
     },
     createMediaStreamDestination(): object {
@@ -246,6 +269,97 @@ describe('connectAvatar / disconnectAvatar', () => {
   it('disconnectAvatar removes the streamSrc edge', () => {
     const mixer = createAudioMixer({ audioContext: fake.ctx as unknown as AudioContext });
     mixer.connectAvatar(fakeTrack());
+    mixer.disconnectAvatar();
+    expect(fake.edges.some((e) => e.from.startsWith('streamSrc#'))).toBe(false);
+  });
+});
+
+type CapturedGain = {
+  value: number;
+  _scheduled: Array<{ op: string }>;
+  cancelScheduledValues: (t: number) => void;
+  setValueAtTime: (v: number, t: number) => void;
+  linearRampToValueAtTime: (v: number, t: number) => void;
+};
+
+function captureGains(): { ctx: object; captured: CapturedGain[] } {
+  const captured: CapturedGain[] = [];
+  const ctx = {
+    ...fake.ctx,
+    createGain(): object {
+      const node = fake.ctx.createGain() as unknown as { gain: CapturedGain };
+      captured.push(node.gain);
+      return node;
+    },
+  };
+  return { ctx, captured };
+}
+
+describe('setSourceGain (audit C1 integration)', () => {
+  it('instant set when durationMs is 0 or omitted', () => {
+    const { ctx, captured } = captureGains();
+    const mixer = createAudioMixer({ audioContext: ctx as unknown as AudioContext });
+    const sourceGain = captured.find((g) => g.value === GAIN_SOURCE)!;
+    expect(sourceGain).toBeDefined();
+    mixer.setSourceGain(0);
+    expect(sourceGain.value).toBe(0);
+    expect(sourceGain._scheduled.some((s) => s.op === 'ramp')).toBe(false);
+  });
+
+  it('ramps when durationMs is positive', () => {
+    const { ctx, captured } = captureGains();
+    const mixer = createAudioMixer({ audioContext: ctx as unknown as AudioContext });
+    const sourceGain = captured.find((g) => g.value === GAIN_SOURCE)!;
+    mixer.setSourceGain(0, 300);
+    const ops = sourceGain._scheduled.map((s) => s.op);
+    expect(ops).toContain('cancel');
+    expect(ops).toContain('set');
+    expect(ops).toContain('ramp');
+  });
+
+  it('clamps value to [0,1]', () => {
+    const { ctx, captured } = captureGains();
+    const mixer = createAudioMixer({ audioContext: ctx as unknown as AudioContext });
+    const sourceGain = captured.find((g) => g.value === GAIN_SOURCE)!;
+    mixer.setSourceGain(2.5);
+    expect(sourceGain.value).toBe(1);
+    mixer.setSourceGain(-0.5);
+    expect(sourceGain.value).toBe(0);
+  });
+
+  it('throws after close()', () => {
+    const mixer = createAudioMixer({ audioContext: fake.ctx as unknown as AudioContext });
+    mixer.close();
+    expect(() => mixer.setSourceGain(0)).toThrow(/after close/);
+  });
+});
+
+describe('disconnectAvatar with ended track (audit C2 integration)', () => {
+  it('skips source.disconnect when track.readyState === "ended"', () => {
+    // Safari WebKit bug 217983: source.disconnect() on a MediaStreamSource
+    // whose underlying track is 'ended' throws InvalidStateError. We
+    // defensively skip the disconnect call and clear branch state directly.
+    const mixer = createAudioMixer({ audioContext: fake.ctx as unknown as AudioContext });
+    const track = { id: 't-x', readyState: 'live' as MediaStreamTrackState };
+    mixer.connectAvatar(track as unknown as MediaStreamTrack);
+    // Mutate to ended (the controller's bridge.close would do this).
+    track.readyState = 'ended';
+    // Verify no source.disconnect call hits the streamSrc edge — it would
+    // remove the streamSrc→gain edge from fake.edges. Snapshot before.
+    const beforeEdges = fake.edges.filter((e) => e.from.startsWith('streamSrc#')).length;
+    mixer.disconnectAvatar();
+    const afterEdges = fake.edges.filter((e) => e.from.startsWith('streamSrc#')).length;
+    // Skip path: edge stays (no disconnect call) but branch state is null.
+    expect(afterEdges).toBe(beforeEdges);
+    // Re-connect succeeds — branch.inputId was nulled.
+    expect(() => mixer.connectAvatar({ id: 'new', readyState: 'live' as MediaStreamTrackState } as unknown as MediaStreamTrack)).not.toThrow();
+  });
+
+  it('disconnects normally when track is still live', () => {
+    const mixer = createAudioMixer({ audioContext: fake.ctx as unknown as AudioContext });
+    const track = { id: 't-y', readyState: 'live' as MediaStreamTrackState };
+    mixer.connectAvatar(track as unknown as MediaStreamTrack);
+    expect(fake.edges.some((e) => e.from.startsWith('streamSrc#'))).toBe(true);
     mixer.disconnectAvatar();
     expect(fake.edges.some((e) => e.from.startsWith('streamSrc#'))).toBe(false);
   });
