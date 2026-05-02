@@ -119,6 +119,10 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
   // pacing experiments. Default 0 = no delay.
   const [interTurnDelayMs, setInterTurnDelayMs] = useState<number>(0);
   const cannedRef = useRef<Uint8Array | null>(null);
+  // sessionIdx → list of binary audio frames captured from the proxy. Kept
+  // in a ref (not state) — audio buffers are large and should not trigger
+  // re-renders. Cleared on each new run.
+  const sessionAudioRef = useRef<Map<number, Uint8Array[]>>(new Map());
   const device = useMemo(detectDevice, []);
 
   const append = useCallback((s: string) => {
@@ -134,6 +138,7 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
   const runOneSession = useCallback(async (sessionIdx: number): Promise<SessionResult> => {
     const result: SessionResult = { sessionIdx, turns: [] };
     const canned = cannedRef.current!;
+    sessionAudioRef.current.set(sessionIdx, []);
 
     // 1. Ticket
     const t0 = performance.now();
@@ -184,7 +189,12 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
 
     ws.addEventListener('message', (ev) => {
       if (typeof ev.data !== 'string') {
-        // Binary: TTS audio frame
+        // Binary: TTS audio frame from Gemini (24kHz LE PCM16 mono per SDK).
+        // Capture for playback so we can verify the model is actually
+        // answering, not emitting garbage. Each ev.data is an ArrayBuffer.
+        const frames = sessionAudioRef.current.get(sessionIdx);
+        if (frames) frames.push(new Uint8Array(ev.data as ArrayBuffer));
+
         if (lastSentAtMs && !firstAudioRecvAtMs) {
           firstAudioRecvAtMs = performance.now();
           pending.turnFirstAudio?.(firstAudioRecvAtMs - lastSentAtMs);
@@ -351,10 +361,39 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
     return result;
   }, [model, creatorId, append, turnsPerSession, interTurnDelayMs]);
 
+  const playSessionAudio = useCallback(async (sessionIdx: number) => {
+    const frames = sessionAudioRef.current.get(sessionIdx);
+    if (!frames || frames.length === 0) {
+      append(`session ${sessionIdx}: no audio captured`);
+      return;
+    }
+    const totalBytes = frames.reduce((n, f) => n + f.length, 0);
+    const merged = new Uint8Array(totalBytes);
+    let off = 0;
+    for (const f of frames) { merged.set(f, off); off += f.length; }
+
+    // Gemini Live emits 24kHz LE PCM16 mono per SDK docs.
+    const SAMPLE_RATE = 24_000;
+    const samples = totalBytes / 2;
+    const float32 = new Float32Array(samples);
+    const view = new DataView(merged.buffer, merged.byteOffset, merged.byteLength);
+    for (let i = 0; i < samples; i++) float32[i] = view.getInt16(i * 2, true) / 32768;
+
+    const ctx = new AudioContext();
+    const buf = ctx.createBuffer(1, samples, SAMPLE_RATE);
+    buf.copyToChannel(float32, 0);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    src.start();
+    append(`session ${sessionIdx}: playing ${(samples / SAMPLE_RATE).toFixed(2)}s of audio`);
+  }, [append]);
+
   const onRun = useCallback(async () => {
     if (!cannedRef.current) return;
     setRunning(true);
     setSessions([]);
+    sessionAudioRef.current.clear();
     append(`starting proxy cell: model=${model}, sessions=${SESSIONS_PER_CELL}, turns=${turnsPerSession}`);
     const collected: SessionResult[] = [];
     for (let i = 1; i <= SESSIONS_PER_CELL; i++) {
@@ -455,7 +494,15 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
         <h3>Sessions</h3>
         {sessions.map((s) => (
           <div key={s.sessionIdx} style={{ marginBottom: 12 }}>
-            <div><strong>Session {s.sessionIdx}</strong> {s.aborted && <span style={{ color: 'crimson' }}>aborted: {s.aborted}</span>}</div>
+            <div>
+              <strong>Session {s.sessionIdx}</strong>
+              <button
+                onClick={() => playSessionAudio(s.sessionIdx)}
+                style={{ marginLeft: 8, fontSize: 12 }}
+                title="Play all TTS audio frames received for this session"
+              >▶ Play audio</button>
+              {s.aborted && <span style={{ color: 'crimson', marginLeft: 8 }}>aborted: {s.aborted}</span>}
+            </div>
             <table style={{ borderCollapse: 'collapse', fontSize: 13 }}>
               <thead><tr>{['turn', 'ticket_ms', 'ws_ms', 'ready_ms', 'ttfa_ms', 'total_ms', 'status'].map((h) => (
                 <th key={h} style={{ border: '1px solid #ccc', padding: '2px 8px', textAlign: 'left' }}>{h}</th>
