@@ -21,7 +21,7 @@
 //      SimliBridge.preMintedSessionToken option — R3-C2/P0-5).
 
 import 'server-only';
-import { type NextRequest } from 'next/server';
+import { type NextRequest, after } from 'next/server';
 import * as Sentry from '@sentry/nextjs';
 import { supabaseServer } from '@/lib/supabase/server';
 import { supabaseAdmin } from '@/lib/supabase/admin';
@@ -30,6 +30,8 @@ import { json, isSameOrigin, mapPgError } from '@/lib/session/http-helpers';
 import { isAllowedWireModel, WIRE_TO_ENUM } from '@/lib/voice/model-map';
 import { mintEphemeral, MintError } from '@/lib/voice/mint-ephemeral';
 import { mintSimliSessionToken, SimliMintError } from '@/lib/avatar/mint-simli';
+import { createHash } from 'node:crypto';
+import { candidateTokenHashes, isValidTokenPlaintext } from '@/lib/recording/referral-token';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -197,6 +199,27 @@ export async function POST(req: NextRequest) {
     return json(502, { error: 'gemini_mint_failed' });
   }
 
+  // Day 4 — first_session credit via Next 15 `after()` so the work runs
+  // post-response while the serverless container is kept alive (audit C2 Day
+  // 4 fix — bare fire-and-forget on Vercel is killed when the response
+  // stream closes, dropping the in-flight Supabase RPC). Idempotent on the
+  // RPC side, so a duplicate call from a cold-start retry is safe.
+  const refCookie = req.cookies.get('oak_ref')?.value;
+  if (refCookie && isValidTokenPlaintext(refCookie)) {
+    // Snapshot the request headers before after() runs — req object may not
+    // be valid after the response has been sent.
+    const ua       = req.headers.get('user-agent') ?? '';
+    const accept   = req.headers.get('accept-language') ?? '';
+    const xff      = req.headers.get('x-forwarded-for') ?? '';
+    after(async () => {
+      try {
+        await creditFirstSessionFireForget(callerUserId, refCookie, { ua, accept, xff });
+      } catch (err) {
+        Sentry.captureException(err, { extra: { op: 'recording_referral_credit_first_session_async' } });
+      }
+    });
+  }
+
   return json(200, {
     session_id: sessionId,
     tier,
@@ -206,4 +229,32 @@ export async function POST(req: NextRequest) {
     max_duration_s: dailyLimitRemaining,
     max_session_s: GEMINI_MAX_SESSION_S,
   });
+}
+
+async function creditFirstSessionFireForget(
+  userId: string,
+  refPlaintext: string,
+  reqMeta: { ua: string; accept: string; xff: string },
+): Promise<void> {
+  const hashes = candidateTokenHashes(refPlaintext);
+  if (hashes.length === 0) return;
+
+  const { ua, accept, xff } = reqMeta;
+  const ip = xff.split(',')[0]?.trim() ?? '';
+  const ipPrefix = ip.includes('.') ? ip.split('.').slice(0, 3).join('.') : ip.split(':').slice(0, 4).join(':');
+  const deviceFp = createHash('sha256').update(`${ua}|${accept}|${ipPrefix}`).digest('hex').slice(0, 32);
+
+  const admin = supabaseAdmin();
+  for (const tokenHash of hashes) {
+    const { error } = await admin.rpc('recording_referral_credit_first_session', {
+      p_token_hash: tokenHash,
+      p_new_user:   userId,
+      p_device_fp:  deviceFp,
+      p_ip_prefix:  ipPrefix,
+    });
+    if (error) {
+      // Surface but don't throw — the user's session opened successfully.
+      Sentry.captureException(error, { extra: { op: 'recording_referral_credit_first_session' } });
+    }
+  }
 }

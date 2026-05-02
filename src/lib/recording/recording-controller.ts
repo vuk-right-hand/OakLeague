@@ -114,9 +114,20 @@ export type UseRecordingControllerOptions = {
   getSourceVideoEl: () => HTMLVideoElement | null;
   /** "vuk" — pass without leading '@'. */
   creatorHandle: string;
-  /** Pre-minted referral URL (Plan R3-M3 — minted at open-check, not finalize,
-   *  so the in-video URL == the share URL). */
+  /** Fallback referral URL drawn into the end-card if the open-check mint
+   *  fails (rate-limit hit / network error / kill-switch off). Format:
+   *  `oakl.gg/r/<creator-handle>` is a reasonable degrade — points to the
+   *  creator's drawer, no attribution. The controller hits
+   *  /api/recording/open-check at ARM and PATCHES the compositor with the
+   *  real shortUrl when the mint succeeds (Plan R3-M3). */
   referralUrl: string;
+  /** UUID — used by /api/recording/open-check to attribute the token to a
+   *  creator. Required for token mint to succeed; if omitted, the controller
+   *  skips the mint and falls back to the static referralUrl. */
+  creatorId?: string;
+  /** UUID — hook_id (hook/longform mode) or video_id (Ask mode). Required
+   *  alongside creatorId for the mint. */
+  clipId?: string;
   /** Pre-rasterized watermark bitmap. The hook does not own the SVG-to-bitmap
    *  rasterization (Plan §20.12 — caller pre-rasterizes once at module init
    *  to amortize the cost). Pass null to skip the logo blit. */
@@ -140,6 +151,11 @@ export type RecordingControllerHandle = {
    *  No-op unless currently armed; if armed, transitions to STOPPED with
    *  stopReason='ask_session_ended' and finalizes the recording. */
   signalAskSessionEnded: () => void;
+  /** Day 4 — explicit user-initiated discard (Discard button in the preview
+   *  modal). Distinguishes from dismissPreview which also fires on RESET /
+   *  unmount / route change (audit C3 Day 4). Calls dismissPreview AND
+   *  POSTs /api/recording/discard to revoke the referral token. */
+  discardByUser: () => void;
 };
 
 const TIMER_TICK_MS = 100; // 100ms cadence is plenty for the cap + end-card
@@ -153,7 +169,7 @@ export function useRecordingController(
   // every long-form viewer playback time tick).
   const {
     enabled, mode, getSourceVideoEl, creatorHandle, referralUrl,
-    watermarkBitmap, onStop, askDeps,
+    creatorId, clipId, watermarkBitmap, onStop, askDeps,
   } = opts;
 
   // Latest-ref callback for the source <video> getter (audit C1 day-2). The
@@ -215,6 +231,10 @@ export function useRecordingController(
   const hiddenAvatarVideoElRef = useRef<HTMLVideoElement | null>(null);
   const hiddenAvatarStreamRef = useRef<MediaStream | null>(null);
   const detachTrackUpdatesRef = useRef<(() => void) | null>(null);
+
+  // Day 4 — referral token plaintext, populated by the open-check fetch
+  // post-permission-grant. Used by discardByUser to call /api/recording/discard.
+  const activeTokenPlaintextRef = useRef<string | null>(null);
   const phaseRef = useRef<RecordingPhase>(phase);
   useEffect(() => { phaseRef.current = phase; }, [phase]);
 
@@ -285,6 +305,11 @@ export function useRecordingController(
     borrowedMicStreamRef.current = false;
     borrowedBridgeRef.current = null;
     blobChunksRef.current = [];
+    // Day 4: clear the token plaintext on teardown. discardByUser revokes
+    // the token via /api/recording/discard BEFORE calling teardown — once
+    // teardown clears the ref, that path is gone. RESET / unmount intentionally
+    // leak the token (90-day expiry; recording finalize at Day 5 will bind it).
+    activeTokenPlaintextRef.current = null;
   }, []);
 
   // ── ARM effect: run side effects on idle→priming→armed transition ────
@@ -382,6 +407,37 @@ export function useRecordingController(
       dispatch({ type: 'CAP_HIT', reason: 'unsupported', nowMs: performance.now() });
       teardown();
       return;
+    }
+
+    // 4b) Day 4 — referral token mint AFTER permission grant, BEFORE
+    //     compositor.start() so the end-card draws the real shortUrl
+    //     (Plan R3-M3, audit C2 Day 4). Mint failure is non-fatal: the
+    //     compositor falls back to the static referralUrl prop. Cap-hit
+    //     (429) and network errors degrade silently.
+    let resolvedReferralUrl = referralUrl;
+    activeTokenPlaintextRef.current = null;
+    if (creatorId && clipId && process.env.NEXT_PUBLIC_REACT_CAPTURE_ENABLED === '1') {
+      try {
+        const res = await fetch('/api/recording/open-check', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ creator_id: creatorId, clip_id: clipId }),
+        });
+        if (seq !== armRequestSeqRef.current) { teardown(); return; }
+        if (res.ok) {
+          const j = (await res.json()) as { token?: string; short_url?: string };
+          if (typeof j.short_url === 'string' && j.short_url.length > 0) {
+            resolvedReferralUrl = j.short_url;
+          }
+          if (typeof j.token === 'string' && j.token.length > 0) {
+            activeTokenPlaintextRef.current = j.token;
+          }
+        }
+        // Non-OK (429 cap, 401, 500): degrade silently, keep static URL.
+      } catch {
+        // Network error / aborted — degrade silently.
+      }
     }
 
     // 5) AudioContext. Hook/longform: lazy-create one per ARM (Chrome 6-cap
@@ -565,7 +621,7 @@ export function useRecordingController(
       cameraVideoEl: camEl,
       sourceVideoEl: compositorSourceEl ?? null,
       watermarkBitmap: watermarkBitmap ?? null,
-      referralUrl,
+      referralUrl: resolvedReferralUrl,
       creatorHandle,
     });
     compositorRef.current = compositor;
@@ -648,7 +704,7 @@ export function useRecordingController(
       if (seq !== armRequestSeqRef.current) return;
       compositorRef.current?.enableEndCard();
     }, MAX_RECORDING_MS - END_CARD_MS);
-  }, [dispatch, enabled, creatorHandle, referralUrl, watermarkBitmap, teardown]);
+  }, [dispatch, enabled, mode, creatorHandle, referralUrl, creatorId, clipId, watermarkBitmap, teardown]);
 
   // ── ARMED side effects: cap timer + visibility + end-card ────────────
   useEffect(() => {
@@ -749,6 +805,27 @@ export function useRecordingController(
     dispatch({ type: 'ASK_SESSION_ENDED', nowMs: performance.now() });
   }, [dispatch]);
 
+  const discardByUser = useCallback((): void => {
+    // Audit C3 Day 4 — explicit user-initiated Discard (preview modal button).
+    // Revokes the referral token BEFORE teardown clears the plaintext ref.
+    // Fire-and-forget POST: failure shouldn't block the UX (the token will
+    // expire naturally at 90d if the revoke route is unreachable).
+    const tokenToRevoke = activeTokenPlaintextRef.current;
+    if (tokenToRevoke && process.env.NEXT_PUBLIC_REACT_CAPTURE_ENABLED === '1') {
+      // No await — controller proceeds with dismissPreview teardown immediately.
+      void fetch('/api/recording/discard', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token: tokenToRevoke }),
+      }).catch(() => { /* non-fatal */ });
+    }
+    armRequestSeqRef.current += 1;
+    teardown();
+    previewRef.current = null;
+    dispatch({ type: 'PREVIEW_DISMISSED', nowMs: performance.now() });
+  }, [dispatch, teardown]);
+
   const dismissPreview = useCallback((): void => {
     // Audit C2 (day-2): the camStream + AudioContext + canvas + watcher
     // were being kept alive deliberately during STOPPED→PREVIEW so the
@@ -794,6 +871,7 @@ export function useRecordingController(
     dismissPreview,
     reset,
     signalAskSessionEnded,
+    discardByUser,
   };
 }
 

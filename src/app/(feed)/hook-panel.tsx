@@ -11,6 +11,7 @@ import { useDeviceId } from '@/lib/feed/device-id';
 import { AskErrorPill } from '@/lib/feed/ask-error-pill';
 import { useFeedImpressionTracker } from './feed-impression-context';
 import { ReactButton } from '@/components/recording/ReactButton';
+import { RecordingPreview } from '@/components/recording/RecordingPreview';
 import { useRecordingController } from '@/lib/recording/recording-controller';
 import { isReactCaptureEnabled } from '@/components/recording/react-button-state';
 
@@ -102,7 +103,13 @@ export function HookPanel({
     // Ref-callback: controller reads at tap time (audit C1 day-2).
     getSourceVideoEl: () => playerRef.current,
     creatorHandle: group.creator.handle,
-    referralUrl: `oakl.gg/r/${hook.hook_id}`, // placeholder — Day-4 wires real referral mint
+    // Static fallback URL (creator drawer). Day 4: controller hits
+    // /api/recording/open-check and PATCHES with the real shortUrl when
+    // the mint succeeds. If mint fails (cap hit / network), this URL is
+    // what gets drawn into the end-card.
+    referralUrl: `oakl.gg/${group.creator.handle}`,
+    creatorId: group.creator.id,
+    clipId: hook.hook_id,
   });
 
   // D5+: track played-seconds, not snapshot position.
@@ -705,6 +712,13 @@ export function HookPanel({
           <ReactButton {...recording.buttonProps} />
         </div>
       )}
+
+      <RecordingPreview
+        preview={recording.preview}
+        onDismiss={recording.dismissPreview}
+        onDiscard={recording.discardByUser}
+      />
+
 
       <div
         style={{

@@ -14,11 +14,12 @@ import { useSessionPipe, type OpenEnvelope } from './use-session-pipe';
 import { shouldShowReconnectOverlay } from './session-reducer';
 import { captureSafe } from '@/lib/posthog-safe-capture';
 import { ReactButton } from '@/components/recording/ReactButton';
+import { RecordingPreview } from '@/components/recording/RecordingPreview';
 import { isReactCaptureEnabled } from '@/components/recording/react-button-state';
 import {
   useRecordingController,
   type AskDeps,
-  type RecordingPreview,
+  type RecordingPreview as RecordingPreviewBlob,
 } from '@/lib/recording/recording-controller';
 
 type Props = {
@@ -157,7 +158,7 @@ function LiveSession(props: LiveProps) {
     pipe.subscribeBridgeTrackUpdates,
   ]);
   const askEnabled = !!askDeps && (phase === 'ready' || phase === 'listening' || phase === 'speaking');
-  const onAskStop = useCallback((preview: RecordingPreview) => {
+  const onAskStop = useCallback((preview: RecordingPreviewBlob) => {
     captureSafe('react_ask_recording_stop', {
       session_id: props.envelope.session_id,
       stop_reason: preview.stopReason,
@@ -171,7 +172,11 @@ function LiveSession(props: LiveProps) {
     mode: 'ask',
     getSourceVideoEl: () => null, // Ask uses the hidden-video shim from askDeps.bridge
     creatorHandle: props.creatorHandle,
-    referralUrl: `oakl.gg/r/${props.hookId}`,
+    // Static fallback URL — controller patches with the real shortUrl from
+    // /api/recording/open-check on successful mint (Day 4).
+    referralUrl: `oakl.gg/${props.creatorHandle}`,
+    creatorId: props.creatorId,
+    clipId: props.hookId,
     askDeps,
     onStop: onAskStop,
   });
@@ -283,6 +288,12 @@ function LiveSession(props: LiveProps) {
             <ReactButton {...recording.buttonProps} />
           </div>
         )}
+
+        <RecordingPreview
+          preview={recording.preview}
+          onDismiss={recording.dismissPreview}
+          onDiscard={recording.discardByUser}
+        />
       </div>
 
       {/* Mic controls */}

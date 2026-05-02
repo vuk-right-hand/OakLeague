@@ -9,6 +9,7 @@ import { useDeviceId } from '@/lib/feed/device-id';
 import { AskErrorPill } from '@/lib/feed/ask-error-pill';
 import { envelopeStorageKey } from '@/app/s/[id]/session-client';
 import { ReactButton } from '@/components/recording/ReactButton';
+import { RecordingPreview } from '@/components/recording/RecordingPreview';
 import { useRecordingController } from '@/lib/recording/recording-controller';
 import { isReactCaptureEnabled } from '@/components/recording/react-button-state';
 import {
@@ -78,7 +79,11 @@ export function LongFormPlayer({
     // and the controller's onTap closure could otherwise lock to null).
     getSourceVideoEl: () => videoRef.current,
     creatorHandle,
-    referralUrl: `oakl.gg/r/${videoId}`, // Day-4 wires real referral mint
+    // Static fallback URL — controller patches with the real shortUrl from
+    // /api/recording/open-check on successful mint (Day 4).
+    referralUrl: `oakl.gg/${creatorHandle}`,
+    creatorId,
+    clipId: videoId,
   });
 
   // Quartile tracker (audit M3 + M5).
@@ -511,6 +516,13 @@ export function LongFormPlayer({
             <ReactButton {...recording.buttonProps} />
           </div>
         )}
+
+        <RecordingPreview
+          preview={recording.preview}
+          onDismiss={recording.dismissPreview}
+          onDiscard={recording.discardByUser}
+        />
+
 
         {/* Back button — top-left, always visible. */}
         <button
