@@ -334,6 +334,82 @@ describe('setSourceGain (audit C1 integration)', () => {
   });
 });
 
+describe('setAvatarGain (Day 3 — symmetric with setSourceGain)', () => {
+  it('instant set when durationMs is 0 or omitted', () => {
+    const { ctx, captured } = captureGains();
+    const mixer = createAudioMixer({ audioContext: ctx as unknown as AudioContext });
+    const avatarGain = captured.find((g) => g.value === GAIN_AVATAR)!;
+    expect(avatarGain).toBeDefined();
+    mixer.setAvatarGain(0.05);
+    expect(avatarGain.value).toBe(0.05);
+    expect(avatarGain._scheduled.some((s) => s.op === 'ramp')).toBe(false);
+  });
+
+  it('ramps when durationMs is positive', () => {
+    const { ctx, captured } = captureGains();
+    const mixer = createAudioMixer({ audioContext: ctx as unknown as AudioContext });
+    const avatarGain = captured.find((g) => g.value === GAIN_AVATAR)!;
+    mixer.setAvatarGain(0.05, 80);
+    const ops = avatarGain._scheduled.map((s) => s.op);
+    expect(ops).toContain('cancel');
+    expect(ops).toContain('set');
+    expect(ops).toContain('ramp');
+  });
+
+  it('clamps value to [0,1]', () => {
+    const { ctx, captured } = captureGains();
+    const mixer = createAudioMixer({ audioContext: ctx as unknown as AudioContext });
+    const avatarGain = captured.find((g) => g.value === GAIN_AVATAR)!;
+    mixer.setAvatarGain(2.5);
+    expect(avatarGain.value).toBe(1);
+    mixer.setAvatarGain(-0.5);
+    expect(avatarGain.value).toBe(0);
+  });
+
+  it('throws after close()', () => {
+    const mixer = createAudioMixer({ audioContext: fake.ctx as unknown as AudioContext });
+    mixer.close();
+    expect(() => mixer.setAvatarGain(0)).toThrow(/after close/);
+  });
+});
+
+describe('connectAvatar resets gain on retrack (audit M4 Day 3)', () => {
+  it('cancels in-flight duck-ramp + restores GAIN_AVATAR when LiveKit replaces the track', () => {
+    const { ctx, captured } = captureGains();
+    const mixer = createAudioMixer({ audioContext: ctx as unknown as AudioContext });
+    const avatarGain = captured.find((g) => g.value === GAIN_AVATAR)!;
+
+    // Initial track + a duck ramp in flight (mid-barge-in).
+    mixer.connectAvatar({ id: 'track-A', readyState: 'live' as MediaStreamTrackState } as unknown as MediaStreamTrack);
+    mixer.setAvatarGain(0.05, 80);
+    // Simulate the audio thread having advanced the param to a partial value
+    // mid-ramp (e.g. 0.4).
+    avatarGain.value = 0.4;
+
+    // LiveKit fires onAudioTrack with a new track ID (renegotiation).
+    avatarGain._scheduled.length = 0;
+    mixer.connectAvatar({ id: 'track-B', readyState: 'live' as MediaStreamTrackState } as unknown as MediaStreamTrack);
+
+    // Cancel + snap back to default — no leaking duck across renegotiation.
+    expect(avatarGain._scheduled.some((s) => s.op === 'cancel')).toBe(true);
+    expect(avatarGain.value).toBe(GAIN_AVATAR);
+  });
+
+  it('does not reset gain when the same-id track is re-bound (idempotent path)', () => {
+    const { ctx, captured } = captureGains();
+    const mixer = createAudioMixer({ audioContext: ctx as unknown as AudioContext });
+    const avatarGain = captured.find((g) => g.value === GAIN_AVATAR)!;
+    const sameTrack = { id: 'track-A', readyState: 'live' as MediaStreamTrackState } as unknown as MediaStreamTrack;
+    mixer.connectAvatar(sameTrack);
+    avatarGain.value = 0.4;
+    avatarGain._scheduled.length = 0;
+    // Same id — re-bind is a no-op, gain must NOT snap back.
+    mixer.connectAvatar({ id: 'track-A', readyState: 'live' as MediaStreamTrackState } as unknown as MediaStreamTrack);
+    expect(avatarGain.value).toBe(0.4);
+    expect(avatarGain._scheduled.length).toBe(0);
+  });
+});
+
 describe('disconnectAvatar with ended track (audit C2 integration)', () => {
   it('skips source.disconnect when track.readyState === "ended"', () => {
     // Safari WebKit bug 217983: source.disconnect() on a MediaStreamSource

@@ -8,11 +8,18 @@
 
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useSessionPipe, type OpenEnvelope } from './use-session-pipe';
 import { shouldShowReconnectOverlay } from './session-reducer';
 import { captureSafe } from '@/lib/posthog-safe-capture';
+import { ReactButton } from '@/components/recording/ReactButton';
+import { isReactCaptureEnabled } from '@/components/recording/react-button-state';
+import {
+  useRecordingController,
+  type AskDeps,
+  type RecordingPreview,
+} from '@/lib/recording/recording-controller';
 
 type Props = {
   sessionId: string;
@@ -120,6 +127,75 @@ function LiveSession(props: LiveProps) {
   const isOpening = phase === 'opening';
   const isRollingOver = phase === 'opening' && pipe.state.openedAtMs !== null && pipe.state.geminiReady === false && pipe.state.avatarReady === false;
 
+  // ── Recording wiring (Day 3) ──────────────────────────────────────────
+  // Mount ReactButton on Ask scene. Kill-switch via NEXT_PUBLIC_REACT_CAPTURE_
+  // ENABLED. The controller borrows AudioContext + mic + bridge from the pipe
+  // (audit C3/C4/M5 Day 3) — Ask scene owns those lifecycles.
+  const reactCaptureOn = isReactCaptureEnabled();
+  // Avatar must be ready before ARM — getCurrentTracks() returns nulls
+  // otherwise. Phase 'ready'/'listening'/'speaking' all imply avatar_ready=true
+  // per session-reducer; 'opening' does not.
+  const avatarReady = pipe.state.avatarReady;
+  // Build askDeps using the pipe accessors. Stable identity across renders
+  // because each function is useCallback-wrapped inside use-session-pipe.
+  const askDeps = useMemo<AskDeps | undefined>(() => {
+    if (!reactCaptureOn) return undefined;
+    if (!avatarReady) return undefined;
+    const ctx = pipe.getAudioContext();
+    const mic = pipe.getMicStream();
+    const bridge = pipe.getBridge();
+    if (!ctx || !mic || !bridge) return undefined;
+    return {
+      audioContext: ctx,
+      micStream: mic,
+      bridge,
+      subscribeTrackUpdates: pipe.subscribeBridgeTrackUpdates,
+    };
+  }, [
+    reactCaptureOn, avatarReady,
+    pipe.getAudioContext, pipe.getMicStream, pipe.getBridge,
+    pipe.subscribeBridgeTrackUpdates,
+  ]);
+  const askEnabled = !!askDeps && (phase === 'ready' || phase === 'listening' || phase === 'speaking');
+  const onAskStop = useCallback((preview: RecordingPreview) => {
+    captureSafe('react_ask_recording_stop', {
+      session_id: props.envelope.session_id,
+      stop_reason: preview.stopReason,
+      duration_ms: preview.durationMs,
+      mime_type: preview.mimeType,
+      blob_size: preview.blob.size,
+    });
+  }, [props.envelope.session_id]);
+  const recording = useRecordingController({
+    enabled: askEnabled,
+    mode: 'ask',
+    getSourceVideoEl: () => null, // Ask uses the hidden-video shim from askDeps.bridge
+    creatorHandle: props.creatorHandle,
+    referralUrl: `oakl.gg/r/${props.hookId}`,
+    askDeps,
+    onStop: onAskStop,
+  });
+  // Audit C1 Day 3 — endSession() is synchronous: it dispatches user_close,
+  // closes the bridge, the audio context, the mixer, the gemini WS — all
+  // before any phase-watching effect can run. By the time `phase==='closed'`
+  // is observed, the avatar tracks are dead and the recording's tail is
+  // silent. The recording controller MUST be signaled BEFORE endSession
+  // tears anything down. Wrap endSession in a handler that signals first.
+  const handleEndSession = useCallback(async (reason: 'user_ended' | 'client_error') => {
+    try { recording.signalAskSessionEnded(); } catch { /* not armed */ }
+    await pipe.endSession(reason);
+  }, [pipe, recording]);
+  // Backstop: a fatal_error path or a server-driven close that never goes
+  // through the End button still sets phase='closed'. Once-only via ref so
+  // re-renders post-close (the 1500ms router.push delay) don't keep firing.
+  const askEndedSignaledRef = useRef(false);
+  useEffect(() => {
+    if (phase === 'closed' && !askEndedSignaledRef.current) {
+      askEndedSignaledRef.current = true;
+      try { recording.signalAskSessionEnded(); } catch { /* */ }
+    }
+  }, [phase, recording]);
+
   return (
     <div
       style={{
@@ -154,7 +230,7 @@ function LiveSession(props: LiveProps) {
           </div>
           <button
             type="button"
-            onClick={() => void pipe.endSession('user_ended')}
+            onClick={() => void handleEndSession('user_ended')}
             style={{
               pointerEvents: 'auto',
               background: 'rgba(255,255,255,0.15)',
@@ -197,6 +273,15 @@ function LiveSession(props: LiveProps) {
             label={pipe.state.errorMessage ?? 'Session ended'}
             sublabel="Returning to feed…"
           />
+        )}
+
+        {/* React button — Day 3 Ask-mode capture. Mounts only with the
+            kill-switch flag on AND avatar ready (so getCurrentTracks has
+            something to return). Bottom-right matches hook-panel placement. */}
+        {reactCaptureOn && askEnabled && (
+          <div style={{ position: 'absolute', right: 16, bottom: 16, zIndex: 2 }}>
+            <ReactButton {...recording.buttonProps} />
+          </div>
         )}
       </div>
 

@@ -94,6 +94,14 @@ export interface AudioMixer {
    *  overlapping hook + avatar audio in the recording. */
   setSourceGain(value: number, durationMs?: number): void;
 
+  /** Ramp the avatar gain — symmetric with setSourceGain. Used to duck the
+   *  avatar in the recording during user barge-in (the live audio at the
+   *  bridge level is already paused; this only affects what's captured into
+   *  the file). Pass 0.05 / 80ms for a typical duck; restore to GAIN_AVATAR
+   *  on resume. Audit M4 (Day 3 plan) — the same cancel-scheduled-values
+   *  treatment that setSourceGain has. */
+  setAvatarGain(value: number, durationMs?: number): void;
+
   /** Tear down all gain nodes + sources. AudioContext lifecycle is the
    *  caller's — close() does NOT call audioContext.close(). */
   close(): void;
@@ -134,7 +142,7 @@ export function createAudioMixer(opts: AudioMixerOptions): AudioMixer {
   // identity OR by track.id — is a no-op. Identity covers stable refs;
   // track.id covers React StrictMode double-invoke / parent re-renders
   // that wrap the track in a new object but expose the same underlying id.
-  function bindTrack(branch: Branch, track: MediaStreamTrack): void {
+  function bindTrack(branch: Branch, track: MediaStreamTrack, defaultGain?: number): void {
     if (branch.inputId === track) return;
     if (track.id && branch.inputTrackId === track.id) {
       branch.inputId = track; // refresh ref, keep node
@@ -149,6 +157,16 @@ export function createAudioMixer(opts: AudioMixerOptions): AudioMixer {
     branch.source = node;
     branch.inputId = track;
     branch.inputTrackId = track.id || null;
+    // Audit M4 (Day 3): if a duck-ramp was in flight on this branch's gain
+    // when LiveKit replaced the track, the GainNode persists with whatever
+    // partial value the ramp had reached (e.g. 0.4). Cancel any scheduled
+    // ramp and snap back to the branch default so the new track plays at
+    // expected volume rather than leaking the duck across the renegotiation.
+    if (defaultGain !== undefined) {
+      const param = branch.gain.gain;
+      try { param.cancelScheduledValues(ctx.currentTime); } catch { /* spec-tolerant */ }
+      param.value = defaultGain;
+    }
   }
 
   function unbind(branch: Branch): void {
@@ -163,6 +181,23 @@ export function createAudioMixer(opts: AudioMixerOptions): AudioMixer {
   let closed = false;
   function ensureOpen(): void {
     if (closed) throw new Error('AudioMixer: method called after close()');
+  }
+
+  // Shared ramp helper for setSourceGain / setAvatarGain. Linear ramp with a
+  // setValueAtTime anchor so chained ramps don't ramp from a future scheduled
+  // value. Sub-render-quantum chained ramps may produce a single-sample step;
+  // acceptable for human-time (80–300ms) duck/swap use cases.
+  function rampGain(param: AudioParam, value: number, durationMs?: number): void {
+    const clamped = Math.max(0, Math.min(1, value));
+    if (!durationMs || durationMs <= 0) {
+      try { param.cancelScheduledValues(ctx.currentTime); } catch { /* spec-tolerant */ }
+      param.value = clamped;
+      return;
+    }
+    const t0 = ctx.currentTime;
+    try { param.cancelScheduledValues(t0); } catch { /* spec-tolerant */ }
+    param.setValueAtTime(param.value, t0);
+    param.linearRampToValueAtTime(clamped, t0 + durationMs / 1000);
   }
 
   return {
@@ -199,7 +234,8 @@ export function createAudioMixer(opts: AudioMixerOptions): AudioMixer {
 
     connectAvatar(track: MediaStreamTrack): void {
       ensureOpen();
-      bindTrack(avatarBranch, track);
+      // Pass GAIN_AVATAR so a retrack mid-duck restores expected loudness.
+      bindTrack(avatarBranch, track, GAIN_AVATAR);
     },
     disconnectAvatar(): void {
       ensureOpen();
@@ -232,29 +268,12 @@ export function createAudioMixer(opts: AudioMixerOptions): AudioMixer {
 
     setSourceGain(value: number, durationMs?: number): void {
       ensureOpen();
-      const param = sourceBranch.gain.gain;
-      const clamped = Math.max(0, Math.min(1, value));
-      if (!durationMs || durationMs <= 0) {
-        // Instant set — cancel any in-flight ramp first so a follow-up
-        // ramp doesn't fight a stale schedule.
-        try { param.cancelScheduledValues(ctx.currentTime); } catch { /* spec-tolerant */ }
-        param.value = clamped;
-        return;
-      }
-      // Linear ramp. setValueAtTime to anchor the starting point, otherwise
-      // linearRampToValueAtTime ramps from the LAST scheduled value, which
-      // can be in the future for a chained ramp.
-      //
-      // Mid-ramp follow-up note: per Web Audio spec, after cancelScheduled-
-      // Values the parameter holds the audio-thread-applied value, which
-      // lags currentTime by one render quantum (~3ms). Reading param.value
-      // and re-anchoring with setValueAtTime is correct for human-time
-      // (300ms+) ramps; sub-render-quantum chained ramps may produce a
-      // single-sample step. Acceptable for the Ask-swap use case.
-      const t0 = ctx.currentTime;
-      try { param.cancelScheduledValues(t0); } catch { /* spec-tolerant */ }
-      param.setValueAtTime(param.value, t0);
-      param.linearRampToValueAtTime(clamped, t0 + durationMs / 1000);
+      rampGain(sourceBranch.gain.gain, value, durationMs);
+    },
+
+    setAvatarGain(value: number, durationMs?: number): void {
+      ensureOpen();
+      rampGain(avatarBranch.gain.gain, value, durationMs);
     },
 
     close(): void {

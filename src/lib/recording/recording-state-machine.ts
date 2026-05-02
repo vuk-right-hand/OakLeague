@@ -28,7 +28,8 @@ export const STOP_REASONS = [
   'swipe',               // feed swipe-up tear-down
   'rtc_track_ended',     // avatar video/audio track ended (Plan §20.11)
   'permission_revoked',  // mid-session getUserMedia track ended/muted
-  'ask_open_timeout',    // Plan §20.10 — 5s without onVideoTrack
+  'ask_open_timeout',    // Plan §20.10 — 5s without onVideoTrack OR hidden-video loadedmetadata never fires
+  'ask_session_ended',   // Day 3 — Ask scene's session pipe closed gracefully (user_ended / closed)
   'recorder_error',      // MediaRecorder onerror
   'unmount',             // surface unmounted (route change)
 ] as const;
@@ -71,6 +72,7 @@ export type RecordingEvent =
   | { type: 'SWIPE'; nowMs: number }
   | { type: 'TRACK_ENDED'; nowMs: number }
   | { type: 'ASK_OPEN_TIMEOUT'; nowMs: number }
+  | { type: 'ASK_SESSION_ENDED'; nowMs: number }
   | { type: 'RECORDER_ERROR'; nowMs: number; message: string }
   | { type: 'UNMOUNT'; nowMs: number }
   | { type: 'PREVIEW_ARRIVED'; nowMs: number; durationMs: number }
@@ -152,6 +154,9 @@ export function recordingReducer(phase: RecordingPhase, ev: RecordingEvent): Rec
       }
       if (ev.type === 'ASK_OPEN_TIMEOUT') {
         return { kind: 'stopped', stopReason: 'ask_open_timeout', armedAtMs: phase.armedAtMs, stoppedAtMs: ev.nowMs };
+      }
+      if (ev.type === 'ASK_SESSION_ENDED') {
+        return { kind: 'stopped', stopReason: 'ask_session_ended', armedAtMs: phase.armedAtMs, stoppedAtMs: ev.nowMs };
       }
       if (ev.type === 'RECORDER_ERROR') {
         return { kind: 'stopped', stopReason: 'recorder_error', armedAtMs: phase.armedAtMs, stoppedAtMs: ev.nowMs };

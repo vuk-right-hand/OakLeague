@@ -83,6 +83,25 @@ export type PipeHandle = {
   // unlock AudioContext on iOS).
   retryAfterGesture: () => Promise<void>;
   lipsyncLatencyMs: number | null;
+  /** Day 3 — accessors for the recording controller's askDeps. Returns null
+   *  when the underlying ref is not yet populated (mic not started, bridge
+   *  pre-open, or post-endSession). The recording controller is expected to
+   *  read these only at ARM time (user-gesture chain — mic is necessarily
+   *  started and bridge is open by then). The track-update subscription
+   *  re-fires on LiveKit renegotiation and on initial bridge open. */
+  getAudioContext: () => AudioContext | null;
+  getMicStream: () => MediaStream | null;
+  getBridge: () => AvatarBridge | null;
+  /** Subscribe to track replacements. Pass `{ replayInitial: false }` (Day 3
+   *  audit C2/C3) when the caller has ALREADY consumed the current tracks
+   *  via getBridge().getCurrentTracks() — otherwise the synchronous replay
+   *  on subscribe will fire `removeTrack(t); addTrack(t)` on a stream that
+   *  was just initialized with that exact track, briefly orphaning the only
+   *  frame source for the hidden-video element (Safari renders a black frame). */
+  subscribeBridgeTrackUpdates: (
+    cb: (tracks: { video: MediaStreamTrack | null; audio: MediaStreamTrack | null }) => void,
+    opts?: { replayInitial?: boolean },
+  ) => () => void;
 };
 
 export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
@@ -114,6 +133,26 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   const closedRef = useRef<boolean>(false);
   const rollingOverRef = useRef<boolean>(false);
   const lipsyncLatencyRef = useRef<number | null>(null);
+  // Day 3 — track-update subscribers (recording controller subscribes for
+  // mid-recording LiveKit renegotiation handling). Plain Set so add/remove
+  // is constant-time; subscriber callbacks fire SYNCHRONOUSLY when the bridge
+  // re-fires onVideoTrack / onAudioTrack. Both are coalesced via the cached
+  // refs below: a joint reneg surfaces as two sequential calls within a
+  // microtask group (avatar-bridge.ts §120-125), so we batch the latest known
+  // tracks rather than emitting once per track.
+  type BridgeTracks = { video: MediaStreamTrack | null; audio: MediaStreamTrack | null };
+  const trackSubscribersRef = useRef<Set<(t: BridgeTracks) => void>>(new Set());
+  const lastTracksRef = useRef<BridgeTracks>({ video: null, audio: null });
+  function broadcastTracks(): void {
+    const snapshot = { ...lastTracksRef.current };
+    for (const cb of trackSubscribersRef.current) {
+      try { cb(snapshot); } catch (e) {
+        if (process.env.NODE_ENV !== 'production') {
+          console.warn('[use-session-pipe] track subscriber threw:', e);
+        }
+      }
+    }
+  }
   // Playback of Gemini audio chunks via the Web Audio API route goes directly
   // to the Simli bridge — we don't play Gemini audio to the user locally.
   // The avatar speaks.
@@ -156,6 +195,10 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
           lipsyncLatencyRef.current = ms;
           captureSafe('simli_lipsync_latency_ms', { ms, session_id: sessionIdRef.current });
         },
+        // Day 3 — broadcast initial track + LiveKit renegotiation re-fires to
+        // recording-controller subscribers.
+        onVideoTrack: (t) => { lastTracksRef.current.video = t; broadcastTracks(); },
+        onAudioTrack: (t) => { lastTracksRef.current.audio = t; broadcastTracks(); },
       });
       bridgeRef.current = bridge;
       try {
@@ -385,6 +428,8 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
           dispatchRef({ kind: 'fatal_error', message: `avatar: ${err.code}` });
         },
         onLipsyncLatency: (ms) => { lipsyncLatencyRef.current = ms; },
+        onVideoTrack: (t) => { lastTracksRef.current.video = t; broadcastTracks(); },
+        onAudioTrack: (t) => { lastTracksRef.current.audio = t; broadcastTracks(); },
       });
       bridgeRef.current = bridge;
       try {
@@ -565,6 +610,34 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     };
   }, []);
 
+  // Day 3 — accessor surface for the recording controller. Closures over
+  // refs, NOT the values, so a parent re-render carries the freshest pointers.
+  const getAudioContext = useCallback((): AudioContext | null => audioCtxRef.current, []);
+  const getMicStream = useCallback((): MediaStream | null => micStreamRef.current, []);
+  const getBridge = useCallback((): AvatarBridge | null => bridgeRef.current, []);
+  const subscribeBridgeTrackUpdates = useCallback(
+    (
+      cb: (t: { video: MediaStreamTrack | null; audio: MediaStreamTrack | null }) => void,
+      opts?: { replayInitial?: boolean },
+    ) => {
+      trackSubscribersRef.current.add(cb);
+      // Replay default ON for backwards compat. Audit C2/C3 Day 3: callers
+      // who consumed the initial tracks via getBridge().getCurrentTracks()
+      // MUST opt out, otherwise the sync replay re-fires the same track
+      // identities and forces a remove/add on a freshly-built stream.
+      const shouldReplay = opts?.replayInitial !== false;
+      if (shouldReplay && (lastTracksRef.current.video || lastTracksRef.current.audio)) {
+        try { cb({ ...lastTracksRef.current }); } catch (e) {
+          if (process.env.NODE_ENV !== 'production') {
+            console.warn('[use-session-pipe] track subscriber threw on replay:', e);
+          }
+        }
+      }
+      return () => { trackSubscribersRef.current.delete(cb); };
+    },
+    [],
+  );
+
   return {
     state,
     videoRef,
@@ -574,5 +647,9 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     endSession,
     retryAfterGesture,
     lipsyncLatencyMs: lipsyncLatencyRef.current,
+    getAudioContext,
+    getMicStream,
+    getBridge,
+    subscribeBridgeTrackUpdates,
   };
 }

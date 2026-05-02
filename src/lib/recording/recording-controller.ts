@@ -53,8 +53,41 @@ import {
   selectButtonState,
 } from './recording-state-machine';
 import type { ReactButtonProps } from '@/components/recording/ReactButton';
+import type { AvatarBridge } from '@/lib/avatar/avatar-bridge';
 
 export type RecordingMode = 'hook' | 'longform' | 'ask';
+
+/** Ask-mode wiring (Day 3). The Ask scene owns the AudioContext, mic stream,
+ *  and avatar bridge — recording is a tap-on observer, not the lifecycle owner.
+ *  All four fields are optional at the type level so hook/longform callers
+ *  don't need to pass them; the controller throws at ARM time if mode='ask'
+ *  and any required Ask deps are missing. */
+export type AskDeps = {
+  /** Shared AudioContext from useSessionPipe. iOS Safari throttles to one
+   *  running context per page; the recording controller MUST reuse this rather
+   *  than creating its own (audit C3 Day 3) — a second context is born
+   *  suspended and resume() doesn't recover it after the user gesture has
+   *  already been consumed by the first. */
+  audioContext: AudioContext;
+  /** Borrowed mic stream from useSessionPipe (already granted for Gemini Live).
+   *  iOS Safari throws NotReadableError on a second getUserMedia({audio:true})
+   *  call for the same mic (audit C4 Day 3). The controller wires the existing
+   *  audio track into the mixer and only requests video for the selfie cam. */
+  micStream: MediaStream;
+  /** Live avatar bridge from useSessionPipe. The controller calls
+   *  bridge.getCurrentTracks() at ARM and bridge.setLocalPlayback(false) to
+   *  avoid double-route echo (audit M3 Day 3). The bridge is NEVER closed
+   *  by the recording controller — Ask scene owns the lifecycle (audit M5). */
+  bridge: AvatarBridge;
+  /** Optional. Subscribe to mid-recording avatar track replacements (LiveKit
+   *  renegotiation, ICE restart, WiFi↔LTE handoff). The callback receives the
+   *  fresh track set; the controller updates the hidden-video srcObject and
+   *  rebinds the mixer's avatar branch. Returns an unsubscribe function. */
+  subscribeTrackUpdates?: (
+    cb: (tracks: { video: MediaStreamTrack | null; audio: MediaStreamTrack | null }) => void,
+    opts?: { replayInitial?: boolean },
+  ) => () => void;
+};
 
 export type RecordingPreview = {
   blob: Blob;
@@ -90,6 +123,8 @@ export type UseRecordingControllerOptions = {
   watermarkBitmap?: ImageBitmap | HTMLImageElement | null;
   /** Optional. Fires once when STOP completes and a preview blob is ready. */
   onStop?: (preview: RecordingPreview) => void;
+  /** Required when mode='ask' — see AskDeps. Hook/longform pass undefined. */
+  askDeps?: AskDeps;
 };
 
 export type RecordingControllerHandle = {
@@ -101,6 +136,10 @@ export type RecordingControllerHandle = {
   dismissPreview: () => void;
   /** Force-reset (e.g. surface unmount, error recovery). */
   reset: () => void;
+  /** Day 3 — signal that the host Ask session has ended (user_ended / closed).
+   *  No-op unless currently armed; if armed, transitions to STOPPED with
+   *  stopReason='ask_session_ended' and finalizes the recording. */
+  signalAskSessionEnded: () => void;
 };
 
 const TIMER_TICK_MS = 100; // 100ms cadence is plenty for the cap + end-card
@@ -114,9 +153,8 @@ export function useRecordingController(
   // every long-form viewer playback time tick).
   const {
     enabled, mode, getSourceVideoEl, creatorHandle, referralUrl,
-    watermarkBitmap, onStop,
+    watermarkBitmap, onStop, askDeps,
   } = opts;
-  void mode; // 'ask' wiring lands Day 3; 'hook'/'longform' both follow the same path
 
   // Latest-ref callback for the source <video> getter (audit C1 day-2). The
   // controller reads via getSourceVideoElRef.current() at tap time so a
@@ -137,6 +175,13 @@ export function useRecordingController(
   const onStopRef = useRef(onStop);
   useEffect(() => { onStopRef.current = onStop; }, [onStop]);
 
+  // Ref to askDeps so the onTap callback always reads the latest bridge /
+  // audioContext / micStream without listing the whole opts in deps. The
+  // useSessionPipe parent re-renders whenever pipe.state changes, but the
+  // underlying refs (audioContext, micStream, bridge) are stable.
+  const askDepsRef = useRef<AskDeps | undefined>(askDeps);
+  useEffect(() => { askDepsRef.current = askDeps; }, [askDeps]);
+
   // Ref to the latest dispatch so async callbacks (track.onended, recorder.onstop)
   // don't capture a stale reference if the component unmounts mid-flight.
   const dispatchRef = useRef(dispatchRaw);
@@ -154,9 +199,22 @@ export function useRecordingController(
   const camVideoElRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const detachWatcherRef = useRef<(() => void) | null>(null);
+  const detachMicWatcherRef = useRef<(() => void) | null>(null); // Ask-mode borrowed mic (audit M2 Day 3)
   const blobChunksRef = useRef<Blob[]>([]);
   const previewRef = useRef<RecordingPreview | null>(null);
   const armRequestSeqRef = useRef(0); // race guard for stale PERMISSION_GRANTED dispatches
+
+  // ── Ask-mode session refs ──────────────────────────────────────────────
+  // Each ARM cycle records its mode + which deps it borrowed so teardown can
+  // safely skip closing them (Ask scene owns audioContext + micStream + bridge
+  // lifecycle; recording is a tap-on observer per audit M5/M6 Day 3).
+  const sessionModeRef = useRef<RecordingMode>('hook');
+  const borrowedAudioContextRef = useRef(false); // true → teardown does NOT close ctx
+  const borrowedMicStreamRef = useRef(false);    // true → teardown does NOT releaseStream
+  const borrowedBridgeRef = useRef<AvatarBridge | null>(null); // bridge we attached avatar audio FROM (never closed by us)
+  const hiddenAvatarVideoElRef = useRef<HTMLVideoElement | null>(null);
+  const hiddenAvatarStreamRef = useRef<MediaStream | null>(null);
+  const detachTrackUpdatesRef = useRef<(() => void) | null>(null);
   const phaseRef = useRef<RecordingPhase>(phase);
   useEffect(() => { phaseRef.current = phase; }, [phase]);
 
@@ -176,15 +234,40 @@ export function useRecordingController(
     try { compositorRef.current?.stop(); } catch { /* */ }
     try { detachWatcherRef.current?.(); } catch { /* */ }
     detachWatcherRef.current = null;
+    try { detachMicWatcherRef.current?.(); } catch { /* */ }
+    detachMicWatcherRef.current = null;
+    try { detachTrackUpdatesRef.current?.(); } catch { /* */ }
+    detachTrackUpdatesRef.current = null;
+    // Restore avatar audible playback BEFORE closing the mixer (audit M3 Day 3
+    // — we silenced it on ARM to prevent double-route echo). Idempotent on
+    // bridge side, safe to call after close.
+    if (borrowedBridgeRef.current) {
+      try { borrowedBridgeRef.current.setLocalPlayback(true); } catch { /* */ }
+    }
     try { mixerRef.current?.close(); } catch { /* */ }
+    // camStreamRef always holds a stream the controller acquired itself
+    // (hook/longform: video+audio; Ask: video-only — mic is borrowed via
+    // askDepsNow.micStream and never assigned to camStreamRef). Always
+    // safe to release. Audit M6 Day 3.
     if (camStreamRef.current) {
       try { releaseStream(camStreamRef.current); } catch { /* */ }
     }
+    // Hidden avatar <video> shim (Ask mode). srcObject=null first so the
+    // referenced MediaStream tracks can be GC'd. The TRACKS themselves are
+    // bridge-owned — we don't stop() them.
+    if (hiddenAvatarVideoElRef.current) {
+      try { hiddenAvatarVideoElRef.current.srcObject = null; } catch { /* */ }
+      try { hiddenAvatarVideoElRef.current.parentNode?.removeChild(hiddenAvatarVideoElRef.current); } catch { /* */ }
+    }
+    hiddenAvatarVideoElRef.current = null;
+    hiddenAvatarStreamRef.current = null;
     if (camVideoElRef.current) {
       try { camVideoElRef.current.srcObject = null; } catch { /* */ }
       try { camVideoElRef.current.parentNode?.removeChild(camVideoElRef.current); } catch { /* */ }
     }
-    if (audioCtxRef.current) {
+    // Audit C3 Day 3 — only close the AudioContext if we OWN it. Ask mode
+    // borrows from useSessionPipe; closing it would kill the live conversation.
+    if (audioCtxRef.current && !borrowedAudioContextRef.current) {
       // close() rejects on already-closed contexts (Firefox InvalidState);
       // the void + .catch swallows the rejection. iOS Safari may hang on a
       // suspended-by-policy context — acceptable for v1; user navigation
@@ -198,6 +281,9 @@ export function useRecordingController(
     camVideoElRef.current = null;
     canvasRef.current = null;
     audioCtxRef.current = null;
+    borrowedAudioContextRef.current = false;
+    borrowedMicStreamRef.current = false;
+    borrowedBridgeRef.current = null;
     blobChunksRef.current = [];
   }, []);
 
@@ -219,15 +305,30 @@ export function useRecordingController(
       return;
     }
 
+    // Ask mode REQUIRES audioContext + micStream + bridge from useSessionPipe.
+    // Surface as recorder_error if missing — caller bug, not a runtime denial.
+    const isAsk = mode === 'ask';
+    const askDepsNow = isAsk ? askDepsRef.current : undefined;
+    if (isAsk && !askDepsNow) {
+      dispatch({ type: 'RECORDER_ERROR', nowMs: performance.now(), message: 'ask mode requires askDeps (audioContext + micStream + bridge)' });
+      return;
+    }
+
     // Increment seq BEFORE dispatch so a concurrent reset() between the
     // increment and the TAP dispatch doesn't leave seq stale (audit M8).
     const seq = ++armRequestSeqRef.current;
     dispatch({ type: 'TAP', nowMs: performance.now() });
+    sessionModeRef.current = mode;
 
-    // 1) Permission first — gates the whole stack.
+    // 1) Permission. Hook/longform: video+audio. Ask: video only — mic is
+    //    borrowed from the Ask scene (audit C4 Day 3). Camera is still ours
+    //    so we always request video.
     let stream: MediaStream;
     try {
-      const result = await requestMediaPermission({ video: true, audio: true });
+      const result = await requestMediaPermission({
+        video: true,
+        audio: !isAsk, // Ask borrows mic; only request video.
+      });
       if (seq !== armRequestSeqRef.current) {
         // A reset() or unmount intervened during the permission prompt.
         releaseStream(result.stream);
@@ -248,6 +349,9 @@ export function useRecordingController(
     camStreamRef.current = stream;
 
     // 2) Watch for mid-session revoke (camera flipped off in OS settings).
+    //    Ask mode: also watch the borrowed mic so a Settings revoke surfaces
+    //    here too (Ask scene has its own watcher; both firing is fine — the
+    //    reducer dedupes via the phase guard).
     detachWatcherRef.current = attachRevokeWatcher(stream, () => {
       dispatch({ type: 'PERMISSION_REVOKED', nowMs: performance.now() });
     });
@@ -280,35 +384,74 @@ export function useRecordingController(
       return;
     }
 
-    // 5) AudioContext lazy-create. Browsers gate construction behind a
-    //    user-gesture chain; the click event that triggered this handler
-    //    qualifies. resume() if the constructor returns 'suspended'.
-    const ctx = new AudioContext();
-    if (ctx.state === 'suspended') {
-      try { await ctx.resume(); } catch { /* recording will be silent — surface anyway */ }
+    // 5) AudioContext. Hook/longform: lazy-create one per ARM (Chrome 6-cap
+    //    handled by teardown). Ask: BORROW from useSessionPipe (audit C3 Day 3
+    //    — iOS Safari throttles to one running ctx per page; a second ctx is
+    //    born suspended and resume() doesn't recover it after the user gesture
+    //    has been consumed by the first).
+    let ctx: AudioContext;
+    if (isAsk && askDepsNow) {
+      ctx = askDepsNow.audioContext;
+      borrowedAudioContextRef.current = true;
+      if (ctx.state === 'suspended') {
+        try { await ctx.resume(); } catch { /* */ }
+      }
+    } else {
+      ctx = new AudioContext();
+      if (ctx.state === 'suspended') {
+        try { await ctx.resume(); } catch { /* recording will be silent — surface anyway */ }
+      }
     }
     audioCtxRef.current = ctx;
 
-    // 6) Mixer + branches. Mic is the user track; source is the page's
-    //    hook/long-form <video> element. Avatar wiring is Day-3.
+    // 6) Mixer + branches.
     const mixer = createAudioMixer({ audioContext: ctx });
     mixerRef.current = mixer;
-    const micTrack = stream.getAudioTracks()[0];
-    if (micTrack) mixer.connectMic(micTrack);
-    // Read the source <video> via the ref-callback NOW, not at hook-call
-    // time (audit C1 day-2 — playerRef.current was null on first render
-    // for the long-form viewer's no-constant-rerender path).
-    const sourceVideoEl = getSourceVideoElRef.current();
-    if (sourceVideoEl) {
-      try { mixer.connectSourceVideo(sourceVideoEl); }
-      catch (e) {
-        // Likely cross-origin tainted (Mux without crossOrigin="anonymous")
-        // OR a one-shot re-bind on the same element across ARM cycles
-        // (createMediaElementSource is permanent per element, NOT per
-        // AudioContext — Plan §4a / audit M7 day-2). Recording proceeds
-        // without source audio. Surface in non-prod so the bug isn't silent.
-        if (process.env.NODE_ENV !== 'production') {
-          console.warn('[recording-controller] mixer.connectSourceVideo failed — recording continues without source audio:', e);
+
+    if (isAsk && askDepsNow) {
+      // Ask branch wiring:
+      //   • mic ← borrowed from Ask scene (audit C4 Day 3)
+      //   • avatar ← bridge.getCurrentTracks().audio (audit C3 Day 3)
+      //   • source video <video> branch ← left empty (no MP4/HLS source)
+      const askMicTrack = askDepsNow.micStream.getAudioTracks()[0];
+      if (askMicTrack) mixer.connectMic(askMicTrack);
+      borrowedMicStreamRef.current = true;
+      // Audit M2 Day 3 — borrowed mic revoke is invisible to the camera-only
+      // watcher. Attach a separate watcher so OS-settings revoke surfaces
+      // here too (Ask scene has its own watcher; firing both is fine — the
+      // reducer's PERMISSION_REVOKED transition is idempotent from 'armed').
+      detachMicWatcherRef.current = attachRevokeWatcher(askDepsNow.micStream, () => {
+        dispatch({ type: 'PERMISSION_REVOKED', nowMs: performance.now() });
+      });
+
+      const initialTracks = askDepsNow.bridge.getCurrentTracks();
+      // Avatar audio → mixer. Track liveness guard per avatar-bridge.ts §175-182.
+      if (initialTracks.audio && initialTracks.audio.readyState === 'live') {
+        mixer.connectAvatar(initialTracks.audio);
+      }
+      // Audit M3 Day 3 — silence the bridge's <audio> route so the
+      // AudioContext destination is the only audible path. Restored on STOP.
+      try { askDepsNow.bridge.setLocalPlayback(false); } catch { /* */ }
+      borrowedBridgeRef.current = askDepsNow.bridge;
+    } else {
+      // Hook/longform path — controller-owned mic.
+      const micTrack = stream.getAudioTracks()[0];
+      if (micTrack) mixer.connectMic(micTrack);
+      // Read the source <video> via the ref-callback NOW, not at hook-call
+      // time (audit C1 day-2 — playerRef.current was null on first render
+      // for the long-form viewer's no-constant-rerender path).
+      const sourceVideoEl = getSourceVideoElRef.current();
+      if (sourceVideoEl) {
+        try { mixer.connectSourceVideo(sourceVideoEl); }
+        catch (e) {
+          // Likely cross-origin tainted (Mux without crossOrigin="anonymous")
+          // OR a one-shot re-bind on the same element across ARM cycles
+          // (createMediaElementSource is permanent per element, NOT per
+          // AudioContext — Plan §4a / audit M7 day-2). Recording proceeds
+          // without source audio. Surface in non-prod so the bug isn't silent.
+          if (process.env.NODE_ENV !== 'production') {
+            console.warn('[recording-controller] mixer.connectSourceVideo failed — recording continues without source audio:', e);
+          }
         }
       }
     }
@@ -319,10 +462,108 @@ export function useRecordingController(
     canvas.width = COMPOSITE_WIDTH;
     canvas.height = COMPOSITE_HEIGHT;
     canvasRef.current = canvas;
+
+    // Source for the compositor:
+    //   • hook/longform: getSourceVideoElRef.current() — the page's <video>.
+    //   • ask: hidden <video srcObject={MediaStream({avatar video track})}>.
+    //     Audit C2 Day 3 — must await loadedmetadata before recording starts
+    //     so the bottom half of the duet isn't black for the first 50–200ms.
+    let compositorSourceEl: HTMLVideoElement | null;
+    if (isAsk && askDepsNow) {
+      const initialAvatarVideo = askDepsNow.bridge.getCurrentTracks().video;
+      const hiddenStream = new MediaStream(
+        initialAvatarVideo && initialAvatarVideo.readyState === 'live' ? [initialAvatarVideo] : [],
+      );
+      hiddenAvatarStreamRef.current = hiddenStream;
+      const hiddenEl = document.createElement('video');
+      hiddenEl.playsInline = true;
+      hiddenEl.muted = true; // visual frames only — audio path is via mixer.connectAvatar
+      hiddenEl.autoplay = true;
+      Object.assign(hiddenEl.style, {
+        position: 'fixed', opacity: '0', width: '1px', height: '1px',
+        pointerEvents: 'none', top: '0', left: '0',
+      });
+      document.body.appendChild(hiddenEl);
+      hiddenEl.srcObject = hiddenStream;
+      try { await hiddenEl.play(); } catch { /* iOS may reject without gesture; frames still flow via srcObject */ }
+      hiddenAvatarVideoElRef.current = hiddenEl;
+      compositorSourceEl = hiddenEl;
+
+      // Wait for first-frame readiness. ASK_OPEN_TIMEOUT after 1s if metadata
+      // never arrives (audit C2 Day 3 — bound the wait, surface clean stop).
+      if (initialAvatarVideo && hiddenEl.readyState < 2 /* HAVE_CURRENT_DATA */) {
+        const ready = await new Promise<boolean>((resolve) => {
+          const onLoaded = (): void => { cleanup(); resolve(true); };
+          const onTimeout = (): void => { cleanup(); resolve(false); };
+          const cleanup = (): void => {
+            hiddenEl.removeEventListener('loadedmetadata', onLoaded);
+            hiddenEl.removeEventListener('canplay', onLoaded);
+            window.clearTimeout(timeoutId);
+          };
+          const timeoutId = window.setTimeout(onTimeout, 1000);
+          hiddenEl.addEventListener('loadedmetadata', onLoaded, { once: true });
+          hiddenEl.addEventListener('canplay', onLoaded, { once: true });
+        });
+        if (seq !== armRequestSeqRef.current) {
+          // A reset / unmount / signalAskSessionEnded fired during the
+          // loadedmetadata wait. PERMISSION_GRANTED hasn't been dispatched
+          // yet, so the reducer is still in 'priming' — dispatch RESET so
+          // the surface doesn't get stuck (audit Small Day 3).
+          dispatch({ type: 'RESET', nowMs: performance.now() });
+          teardown();
+          return;
+        }
+        if (!ready) {
+          dispatch({ type: 'ASK_OPEN_TIMEOUT', nowMs: performance.now() });
+          teardown();
+          return;
+        }
+      }
+
+      // Subscribe to mid-recording track replacements (LiveKit renegotiation).
+      // Reuses the SAME hidden <video> element — never re-creates it (audit C1
+      // Day 3 — connectSourceVideo is one-shot per AudioContext but we use
+      // MediaStream srcObject which is mutate-only; for video tracks we just
+      // replace tracks on the existing MediaStream).
+      //
+      // Pass replayInitial:false (audit C2/C3 Day 3) — we already consumed
+      // the current tracks via bridge.getCurrentTracks() above. Without this
+      // opt-out, the synchronous sub.replay would fire (removeTrack(t);
+      // addTrack(t)) on the freshly-built stream and orphan the only frame
+      // source for ~1 microtask, producing a black first frame on Safari.
+      if (askDepsNow.subscribeTrackUpdates) {
+        detachTrackUpdatesRef.current = askDepsNow.subscribeTrackUpdates((tracks) => {
+          // Video: swap track on the same MediaStream → same <video> srcObject
+          // → same DOM element → compositor's draw loop continues seamlessly.
+          const stream = hiddenAvatarStreamRef.current;
+          if (stream) {
+            for (const t of stream.getVideoTracks()) {
+              try { stream.removeTrack(t); } catch { /* */ }
+            }
+            if (tracks.video && tracks.video.readyState === 'live') {
+              try { stream.addTrack(tracks.video); } catch { /* */ }
+            }
+          }
+          // Audio: rebind mixer's avatar branch. bindTrack's M4 reset-on-id-change
+          // cancels any in-flight duck-ramp on retrack.
+          const mx = mixerRef.current;
+          if (mx) {
+            if (tracks.audio && tracks.audio.readyState === 'live') {
+              try { mx.connectAvatar(tracks.audio); } catch { /* mixer closed mid-update */ }
+            } else {
+              try { mx.disconnectAvatar(); } catch { /* */ }
+            }
+          }
+        }, { replayInitial: false });
+      }
+    } else {
+      compositorSourceEl = getSourceVideoElRef.current();
+    }
+
     const compositor = createCompositor({
       canvas,
       cameraVideoEl: camEl,
-      sourceVideoEl: sourceVideoEl ?? null,
+      sourceVideoEl: compositorSourceEl ?? null,
       watermarkBitmap: watermarkBitmap ?? null,
       referralUrl,
       creatorHandle,
@@ -499,6 +740,15 @@ export function useRecordingController(
     dispatch({ type: 'RESET', nowMs: performance.now() });
   }, [dispatch, teardown]);
 
+  const signalAskSessionEnded = useCallback((): void => {
+    // Audit M1 Day 3 — bump the seq so an in-flight priming arm (mic permission
+    // prompt open when the Ask scene closes) bails on resume. Without this,
+    // the post-permission code wires mic into an already-closed AudioContext
+    // borrowed from the dead pipe and bubbles an unhandled rejection.
+    armRequestSeqRef.current += 1;
+    dispatch({ type: 'ASK_SESSION_ENDED', nowMs: performance.now() });
+  }, [dispatch]);
+
   const dismissPreview = useCallback((): void => {
     // Audit C2 (day-2): the camStream + AudioContext + canvas + watcher
     // were being kept alive deliberately during STOPPED→PREVIEW so the
@@ -543,6 +793,7 @@ export function useRecordingController(
     preview: phase.kind === 'preview' ? previewRef.current : null,
     dismissPreview,
     reset,
+    signalAskSessionEnded,
   };
 }
 

@@ -137,6 +137,7 @@ describe('reducer — ARMED', () => {
     ['TRACK_ENDED', 'rtc_track_ended'],
     ['PERMISSION_REVOKED', 'permission_revoked'],
     ['ASK_OPEN_TIMEOUT', 'ask_open_timeout'],
+    ['ASK_SESSION_ENDED', 'ask_session_ended'],
     ['UNMOUNT', 'unmount'],
   ] as const)('%s stops with reason=%s', (eventType, expectedReason) => {
     const next = recordingReducer(armed(0), { type: eventType, nowMs: 5000 });
