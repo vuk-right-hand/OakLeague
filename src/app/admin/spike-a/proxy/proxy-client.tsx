@@ -112,6 +112,12 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
   // (eliminates "model gets bored of identical input" degradation hypothesis
   // — see SPIKE_A_DEFERRED_FIXUP_PLAN.md priming spike test).
   const [turnsPerSession, setTurnsPerSession] = useState<number>(DEFAULT_TURNS_PER_SESSION);
+  // Sleep between turn_complete and the next turn_start. 2026-05-02: workaround
+  // probe for Gemini Live manual-VAD multi-turn regression — turn 2 deterministi-
+  // cally times out when activityStart is sent immediately after turnComplete.
+  // Forum thread: discuss.ai.google.dev/t/142838 (Apr 29). Test 0/200/500ms to
+  // find the minimum cool-down that unblocks turn 2+.
+  const [interTurnDelayMs, setInterTurnDelayMs] = useState<number>(0);
   const cannedRef = useRef<Uint8Array | null>(null);
   const device = useMemo(detectDevice, []);
 
@@ -335,11 +341,15 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
         totalMs:  Math.round(performance.now() - turnStart),
         status: 'DONE',
       });
+
+      // Inter-turn cool-down — workaround for Gemini Live manual-VAD turn-2
+      // regression (see interTurnDelayMs comment near useState).
+      if (interTurnDelayMs > 0 && turn < turnsPerSession) await sleep(interTurnDelayMs);
     }
 
     try { ws.close(1000, 'session_done'); } catch {}
     return result;
-  }, [model, creatorId, append, turnsPerSession]);
+  }, [model, creatorId, append, turnsPerSession, interTurnDelayMs]);
 
   const onRun = useCallback(async () => {
     if (!cannedRef.current) return;
@@ -411,6 +421,21 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
           }}
           disabled={running}
           style={{ marginLeft: 6, width: 56 }}
+        />
+        <label style={{ marginLeft: 12 }}>Inter-turn ms:</label>
+        <input
+          type="number"
+          min={0}
+          max={5000}
+          step={100}
+          value={interTurnDelayMs}
+          onChange={(e) => {
+            const n = Math.max(0, Math.min(5000, Math.floor(Number(e.target.value) || 0)));
+            setInterTurnDelayMs(n);
+          }}
+          disabled={running}
+          style={{ marginLeft: 6, width: 72 }}
+          title="Sleep between turn_complete and next turn_start (Gemini Live manual-VAD workaround probe)"
         />
         <button style={{ marginLeft: 12 }} onClick={onRun} disabled={running || !creatorId}>
           {running ? 'Running…' : `Run ${SESSIONS_PER_CELL}×${turnsPerSession} cell`}
