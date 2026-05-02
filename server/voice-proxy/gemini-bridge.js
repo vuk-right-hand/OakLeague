@@ -53,7 +53,16 @@ export class GeminiBridge extends EventEmitter {
       config: {
         responseModalities: [Modality.AUDIO],
         systemInstruction: systemInstruction || DEFAULT_SYSTEM,
-        realtimeInputConfig: { automaticActivityDetection: { disabled: true } },
+        // 2026-05-02: switched from manual VAD (disabled: true) to default
+        // auto-VAD to bypass the multi-turn server-side regression hit on
+        // Apr 29 — manual-VAD turn 2 deterministically times out after
+        // activityEnd. Forum: discuss.ai.google.dev/t/142838.
+        //
+        // Auto-VAD path: omit realtimeInputConfig (defaults: auto-VAD on,
+        // endOfSpeechSensitivity = END_SENSITIVITY_HIGH). turnStart is a
+        // no-op; turnEnd sends `audioStreamEnd: true` (the auto-VAD signal
+        // equivalent to manual-mode `activityEnd: {}`). Revert this whole
+        // setup if/when Google fixes manual-VAD inference.
       },
       callbacks: {
         onopen: () => {},
@@ -120,7 +129,10 @@ export class GeminiBridge extends EventEmitter {
     this._currentTurnOutputBytes = 0;
     this._currentTurnInputBytes = 0;
     this._currentTurnUsage = null;
-    this._session.sendRealtimeInput({ activityStart: {} });
+    // activityStart omitted — auto-VAD is now the default (see open() comment).
+    // Auto-VAD infers turn boundaries from audio content, not from explicit
+    // activity signals. Sending activityStart in auto-VAD mode is a no-op or
+    // protocol error depending on SDK version.
   }
 
   sendAudio({ bytes, mimeType }) {
@@ -133,10 +145,16 @@ export class GeminiBridge extends EventEmitter {
     });
   }
 
-  /** Signals activityEnd, resolves on next turn_complete with per-turn metrics. */
+  /** Signals end of client audio stream, resolves on next turn_complete with
+   *  per-turn metrics. In auto-VAD mode the explicit signal is `audioStreamEnd`
+   *  (the auto-VAD equivalent of manual-VAD's `activityEnd`). Per Live API
+   *  reference: "Indicates that the audio stream has ended … should only be
+   *  sent when automatic activity detection is enabled (which is the default)
+   *  … client can reopen the stream by sending subsequent audio messages."
+   *  https://ai.google.dev/api/live#RealtimeInputConfig */
   async turnEnd({ timeoutMs = 30_000 } = {}) {
     if (!this._session || this._closed) throw new Error('bridge_not_open');
-    this._session.sendRealtimeInput({ activityEnd: {} });
+    this._session.sendRealtimeInput({ audioStreamEnd: true });
 
     await new Promise((resolve, reject) => {
       const to = setTimeout(() => { this.off('event', h); reject(new Error('turn_complete_timeout')); }, timeoutMs);

@@ -112,11 +112,11 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
   // (eliminates "model gets bored of identical input" degradation hypothesis
   // — see SPIKE_A_DEFERRED_FIXUP_PLAN.md priming spike test).
   const [turnsPerSession, setTurnsPerSession] = useState<number>(DEFAULT_TURNS_PER_SESSION);
-  // Sleep between turn_complete and the next turn_start. 2026-05-02: workaround
-  // probe for Gemini Live manual-VAD multi-turn regression — turn 2 deterministi-
-  // cally times out when activityStart is sent immediately after turnComplete.
-  // Forum thread: discuss.ai.google.dev/t/142838 (Apr 29). Test 0/200/500ms to
-  // find the minimum cool-down that unblocks turn 2+.
+  // Sleep between turn_complete and the next turn_start. Originally added as
+  // a 2026-05-02 probe for the manual-VAD multi-turn regression (forum
+  // discuss.ai.google.dev/t/142838); 500ms didn't help, so the proxy moved
+  // to auto-VAD with `audioStreamEnd`. Kept as a knob for future post-turn
+  // pacing experiments. Default 0 = no delay.
   const [interTurnDelayMs, setInterTurnDelayMs] = useState<number>(0);
   const cannedRef = useRef<Uint8Array | null>(null);
   const device = useMemo(detectDevice, []);
