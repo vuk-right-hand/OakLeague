@@ -25,7 +25,7 @@
 
 'use client';
 
-import { useCallback, useEffect, useReducer, useRef } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import {
   type AudioMixer,
   createAudioMixer,
@@ -125,6 +125,13 @@ export function useRecordingController(
   useEffect(() => { getSourceVideoElRef.current = getSourceVideoEl; }, [getSourceVideoEl]);
 
   const [phase, dispatchRaw] = useReducer(recordingReducer, { kind: 'idle' as const });
+
+  // Tick state forces a re-render every TIMER_TICK so the armed countdown
+  // updates visibly. Without this, the reducer returns the same phase
+  // reference when endCardArmed is unchanged (idempotent), so React skips
+  // the render and selectArmedSecondsRemaining stays frozen at its last
+  // value until the user causes some other state change.
+  const [, setTick] = useState(0);
 
   // Ref to onStop so async recorder.onstop doesn't capture a stale handler.
   const onStopRef = useRef(onStop);
@@ -408,6 +415,7 @@ export function useRecordingController(
 
     const timerId = window.setInterval(() => {
       dispatch({ type: 'TIMER_TICK', nowMs: performance.now() });
+      setTick((n) => n + 1);
     }, TIMER_TICK_MS);
 
     const onVisibility = (): void => {
