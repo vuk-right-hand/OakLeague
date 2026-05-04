@@ -11,8 +11,18 @@ FROM node:22-alpine
 
 WORKDIR /app
 
-COPY package.json package-lock.json* ./
-RUN npm install --omit=dev --no-audit --no-fund
+COPY package.json package-lock.json ./
+# `npm ci`, NOT `npm install`. With caret ranges in package.json (e.g.
+# `^1.50.1`), `npm install` resolves to whatever satisfies the range at
+# build time and can silently drift past the lockfile pin (e.g. 1.50.1 →
+# 1.51.0 when the latter ships). `npm ci` reads the lockfile authoritatively
+# and fails the build if package.json and lockfile disagree.
+# Background: 2026-05-02 — when Gemini Live multi-turn regressed we initially
+# suspected `@google/genai` 1.50.1 → 1.51.0 drift (1.51.0 published Apr 29,
+# same window as the regression). The running image turned out to still be
+# 1.50.1, but it took a `flyctl ssh` to prove it. Pinning removes that class
+# of false leads. Lockfile is now load-bearing — keep it committed.
+RUN npm ci --omit=dev --no-audit --no-fund
 
 COPY index.js gemini-bridge.js cartesia-bridge.js quota-gate.js sentry.js proxy-handlers.js voice-delete-worker.js ./
 

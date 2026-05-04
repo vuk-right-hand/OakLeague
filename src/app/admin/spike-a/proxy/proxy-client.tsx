@@ -23,7 +23,12 @@ type ModelId =
   | 'gemini-2.5-flash-native-audio-preview-12-2025'
   | 'gemini-3.1-flash-live-preview';
 
-type Status = 'DONE' | 'ERROR' | 'TIMEOUT' | 'INVALID';
+// EMPTY_RESPONSE = first_chunk_timeout but turn_complete arrived → Gemini
+// decided not to emit audio (model behavior). TIMEOUT = neither audio nor
+// turn_complete within budget → API-side silence (infrastructure/SLA).
+// Splits the ~22% timeout bucket so we can tell model regression apart from
+// API regression. See SPIKE_A_DEFERRED_FIXUP_PLAN.md "timeout diagnosis".
+type Status = 'DONE' | 'ERROR' | 'TIMEOUT' | 'EMPTY_RESPONSE' | 'INVALID';
 
 type TurnRow = {
   turn: number;
@@ -107,7 +112,17 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
   // (eliminates "model gets bored of identical input" degradation hypothesis
   // — see SPIKE_A_DEFERRED_FIXUP_PLAN.md priming spike test).
   const [turnsPerSession, setTurnsPerSession] = useState<number>(DEFAULT_TURNS_PER_SESSION);
+  // Sleep between turn_complete and the next turn_start. Originally added as
+  // a 2026-05-02 probe for the manual-VAD multi-turn regression (forum
+  // discuss.ai.google.dev/t/142838); 500ms didn't help, so the proxy moved
+  // to auto-VAD with `audioStreamEnd`. Kept as a knob for future post-turn
+  // pacing experiments. Default 0 = no delay.
+  const [interTurnDelayMs, setInterTurnDelayMs] = useState<number>(0);
   const cannedRef = useRef<Uint8Array | null>(null);
+  // sessionIdx → list of binary audio frames captured from the proxy. Kept
+  // in a ref (not state) — audio buffers are large and should not trigger
+  // re-renders. Cleared on each new run.
+  const sessionAudioRef = useRef<Map<number, Uint8Array[]>>(new Map());
   const device = useMemo(detectDevice, []);
 
   const append = useCallback((s: string) => {
@@ -123,6 +138,7 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
   const runOneSession = useCallback(async (sessionIdx: number): Promise<SessionResult> => {
     const result: SessionResult = { sessionIdx, turns: [] };
     const canned = cannedRef.current!;
+    sessionAudioRef.current.set(sessionIdx, []);
 
     // 1. Ticket
     const t0 = performance.now();
@@ -173,7 +189,12 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
 
     ws.addEventListener('message', (ev) => {
       if (typeof ev.data !== 'string') {
-        // Binary: TTS audio frame
+        // Binary: TTS audio frame from Gemini (24kHz LE PCM16 mono per SDK).
+        // Capture for playback so we can verify the model is actually
+        // answering, not emitting garbage. Each ev.data is an ArrayBuffer.
+        const frames = sessionAudioRef.current.get(sessionIdx);
+        if (frames) frames.push(new Uint8Array(ev.data as ArrayBuffer));
+
         if (lastSentAtMs && !firstAudioRecvAtMs) {
           firstAudioRecvAtMs = performance.now();
           pending.turnFirstAudio?.(firstAudioRecvAtMs - lastSentAtMs);
@@ -271,10 +292,51 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
       }
 
       let ttfaMs: number | undefined;
-      try { ttfaMs = await firstAudioP; } catch (e) {
-        result.turns.push({ turn, status: 'TIMEOUT', reason: (e as Error).message });
-        break;
+      let firstAudioErr: Error | null = null;
+      try { ttfaMs = await firstAudioP; } catch (e) { firstAudioErr = e as Error; }
+
+      if (firstAudioErr) {
+        // No audio frame within FIRST_CHUNK_TIMEOUT_MS. Race turn_complete
+        // (still has ~TURN_COMPLETE_TIMEOUT_MS budget remaining) to split:
+        //   turn_complete arrived  → EMPTY_RESPONSE (model emitted nothing)
+        //   turn_complete rejects via abortPending (ws close / proxy error)
+        //                         → ERROR with the real cause
+        //   turn_complete also missing → TIMEOUT (API-side silence)
+        try {
+          await turnCompleteP;
+          result.turns.push({
+            turn,
+            ticketMs: Math.round(t1 - t0),
+            wsMs:     Math.round(t2 - t1),
+            readyMs:  Math.round(t3 - t2),
+            totalMs:  Math.round(performance.now() - turnStart),
+            status: 'EMPTY_RESPONSE',
+            reason:  firstAudioErr.message,
+          });
+          continue;
+        } catch (e2) {
+          // If a proxy error or WS close interrupted the race, that's the
+          // real cause — don't bucket as API timeout.
+          if (state.proxyError) {
+            result.turns.push({ turn, status: 'ERROR', reason: state.proxyError });
+          } else if (state.closeInfo !== null) {
+            const ci = state.closeInfo as CloseInfo;
+            result.turns.push({
+              turn,
+              status: 'ERROR',
+              reason: `ws_closed_${ci.code ?? 'unknown'}`,
+            });
+          } else {
+            result.turns.push({
+              turn,
+              status: 'TIMEOUT',
+              reason: `${firstAudioErr.message}|${(e2 as Error).message}`,
+            });
+          }
+          break;
+        }
       }
+
       try { await turnCompleteP; } catch (e) {
         result.turns.push({ turn, status: 'ERROR', reason: (e as Error).message });
         break;
@@ -285,20 +347,53 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
         ticketMs: Math.round(t1 - t0),
         wsMs:     Math.round(t2 - t1),
         readyMs:  Math.round(t3 - t2),
-        ttfaMs:   Math.round(ttfaMs),
+        ttfaMs:   Math.round(ttfaMs!),
         totalMs:  Math.round(performance.now() - turnStart),
         status: 'DONE',
       });
+
+      // Inter-turn cool-down — workaround for Gemini Live manual-VAD turn-2
+      // regression (see interTurnDelayMs comment near useState).
+      if (interTurnDelayMs > 0 && turn < turnsPerSession) await sleep(interTurnDelayMs);
     }
 
     try { ws.close(1000, 'session_done'); } catch {}
     return result;
-  }, [model, creatorId, append, turnsPerSession]);
+  }, [model, creatorId, append, turnsPerSession, interTurnDelayMs]);
+
+  const playSessionAudio = useCallback(async (sessionIdx: number) => {
+    const frames = sessionAudioRef.current.get(sessionIdx);
+    if (!frames || frames.length === 0) {
+      append(`session ${sessionIdx}: no audio captured`);
+      return;
+    }
+    const totalBytes = frames.reduce((n, f) => n + f.length, 0);
+    const merged = new Uint8Array(totalBytes);
+    let off = 0;
+    for (const f of frames) { merged.set(f, off); off += f.length; }
+
+    // Gemini Live emits 24kHz LE PCM16 mono per SDK docs.
+    const SAMPLE_RATE = 24_000;
+    const samples = totalBytes / 2;
+    const float32 = new Float32Array(samples);
+    const view = new DataView(merged.buffer, merged.byteOffset, merged.byteLength);
+    for (let i = 0; i < samples; i++) float32[i] = view.getInt16(i * 2, true) / 32768;
+
+    const ctx = new AudioContext();
+    const buf = ctx.createBuffer(1, samples, SAMPLE_RATE);
+    buf.copyToChannel(float32, 0);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    src.start();
+    append(`session ${sessionIdx}: playing ${(samples / SAMPLE_RATE).toFixed(2)}s of audio`);
+  }, [append]);
 
   const onRun = useCallback(async () => {
     if (!cannedRef.current) return;
     setRunning(true);
     setSessions([]);
+    sessionAudioRef.current.clear();
     append(`starting proxy cell: model=${model}, sessions=${SESSIONS_PER_CELL}, turns=${turnsPerSession}`);
     const collected: SessionResult[] = [];
     for (let i = 1; i <= SESSIONS_PER_CELL; i++) {
@@ -313,6 +408,11 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
   }, [model, runOneSession, append]);
 
   const ttfas = useMemo(() => sessions.flatMap((s) => s.turns.filter((t) => t.status === 'DONE').map((t) => t.ttfaMs!)), [sessions]);
+  const statusCounts = useMemo(() => {
+    const c: Record<Status, number> = { DONE: 0, ERROR: 0, TIMEOUT: 0, EMPTY_RESPONSE: 0, INVALID: 0 };
+    for (const s of sessions) for (const t of s.turns) c[t.status]++;
+    return c;
+  }, [sessions]);
 
   const copyJson = useCallback(() => {
     navigator.clipboard?.writeText(JSON.stringify({
@@ -361,6 +461,21 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
           disabled={running}
           style={{ marginLeft: 6, width: 56 }}
         />
+        <label style={{ marginLeft: 12 }}>Inter-turn ms:</label>
+        <input
+          type="number"
+          min={0}
+          max={5000}
+          step={100}
+          value={interTurnDelayMs}
+          onChange={(e) => {
+            const n = Math.max(0, Math.min(5000, Math.floor(Number(e.target.value) || 0)));
+            setInterTurnDelayMs(n);
+          }}
+          disabled={running}
+          style={{ marginLeft: 6, width: 72 }}
+          title="Sleep between turn_complete and next turn_start (Gemini Live manual-VAD workaround probe)"
+        />
         <button style={{ marginLeft: 12 }} onClick={onRun} disabled={running || !creatorId}>
           {running ? 'Running…' : `Run ${SESSIONS_PER_CELL}×${turnsPerSession} cell`}
         </button>
@@ -370,13 +485,24 @@ export default function ProxyClient({ creators }: { creators: CreatorOption[] })
       <section style={{ marginBottom: 16 }}>
         <h3>Aggregate TTFA</h3>
         <div>n={ttfas.length} · p50={pct(ttfas, 0.5) ?? '—'}ms · p90={pct(ttfas, 0.9) ?? '—'}ms</div>
+        <div style={{ marginTop: 4, fontSize: 13 }}>
+          DONE={statusCounts.DONE} · EMPTY_RESPONSE={statusCounts.EMPTY_RESPONSE} · TIMEOUT={statusCounts.TIMEOUT} · ERROR={statusCounts.ERROR} · INVALID={statusCounts.INVALID}
+        </div>
       </section>
 
       <section style={{ marginBottom: 16 }}>
         <h3>Sessions</h3>
         {sessions.map((s) => (
           <div key={s.sessionIdx} style={{ marginBottom: 12 }}>
-            <div><strong>Session {s.sessionIdx}</strong> {s.aborted && <span style={{ color: 'crimson' }}>aborted: {s.aborted}</span>}</div>
+            <div>
+              <strong>Session {s.sessionIdx}</strong>
+              <button
+                onClick={() => playSessionAudio(s.sessionIdx)}
+                style={{ marginLeft: 8, fontSize: 12 }}
+                title="Play all TTS audio frames received for this session"
+              >▶ Play audio</button>
+              {s.aborted && <span style={{ color: 'crimson', marginLeft: 8 }}>aborted: {s.aborted}</span>}
+            </div>
             <table style={{ borderCollapse: 'collapse', fontSize: 13 }}>
               <thead><tr>{['turn', 'ticket_ms', 'ws_ms', 'ready_ms', 'ttfa_ms', 'total_ms', 'status'].map((h) => (
                 <th key={h} style={{ border: '1px solid #ccc', padding: '2px 8px', textAlign: 'left' }}>{h}</th>
