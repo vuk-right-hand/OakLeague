@@ -32,6 +32,7 @@ import { mintEphemeral, MintError } from '@/lib/voice/mint-ephemeral';
 import { mintSimliSessionToken, SimliMintError } from '@/lib/avatar/mint-simli';
 import { createHash } from 'node:crypto';
 import { candidateTokenHashes, isValidTokenPlaintext } from '@/lib/recording/referral-token';
+import { captureServerSafe } from '@/lib/posthog-server';
 import { getProxyVoiceConfig } from '@/lib/voice/voice-config';
 
 export const runtime = 'nodejs';
@@ -257,8 +258,9 @@ async function creditFirstSessionFireForget(
   const deviceFp = createHash('sha256').update(`${ua}|${accept}|${ipPrefix}`).digest('hex').slice(0, 32);
 
   const admin = supabaseAdmin();
+  let credited = false;
   for (const tokenHash of hashes) {
-    const { error } = await admin.rpc('recording_referral_credit_first_session', {
+    const { data, error } = await admin.rpc('recording_referral_credit_first_session', {
       p_token_hash: tokenHash,
       p_new_user:   userId,
       p_device_fp:  deviceFp,
@@ -267,6 +269,17 @@ async function creditFirstSessionFireForget(
     if (error) {
       // Surface but don't throw — the user's session opened successfully.
       Sentry.captureException(error, { extra: { op: 'recording_referral_credit_first_session' } });
+      continue;
     }
+    if (data === true) { credited = true; break; }
+  }
+
+  // PostHog event (plan §11). Only fires on a *fresh* credit (RPC returns
+  // true) — duplicate calls (idempotent at the RPC level) don't double-count.
+  // distinctId = the new user's UUID so the funnel joins to their other events.
+  if (credited) {
+    await captureServerSafe(userId, 'referral_first_session', {
+      ref_id_prefix: refPlaintext.slice(0, 6),
+    });
   }
 }

@@ -24,7 +24,7 @@
 // see the cookie.
 
 import 'server-only';
-import { type NextRequest, NextResponse } from 'next/server';
+import { type NextRequest, NextResponse, after } from 'next/server';
 import { createHash } from 'node:crypto';
 import * as Sentry from '@sentry/nextjs';
 import { supabaseAdmin } from '@/lib/supabase/admin';
@@ -32,6 +32,7 @@ import {
   candidateTokenHashes,
   isValidTokenPlaintext,
 } from '@/lib/recording/referral-token';
+import { captureServerSafe } from '@/lib/posthog-server';
 
 export const dynamic = 'force-dynamic';
 
@@ -88,6 +89,24 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ toke
       continue;
     }
     if (data) { creatorId = data as string; break; }
+  }
+
+  // PostHog landing event (plan §11). Wrapped in after() so the user's
+  // 302 redirect is NOT blocked on the PostHog flush — landing is the
+  // first thing a referred visitor sees and the cold-start critical path.
+  // distinctId = device_fp for anon visitors; ref_id_prefix is the first
+  // 6 chars of the plaintext (non-secret per Plan §S10 — full token has
+  // 96 bits of entropy, prefix is analytics-only).
+  if (creatorId) {
+    after(async () => {
+      await captureServerSafe(deviceFp, 'referral_landing', {
+        ref_id_prefix: plaintext.slice(0, 6),
+        creator_id: creatorId,
+        // Mirror cookie_set_ok column so dashboards can split landing
+        // volume by Safari ITP / private-mode failure rate later.
+        cookie_set_ok: true,
+      });
+    });
   }
 
   // Even if no token_hash matched (invalid / expired), still redirect to
