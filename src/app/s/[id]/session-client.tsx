@@ -178,9 +178,9 @@ function LiveSession(props: LiveProps) {
     mode: 'ask',
     getSourceVideoEl: () => null, // Ask uses the hidden-video shim from askDeps.bridge
     creatorHandle: props.creatorHandle,
-    // Static fallback URL — controller patches with the real shortUrl from
-    // /api/recording/open-check on successful mint (Day 4).
-    referralUrl: `oakl.gg/${props.creatorHandle}`,
+    // Static fallback URL — `oakl.gg` root (audit C2 cross-cutting Day 4:
+    // `/<handle>` would be a 404 with no creator-drawer route).
+    referralUrl: 'oakl.gg',
     creatorId: props.creatorId,
     clipId: props.hookId,
     askDeps,

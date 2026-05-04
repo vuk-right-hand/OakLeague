@@ -79,9 +79,11 @@ export function LongFormPlayer({
     // and the controller's onTap closure could otherwise lock to null).
     getSourceVideoEl: () => videoRef.current,
     creatorHandle,
-    // Static fallback URL — controller patches with the real shortUrl from
-    // /api/recording/open-check on successful mint (Day 4).
-    referralUrl: `oakl.gg/${creatorHandle}`,
+    // Static fallback URL — `oakl.gg` root (audit C2 cross-cutting Day 4:
+    // `/<handle>` would be a 404 with no creator-drawer route). Controller
+    // patches with the real shortUrl from /api/recording/open-check on
+    // successful mint.
+    referralUrl: 'oakl.gg',
     creatorId,
     clipId: videoId,
   });

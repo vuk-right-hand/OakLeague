@@ -21,6 +21,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { saveOnly, shareOrSave, type ShareResult } from '@/lib/recording/share';
 import type { RecordingPreview as PreviewBlob } from '@/lib/recording/recording-controller';
+import { captureSafe } from '@/lib/posthog-safe-capture';
 
 type Props = {
   preview: PreviewBlob | null;
@@ -67,6 +68,11 @@ export function RecordingPreview({ preview, onDismiss, onDiscard }: Props) {
       shortId: `${Math.round(preview.durationMs / 1000)}s`,
     });
     setSaveState(r.kind === 'downloaded' ? 'saved' : 'failed');
+    captureSafe('react_save_clicked', {
+      result: r.kind,
+      duration_ms: preview.durationMs,
+      mime_type: preview.mimeType,
+    });
     // Reset to idle so a second tap re-renders "Save" and triggers a fresh
     // download (otherwise the button stays "Saved ✓" forever for the
     // duration of the modal — confusing on repeat).
@@ -76,6 +82,11 @@ export function RecordingPreview({ preview, onDismiss, onDiscard }: Props) {
   async function onShareClick(): Promise<void> {
     if (!preview) return;
     setShareState('sharing');
+    captureSafe('react_share_opened', {
+      duration_ms: preview.durationMs,
+      mime_type: preview.mimeType,
+      stop_reason: preview.stopReason,
+    });
     const result = await shareOrSave({
       blob: preview.blob,
       mimeType: preview.mimeType,
@@ -84,6 +95,10 @@ export function RecordingPreview({ preview, onDismiss, onDiscard }: Props) {
       shortId: `${Math.round(preview.durationMs / 1000)}s`,
     });
     setShareState(result.kind);
+    captureSafe('react_share_completed', {
+      result: result.kind,
+      duration_ms: preview.durationMs,
+    });
     // Auto-dismiss only on a successful share — keep the modal open on
     // download (user may want to inspect or share again) and on
     // cancellation (user explicitly backed out of the share sheet).

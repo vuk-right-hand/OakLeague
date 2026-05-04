@@ -183,6 +183,14 @@ describe('reducer — STOPPED → PREVIEW', () => {
     expect(recordingReducer(stopped, { type: 'RESET', nowMs: 1 })).toEqual(idle);
   });
 
+  it('PREVIEW_DISMISSED from STOPPED returns to IDLE (audit C1 cross-cutting Day-4)', () => {
+    // Repro: user taps X on a barely-armed countdown so STOP fires before
+    // recorder.onstop, then dismisses. Without this transition, the reducer
+    // is stuck in 'stopped' and the surface can never record again.
+    const stopped = recordingReducer(armed(0), { type: 'TAP', nowMs: 5000 });
+    expect(recordingReducer(stopped, { type: 'PREVIEW_DISMISSED', nowMs: 1 })).toEqual(idle);
+  });
+
   it('PREVIEW_DISMISSED returns PREVIEW to IDLE', () => {
     const stopped = recordingReducer(armed(0), { type: 'TAP', nowMs: 5000 });
     const preview = recordingReducer(stopped, { type: 'PREVIEW_ARRIVED', nowMs: 5500, durationMs: 5000 });

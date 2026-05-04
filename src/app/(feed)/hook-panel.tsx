@@ -103,11 +103,12 @@ export function HookPanel({
     // Ref-callback: controller reads at tap time (audit C1 day-2).
     getSourceVideoEl: () => playerRef.current,
     creatorHandle: group.creator.handle,
-    // Static fallback URL (creator drawer). Day 4: controller hits
-    // /api/recording/open-check and PATCHES with the real shortUrl when
-    // the mint succeeds. If mint fails (cap hit / network), this URL is
-    // what gets drawn into the end-card.
-    referralUrl: `oakl.gg/${group.creator.handle}`,
+    // Static fallback URL — `oakl.gg` root (audit C2 cross-cutting Day 4:
+    // `/<handle>` would be a 404 since no creator-drawer route exists yet).
+    // Day 4: controller hits /api/recording/open-check and PATCHES with the
+    // real shortUrl when the mint succeeds. Fallback only fires on cap-hit
+    // / network error.
+    referralUrl: 'oakl.gg',
     creatorId: group.creator.id,
     clipId: hook.hook_id,
   });

@@ -54,6 +54,7 @@ import {
 } from './recording-state-machine';
 import type { ReactButtonProps } from '@/components/recording/ReactButton';
 import type { AvatarBridge } from '@/lib/avatar/avatar-bridge';
+import { captureSafe } from '@/lib/posthog-safe-capture';
 
 export type RecordingMode = 'hook' | 'longform' | 'ask';
 
@@ -342,8 +343,10 @@ export function useRecordingController(
     // Increment seq BEFORE dispatch so a concurrent reset() between the
     // increment and the TAP dispatch doesn't leave seq stale (audit M8).
     const seq = ++armRequestSeqRef.current;
-    dispatch({ type: 'TAP', nowMs: performance.now() });
+    const tapAtMs = performance.now();
+    dispatch({ type: 'TAP', nowMs: tapAtMs });
     sessionModeRef.current = mode;
+    captureSafe('react_tap', { mode });
 
     // 1) Permission. Hook/longform: video+audio. Ask: video only — mic is
     //    borrowed from the Ask scene (audit C4 Day 3). Camera is still ours
@@ -363,10 +366,12 @@ export function useRecordingController(
     } catch (e) {
       const code = e instanceof RecordingPermissionError ? e.code : 'unknown';
       if (code === 'denied' || code === 'security') {
+        captureSafe('react_permission_denied', { mode, reason: code });
         dispatch({ type: 'PERMISSION_DENIED', nowMs: performance.now() });
       } else if (code === 'disabled' || code === 'unsupported') {
         dispatch({ type: 'CAP_HIT', reason: code === 'disabled' ? 'feature_disabled' : 'unsupported', nowMs: performance.now() });
       } else {
+        captureSafe('react_capture_error', { mode, code });
         dispatch({ type: 'RECORDER_ERROR', nowMs: performance.now(), message: String(code) });
       }
       return;
@@ -671,6 +676,12 @@ export function useRecordingController(
         cur.kind === 'preview' ? cur.stopReason : 'recorder_error';
       const durationMs = Math.max(0, stoppedAt - armedAt);
       previewRef.current = { blob, mimeType: mime.mimeType, durationMs, stopReason };
+      captureSafe('react_stopped', {
+        mode,
+        duration_ms: durationMs,
+        stop_reason: stopReason,
+        blob_size: blob.size,
+      });
       dispatch({ type: 'PREVIEW_ARRIVED', nowMs: performance.now(), durationMs });
       try { onStopRef.current?.(previewRef.current); } catch (e) {
         if (process.env.NODE_ENV !== 'production') {
@@ -695,7 +706,12 @@ export function useRecordingController(
       teardown();
       return;
     }
-    dispatch({ type: 'PERMISSION_GRANTED', nowMs: performance.now() });
+    const armedAtMs = performance.now();
+    captureSafe('react_armed', {
+      mode,
+      ms_to_arm: Math.round(armedAtMs - tapAtMs),
+    });
+    dispatch({ type: 'PERMISSION_GRANTED', nowMs: armedAtMs });
     // Schedule the end-card rising edge precisely (audit M2): setTimeout
     // fires within 1-2ms vs the 100ms TIMER_TICK granularity, hitting the
     // Plan §25.4 "1.5s ± 100ms" gate cleanly. Compositor.enableEndCard is
@@ -813,11 +829,16 @@ export function useRecordingController(
     const tokenToRevoke = activeTokenPlaintextRef.current;
     if (tokenToRevoke && process.env.NEXT_PUBLIC_REACT_CAPTURE_ENABLED === '1') {
       // No await — controller proceeds with dismissPreview teardown immediately.
+      // keepalive:true (audit C3 cross-cutting Day 4) so the request survives
+      // a tab close right after Discard. Without it, the browser cancels the
+      // in-flight fetch and the token never gets revoked → 90-day-valid
+      // token in the wild that the user thought they killed.
       void fetch('/api/recording/discard', {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ token: tokenToRevoke }),
+        keepalive: true,
       }).catch(() => { /* non-fatal */ });
     }
     armRequestSeqRef.current += 1;

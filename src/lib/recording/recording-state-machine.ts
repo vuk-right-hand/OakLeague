@@ -179,6 +179,12 @@ export function recordingReducer(phase: RecordingPhase, ev: RecordingEvent): Rec
         };
       }
       if (ev.type === 'RESET' || ev.type === 'UNMOUNT') return { kind: 'idle' };
+      // Audit C1 cross-cutting: dismissPreview / discardByUser racing the
+      // recorder.onstop seq guard would strand the surface in 'stopped'
+      // forever. Accept PREVIEW_DISMISSED from stopped and treat as RESET
+      // — equivalent because the recorder is dead and no preview blob will
+      // ever materialize.
+      if (ev.type === 'PREVIEW_DISMISSED') return { kind: 'idle' };
       return phase;
     }
 
