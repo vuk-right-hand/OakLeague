@@ -19,7 +19,7 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { shareOrSave, type ShareResult } from '@/lib/recording/share';
+import { saveOnly, shareOrSave, type ShareResult } from '@/lib/recording/share';
 import type { RecordingPreview as PreviewBlob } from '@/lib/recording/recording-controller';
 
 type Props = {
@@ -43,6 +43,7 @@ export function RecordingPreview({ preview, onDismiss, onDiscard }: Props) {
   }, [blobUrl]);
 
   const [shareState, setShareState] = useState<'idle' | 'sharing' | ShareResult['kind']>('idle');
+  const [saveState, setSaveState] = useState<'idle' | 'saved' | 'failed'>('idle');
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
   // ESC + backdrop dismiss. Document keydown so the listener works regardless
@@ -57,6 +58,20 @@ export function RecordingPreview({ preview, onDismiss, onDiscard }: Props) {
   }, [preview, onDismiss]);
 
   if (!preview || !blobUrl) return null;
+
+  function onSaveClick(): void {
+    if (!preview) return;
+    const r = saveOnly({
+      blob: preview.blob,
+      mimeType: preview.mimeType,
+      shortId: `${Math.round(preview.durationMs / 1000)}s`,
+    });
+    setSaveState(r.kind === 'downloaded' ? 'saved' : 'failed');
+    // Reset to idle so a second tap re-renders "Save" and triggers a fresh
+    // download (otherwise the button stays "Saved ✓" forever for the
+    // duration of the modal — confusing on repeat).
+    setTimeout(() => setSaveState('idle'), 1500);
+  }
 
   async function onShareClick(): Promise<void> {
     if (!preview) return;
@@ -160,6 +175,22 @@ export function RecordingPreview({ preview, onDismiss, onDiscard }: Props) {
             }}
           >
             Discard
+          </button>
+          <button
+            type="button"
+            onClick={onSaveClick}
+            disabled={shareState === 'sharing'}
+            style={{
+              flex: 1, height: 44, borderRadius: 22,
+              background: 'transparent',
+              color: '#fff',
+              border: '1px solid rgba(255,255,255,0.3)',
+              fontSize: 14, fontWeight: 600,
+              cursor: shareState === 'sharing' ? 'not-allowed' : 'pointer',
+              opacity: shareState === 'sharing' ? 0.5 : 1,
+            }}
+          >
+            {saveState === 'saved' ? 'Saved ✓' : saveState === 'failed' ? 'Save failed' : 'Save'}
           </button>
           <button
             type="button"

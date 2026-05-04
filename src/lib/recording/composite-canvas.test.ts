@@ -14,7 +14,9 @@ import {
   CROSSFADE_MS,
   END_CARD_MS,
   HALF_HEIGHT,
+  computeContainLayout,
   computeCoverLayout,
+  computeFitLayout,
   createCompositor,
   crossfadeAlpha,
 } from './composite-canvas';
@@ -114,6 +116,82 @@ describe('computeCoverLayout', () => {
   it('exact-AR match reads the full source rect', () => {
     const lay = computeCoverLayout(540, 480, 10, 20, 540, 480);
     expect(lay).toMatchObject({ sx: 0, sy: 0, sw: 540, sh: 480, dx: 10, dy: 20, dw: 540, dh: 480 });
+  });
+});
+
+// ── computeContainLayout ───────────────────────────────────────────────
+
+describe('computeContainLayout (B-prime)', () => {
+  it('returns degenerate layout for invalid input', () => {
+    expect(computeContainLayout(0, 0, 0, 0, 540, 480)).toMatchObject({ sw: 0, sh: 0 });
+    expect(computeContainLayout(720, 0, 0, 0, 540, 480)).toMatchObject({ sw: 0, sh: 0 });
+  });
+
+  it('portrait 9:16 source into landscape 1.125 slot → pillarbox left+right, full source', () => {
+    // 720×1280 (videoAR ≈ 0.5625) into 540×480 (destAR = 1.125) → fit height,
+    // dest width = 480 * 0.5625 = 270, pillarbox ((540-270)/2)=135 each side.
+    const lay = computeContainLayout(720, 1280, 0, 0, 540, 480);
+    expect(lay.sx).toBe(0);
+    expect(lay.sy).toBe(0);
+    expect(lay.sw).toBe(720);
+    expect(lay.sh).toBe(1280);
+    expect(lay.dh).toBe(480);
+    expect(lay.dw).toBe(270);
+    expect(lay.dx).toBe(135);
+    expect(lay.dy).toBe(0);
+  });
+
+  it('landscape 16:9 source into landscape 1.125 slot → letterbox top+bottom, full source', () => {
+    // 1280×720 (videoAR ≈ 1.78) into 540×480 (destAR = 1.125) → fit width,
+    // dest height = 540/1.78 ≈ 304, letterbox ((480-304)/2)=88 each side.
+    const lay = computeContainLayout(1280, 720, 0, 0, 540, 480);
+    expect(lay.sw).toBe(1280);
+    expect(lay.sh).toBe(720);
+    expect(lay.dw).toBe(540);
+    expect(lay.dh).toBe(304); // 540/(1280/720) = 303.75 → 304
+    expect(lay.dx).toBe(0);
+    expect(lay.dy).toBe(88);  // (480-304)/2 = 88
+  });
+
+  it('exact-AR match fills the slot with no bars', () => {
+    const lay = computeContainLayout(540, 480, 10, 20, 540, 480);
+    expect(lay).toMatchObject({ dx: 10, dy: 20, dw: 540, dh: 480 });
+  });
+});
+
+// ── computeFitLayout (smart auto rule) ────────────────────────────────
+
+describe('computeFitLayout', () => {
+  it('auto picks contain when source is portrait-er than slot', () => {
+    // 9:16 source vs 1.125:1 slot — videoAR < destAR → contain.
+    const auto = computeFitLayout(720, 1280, 0, 0, 540, 480, 'auto');
+    const cont = computeContainLayout(720, 1280, 0, 0, 540, 480);
+    expect(auto).toEqual(cont);
+  });
+
+  it('auto picks cover when source is landscape (matches/exceeds slot AR)', () => {
+    // 16:9 source vs 1.125:1 slot — videoAR > destAR → cover.
+    const auto = computeFitLayout(1280, 720, 0, 0, 540, 480, 'auto');
+    const cov  = computeCoverLayout(1280, 720, 0, 0, 540, 480);
+    expect(auto).toEqual(cov);
+  });
+
+  it('explicit cover mode forces cover even on portrait source', () => {
+    const forced = computeFitLayout(720, 1280, 0, 0, 540, 480, 'cover');
+    const cov    = computeCoverLayout(720, 1280, 0, 0, 540, 480);
+    expect(forced).toEqual(cov);
+  });
+
+  it('explicit contain mode forces contain even on landscape source', () => {
+    const forced = computeFitLayout(1280, 720, 0, 0, 540, 480, 'contain');
+    const cont   = computeContainLayout(1280, 720, 0, 0, 540, 480);
+    expect(forced).toEqual(cont);
+  });
+
+  it('returns degenerate layout for invalid input regardless of mode', () => {
+    for (const mode of ['auto', 'cover', 'contain'] as const) {
+      expect(computeFitLayout(0, 0, 0, 0, 540, 480, mode)).toMatchObject({ sw: 0, sh: 0 });
+    }
   });
 });
 

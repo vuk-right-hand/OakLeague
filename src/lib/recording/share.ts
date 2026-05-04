@@ -38,7 +38,12 @@ export type ShareOptions = {
 export async function shareOrSave(opts: ShareOptions): Promise<ShareResult> {
   const ext = extensionForMime(opts.mimeType);
   const filename = `oakleague-${sanitizeFilenameSegment(opts.shortId)}.${ext}`;
-  const file = makeFile(opts.blob, filename, opts.mimeType);
+  // Strip codec params from the MIME (e.g. `video/webm;codecs=vp9,opus`
+  // → `video/webm`) — Android Chrome's `canShare({files})` rejects MIMEs
+  // with codec params even though MediaRecorder produces them. The
+  // container type alone is what the system share sheet matches against.
+  const cleanMime = stripCodecParams(opts.mimeType);
+  const file = makeFile(opts.blob, filename, cleanMime);
 
   // Web Share API support check. The canShare guard is essential — bare
   // `if (navigator.share)` lies on browsers that have the function but
@@ -65,6 +70,14 @@ export async function shareOrSave(opts: ShareOptions): Promise<ShareResult> {
   return triggerDownloadFallback(opts.blob, filename);
 }
 
+/** Always-download. Used by the explicit Save button regardless of Web
+ *  Share availability. Mirrors shareOrSave's filename + extension logic. */
+export function saveOnly(opts: ShareOptions): ShareResult {
+  const ext = extensionForMime(opts.mimeType);
+  const filename = `oakleague-${sanitizeFilenameSegment(opts.shortId)}.${ext}`;
+  return triggerDownloadFallback(opts.blob, filename);
+}
+
 /** Extension lookup. Centralized so a new MIME priority entry only changes
  *  recording-mime.ts and one row here. */
 export function extensionForMime(mimeType: string): 'mp4' | 'webm' {
@@ -82,6 +95,13 @@ function makeFile(blob: Blob, filename: string, mimeType: string): File {
   // fall back to a tiny stub so canShare doesn't throw before our test.
   // (Real recordings are always > a few KB.)
   return new File([blob], filename, { type: mimeType });
+}
+
+/** Strip the `;codecs=...` suffix off a MIME so canShare/system share sheets
+ *  recognize the container type. `video/webm;codecs=vp9,opus` → `video/webm`. */
+function stripCodecParams(mimeType: string): string {
+  const idx = mimeType.indexOf(';');
+  return (idx === -1 ? mimeType : mimeType.slice(0, idx)).trim().toLowerCase();
 }
 
 function sanitizeFilenameSegment(s: string): string {

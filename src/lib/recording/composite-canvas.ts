@@ -72,6 +72,74 @@ export function computeCoverLayout(
 }
 
 /**
+ * Object-fit:contain math (Day-4-polish: B-prime). Source rect is the FULL
+ * frame; dest rect is centered + scaled to fit entirely inside the slot.
+ * Caller fills the slot's leftover (letterbox / pillarbox) with black before
+ * drawing so prior-frame pixels don't bleed through.
+ */
+export function computeContainLayout(
+  videoW: number, videoH: number,
+  destX: number, destY: number, destW: number, destH: number,
+): CoverLayout {
+  if (videoW <= 0 || videoH <= 0 || destW <= 0 || destH <= 0) {
+    return { sx: 0, sy: 0, sw: 0, sh: 0, dx: destX, dy: destY, dw: destW, dh: destH };
+  }
+  const videoAR = videoW / videoH;
+  const destAR = destW / destH;
+  let dw: number, dh: number;
+  if (videoAR > destAR) {
+    // Video is wider than slot → fit width, leave bars top + bottom.
+    dw = destW;
+    dh = Math.round(destW / videoAR);
+  } else {
+    // Video is taller than (or equal to) slot → fit height, leave bars
+    // left + right (the common 9:16 selfie/hook → 1.125:1 slot case).
+    dh = destH;
+    dw = Math.round(destH * videoAR);
+  }
+  const dx = destX + Math.round((destW - dw) / 2);
+  const dy = destY + Math.round((destH - dh) / 2);
+  return { sx: 0, sy: 0, sw: videoW, sh: videoH, dx, dy, dw, dh };
+}
+
+export type FitMode = 'cover' | 'contain' | 'auto';
+
+/**
+ * Smart fit (Day-4-polish: B-prime). 'auto' picks contain when the source
+ * aspect is more portrait-y than the slot — the case where cover would
+ * aggressively chop top + bottom of a vertical video and lose creator
+ * content (cooking hands, makeup detail, product close-ups). For sources
+ * that match or are wider than the slot, cover is fine because the side
+ * crop is small and there's room to spare on the long axis.
+ *
+ * Concrete rule: contain when videoAR < destAR. The two slots in our
+ * 540×960 stack are 540×480 each (destAR = 1.125), so any source taller
+ * than 1.125:1 (which is essentially every selfie cam + every TikTok-shaped
+ * hook) gets contain. Landscape sources (1.78:1 webcams, 16:9 long-form)
+ * fall through to cover.
+ */
+export function computeFitLayout(
+  videoW: number, videoH: number,
+  destX: number, destY: number, destW: number, destH: number,
+  mode: FitMode = 'auto',
+): CoverLayout {
+  if (videoW <= 0 || videoH <= 0 || destW <= 0 || destH <= 0) {
+    return { sx: 0, sy: 0, sw: 0, sh: 0, dx: destX, dy: destY, dw: destW, dh: destH };
+  }
+  let chosen: 'cover' | 'contain';
+  if (mode === 'auto') {
+    const videoAR = videoW / videoH;
+    const destAR = destW / destH;
+    chosen = videoAR < destAR ? 'contain' : 'cover';
+  } else {
+    chosen = mode;
+  }
+  return chosen === 'contain'
+    ? computeContainLayout(videoW, videoH, destX, destY, destW, destH)
+    : computeCoverLayout(videoW, videoH, destX, destY, destW, destH);
+}
+
+/**
  * Linear crossfade alphas — incoming ramps 0→1, outgoing ramps 1→0 over
  * durationMs. Clamped at the boundaries. elapsedMs is wall-clock since the
  * swap began.
@@ -162,7 +230,7 @@ export function createCompositor(opts: CompositorOptions): Compositor {
 
   function drawCover(
     videoEl: HTMLVideoElement,
-    dx: number, dy: number, dw: number, dh: number,
+    slotDx: number, slotDy: number, slotDw: number, slotDh: number,
     mirror: boolean,
   ): void {
     const vw = videoEl.videoWidth || 0;
@@ -171,10 +239,18 @@ export function createCompositor(opts: CompositorOptions): Compositor {
       // Video metadata not ready (Mux HLS pre-buffer, Simli pre-track).
       // Fill black so prior-frame pixels don't bleed through.
       ctx!.fillStyle = '#000';
-      ctx!.fillRect(dx, dy, dw, dh);
+      ctx!.fillRect(slotDx, slotDy, slotDw, slotDh);
       return;
     }
-    const lay = computeCoverLayout(vw, vh, dx, dy, dw, dh);
+    // B-prime smart-fit: contain when source is portrait-er than slot,
+    // else cover. Letterbox bars (when contain wins) are filled black
+    // first so prior-frame pixels don't bleed into the new bars region.
+    const lay = computeFitLayout(vw, vh, slotDx, slotDy, slotDw, slotDh, 'auto');
+    const isContain = lay.dw < slotDw || lay.dh < slotDh;
+    if (isContain) {
+      ctx!.fillStyle = '#000';
+      ctx!.fillRect(slotDx, slotDy, slotDw, slotDh);
+    }
     if (mirror) {
       // try/finally pairs save/restore unconditionally — drawImage can throw
       // InvalidStateError when a video loses its src mid-flight (Mux HLS
@@ -182,15 +258,15 @@ export function createCompositor(opts: CompositorOptions): Compositor {
       // (transform, alpha, shadow) leaks into every subsequent frame.
       ctx!.save();
       try {
-        ctx!.translate(dx + dw, dy);
+        ctx!.translate(lay.dx + lay.dw, lay.dy);
         ctx!.scale(-1, 1);
-        ctx!.drawImage(videoEl, lay.sx, lay.sy, lay.sw, lay.sh, 0, 0, dw, dh);
+        ctx!.drawImage(videoEl, lay.sx, lay.sy, lay.sw, lay.sh, 0, 0, lay.dw, lay.dh);
         noteDrawImageOk();
       } catch { noteDrawImageError(); }
       finally { ctx!.restore(); }
     } else {
       try {
-        ctx!.drawImage(videoEl, lay.sx, lay.sy, lay.sw, lay.sh, dx, dy, dw, dh);
+        ctx!.drawImage(videoEl, lay.sx, lay.sy, lay.sw, lay.sh, lay.dx, lay.dy, lay.dw, lay.dh);
         noteDrawImageOk();
       } catch { noteDrawImageError(); }
     }
