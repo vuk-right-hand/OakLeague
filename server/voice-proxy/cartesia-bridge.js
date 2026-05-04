@@ -96,6 +96,10 @@ export class CartesiaTTSBridge extends EventEmitter {
     this._reconnecting = false;
     this._reconnectAttempt = 0;
     this._unknownTypeWarned = false;
+    // Sliding-window thrash guard (audit M7): if Cartesia closes idle
+    // and successfully reconnects in tight succession, we'd loop forever.
+    // Cap successful reconnects at 5 within a 60s window before giving up.
+    this._reconnectTimestamps = [];
   }
 
   /** Opens the WS. Resolves on first successful connect; rejects on timeout. */
@@ -430,6 +434,20 @@ export class CartesiaTTSBridge extends EventEmitter {
   async _reconnect() {
     if (this._closed) return;
     if (this._reconnecting) return;
+    // Sliding-window thrash guard: prune timestamps older than 60s, then
+    // refuse if we already burned 5 successful reconnects in the window.
+    const now = Date.now();
+    this._reconnectTimestamps = this._reconnectTimestamps.filter((t) => now - t < 60_000);
+    if (this._reconnectTimestamps.length >= 5) {
+      this.emit('event', {
+        kind: 'error',
+        at: now,
+        code: 'connection_lost',
+        message: 'cartesia_reconnect_thrash_window',
+        fatal: true,
+      });
+      return;
+    }
     this._reconnecting = true;
     for (const wait of RECONNECT_BACKOFFS_MS) {
       this._reconnectAttempt += 1;
@@ -439,6 +457,7 @@ export class CartesiaTTSBridge extends EventEmitter {
         await this._openOnce();
         this._reconnecting = false;
         this._reconnectAttempt = 0;
+        this._reconnectTimestamps.push(Date.now());
         this.emit('event', { kind: 'reconnected', at: Date.now() });
         return;
       } catch (e) {

@@ -799,7 +799,14 @@ wss.on('connection', async (ws, req) => {
               closeWs(ws, 4006, res.reason);
             }
           })
-          .catch(() => {});
+          .catch((e) => {
+            // Non-fatal accumulate failure: quota seconds for this turn
+            // are dropped (user gets a free turn). Surface to Sentry
+            // rather than swallowing — repeated drops indicate a quota
+            // RPC outage that the kill-switch's degraded-snapshot path
+            // should be handling, but we want to see it.
+            captureException(e, { level: 'warning', op: 'accumulateSeconds', sessionId });
+          });
       } else if (msg.type === 'cancel') {
         // R3-M1 / R4-S1 — set the relay-loop flag SYNCHRONOUSLY before
         // any await, then ws-send cancel to Cartesia. Bridge.cancel
