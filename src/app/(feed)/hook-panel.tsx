@@ -619,7 +619,8 @@ export function HookPanel({
             if (!r.ok) {
               const body = (await r.json().catch(() => ({}))) as { error?: string };
               const outcome =
-                body?.error === 'creator_not_ready' ? 'creator_not_ready'
+                body?.error === 'creator_voice_not_trained' ? 'creator_voice_not_trained'
+                : body?.error === 'creator_not_ready' ? 'creator_not_ready'
                 : body?.error === 'rate_limited' || r.status === 429 ? 'kill_switch_blocked'
                 : body?.error === 'unauthorized' || r.status === 401 ? 'auth_required'
                 : 'unknown_error';

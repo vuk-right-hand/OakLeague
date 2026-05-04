@@ -223,3 +223,147 @@ test('cogs RPC: leg-1 cost computation is finite and non-negative', async () => 
   assert.ok(p.p_gemini_audio_in_cost > 0, 'cost is positive for non-zero seconds');
   assert.equal(p.p_gemini_audio_out_tokens, 0);
 });
+
+// ── Pipeline α' / Cartesia leg tests ────────────────────────────────────
+
+test("α': cartesia payload populates legs 3+4 with real values + drops cartesia_pending", async () => {
+  // Set up Cartesia env for getCartesiaPricing.
+  process.env.VOICE_CARTESIA_ENABLED = '1';
+  process.env.CARTESIA_USD_PER_CHAR = '0.000015'; // $15/1M chars
+  process.env.CARTESIA_QUOTED_AT = '2026-05-02';
+  // Force re-import so module-level snapshots pick up the env.
+  const mod = await import(`./proxy-handlers.js?cartesia=${Date.now()}`);
+  const sb = mkSupabase();
+  const { logTurnCogs } = mod.makeLogTurnCogs({ supabase: sb });
+
+  await logTurnCogs({
+    userId: 'u', sessionId: 's-c1', turnNumber: 1,
+    inputSeconds: 1.0, outputSeconds: 2.0,
+    usageMetadata: { responseTokenCount: 100 },
+    cartesia: {
+      characters: 200,
+      audioBytes: 240000, // 5s of 24kHz s16le = 240000 bytes
+      audioSeconds: 5.0,
+      partial: false,
+    },
+  });
+  const p = sb.calls[0].payload;
+  assert.equal(p.p_cartesia_characters, 200);
+  // 200 chars × 0.000015 = 0.003 USD
+  assert.equal(p.p_cartesia_cost, 0.003);
+  assert.equal(p.p_cartesia_audio_seconds, 5.0);
+  assert.equal(p.p_metadata.cartesia_quoted_at, '2026-05-02');
+  assert.equal(p.p_metadata.cartesia_pending, undefined,
+    'pending flag must be cleared on real Cartesia legs');
+  assert.equal(p.p_metadata.cartesia_partial, undefined,
+    'partial flag absent on a clean turn');
+});
+
+test("α': cartesia.partial=true sets cartesia_partial metadata", async () => {
+  process.env.VOICE_CARTESIA_ENABLED = '1';
+  process.env.CARTESIA_USD_PER_CHAR = '0.000015';
+  process.env.CARTESIA_QUOTED_AT = '2026-05-02';
+  const mod = await import(`./proxy-handlers.js?partial=${Date.now()}`);
+  const sb = mkSupabase();
+  const { logTurnCogs } = mod.makeLogTurnCogs({ supabase: sb });
+  await logTurnCogs({
+    userId: 'u', sessionId: 's-p', turnNumber: 1,
+    inputSeconds: 1, outputSeconds: 2,
+    usageMetadata: { responseTokenCount: 100 },
+    cartesia: { characters: 50, audioBytes: 0, audioSeconds: 0, partial: true },
+  });
+  const p = sb.calls[0].payload;
+  assert.equal(p.p_metadata.cartesia_partial, true);
+  assert.equal(p.p_cartesia_audio_seconds, 0);
+  assert.equal(p.p_cartesia_characters, 50);
+});
+
+test('M4 mixed-rows scenario: dashboard headline filter excludes pending + partial', () => {
+  // Simulates the SQL the live cogs route applies. Vibes-check that the
+  // metadata shape we write is filterable.
+  const rows = [
+    { cost_usd: 0.0042, metadata: {} },
+    { cost_usd: 0.0010, metadata: { cartesia_pending: true } },
+    { cost_usd: 0.0030, metadata: { cartesia_partial: true } },
+    { cost_usd: 0.0050, metadata: { cartesia_quoted_at: '2026-05-02' } },
+  ];
+  // headline = sum where neither flag set
+  const headline = rows
+    .filter((r) => !r.metadata.cartesia_pending && !r.metadata.cartesia_partial)
+    .reduce((a, r) => a + r.cost_usd, 0);
+  assert.equal(headline, 0.0042 + 0.0050);
+});
+
+test('R3-S6 cost precision: $6/turn ceiling rounds to 6 decimals (no integer pennies)', async () => {
+  process.env.VOICE_CARTESIA_ENABLED = '1';
+  // Hypothetical worst-case: $0.0015/char × 4000 char cap = $6.00.
+  process.env.CARTESIA_USD_PER_CHAR = '0.0015';
+  process.env.CARTESIA_QUOTED_AT = '2026-05-02';
+  const mod = await import(`./proxy-handlers.js?precision=${Date.now()}`);
+  const sb = mkSupabase();
+  const { logTurnCogs } = mod.makeLogTurnCogs({ supabase: sb });
+  await logTurnCogs({
+    userId: 'u', sessionId: 's-prec', turnNumber: 1,
+    inputSeconds: 1, outputSeconds: 0,
+    cartesia: { characters: 4000, audioBytes: 0, audioSeconds: 0, partial: false },
+  });
+  const p = sb.calls[0].payload;
+  // 4000 × 0.0015 = 6.000000
+  assert.equal(p.p_cartesia_cost, 6);
+  // Confirm we DIDN'T floor to dollars.
+  assert.notEqual(p.p_cartesia_cost.toString(), '0');
+});
+
+test('R4-S3 fail-closed: missing CARTESIA_USD_PER_CHAR throws when enabled', async () => {
+  process.env.VOICE_CARTESIA_ENABLED = '1';
+  delete process.env.CARTESIA_USD_PER_CHAR;
+  process.env.CARTESIA_QUOTED_AT = '2026-05-02';
+  const mod = await import(`./proxy-handlers.js?missing=${Date.now()}`);
+  const sb = mkSupabase();
+  const { logTurnCogs } = mod.makeLogTurnCogs({ supabase: sb });
+  await assert.rejects(
+    () => logTurnCogs({
+      userId: 'u', sessionId: 's-fc', turnNumber: 1,
+      inputSeconds: 1, outputSeconds: 0,
+      cartesia: { characters: 100, audioBytes: 0, audioSeconds: 0, partial: false },
+    }),
+    /CARTESIA_USD_PER_CHAR/,
+  );
+});
+
+test('R4-S3: empty-string env → finite-positive guard rejects (caught Number(\'\') === 0 trap)', async () => {
+  process.env.VOICE_CARTESIA_ENABLED = '1';
+  process.env.CARTESIA_USD_PER_CHAR = ''; // empty → Number('') = 0
+  process.env.CARTESIA_QUOTED_AT = '2026-05-02';
+  const mod = await import(`./proxy-handlers.js?empty=${Date.now()}`);
+  const sb = mkSupabase();
+  const { logTurnCogs } = mod.makeLogTurnCogs({ supabase: sb });
+  await assert.rejects(
+    () => logTurnCogs({
+      userId: 'u', sessionId: 's-em', turnNumber: 1,
+      inputSeconds: 1, outputSeconds: 0,
+      cartesia: { characters: 100, audioBytes: 0, audioSeconds: 0, partial: false },
+    }),
+    /CARTESIA_USD_PER_CHAR/,
+  );
+});
+
+test('Cartesia disabled (default env): legacy zeros + cartesia_pending preserved', async () => {
+  delete process.env.VOICE_CARTESIA_ENABLED;
+  delete process.env.CARTESIA_USD_PER_CHAR;
+  delete process.env.CARTESIA_QUOTED_AT;
+  const mod = await import(`./proxy-handlers.js?disabled=${Date.now()}`);
+  const sb = mkSupabase();
+  const { logTurnCogs } = mod.makeLogTurnCogs({ supabase: sb });
+  await logTurnCogs({
+    userId: 'u', sessionId: 's-off', turnNumber: 1,
+    inputSeconds: 1, outputSeconds: 2,
+    usageMetadata: { responseTokenCount: 50 },
+  });
+  const p = sb.calls[0].payload;
+  assert.equal(p.p_cartesia_characters, 0);
+  assert.equal(p.p_cartesia_cost, 0);
+  assert.equal(p.p_cartesia_audio_seconds, 0);
+  assert.equal(p.p_metadata.cartesia_pending, true);
+  assert.equal(p.p_metadata.cartesia_quoted_at, undefined);
+});

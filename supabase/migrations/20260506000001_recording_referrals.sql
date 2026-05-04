@@ -48,8 +48,11 @@ COMMENT ON TABLE public.referral_tokens IS
 CREATE INDEX referral_tokens_user_id_created_at_idx
   ON public.referral_tokens (user_id, created_at DESC);
 CREATE INDEX referral_tokens_expires_at_idx
-  ON public.referral_tokens (expires_at)
-  WHERE expires_at > now();  -- partial index for the active-token lookups
+  ON public.referral_tokens (expires_at);
+-- Was: WHERE expires_at > now(). Postgres rejects now() in index predicates
+-- (functions in index predicate must be marked IMMUTABLE — now() is STABLE).
+-- Full index is functionally equivalent for active-token lookups at our scale;
+-- expired entries grow linearly but are pruned by future GC sweeps.
 
 -- 2. referral_redemptions --------------------------------------------------
 -- Credit events: landing / first_session / first_paid.

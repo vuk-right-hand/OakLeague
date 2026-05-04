@@ -13,9 +13,15 @@
 //   4002 session_already_active  — unique_violation on sessions insert
 //   4003 kill_switch_fired       — latch raised by sessions_enforce trigger
 //   4004 bad_request             — missing ticket/model or bad model id
-//   4005 upstream_error          — GeminiBridge open failed
+//   4005 upstream_error          — Gemini or Cartesia bridge open failed
 //   4006 quota_state_inconsistent — P0002 from voice_check_quota (turn_start) or
-//                                    voice_accumulate_seconds (turn_end) — missing daily_quotas row
+//                                    voice_accumulate_seconds (turn_end) — missing
+//                                    daily_quotas row OR R4-C2 22003 oob
+//   4009 cartesia_no_voice       — useCartesia=true but creators.voice_id IS NULL
+//   4010 model_not_compatible    — useCartesia=true with a non-allowlisted model
+//                                    (R4-M6: only 3.1 Live verified for transcription)
+//   4011 tts_reconnecting        — turn_start during Cartesia reconnect window (R4-M2)
+//   4012 backpressure            — user WS bufferedAmount > 2 MB (R3-C2)
 //   1008 quota_exceeded          — kill-switch or degraded-and-unknown at turn_start
 //   1011 internal_error          — unhandled
 //   1000 normal_closure          — client initiated
@@ -29,8 +35,10 @@ import { createHash } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { createClient } from '@supabase/supabase-js';
 import { GeminiBridge } from './gemini-bridge.js';
+import { CartesiaTTSBridge } from './cartesia-bridge.js';
 import { decideQuotaGate } from './quota-gate.js';
-import { makeLogTurnCogs, installReaper } from './proxy-handlers.js';
+import { makeLogTurnCogs, installReaper, VOICE_CARTESIA_ENABLED, getCartesiaPricing } from './proxy-handlers.js';
+import { makeVoiceDeleteWorker } from './voice-delete-worker.js';
 
 const PORT = Number(process.env.PORT || 8080);
 const BUILD = process.env.FLY_MACHINE_ID || 'local';
@@ -38,6 +46,36 @@ const BUILD = process.env.FLY_MACHINE_ID || 'local';
 const SUPABASE_URL          = requireEnv('SUPABASE_URL');
 const SUPABASE_SERVICE_KEY  = requireEnv('SUPABASE_SERVICE_ROLE_KEY');
 const GEMINI_API_KEY        = requireEnv('GEMINI_API_KEY');
+// CARTESIA_API_KEY is required only when VOICE_CARTESIA_ENABLED=1.
+const CARTESIA_API_KEY      = process.env.CARTESIA_API_KEY || '';
+if (VOICE_CARTESIA_ENABLED) {
+  if (!CARTESIA_API_KEY) {
+    console.error('FATAL: CARTESIA_API_KEY missing while VOICE_CARTESIA_ENABLED=1');
+    process.exit(1);
+  }
+  // Trip the pricing-env validator at boot so a missing rate is a hard fail.
+  getCartesiaPricing();
+}
+
+// R4-M6 — Cartesia is only safe with models we've Phase-0-verified for
+// outputAudioTranscription. Explicit allowlist; no startsWith fuzz.
+const CARTESIA_COMPATIBLE_MODELS = new Set([
+  'gemini-3.1-flash-live-preview',
+]);
+
+// R3-C2 / S-M7 user-WS backpressure cap.
+// Per-session: 2 MB ≈ 42s of 24kHz s16le.
+// Per-VM aggregate: 32 MB. With 200 concurrent sessions a 2 MB per-session
+// cap could in principle hit 400 MB heap on a Fly small instance — well
+// past the OOM line. The aggregate cap closes the OLDEST session with
+// >=1 MB buffered when the VM total breaches.
+const USER_WS_BACKPRESSURE_MAX_BYTES = 2 * 1024 * 1024;
+const USER_WS_BACKPRESSURE_WARN_BYTES = 1 * 1024 * 1024;
+const USER_WS_AGGREGATE_MAX_BYTES = 32 * 1024 * 1024;
+
+// sessionId → { ws, openedAt }. Used to compute aggregate bufferedAmount
+// and to pick the oldest offender on aggregate breach.
+const wsRegistry = new Map();
 
 const ALLOWED_MODELS = new Set([
   'gemini-2.5-flash-native-audio-preview-12-2025',
@@ -75,6 +113,24 @@ const server = http.createServer((req, res) => {
   if (req.url === '/healthz') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, build: BUILD, ts: Date.now() }));
+    return;
+  }
+  // R3-C2 (sec) — single source of truth for the α' rollout flag.
+  // Vercel polls this endpoint (60s in-process cache) instead of
+  // reading its own env, so flipping VOICE_CARTESIA_ENABLED on Fly
+  // alone propagates to the pre-WS gate at /api/sessions/open. Public
+  // (no auth) but only exposes flags + version, no secrets.
+  if (req.url === '/voice-config') {
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      // Cache control: short, so a Fly secret flip propagates within ~1m.
+      'cache-control': 'public, max-age=30',
+    });
+    res.end(JSON.stringify({
+      useCartesia: VOICE_CARTESIA_ENABLED,
+      build: BUILD,
+      ts: Date.now(),
+    }));
     return;
   }
   res.writeHead(404);
@@ -236,6 +292,22 @@ async function accumulateSeconds(sessionId, seconds) {
       });
       return { ok: false, fatal: true, reason: 'quota_state_inconsistent' };
     }
+    if (code === '22003') {
+      // R4-C2: per-turn second sum exceeded the 3600s RPC oob ceiling.
+      // Under the 4000-char R3-C4 transcript cap this should be unreachable
+      // (worst-case ~600s). Hitting it means either the cap was bumped
+      // without re-deriving the second-equivalent ceiling, or a Gemini
+      // turn ran > 30 minutes — both are alarms. Promote to fatal so the
+      // WS closes 4006 instead of silently desync'ing seconds_used.
+      console.error('[voice_accumulate_seconds] FATAL 22003 (oob)', error);
+      captureException(error, {
+        level: 'fatal',
+        op: 'voice_accumulate_seconds',
+        sessionId,
+        quotaOob: true,
+      });
+      return { ok: false, fatal: true, reason: 'quota_oob' };
+    }
     console.error('[voice_accumulate_seconds]', error);
     captureException(error, { op: 'voice_accumulate_seconds', sessionId, code });
     return { ok: false, fatal: false, reason: 'quota_accumulate_failed' };
@@ -299,16 +371,19 @@ wss.on('connection', async (ws, req) => {
   const sessionId = sess.sessionId;
   console.log(`[ws ${connId}] session ok id=${sessionId.slice(0,8)}`);
   sessionToWs.set(sessionId, ws);
+  wsRegistry.set(sessionId, { ws, openedAt: Date.now() });
 
   let bridge = null;
+  let cartesia = null;
   let closed = false;
   let lastHeartbeatAt = Date.now();
   let heartbeatInterval = null;
-  // Per-session monotonic turn counter for cogs_insert_turn_voice idempotency
-  // key (session_id, turn_number, service, operation). Increments on each
-  // turn_start; the same value is passed to logTurnCogs at the matching
-  // turn_end.
   let turnNumber = 0;
+  let cartesiaTurnDead = false; // R3-M1 / R4-S1 — relay-loop gate for barge-in
+
+  // R3-A8 / R4-S8 — snapshot the rollback flag and model gate ONCE per
+  // session. No mid-session re-read.
+  const useCartesia = VOICE_CARTESIA_ENABLED;
 
   const teardown = async (reason) => {
     if (closed) return;
@@ -316,22 +391,86 @@ wss.on('connection', async (ws, req) => {
     clearInterval(heartbeatInterval);
     quotaCache.delete(sessionId);
     sessionToWs.delete(sessionId);
+    wsRegistry.delete(sessionId);
     dropCogsSession(sessionId);
-    try { await bridge?.close(); } catch {}
+    // R4-M1 — null-check INSTANCES, not booleans. Either bridge may be
+    // null if the open path bailed early.
+    try { if (cartesia) await cartesia.close(); } catch {}
+    try { if (bridge)   await bridge.close();   } catch {}
     await endSession(sessionId, reason);
   };
 
+  // R4-M6 — model gate before any bridge instantiation when α' is on.
+  if (useCartesia && !CARTESIA_COMPATIBLE_MODELS.has(modelWire)) {
+    console.log(`[ws ${connId}] model_not_compatible_with_cartesia ${modelWire}`);
+    await teardown('model_not_compatible_with_cartesia');
+    return closeWs(ws, 4010, 'model_not_compatible');
+  }
+
+  // R3-Phase3 — voice id lookup. Fail-closed when α' is on but creator
+  // hasn't been cloned yet.
+  let creatorVoiceId = null;
+  if (useCartesia) {
+    try {
+      const { data, error } = await supabase
+        .from('creators')
+        .select('voice_id')
+        .eq('id', creatorId)
+        .maybeSingle();
+      if (error) throw error;
+      creatorVoiceId = data?.voice_id || null;
+    } catch (e) {
+      console.error(`[ws ${connId}] voice-id-lookup`, e);
+      captureException(e, { op: 'voice-id-lookup', sessionId, creatorId });
+      await teardown('voice_id_lookup_failed');
+      return closeWs(ws, 4005, 'upstream_error');
+    }
+    if (!creatorVoiceId) {
+      console.log(`[ws ${connId}] cartesia_no_voice creator=${creatorId.slice(0,8)}`);
+      await teardown('cartesia_no_voice');
+      return closeWs(ws, 4009, 'cartesia_no_voice');
+    }
+  }
+
+  // R3-C3 / R4-S8 — SERIAL open: Gemini first (it doesn't accept user
+  // audio until 'ready' is sent), then Cartesia. If Cartesia rejects we
+  // close Gemini before user-WS close to prevent token-bill leaks.
   try {
-    bridge = new GeminiBridge({ apiKey: GEMINI_API_KEY });
-    console.log(`[ws ${connId}] bridge.open start`);
-    const bridgeT0 = Date.now();
+    bridge = new GeminiBridge({
+      apiKey: GEMINI_API_KEY,
+      enableOutputTranscription: useCartesia,
+      discardAudioOut: useCartesia,
+    });
+    console.log(`[ws ${connId}] gemini.open start (cartesia=${useCartesia})`);
+    const t0 = Date.now();
     await bridge.open({ model: modelWire, sessionId });
-    console.log(`[ws ${connId}] bridge.open ok in ${Date.now() - bridgeT0}ms`);
+    console.log(`[ws ${connId}] gemini.open ok in ${Date.now() - t0}ms`);
   } catch (e) {
-    console.error(`[ws ${connId}] bridge-open FAIL:`, e?.message || e);
+    console.error(`[ws ${connId}] gemini-open FAIL:`, e?.message || e);
     captureException(e, { op: 'bridge-open', connId, modelWire, sessionId });
     await teardown('bridge_open_failed');
     return closeWs(ws, 4005, 'upstream_error');
+  }
+
+  if (useCartesia) {
+    try {
+      cartesia = new CartesiaTTSBridge({
+        apiKey: CARTESIA_API_KEY,
+        voiceId: creatorVoiceId,
+      });
+      const t0 = Date.now();
+      await cartesia.open();
+      console.log(`[ws ${connId}] cartesia.open ok in ${Date.now() - t0}ms`);
+    } catch (e) {
+      console.error(`[ws ${connId}] cartesia-open FAIL:`, e?.message || e);
+      captureException(e, { op: 'cartesia-open', connId, sessionId });
+      // R3-C3 — close Gemini before user WS so it doesn't accept audio
+      // for a session that can't synthesize.
+      try { await bridge?.close(); } catch {}
+      bridge = null;
+      await teardown('cartesia_open_failed');
+      return closeWs(ws, 4005, 'upstream_error');
+    }
   }
 
   // Mark session active + start heartbeat touches on sessions.last_heartbeat_at.
@@ -350,13 +489,98 @@ wss.on('connection', async (ws, req) => {
     captureException(e, { op: 'activate-session', sessionId });
   }
 
-  ws.send(JSON.stringify({ type: 'ready', sessionId, build: BUILD }));
+  ws.send(JSON.stringify({ type: 'ready', sessionId, build: BUILD, useCartesia }));
 
-  // Bridge → client audio + turn events
+  // R3-C2 / R4-C4 / S-M7 — backpressure-aware send. Applied to every
+  // audio frame forwarded to the user WS (Gemini fallback or Cartesia α').
+  // Three-tier cap:
+  //   * per-session warn (1 MB)   → Sentry breadcrumb + user-visible
+  //                                  `slow_connection` advisory event
+  //   * per-session hard (2 MB)   → close 4012 backpressure
+  //   * VM-aggregate hard (32 MB) → close oldest offender 4012
+  let bpWarned = false;
+  function sendBinaryWithBackpressure(bytes) {
+    if (closed || ws.readyState !== ws.OPEN) return;
+    if (ws.bufferedAmount > USER_WS_BACKPRESSURE_MAX_BYTES) {
+      console.warn(`[ws ${connId}] backpressure-cap bufferedAmount=${ws.bufferedAmount}`);
+      captureException(new Error('user_ws_backpressure_cap'), {
+        level: 'warning',
+        op: 'backpressure',
+        sessionId,
+        bufferedAmount: ws.bufferedAmount,
+      });
+      try { ws.send(JSON.stringify({ type: 'error', code: 'client_too_slow' })); } catch {}
+      teardown('backpressure').catch(() => {});
+      return closeWs(ws, 4012, 'backpressure');
+    }
+    if (!bpWarned && ws.bufferedAmount > USER_WS_BACKPRESSURE_WARN_BYTES) {
+      bpWarned = true;
+      // U-M5 — give the user a chance to act before forced disconnect.
+      try { ws.send(JSON.stringify({ type: 'warning', code: 'slow_connection', at: Date.now() })); } catch {}
+      captureException(new Error('user_ws_backpressure_warn'), {
+        level: 'warning',
+        op: 'backpressure_warn',
+        sessionId,
+        bufferedAmount: ws.bufferedAmount,
+      });
+    }
+    // S-M7 — VM-aggregate guard. Cheap O(N) sum per send; N ≤ a few
+    // hundred concurrent sessions per Fly machine. If ever a hot path,
+    // amortize via a running counter.
+    let aggregate = 0;
+    let oldest = { sessionId: null, ws: null, openedAt: Infinity, buffered: 0 };
+    for (const [sid, entry] of wsRegistry.entries()) {
+      const b = entry.ws.bufferedAmount || 0;
+      aggregate += b;
+      if (b >= USER_WS_BACKPRESSURE_WARN_BYTES && entry.openedAt < oldest.openedAt) {
+        oldest = { sessionId: sid, ws: entry.ws, openedAt: entry.openedAt, buffered: b };
+      }
+    }
+    if (aggregate > USER_WS_AGGREGATE_MAX_BYTES && oldest.ws) {
+      console.warn(`[ws ${connId}] vm-aggregate-backpressure aggregate=${aggregate} closing=${oldest.sessionId?.slice(0,8)}`);
+      captureException(new Error('user_ws_vm_aggregate_backpressure'), {
+        level: 'error',
+        op: 'backpressure_aggregate',
+        aggregate,
+        offenderSessionId: oldest.sessionId,
+        offenderBuffered: oldest.buffered,
+      });
+      try { oldest.ws.send(JSON.stringify({ type: 'error', code: 'client_too_slow' })); } catch {}
+      try { oldest.ws.close(4012, 'backpressure'); } catch {}
+    }
+    ws.send(bytes, { binary: true });
+  }
+
+  // ── Gemini events ─────────────────────────────────────────────────────
   bridge.on((e) => {
     if (closed) return;
     if (e.kind === 'audio_out') {
-      if (ws.readyState === ws.OPEN) ws.send(e.chunk.bytes, { binary: true });
+      // R3-S3 — when α' is on the bridge already discards audio_out at
+      // emit time (discardAudioOut:true). This branch is the rollback
+      // path: Gemini's audio goes straight to the user.
+      if (!useCartesia) sendBinaryWithBackpressure(e.chunk.bytes);
+    } else if (e.kind === 'output_transcription_chunk') {
+      // R3-C4 — pipe transcript text into Cartesia. Cartesia's
+      // _turnDead flag drops the chunk if a barge-in already fired
+      // synchronously. sendText is a no-op when bridge isn't open or
+      // turn isn't started.
+      if (useCartesia && cartesia) {
+        try { cartesia.sendText(e.text); } catch (err) {
+          captureException(err, { op: 'cartesia.sendText', sessionId });
+        }
+      }
+    } else if (e.kind === 'transcript_runaway') {
+      // L-M4 — bumped from 'warning' to 'error'. R4-C2 made the
+      // OUTPUT_TRANSCRIPT_MAX_CHARS cap load-bearing for the kill-switch;
+      // hitting it is a bug-class signal (model loop, prompt-injection,
+      // or cap mis-tuning), not just noise. Sentry alert routes off this.
+      console.error(`[ws ${connId}] transcript_runaway chars=${e.characterCount}`);
+      captureException(new Error('transcript_runaway'), {
+        level: 'error',
+        op: 'transcript_runaway',
+        sessionId,
+        characterCount: e.characterCount,
+      });
     } else if (e.kind === 'turn_complete') {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'turn_complete', at: e.at }));
     } else if (e.kind === 'interrupted') {
@@ -369,6 +593,43 @@ wss.on('connection', async (ws, req) => {
       closeWs(ws, 1011, 'upstream_closed');
     }
   });
+
+  // ── Cartesia events ───────────────────────────────────────────────────
+  if (useCartesia && cartesia) {
+    cartesia.on((e) => {
+      if (closed) return;
+      if (e.kind === 'audio_out') {
+        // R3-M1 / R4-S1 — relay-loop gate, in addition to the bridge's
+        // own _turnDead check. Belt-and-suspenders against late chunks
+        // from the WS receive buffer at cancel time.
+        if (cartesiaTurnDead) return;
+        sendBinaryWithBackpressure(e.chunk.bytes);
+      } else if (e.kind === 'reconnected') {
+        if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'tts_reconnected', at: e.at }));
+      } else if (e.kind === 'error') {
+        // Diagnostic 2026-05-04 — surface Cartesia error details to Fly logs
+        // (Sentry is no-op until SENTRY_DSN is wired). Without this we only
+        // see `tts_failed` at the harness with no upstream cause.
+        console.error(`[cartesia.error] code=${e.code} message=${e.message} fatal=${e.fatal}`);
+        if (e.fatal) {
+          if (ws.readyState === ws.OPEN) {
+            ws.send(JSON.stringify({ type: 'error', code: 'tts_failed', at: e.at, detail: e.code }));
+          }
+          captureException(new Error(`cartesia.${e.code}`), {
+            op: 'cartesia.error',
+            sessionId,
+            cartesiaCode: e.code,
+            detail: e.message,
+          });
+          teardown('tts_failed').catch(() => {});
+          closeWs(ws, 1011, 'tts_failed');
+        }
+      } else if (e.kind === 'closed') {
+        // Idle-window close handled by the bridge's auto-reconnect
+        // (R3-M2 / R4-M2). No action required here.
+      }
+    });
+  }
 
   // Heartbeat: ws.ping every 20s. Client must pong (native WS behavior).
   // On pong, touch sessions.last_heartbeat_at for reaper input.
@@ -406,28 +667,131 @@ wss.on('connection', async (ws, req) => {
         if (!gate.ok) {
           ws.send(JSON.stringify({ type: 'error', code: gate.reason, op: 'turn_start' }));
           await teardown(gate.reason);
-          // B1: fatal at turn_start uses the same distinct close code as
-          // fatal at turn_end so the client can distinguish "you're over
-          // quota" (1008) from "your quota row is gone" (4006).
           const closeCode = gate.fatal ? 4006 : 1008;
           return closeWs(ws, closeCode, gate.reason);
         }
         turnNumber += 1;
+        // R3-M1 / U-C5 — clear the relay-loop barge-in flag BEFORE bridge
+        // turnStart so any race with a stale chunk in the WS receive
+        // buffer drops cleanly. (Was post-turnStart; moved per audit C3.)
+        cartesiaTurnDead = false;
         bridge.turnStart();
+        // R4-M2 / U-C5 — cartesia.turnStart can throw `tts_reconnecting`
+        // synchronously when the bridge is in the auto-reconnect window.
+        // Bridge auto-reconnect typically lands in 200–700ms; wait up to
+        // 1500ms for `reconnected` before giving up so a single
+        // unfortunately-timed tap doesn't kill the session.
+        // Audit R3-C1 (logic) flagged a listener-attach race here;
+        // verified false-positive. JS is single-threaded and
+        // `cartesia.on(handler)` runs synchronously inside the Promise
+        // constructor body BEFORE the await yields. The bridge needs
+        // at least one `await` cycle (setTimeout 200ms) to reach
+        // `emit('reconnected')`, which is well after the listener is
+        // attached. No race in this execution model.
+        if (useCartesia && cartesia) {
+          let attempt = 0;
+          while (attempt < 2) {
+            try {
+              cartesia.turnStart(`${sessionId}:${turnNumber}`);
+              break; // success
+            } catch (e) {
+              if (e?.code === 'tts_reconnecting' && attempt === 0) {
+                attempt += 1;
+                // Wait for the bridge's `reconnected` event — single
+                // listener with a 1500ms ceiling.
+                const waited = await new Promise((resolve) => {
+                  const to = setTimeout(() => { off(); resolve(false); }, 1500);
+                  const off = cartesia.on((ev) => {
+                    if (ev.kind === 'reconnected') { clearTimeout(to); off(); resolve(true); }
+                    else if (ev.kind === 'error' && ev.fatal) { clearTimeout(to); off(); resolve(false); }
+                  });
+                });
+                if (!waited) {
+                  ws.send(JSON.stringify({ type: 'error', code: 'tts_reconnecting', op: 'turn_start' }));
+                  await teardown('tts_reconnecting');
+                  return closeWs(ws, 4011, 'tts_reconnecting');
+                }
+                continue; // retry turnStart now that we're reconnected
+              }
+              if (e?.code === 'tts_reconnecting') {
+                // Second attempt also hit the window — give up.
+                ws.send(JSON.stringify({ type: 'error', code: 'tts_reconnecting', op: 'turn_start' }));
+                await teardown('tts_reconnecting');
+                return closeWs(ws, 4011, 'tts_reconnecting');
+              }
+              // Anything else: tear down as upstream error.
+              captureException(e, { op: 'cartesia.turnStart', sessionId });
+              await teardown('cartesia_turn_start_failed');
+              return closeWs(ws, 4005, 'upstream_error');
+            }
+          }
+        }
       } else if (msg.type === 'turn_end') {
         const metrics = await bridge.turnEnd({ timeoutMs: msg.timeoutMs || 30_000 });
-        ws.send(JSON.stringify({ type: 'turn_end_ack', metrics }));
+        let cartesiaMetrics = null;
+        if (useCartesia && cartesia) {
+          // R3-C1 / R4-C1 — always await; bridge resolves with partial:true
+          // on timeout/error so logTurnCogs (and the Gemini legs) always
+          // land. NEVER throw out of this path.
+          // 10s default: Phase 0 measured cold-connect `done` ack at ~6s,
+          // so 5s would flag partial:true on the steady state and break
+          // dashboard gating on cartesia_partial.
+          cartesiaMetrics = await cartesia.turnEnd({ timeoutMs: 10_000 });
+        }
+        // U-M6 — surface a user-facing warning when Cartesia returned
+        // partial. Proxy already records cartesia_partial in metadata for
+        // dashboard reconciliation; this lets the client UI show "(this
+        // response was cut off — ask again)" instead of failing silent.
+        if (cartesiaMetrics?.partial) {
+          try {
+            ws.send(JSON.stringify({
+              type: 'warning',
+              code: 'response_truncated',
+              at: Date.now(),
+              characters: cartesiaMetrics.characters,
+            }));
+          } catch {}
+        }
+        ws.send(JSON.stringify({ type: 'turn_end_ack', metrics, cartesia: cartesiaMetrics }));
         logTurnCogs({
           userId, sessionId, turnNumber,
           inputSeconds: metrics.inputSeconds,
           outputSeconds: metrics.outputSeconds,
           usageMetadata: metrics.usageMetadata,
-        }).catch(() => {});
-        // Quota accumulate: normally fire-and-forget (latch trigger handles
-        // 150% crossing), but a fatal P0002 means daily_quotas row is gone
-        // and we must tear down with a distinct WS code (4006) so the
-        // client can surface a real error instead of a silent free-turn leak.
-        accumulateSeconds(sessionId, (metrics.inputSeconds || 0) + (metrics.outputSeconds || 0))
+          cartesia: cartesiaMetrics,
+        }).catch((e) => {
+          // R4-S3 fail-closed: getCartesiaPricing() throws if env is
+          // missing/zero. The validator runs at module-load (proxy boot)
+          // so this catch is dead in steady state — but a Fly secret
+          // rotation that briefly clears the env between restarts would
+          // surface here. L-M5: kept intentionally; not dead in practice.
+          captureException(e, { op: 'logTurnCogs', sessionId, fatal: true });
+          ws.send(JSON.stringify({ type: 'error', code: 'cogs_misconfig', op: 'turn_end' }));
+          teardown('cogs_misconfig').catch(() => {});
+          closeWs(ws, 1011, 'cogs_misconfig');
+        });
+        // R4-C1 — quota math: when α' is on, sum mic seconds + REAL
+        // Cartesia audio seconds. L-C2 fix: when Cartesia returns
+        // `partial:true` (hang/timeout/error mid-turn), fall back to
+        // Gemini's `outputSeconds` so the kill-switch still sees real
+        // assistant-talk seconds. Without this fallback a runaway turn
+        // that hung Cartesia would bill ZERO assistant seconds and
+        // never trip the latch — the user could burn the daily char
+        // cap while seconds_used ticks at 1× mic only.
+        let quotaSeconds;
+        if (useCartesia) {
+          if (cartesiaMetrics?.partial) {
+            // Trust Gemini's audio-out length as the assistant-talk
+            // proxy. Slightly over-bills (Cartesia would have been
+            // shorter or longer) but never under-bills.
+            quotaSeconds = (metrics.inputSeconds || 0) + (metrics.outputSeconds || 0);
+          } else {
+            quotaSeconds = (metrics.inputSeconds || 0) + ((cartesiaMetrics?.audioSeconds) || 0);
+          }
+        } else {
+          quotaSeconds = (metrics.inputSeconds || 0) + (metrics.outputSeconds || 0);
+        }
+        accumulateSeconds(sessionId, quotaSeconds)
           .then(async (res) => {
             if (res?.fatal) {
               ws.send(JSON.stringify({ type: 'error', code: res.reason, op: 'turn_end' }));
@@ -437,7 +801,12 @@ wss.on('connection', async (ws, req) => {
           })
           .catch(() => {});
       } else if (msg.type === 'cancel') {
+        // R3-M1 / R4-S1 — set the relay-loop flag SYNCHRONOUSLY before
+        // any await, then ws-send cancel to Cartesia. Bridge.cancel
+        // also sets its own flag synchronously.
+        cartesiaTurnDead = true;
         bridge.cancel();
+        if (useCartesia && cartesia) cartesia.cancel();
       }
     } catch (e) {
       console.error('[control]', msg?.type, e);
@@ -458,18 +827,26 @@ wss.on('connection', async (ws, req) => {
 // ── Start ────────────────────────────────────────────────────────────────
 
 let reaperHandle = null;
+let voiceDeleteHandle = null;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`voice-proxy listening on :${PORT} (build=${BUILD})`);
   // Reaper: 20s cadence + 60s threshold (RPC default). Fires once at boot for
   // proxy-crash recovery, then every 20s. See plan §1B.
   reaperHandle = installReaper({ supabase }).handle;
+  // R4-M3 — voice-delete worker (Cartesia DELETE /voices deferred queue).
+  // Only when α' is enabled; otherwise no rows are ever enqueued.
+  if (VOICE_CARTESIA_ENABLED && CARTESIA_API_KEY) {
+    voiceDeleteHandle = makeVoiceDeleteWorker({ supabase, cartesiaApiKey: CARTESIA_API_KEY })
+      .install().handle;
+  }
 });
 
 // Graceful shutdown — stop the reaper interval so node exits cleanly when the
 // http server's connections drain. SIGTERM is what Fly sends on deploy.
 function shutdown(signal) {
-  console.log(`[shutdown] ${signal} — clearing reaper`);
+  console.log(`[shutdown] ${signal} — clearing reaper + voice-delete worker`);
   if (reaperHandle) clearInterval(reaperHandle);
+  if (voiceDeleteHandle) clearInterval(voiceDeleteHandle);
   server.close(() => process.exit(0));
   // Hard-exit after 5s if connections won't drain.
   setTimeout(() => process.exit(0), 5000).unref();

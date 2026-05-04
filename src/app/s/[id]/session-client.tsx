@@ -55,12 +55,18 @@ function readEnvelope(sessionId: string): OpenEnvelope | null {
 export function SessionClient(props: Props) {
   const [envelope, setEnvelope] = useState<OpenEnvelope | null>(null);
   const [envelopeChecked, setEnvelopeChecked] = useState(false);
+  const envelopeReadOnceRef = useRef(false);
 
   useEffect(() => {
     if (props.sessionAlreadyEnded) {
       setEnvelopeChecked(true);
       return;
     }
+    // React 18 strict mode runs effects twice in dev — readEnvelope is
+    // destructive (removes from sessionStorage on success), so without this
+    // ref guard the second run reads null and overwrites a valid envelope.
+    if (envelopeReadOnceRef.current) return;
+    envelopeReadOnceRef.current = true;
     const env = readEnvelope(props.sessionId);
     setEnvelope(env);
     setEnvelopeChecked(true);

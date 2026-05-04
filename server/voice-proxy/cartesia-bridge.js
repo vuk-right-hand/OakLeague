@@ -1,0 +1,467 @@
+// CartesiaTTSBridge — Pipeline α' TTS leg (Cartesia Sonic 3 over WS).
+//
+// Lifecycle: open → turnStart(ctxId) → sendText* → turnEnd → (repeat) → close
+// Events:    setup_complete | audio_out | turn_done | error | closed |
+//            reconnected
+//
+// Auth (verified against docs.cartesia.ai 2026-05-02): the Cartesia REST API
+// uses `Authorization: Bearer ${key}` (e.g. /voices/clone, DELETE /voices/{id}
+// — see route.ts + voice-delete-worker.js). The WebSocket endpoint uses
+// `X-API-Key: ${key}` because browsers can't set headers on WS opens — the
+// docs explicitly list the two as separate schemes. Both are correct; this
+// comment exists so a future reviewer doesn't "fix" the apparent mismatch.
+//
+// Wire format (cartesia_version=2026-03-01, JSON-base64 envelopes per
+// docs.cartesia.ai/api-reference/tts/websocket — VERIFIED in Phase-0 re-run
+// `scripts/cartesia-phase0-rerun.mjs`).
+//
+//   Outbound first chunk of a turn:
+//     { context_id, model_id:'sonic-3', transcript, voice:{mode:'id', id:<voiceId>},
+//       output_format:{ container:'raw', encoding:'pcm_s16le', sample_rate:24000 },
+//       continue:true }
+//   Outbound continuation:
+//     { context_id, transcript, continue:true }
+//   Outbound final flush:
+//     { context_id, transcript:'', continue:false }
+//   Outbound cancel:
+//     { context_id, cancel:true }
+//
+//   Inbound chunk:
+//     { type:'chunk', data:'<base64-pcm>', context_id, done:false, status_code:206 }
+//   Inbound done:
+//     { type:'done', done:true, context_id, status_code:206 }
+//   Inbound error:
+//     { type:'error', error_code, title, message, status_code, context_id }
+//
+// Strict JSON parse (R3-C4): non-JSON or unknown `type` is treated as a
+// protocol violation; the bridge emits error{code:'protocol_violation'}
+// and the caller MUST tear down. No raw-binary fallback.
+//
+// Inbound payload cap: maxPayload: 1 MB (R4-C4). Cartesia-side runaway
+// frames close the WS with code 1009 → onclose handler maps to error.
+//
+// Reconnect (R3-M2 / R4-M2): if the WS closes with no in-flight turn,
+// auto-reopen up to 3 times with backoff [200, 500, 1000] ms. If a
+// turnStart arrives during the reconnect window, reject synchronously
+// with error{code:'tts_reconnecting'} so the proxy can close 4011. A
+// mid-turn close stays terminal — Cartesia would re-bill the same
+// context_id per Phase-0 cross-check.
+
+import WebSocket from 'ws';
+import { EventEmitter } from 'node:events';
+
+const CARTESIA_WSS = 'wss://api.cartesia.ai/tts/websocket';
+const CARTESIA_VERSION = '2026-03-01';
+const SONIC_MODEL = 'sonic-3';
+const DEFAULT_SAMPLE_RATE = 24000;
+const DEFAULT_OPEN_TIMEOUT_MS = 5000;
+const INBOUND_MAX_PAYLOAD = 1 * 1024 * 1024;
+
+const RECONNECT_BACKOFFS_MS = [200, 500, 1000];
+
+const KNOWN_INBOUND_TYPES = new Set(['chunk', 'done', 'timestamps', 'error', 'flush_done']);
+
+// Bridge error code taxonomy. Provider-specific codes map onto these
+// const-union strings at the bridge boundary so consumers never see raw
+// Cartesia strings.
+const CARTESIA_ERROR_MAP = {
+  voice_not_found: 'bad_voice_id',
+  rate_limited: 'rate_limited',
+  model_not_found: 'model_not_found',
+  // anything else → 'other'
+};
+
+export class CartesiaTTSBridge extends EventEmitter {
+  /**
+   * @param {object} opts
+   * @param {string} opts.apiKey            Cartesia API key (header auth).
+   * @param {string} opts.voiceId           IVC voice id (creator clone).
+   * @param {number} [opts.sampleRate=24000]
+   * @param {number} [opts.openTimeoutMs=5000]
+   */
+  constructor({ apiKey, voiceId, sampleRate = DEFAULT_SAMPLE_RATE, openTimeoutMs = DEFAULT_OPEN_TIMEOUT_MS } = {}) {
+    super();
+    if (!apiKey) throw new Error('CARTESIA_API_KEY missing');
+    if (!voiceId) throw new Error('voiceId missing');
+    this._apiKey = apiKey;
+    this._voiceId = voiceId;
+    this._sampleRate = sampleRate;
+    this._openTimeoutMs = openTimeoutMs;
+    this._ws = null;
+    this._closed = false;
+    this._currentContextId = null;
+    this._turnDead = false;
+    this._charsThisTurn = 0;
+    this._audioBytesThisTurn = 0;
+    this._reconnecting = false;
+    this._reconnectAttempt = 0;
+    this._unknownTypeWarned = false;
+  }
+
+  /** Opens the WS. Resolves on first successful connect; rejects on timeout. */
+  async open() {
+    if (this._closed) throw new Error('bridge_closed');
+    if (this._ws) throw new Error('bridge_already_open');
+    await this._openOnce();
+  }
+
+  async _openOnce() {
+    const url = `${CARTESIA_WSS}?cartesia_version=${encodeURIComponent(CARTESIA_VERSION)}`;
+    const ws = new WebSocket(url, {
+      headers: { 'X-API-Key': this._apiKey },
+      maxPayload: INBOUND_MAX_PAYLOAD,
+      perMessageDeflate: false,
+    });
+    this._ws = ws;
+
+    await new Promise((resolve, reject) => {
+      const to = setTimeout(() => {
+        try { ws.terminate(); } catch {}
+        reject(new Error('cartesia_open_timeout'));
+      }, this._openTimeoutMs);
+      ws.once('open', () => {
+        clearTimeout(to);
+        ws.on('message', (data, isBinary) => this._onMessage(data, isBinary));
+        ws.on('close', (code, reason) => this._onClose(code, reason));
+        ws.on('error', (e) => this._onError(e));
+        resolve();
+      });
+      ws.once('error', (e) => {
+        clearTimeout(to);
+        reject(e);
+      });
+    });
+    // No setup-complete equivalent in the documented Cartesia WS protocol;
+    // the WS being open is the signal.
+    this.emit('event', { kind: 'setup_complete', at: Date.now() });
+  }
+
+  /**
+   * Marks the start of a Cartesia turn. context_id format
+   * `<sessionId>:<turnNumber>` is the caller's responsibility.
+   * R3-M1 / R4-S1: must be called synchronously before sendText.
+   */
+  turnStart(contextId) {
+    if (this._closed) throw new Error('bridge_closed');
+    if (!contextId || typeof contextId !== 'string') throw new Error('bad_context_id');
+    if (this._reconnecting) {
+      // R4-M2: synchronous reject when reconnect is in flight.
+      const err = new Error('tts_reconnecting');
+      err.code = 'tts_reconnecting';
+      throw err;
+    }
+    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) {
+      const err = new Error('bridge_not_open');
+      err.code = 'bridge_not_open';
+      throw err;
+    }
+    this._currentContextId = contextId;
+    this._turnDead = false;
+    this._charsThisTurn = 0;
+    this._audioBytesThisTurn = 0;
+    this._sentFirstChunkOfTurn = false;
+  }
+
+  /** Streams a transcript chunk. Maintains continue:true. */
+  sendText(text) {
+    if (!text) return;
+    if (this._closed || this._turnDead) return;
+    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+    if (!this._currentContextId) throw new Error('sendText before turnStart');
+
+    // 2026-05-04 — Cartesia rejects continuation messages that omit `voice` /
+    // `model_id` / `output_format` with "neither embedding nor ID provided".
+    // Reference implementation (pipecat) sends the full block on EVERY
+    // message, not just the first. We follow that pattern.
+    const msg = {
+      context_id: this._currentContextId,
+      model_id: SONIC_MODEL,
+      transcript: text,
+      voice: { mode: 'id', id: this._voiceId },
+      output_format: {
+        container: 'raw',
+        encoding: 'pcm_s16le',
+        sample_rate: this._sampleRate,
+      },
+      continue: true,
+    };
+    this._charsThisTurn += text.length;
+    this._sentFirstChunkOfTurn = true;
+    this._wsSend(msg);
+  }
+
+  /**
+   * Sends final continue:false and awaits the matching `done` event.
+   * Resolves with per-turn metrics. On timeout/error, resolves with
+   * `partial:true` so the caller can still write Gemini cogs legs
+   * (R3-C1 / R4-C1 quota-correctness rule).
+   *
+   * Audit R3-M1 (logic) flagged "cancel-then-turnEnd throws because
+   * `_currentContextId` is null"; verified false-positive — the
+   * `_turnDead` short-circuit at the top of the function returns
+   * partialResult() before reaching the !_currentContextId throw.
+   * Sequence: cancel() sets _turnDead=true and nulls _currentContextId,
+   * then turnEnd() hits the first `if (this._closed || this._turnDead)`
+   * check and bails clean.
+   *
+   * Phase 0 re-run 2026-05-04: Cartesia emits `done` ~6s after
+   * `continue:false` from a cold-connection turn (measured 6072ms).
+   * Default timeoutMs=5000 will frequently produce partial:true at
+   * session-end teardown — that is expected and handled (Gemini legs
+   * still flush correctly). Not on user critical path: contexts only
+   * close at session end, never turn-to-turn. Bump timeoutMs only if
+   * we need precise Cartesia COGS at session close.
+   */
+  async turnEnd({ timeoutMs = 5000 } = {}) {
+    const partialResult = () => ({
+      characters: this._charsThisTurn,
+      audioBytes: this._audioBytesThisTurn,
+      audioSeconds: this._audioBytesThisTurn / (this._sampleRate * 2),
+      partial: true,
+    });
+    if (this._closed || this._turnDead) return partialResult();
+    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return partialResult();
+    if (!this._currentContextId) throw new Error('turnEnd before turnStart');
+
+    if (this._sentFirstChunkOfTurn) {
+      // Match pipecat reference: full block on every message including the
+      // empty-transcript terminator.
+      this._wsSend({
+        context_id: this._currentContextId,
+        model_id: SONIC_MODEL,
+        transcript: '',
+        voice: { mode: 'id', id: this._voiceId },
+        output_format: {
+          container: 'raw',
+          encoding: 'pcm_s16le',
+          sample_rate: this._sampleRate,
+        },
+        continue: false,
+      });
+    } else {
+      // No text was sent this turn (e.g., model produced empty transcript).
+      // Skip the synth and resolve immediately as non-partial zero.
+      this._currentContextId = null;
+      return { characters: 0, audioBytes: 0, audioSeconds: 0, partial: false };
+    }
+
+    return new Promise((resolve) => {
+      const ctxId = this._currentContextId;
+      const to = setTimeout(() => {
+        cleanup();
+        // R3-C1: never throw — return partial so logTurnCogs always lands.
+        resolve(partialResult());
+      }, timeoutMs);
+      const handler = (e) => {
+        if (e.kind === 'turn_done' && e.contextId === ctxId) {
+          cleanup();
+          resolve({
+            characters: this._charsThisTurn,
+            audioBytes: this._audioBytesThisTurn,
+            audioSeconds: this._audioBytesThisTurn / (this._sampleRate * 2),
+            partial: false,
+          });
+        } else if (e.kind === 'error') {
+          cleanup();
+          resolve(partialResult());
+        } else if (e.kind === 'closed') {
+          cleanup();
+          resolve(partialResult());
+        }
+      };
+      const cleanup = () => {
+        clearTimeout(to);
+        this.off('event', handler);
+        this._currentContextId = null;
+      };
+      this.on('event', handler);
+    });
+  }
+
+  /** Barge-in. Synchronous flag set + cancel WS send (R3-M1 / R4-S1).
+   *  Nulls `_currentContextId` (L-M1) so a stray `turnEnd` after cancel
+   *  doesn't try to flush against a dead context — that path used to
+   *  hang for the full 5s timeout window before resolving partial.
+   */
+  cancel() {
+    this._turnDead = true;
+    const ctx = this._currentContextId;
+    this._currentContextId = null;
+    if (this._closed || !ctx) return;
+    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+    this._wsSend({ context_id: ctx, cancel: true });
+  }
+
+  /** Subscribe; returns unsubscribe. */
+  on(listener) {
+    if (typeof listener === 'function') {
+      super.on('event', listener);
+      return () => super.off('event', listener);
+    }
+    return super.on(listener, arguments[1]);
+  }
+
+  off(listener, fn) {
+    if (typeof listener === 'function') {
+      super.off('event', listener);
+      return;
+    }
+    super.off(listener, fn);
+  }
+
+  /** Idempotent. */
+  async close() {
+    if (this._closed) return;
+    this._closed = true;
+    try { this._ws?.close(1000, 'normal_closure'); } catch {}
+    this._ws = null;
+  }
+
+  // ── Internals ─────────────────────────────────────────────────────────
+
+  _wsSend(obj) {
+    try {
+      this._ws.send(JSON.stringify(obj));
+    } catch (e) {
+      this._emitError('connection_lost', e?.message || 'ws_send_failed', { fatal: true });
+    }
+  }
+
+  _onMessage(data, isBinary) {
+    if (this._closed) return;
+    if (isBinary) {
+      // R3-C4 strict: docs guarantee JSON envelopes on 2026-03-01.
+      this._emitError('protocol_violation', 'binary frame on JSON wire', { fatal: true });
+      return;
+    }
+    let msg;
+    try {
+      msg = JSON.parse(data.toString('utf8'));
+    } catch {
+      this._emitError('protocol_violation', 'non-json frame', { fatal: true });
+      return;
+    }
+    if (!msg || typeof msg !== 'object') return;
+    const t = msg.type;
+    if (!t || !KNOWN_INBOUND_TYPES.has(t)) {
+      // Cartesia might add new envelope types in the future. Emit a
+      // soft-error once per session, but don't kill the bridge on the
+      // first sighting — flush_done was added without an SDK bump.
+      if (!this._unknownTypeWarned) {
+        this._unknownTypeWarned = true;
+        this.emit('event', {
+          kind: 'error',
+          at: Date.now(),
+          code: 'unknown_envelope_type',
+          message: `unknown type: ${String(t).slice(0, 40)}`,
+          fatal: false,
+        });
+      }
+      return;
+    }
+    if (t === 'chunk') {
+      // Drop late-arriving chunks for a cancelled turn (R3-M1 / R4-S1)
+      // OR for a turn whose `turnEnd` already resolved partial:true (the
+      // ctx was nulled on timeout — chunks for it would otherwise replay
+      // out-of-order into the next turn's audio stream).
+      if (this._turnDead) return;
+      if (msg.context_id && msg.context_id !== this._currentContextId) return;
+      const b64 = msg.data || '';
+      if (typeof b64 !== 'string' || b64.length === 0) return;
+      const bytes = Buffer.from(b64, 'base64');
+      this._audioBytesThisTurn += bytes.length;
+      this.emit('event', {
+        kind: 'audio_out',
+        at: Date.now(),
+        chunk: { bytes, mimeType: `audio/pcm;rate=${this._sampleRate}` },
+        contextId: msg.context_id,
+      });
+    } else if (t === 'done') {
+      this.emit('event', { kind: 'turn_done', at: Date.now(), contextId: msg.context_id });
+    } else if (t === 'error') {
+      const cartesiaCode = String(msg.error_code || '').toLowerCase();
+      const mapped = CARTESIA_ERROR_MAP[cartesiaCode] || 'other';
+      this.emit('event', {
+        kind: 'error',
+        at: Date.now(),
+        code: mapped,
+        // Truncate provider message to keep Sentry payloads small.
+        message: String(msg.title || msg.message || 'cartesia_error').slice(0, 200),
+        fatal: true,
+      });
+    }
+    // 'timestamps' and 'flush_done' currently ignored.
+  }
+
+  _onError(e) {
+    // ws-library transport-level error. Surface as non-fatal; the close
+    // event that follows handles teardown semantics.
+    this.emit('event', {
+      kind: 'error',
+      at: Date.now(),
+      code: 'connection_lost',
+      message: String(e?.message || e || 'ws_error').slice(0, 200),
+      fatal: false,
+    });
+  }
+
+  _onClose(code, reason) {
+    if (this._closed) return;
+    const inMidTurn = !!this._currentContextId;
+    this.emit('event', { kind: 'closed', at: Date.now(), code, reason: String(reason || '').slice(0, 80) });
+    this._ws = null;
+    if (inMidTurn) {
+      // Mid-turn close stays terminal — Cartesia would re-bill on the same
+      // context_id per Phase 0 cross-check (R3-M2 / R4-M2).
+      this.emit('event', {
+        kind: 'error',
+        at: Date.now(),
+        code: 'connection_lost',
+        message: 'cartesia_closed_mid_turn',
+        fatal: true,
+      });
+      return;
+    }
+    // Idle window: try one auto-reconnect with backoff. Sets a flag so any
+    // user turn_start during the gap rejects cleanly.
+    this._reconnect();
+  }
+
+  async _reconnect() {
+    if (this._closed) return;
+    if (this._reconnecting) return;
+    this._reconnecting = true;
+    for (const wait of RECONNECT_BACKOFFS_MS) {
+      this._reconnectAttempt += 1;
+      await new Promise((r) => setTimeout(r, wait));
+      if (this._closed) { this._reconnecting = false; return; }
+      try {
+        await this._openOnce();
+        this._reconnecting = false;
+        this._reconnectAttempt = 0;
+        this.emit('event', { kind: 'reconnected', at: Date.now() });
+        return;
+      } catch (e) {
+        // Try the next backoff.
+      }
+    }
+    this._reconnecting = false;
+    this.emit('event', {
+      kind: 'error',
+      at: Date.now(),
+      code: 'connection_lost',
+      message: 'cartesia_reconnect_exhausted',
+      fatal: true,
+    });
+  }
+
+  _emitError(code, message, { fatal }) {
+    this.emit('event', {
+      kind: 'error',
+      at: Date.now(),
+      code,
+      message: String(message).slice(0, 200),
+      fatal: !!fatal,
+    });
+  }
+}

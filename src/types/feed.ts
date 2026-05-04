@@ -92,6 +92,11 @@ export const MIC_TAP_OUTCOMES = [
   'kill_switch_blocked',
   'auth_required',
   'creator_not_ready',
+  // R3-C1 (UX) — Pipeline α' pre-WS gate: creator has no Cartesia voice
+  // clone uploaded yet. Distinct from creator_not_ready (which means
+  // simli_face_id is NULL). Mirror the SQL enum mic_tap_outcome —
+  // migration update queued in 0506.
+  'creator_voice_not_trained',
   'unknown_error',
 ] as const;
 

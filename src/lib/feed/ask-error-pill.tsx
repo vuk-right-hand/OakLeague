@@ -50,6 +50,26 @@ export function AskErrorPill({ error, style }: Props) {
     );
   }
 
+  // R3-C1 (UX) — Pipeline α' pre-WS gate: creator's voice clone hasn't
+  // been uploaded yet. Friendly copy so demo day "this creator's voice
+  // isn't ready" doesn't surface as the generic "Couldn't start session"
+  // string.
+  if (error === 'creator_voice_not_trained') {
+    return (
+      <div role="alert" style={{ ...basePill, ...style }}>
+        This creator&apos;s voice isn&apos;t ready yet — check back soon.
+      </div>
+    );
+  }
+
+  if (error === 'creator_not_ready') {
+    return (
+      <div role="alert" style={{ ...basePill, ...style }}>
+        This creator isn&apos;t fully set up yet — check back soon.
+      </div>
+    );
+  }
+
   return (
     <div role="alert" style={{ ...basePill, ...style }}>
       Couldn&apos;t start session: {error}

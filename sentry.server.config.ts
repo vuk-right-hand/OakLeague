@@ -1,4 +1,5 @@
 import * as Sentry from '@sentry/nextjs';
+import { applyTranscriptScrub } from '@/lib/sentry-scrub';
 
 Sentry.init({
   dsn: process.env.SENTRY_DSN,
@@ -42,6 +43,11 @@ function scrub(event: Sentry.ErrorEvent): Sentry.ErrorEvent {
       if (typeof c.data?.url === 'string') c.data.url = redactSensitive(c.data.url);
     }
   }
+  // S-C4 / R3-C4 — strip user-conversation-content keys from extras,
+  // contexts, and breadcrumbs[].data. Mirrors the proxy-side scrub at
+  // server/voice-proxy/sentry.js. Voice-clone routes occasionally log
+  // Cartesia error bodies that include description/name fields.
+  applyTranscriptScrub(event);
   return event;
 }
 

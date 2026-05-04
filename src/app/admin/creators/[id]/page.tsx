@@ -1,6 +1,7 @@
 import 'server-only';
 import { notFound } from 'next/navigation';
 import { supabaseAdmin } from '@/lib/supabase/admin';
+import { VoiceCloneUpload } from './voice-clone-upload';
 
 export const dynamic = 'force-dynamic';
 
@@ -139,11 +140,7 @@ export default async function AdminCreatorDetail({
             }
           />
         </div>
-        {uploadRows.length === 0 && (
-          <p style={{ marginTop: 8, fontSize: 12, opacity: 0.6 }}>
-            No clone uploaded yet. Admins mint one via the application approval flow at <a href="/admin/applications" style={{ color: 'inherit' }}>/admin/applications</a>.
-          </p>
-        )}
+        <VoiceCloneUpload creatorId={creator.id} hasExistingVoice={!!creator.voice_id} />
         {uploadRows.length > 1 && (
           <details style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
             <summary>Earlier uploads ({uploadRows.length - 1})</summary>

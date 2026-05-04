@@ -104,3 +104,96 @@ test('C3: no usageMetadata in any message → _currentTurnUsage stays null', () 
     'missing metadata must stay null so downstream can distinguish from real zeros');
   off();
 });
+
+// ── Pipeline α' upgrade tests ───────────────────────────────────────────
+
+import { OUTPUT_TRANSCRIPT_MAX_CHARS } from './gemini-bridge.js';
+
+function makeAlphaBridge({ discardAudioOut = false } = {}) {
+  const b = new GeminiBridge({
+    apiKey: 'test-key',
+    enableOutputTranscription: true,
+    discardAudioOut,
+  });
+  b._session = { sendRealtimeInput: () => {}, close: () => {} };
+  b._closed = false;
+  return b;
+}
+
+test("α': outputTranscription chunks fire output_transcription_chunk events + accumulate", () => {
+  const bridge = makeAlphaBridge();
+  bridge.turnStart();
+  const events = [];
+  const off = bridge.on((e) => events.push(e));
+
+  bridge._onMessage({ serverContent: { outputTranscription: { text: 'Hello,' } } });
+  bridge._onMessage({ serverContent: { outputTranscription: { text: ' world.' } } });
+
+  const chunks = events.filter((e) => e.kind === 'output_transcription_chunk');
+  assert.equal(chunks.length, 2);
+  assert.equal(chunks[0].text, 'Hello,');
+  assert.equal(chunks[1].text, ' world.');
+  assert.equal(bridge._currentTurnOutputTranscript, 'Hello, world.');
+  off();
+});
+
+test("α': transcript_runaway fires once at the cap and further chunks are dropped", () => {
+  const bridge = makeAlphaBridge();
+  bridge.turnStart();
+  const events = [];
+  const off = bridge.on((e) => events.push(e));
+
+  // Push exactly to the cap, then one more chunk that must be ignored.
+  const big = 'x'.repeat(OUTPUT_TRANSCRIPT_MAX_CHARS);
+  bridge._onMessage({ serverContent: { outputTranscription: { text: big } } });
+  bridge._onMessage({ serverContent: { outputTranscription: { text: 'overflow' } } });
+  bridge._onMessage({ serverContent: { outputTranscription: { text: 'overflow2' } } });
+
+  const runaway = events.filter((e) => e.kind === 'transcript_runaway');
+  assert.equal(runaway.length, 1, 'runaway must fire exactly once per turn');
+  assert.equal(runaway[0].characterCount, OUTPUT_TRANSCRIPT_MAX_CHARS);
+  assert.equal(bridge._currentTurnOutputTranscript.length, OUTPUT_TRANSCRIPT_MAX_CHARS);
+  off();
+});
+
+test("α': discardAudioOut skips audio_out events but still tracks output bytes", () => {
+  const bridge = makeAlphaBridge({ discardAudioOut: true });
+  bridge.turnStart();
+  const events = [];
+  const off = bridge.on((e) => events.push(e));
+
+  // 4 bytes of base64 → ~3 bytes (0.75 ratio).
+  bridge._onMessage({
+    serverContent: {
+      modelTurn: { parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data: 'AAAA' } }] },
+    },
+  });
+
+  const audio = events.filter((e) => e.kind === 'audio_out');
+  assert.equal(audio.length, 0, 'discardAudioOut must suppress audio_out emission');
+  assert.equal(bridge._currentTurnOutputBytes, 3, 'byte counter still increments for cogs leg-2');
+  off();
+});
+
+test("α': turnStart resets transcript + runaway state between turns", () => {
+  const bridge = makeAlphaBridge();
+  bridge.turnStart();
+  bridge._currentTurnOutputTranscript = 'leftover';
+  bridge._currentTurnRunawayFired = true;
+  bridge.turnStart();
+  assert.equal(bridge._currentTurnOutputTranscript, '');
+  assert.equal(bridge._currentTurnRunawayFired, false);
+});
+
+test("α': bridge without enableOutputTranscription ignores outputTranscription text", () => {
+  const bridge = new GeminiBridge({ apiKey: 'test-key' });
+  bridge._session = { sendRealtimeInput: () => {}, close: () => {} };
+  bridge._closed = false;
+  bridge.turnStart();
+  const events = [];
+  const off = bridge.on((e) => events.push(e));
+  bridge._onMessage({ serverContent: { outputTranscription: { text: 'should be dropped' } } });
+  assert.equal(events.filter((e) => e.kind === 'output_transcription_chunk').length, 0);
+  assert.equal(bridge._currentTurnOutputTranscript, '');
+  off();
+});

@@ -32,6 +32,7 @@ import { mintEphemeral, MintError } from '@/lib/voice/mint-ephemeral';
 import { mintSimliSessionToken, SimliMintError } from '@/lib/avatar/mint-simli';
 import { createHash } from 'node:crypto';
 import { candidateTokenHashes, isValidTokenPlaintext } from '@/lib/recording/referral-token';
+import { getProxyVoiceConfig } from '@/lib/voice/voice-config';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -86,17 +87,28 @@ export async function POST(req: NextRequest) {
   if (!isAllowedWireModel(wireModel)) return json(400, { error: 'model_not_allowed' });
   const enumModel = WIRE_TO_ENUM[wireModel];
 
-  // Resolve the creator's simli_face_id before opening the session. No row →
-  // 404 early. We read with the service-role client because `creators` public
-  // SELECT is "published only" — drafts still need to route (admin preview).
+  // Resolve the creator's simli_face_id + voice_id before opening the
+  // session. No row → 404 early. We read with the service-role client
+  // because `creators` public SELECT is "published only" — drafts still
+  // need to route (admin preview).
   const { data: creatorRow, error: creatorErr } = await admin
     .from('creators')
-    .select('id, simli_face_id, published_at')
+    .select('id, simli_face_id, voice_id, published_at')
     .eq('id', creatorId)
-    .maybeSingle<{ id: string; simli_face_id: string | null; published_at: string | null }>();
+    .maybeSingle<{ id: string; simli_face_id: string | null; voice_id: string | null; published_at: string | null }>();
   if (creatorErr) return json(500, { error: 'creator_lookup_failed' });
   if (!creatorRow) return json(404, { error: 'creator_not_found' });
   if (!creatorRow.simli_face_id) return json(409, { error: 'creator_not_ready' });
+  // U-C1 pre-WS gate: when the proxy's α' path is on, a session against a
+  // creator with no voice_id will die at 4009 cartesia_no_voice on first
+  // WS open. Pre-empt with a user-actionable 409. R3-C2 single-sourced:
+  // the proxy is the authority for `useCartesia`; Vercel polls
+  // /voice-config (60s cache, fail-open) — flipping the Fly secret alone
+  // propagates to this gate.
+  const { useCartesia } = await getProxyVoiceConfig();
+  if (useCartesia && !creatorRow.voice_id) {
+    return json(409, { error: 'creator_voice_not_trained' });
+  }
 
   // RPC under the cookie-bound client so auth.uid() resolves to the caller.
   const sb = await supabaseServer();

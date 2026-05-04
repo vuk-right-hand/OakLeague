@@ -27,6 +27,48 @@ export const GEMINI_OUTPUT_USD_PER_SEC_FALLBACK = Number(process.env.GEMINI_OUTP
 export const GEMINI_TOKENS_PER_SEC_FALLBACK     = Number(process.env.GEMINI_TOKENS_PER_SEC_FALLBACK     ?? 50);
 export const GEMINI_TOKENS_PER_SEC_FALLBACK_SOURCE = process.env.GEMINI_TOKENS_PER_SEC_FALLBACK_SOURCE ?? 'default-50';
 
+// ── Cartesia pricing (Pipeline α' leg 3) ─────────────────────────────────
+//
+// CARTESIA_USD_PER_CHAR + CARTESIA_QUOTED_AT are Fly secrets pasted by Vuk
+// from the Cartesia dashboard before merge. NO code default (R3-A11 +
+// R4-S3): Number-only-when-finite-and-positive guard, throw at module
+// load otherwise. A missed env var must be a hard fail at boot, never a
+// silent ship-at-$0.
+//
+// VOICE_CARTESIA_ENABLED governs whether the proxy instantiates the
+// bridge at session-open — when '0', leg-3/leg-4 stay at zero with
+// metadata.cartesia_pending=true (back-compat with pre-α' rows).
+export const VOICE_CARTESIA_ENABLED = process.env.VOICE_CARTESIA_ENABLED === '1';
+
+let _cartesiaUsdPerChar = null;
+let _cartesiaQuotedAt = null;
+export function getCartesiaPricing() {
+  if (_cartesiaUsdPerChar !== null) {
+    return { usdPerChar: _cartesiaUsdPerChar, quotedAt: _cartesiaQuotedAt };
+  }
+  if (!VOICE_CARTESIA_ENABLED) {
+    // Cartesia disabled: no need to validate the constants.
+    _cartesiaUsdPerChar = 0;
+    _cartesiaQuotedAt = '';
+    return { usdPerChar: 0, quotedAt: '' };
+  }
+  const raw = Number(process.env.CARTESIA_USD_PER_CHAR);
+  if (!Number.isFinite(raw) || raw <= 0) {
+    throw new Error(
+      'CARTESIA_USD_PER_CHAR must be a positive finite number when VOICE_CARTESIA_ENABLED=1 (R4-S3 fail-closed)',
+    );
+  }
+  const quoted = String(process.env.CARTESIA_QUOTED_AT || '').trim();
+  if (!quoted || !/^\d{4}-\d{2}-\d{2}$/.test(quoted)) {
+    throw new Error(
+      'CARTESIA_QUOTED_AT must be a YYYY-MM-DD date string when VOICE_CARTESIA_ENABLED=1',
+    );
+  }
+  _cartesiaUsdPerChar = raw;
+  _cartesiaQuotedAt = quoted;
+  return { usdPerChar: raw, quotedAt: quoted };
+}
+
 // ── Reaper cadence ──────────────────────────────────────────────────────────
 //
 // 20s cadence + 60s RPC-default threshold = max ghost life ~80s. Threshold
@@ -90,12 +132,18 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
 
   // payload = {
   //   userId, sessionId, turnNumber,
-  //   inputSeconds, outputSeconds, usageMetadata
+  //   inputSeconds, outputSeconds, usageMetadata,
+  //   cartesia?: { characters, audioBytes, audioSeconds, partial }
   // }
+  // When `cartesia` is present, legs 3+4 are written with real values and
+  // metadata.cartesia_pending is dropped (replaced with cartesia_quoted_at +
+  // optional cartesia_partial). When absent, the legacy zeros + pending flag
+  // are written so dashboards keep the "α' not yet wired" bucket meaningful.
   async function logTurnCogs(payload) {
     const {
       userId, sessionId, turnNumber,
       inputSeconds = 0, outputSeconds = 0, usageMetadata = null,
+      cartesia = null,
     } = payload;
 
     // Leg 2: tokens-of-truth path vs seconds-derived fallback. The proxy-
@@ -123,14 +171,15 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
     const meta = {
       source: env,
       quoted_at: PRICING_QUOTED_AT,
-      // TODO(α'-cutover): when use-session-pipe.ts is rewired to forward
-      // Gemini transcript text → Cartesia → Simli (Pipeline α'), and Cartesia
-      // legs 3+4 receive real characters/audio_seconds via the new
-      // POST /cogs/cartesia-leg endpoint, this flag MUST flip to false (or
-      // be removed). Today's rows correctly carry true; future rows would lie.
-      // See SPIKE_A_DEFERRED_FIXUP_PLAN.md "Cartesia leg deferral spec".
-      cartesia_pending: true,
     };
+    if (cartesia) {
+      const { quotedAt } = getCartesiaPricing();
+      meta.cartesia_quoted_at = quotedAt;
+      if (cartesia.partial) meta.cartesia_partial = true;
+    } else {
+      // Pre-α' rows: keep the deferral flag for dashboard bucketing.
+      meta.cartesia_pending = true;
+    }
     if (isFallback) {
       meta.fallback = 'seconds';
       meta.fallback_seconds = outputSeconds;
@@ -150,6 +199,19 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
 
     const inputCost = (inputSeconds || 0) * GEMINI_INPUT_USD_PER_SEC;
 
+    // Cartesia legs 3 + 4 — populated only when α' is on (caller passed
+    // `cartesia`). Cost computed at call-time so the kill-switch at
+    // module-load failure (R4-S3) can still fire.
+    let cartesiaChars = 0;
+    let cartesiaCost = 0;
+    let cartesiaAudioSeconds = 0;
+    if (cartesia) {
+      const { usdPerChar } = getCartesiaPricing();
+      cartesiaChars = Math.max(0, Math.round(cartesia.characters || 0));
+      cartesiaCost = Number((cartesiaChars * usdPerChar).toFixed(6));
+      cartesiaAudioSeconds = Number((cartesia.audioSeconds || 0).toFixed(4));
+    }
+
     try {
       const { error } = await supabase.rpc('cogs_insert_turn_voice', {
         p_user_id: userId,
@@ -161,10 +223,10 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
         // Leg 2 — Gemini audio-out tokens (or seconds-derived fallback)
         p_gemini_audio_out_tokens: audioOutTokens,
         p_gemini_audio_out_cost:   Number(audioOutCost.toFixed(6)),
-        // Legs 3 + 4 — Cartesia not in proxy yet (M7 deferral)
-        p_cartesia_characters:     0,
-        p_cartesia_cost:           0,
-        p_cartesia_audio_seconds:  0,
+        // Legs 3 + 4 — Cartesia (zero when α' off / cartesia not passed)
+        p_cartesia_characters:     cartesiaChars,
+        p_cartesia_cost:           cartesiaCost,
+        p_cartesia_audio_seconds:  cartesiaAudioSeconds,
         p_environment: env,
         p_metadata: meta,
       });

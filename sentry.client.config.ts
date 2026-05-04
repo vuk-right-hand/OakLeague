@@ -1,4 +1,5 @@
 import * as Sentry from '@sentry/nextjs';
+import { applyTranscriptScrub } from '@/lib/sentry-scrub';
 
 Sentry.init({
   dsn: process.env.NEXT_PUBLIC_SENTRY_DSN,
@@ -38,6 +39,8 @@ function scrub(event: Sentry.ErrorEvent): Sentry.ErrorEvent {
       if (typeof c.data?.url === 'string') c.data.url = redactSensitive(c.data.url);
     }
   }
+  // S-C4 / R3-C4 — transcript-key scrub mirroring the proxy.
+  applyTranscriptScrub(event);
   return event;
 }
 
