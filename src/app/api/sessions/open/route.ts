@@ -30,6 +30,8 @@ import { json, isSameOrigin, mapPgError } from '@/lib/session/http-helpers';
 import { isAllowedWireModel, WIRE_TO_ENUM } from '@/lib/voice/model-map';
 import { mintEphemeral, MintError } from '@/lib/voice/mint-ephemeral';
 import { mintSimliSessionToken, SimliMintError } from '@/lib/avatar/mint-simli';
+import { mintVoiceTicket, VoiceTicketMintError } from '@/lib/voice/mint-voice-ticket';
+import { resolveVoiceId } from '@/lib/voice/env-scoped-voice-id';
 import { createHash } from 'node:crypto';
 import { candidateTokenHashes, isValidTokenPlaintext } from '@/lib/recording/referral-token';
 import { captureServerSafe } from '@/lib/posthog-server';
@@ -88,26 +90,36 @@ export async function POST(req: NextRequest) {
   if (!isAllowedWireModel(wireModel)) return json(400, { error: 'model_not_allowed' });
   const enumModel = WIRE_TO_ENUM[wireModel];
 
-  // Resolve the creator's simli_face_id + voice_id before opening the
-  // session. No row → 404 early. We read with the service-role client
-  // because `creators` public SELECT is "published only" — drafts still
-  // need to route (admin preview).
+  // Resolve the creator's simli_face_id + env-scoped voice_id before
+  // opening the session. No row → 404 early. We read with the service-role
+  // client because `creators` public SELECT is "published only" — drafts
+  // still need to route (admin preview).
+  //
+  // R3-Missing-1 / R4-M6 — three voice_id columns scoped by VERCEL_ENV.
+  // resolveVoiceId() picks the env-appropriate value.
   const { data: creatorRow, error: creatorErr } = await admin
     .from('creators')
-    .select('id, simli_face_id, voice_id, published_at')
+    .select('id, simli_face_id, voice_id, voice_id_preview, voice_id_dev, published_at')
     .eq('id', creatorId)
-    .maybeSingle<{ id: string; simli_face_id: string | null; voice_id: string | null; published_at: string | null }>();
+    .maybeSingle<{
+      id: string;
+      simli_face_id: string | null;
+      voice_id: string | null;
+      voice_id_preview: string | null;
+      voice_id_dev: string | null;
+      published_at: string | null;
+    }>();
   if (creatorErr) return json(500, { error: 'creator_lookup_failed' });
   if (!creatorRow) return json(404, { error: 'creator_not_found' });
   if (!creatorRow.simli_face_id) return json(409, { error: 'creator_not_ready' });
+  const envVoiceId = resolveVoiceId(creatorRow);
   // U-C1 pre-WS gate: when the proxy's α' path is on, a session against a
-  // creator with no voice_id will die at 4009 cartesia_no_voice on first
-  // WS open. Pre-empt with a user-actionable 409. R3-C2 single-sourced:
-  // the proxy is the authority for `useCartesia`; Vercel polls
-  // /voice-config (60s cache, fail-open) — flipping the Fly secret alone
-  // propagates to this gate.
+  // creator with no env-scoped voice_id will die at 4009 cartesia_no_voice
+  // on first WS open. Pre-empt with a user-actionable 409. The proxy is
+  // the authority for `useCartesia`; Vercel polls /voice-config (60s
+  // cache, fail-open) — flipping the Fly secret alone propagates here.
   const { useCartesia } = await getProxyVoiceConfig();
-  if (useCartesia && !creatorRow.voice_id) {
+  if (useCartesia && !envVoiceId) {
     return json(409, { error: 'creator_voice_not_trained' });
   }
 
@@ -118,15 +130,69 @@ export async function POST(req: NextRequest) {
     p_hook_id: hookId,
     p_model: enumModel,
   });
+
+  let sessionId: string;
+  let tier: 'free' | 'premium' | 'boardroom';
+  let dailyLimitRemaining: number;
+  let isTakeover = false;
+
   if (openErr) {
-    const { status, body: errBody } = mapPgError(openErr);
-    return json(status, errBody);
+    // R3-C2 — multi-tab takeover. session_open RPC returns 23505 when the
+    // sessions_one_active_per_user partial-unique index trips (user already
+    // has a live session in another tab / a stalled previous attempt).
+    // Resolve by attaching to the existing active session: re-mint a fresh
+    // ticket pinned to that session_id and return the same envelope shape.
+    // Audit row in cogs_log for ops visibility.
+    const code = (openErr as { code?: string }).code;
+    const isUniqueViolation = code === '23505'
+      || /sessions_one_active_per_user/.test(openErr.message || '');
+    if (!isUniqueViolation) {
+      const { status, body: errBody } = mapPgError(openErr);
+      return json(status, errBody);
+    }
+    // Find the existing active session for this user against THIS creator.
+    // If the active session belongs to a different creator, surface a
+    // distinct error — we don't silently swap creators.
+    const { data: live, error: liveErr } = await admin
+      .from('sessions')
+      .select('id, creator_id, tier_at_session')
+      .eq('user_id', callerUserId)
+      .is('ended_at', null)
+      .maybeSingle<{ id: string; creator_id: string; tier_at_session: 'free' | 'premium' | 'boardroom' }>();
+    if (liveErr) return json(500, { error: 'session_lookup_failed' });
+    if (!live) return json(500, { error: 'session_takeover_inconsistent' });
+    if (live.creator_id !== creatorId) {
+      return json(409, { error: 'live_session_other_creator', existing_creator_id: live.creator_id });
+    }
+    sessionId = live.id;
+    tier = live.tier_at_session;
+    // Daily-limit-remaining isn't returned in the takeover path; estimate
+    // conservatively as full Gemini cap and let server-side enforcement
+    // gate. For the avatar TTL clamp, we use 600s default in mintSimli.
+    dailyLimitRemaining = GEMINI_MAX_SESSION_S;
+    isTakeover = true;
+    try {
+      await admin.from('cogs_log').insert({
+        user_id: callerUserId,
+        session_id: sessionId,
+        service: 'gemini',
+        operation: 'sessions_open_takeover',
+        units: 1,
+        unit_label: 'event',
+        cost_usd: 0,
+        environment: 'production',
+        metadata: { creator_id: creatorId, hook_id: hookId },
+      });
+    } catch (e) {
+      Sentry.captureException(e, { extra: { op: 'sessions_open_takeover_audit', session_id: sessionId } });
+    }
+  } else {
+    const openRow = Array.isArray(openRows) ? openRows[0] : openRows;
+    if (!openRow?.session_id) return json(500, { error: 'session_open_empty' });
+    sessionId = openRow.session_id as string;
+    tier = openRow.tier as 'free' | 'premium' | 'boardroom';
+    dailyLimitRemaining = (openRow.daily_limit_remaining_s as number) ?? 0;
   }
-  const openRow = Array.isArray(openRows) ? openRows[0] : openRows;
-  if (!openRow?.session_id) return json(500, { error: 'session_open_empty' });
-  const sessionId = openRow.session_id as string;
-  const tier = openRow.tier as 'free' | 'premium' | 'boardroom';
-  const dailyLimitRemaining = (openRow.daily_limit_remaining_s as number) ?? 0;
 
   // ── Mint Simli FIRST (R3-M2) ────────────────────────────────────────────
   // Session length clamped to min(15min, remaining daily quota, 600s) so the
@@ -176,13 +242,18 @@ export async function POST(req: NextRequest) {
     // R4-C2: close the freshly-opened session BEFORE returning 503 — otherwise
     // the one-active-per-user partial-unique index blocks retry until the
     // reaper runs 60s later.
-    try {
-      await sb.rpc('session_close', {
-        p_session_id: sessionId,
-        p_end_reason: 'force_required_mint_failed',
-      });
-    } catch (e) {
-      Sentry.captureException(e, { extra: { op: 'sessions_open_force_close_after_mint_fail', session_id: sessionId } });
+    //
+    // R3-C2 — takeover path: the session belongs to another tab; do NOT
+    // close it. Just return 503 and let the other tab live.
+    if (!isTakeover) {
+      try {
+        await sb.rpc('session_close', {
+          p_session_id: sessionId,
+          p_end_reason: 'force_required_mint_failed',
+        });
+      } catch (e) {
+        Sentry.captureException(e, { extra: { op: 'sessions_open_force_close_after_mint_fail', session_id: sessionId } });
+      }
     }
     return json(503, { error: 'avatar_unavailable', detail: avatarError ?? 'mint_failed' });
   }
@@ -202,14 +273,44 @@ export async function POST(req: NextRequest) {
     Sentry.captureException(e, { extra: { op: 'sessions_open_gemini_mint', session_id: sessionId } });
     // Gemini is non-recoverable for this session — close it. The client will
     // show "Voice unavailable, try again" and tap to start a new one.
-    try {
-      await sb.rpc('session_close', {
-        p_session_id: sessionId,
-        p_end_reason: 'gemini_mint_failed',
-      });
-    } catch { /* already logged */ }
+    // R3-C2 takeover guard: session belongs to another tab.
+    if (!isTakeover) {
+      try {
+        await sb.rpc('session_close', {
+          p_session_id: sessionId,
+          p_end_reason: 'gemini_mint_failed',
+        });
+      } catch { /* already logged */ }
+    }
     if (e instanceof MintError) return json(e.httpStatus, { error: e.code });
     return json(502, { error: 'gemini_mint_failed' });
+  }
+
+  // ── Mint voice ticket (cutover proxy WS auth) ─────────────────────────
+  // SIMLI_WIREUP §2 — pre-mint a UA-bound, session-pinned ticket so the
+  // browser can open the proxy WS without a second client RTT. Failure
+  // here is non-fatal for the flag-off path: the legacy direct-Gemini
+  // codepath ignores `voice_ticket`. For the flag-on cutover path a
+  // missing ticket means the WS open will fail, surfaced via the
+  // session-client UX shell.
+  let voiceTicket: { ticket: string; expiresAt: string } | null = null;
+  try {
+    voiceTicket = await mintVoiceTicket({
+      userId:       callerUserId,
+      sessionId,
+      creatorId,
+      hookId,
+      expectedTier: tier,
+      ua:           req.headers.get('user-agent') ?? '',
+    });
+  } catch (e) {
+    Sentry.captureException(e, { extra: { op: 'sessions_open_voice_ticket', session_id: sessionId } });
+    if (e instanceof VoiceTicketMintError && e.code === 'too_many_tickets') {
+      // Don't close session — user just needs to back off. The legacy
+      // path (flag-off) doesn't need the ticket anyway.
+    }
+    // For other ticket-mint failures, log and return without ticket.
+    // Cutover path will show "Service unavailable" via session-client.
   }
 
   // Day 4 — first_session credit via Next 15 `after()` so the work runs
@@ -238,9 +339,15 @@ export async function POST(req: NextRequest) {
     tier,
     avatar,
     avatar_status: avatarStatus,
+    // gemini.token kept during the flag-on/off window (R2-C3). Cleanup PR
+    // after 24h-green deletes the field together with the @google/genai
+    // import in use-session-pipe.
     gemini: { token: token.token, model: token.model },
+    voice_ticket: voiceTicket,
+    proxy_url: process.env.NEXT_PUBLIC_VOICE_PROXY_URL ?? null,
     max_duration_s: dailyLimitRemaining,
     max_session_s: GEMINI_MAX_SESSION_S,
+    is_takeover: isTakeover,
   });
 }
 

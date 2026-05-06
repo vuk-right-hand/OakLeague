@@ -25,6 +25,7 @@ import { json, isSameOrigin, mapPgError } from '@/lib/session/http-helpers';
 import { isAllowedWireModel, WIRE_TO_ENUM } from '@/lib/voice/model-map';
 import { mintEphemeral, MintError } from '@/lib/voice/mint-ephemeral';
 import { mintSimliSessionToken, SimliMintError } from '@/lib/avatar/mint-simli';
+import { mintVoiceTicket } from '@/lib/voice/mint-voice-ticket';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -140,12 +141,32 @@ export async function POST(req: NextRequest) {
     return json(502, { error: 'gemini_mint_failed' });
   }
 
+  // SIMLI_WIREUP §4 / R3-C3 — overlap rollover requires a fresh voice
+  // ticket pinned to the new session_id. Mint failure isn't fatal — the
+  // legacy direct-Gemini path still works without a ticket; the cutover
+  // path will surface "service unavailable" via session-client.
+  let voiceTicket: { ticket: string; expiresAt: string } | null = null;
+  try {
+    voiceTicket = await mintVoiceTicket({
+      userId:       callerUserId,
+      sessionId:    newSessionId,
+      creatorId,
+      hookId,
+      expectedTier: tier,
+      ua:           req.headers.get('user-agent') ?? '',
+    });
+  } catch (e) {
+    Sentry.captureException(e, { extra: { op: 'sessions_rollover_voice_ticket', session_id: newSessionId } });
+  }
+
   return json(200, {
     session_id: newSessionId,
     tier,
     avatar,
     avatar_status: avatarStatus,
     gemini: { token: token.token, model: token.model },
+    voice_ticket: voiceTicket,
+    proxy_url: process.env.NEXT_PUBLIC_VOICE_PROXY_URL ?? null,
     max_duration_s: dailyLimitRemaining,
     max_session_s: GEMINI_MAX_SESSION_S,
   });

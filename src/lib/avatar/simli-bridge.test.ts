@@ -58,6 +58,8 @@ const sdkState = vi.hoisted(() => ({
   startResolve: null as (() => void) | null,
   startReject: null as ((e: unknown) => void) | null,
   lastClient: null as unknown,
+  audioCalls: [] as Uint8Array[],
+  clearBufferCalls: 0,
 }));
 
 vi.mock('simli-client', () => {
@@ -84,8 +86,12 @@ vi.mock('simli-client', () => {
       });
     }
     stop(): Promise<void> { return Promise.resolve(); }
-    sendAudioData(): void { /* unused */ }
-    ClearBuffer(): void { /* unused */ }
+    sendAudioData(chunk: Uint8Array): void {
+      // SIMLI_WIREUP §B5 / R3-C1 — record chunks so the chunker test can
+      // assert exact 6000-byte cadence + remainder carry behavior.
+      sdkState.audioCalls.push(new Uint8Array(chunk));
+    }
+    ClearBuffer(): void { sdkState.clearBufferCalls += 1; }
   }
   return { SimliClient: FakeSimliClient };
 });
@@ -126,6 +132,8 @@ afterEach(() => {
   sdkState.startResolve = null;
   sdkState.startReject = null;
   sdkState.lastClient = null;
+  sdkState.audioCalls = [];
+  sdkState.clearBufferCalls = 0;
   vi.restoreAllMocks();
 });
 
@@ -390,3 +398,55 @@ describe('srcObject swap (LiveKit reconnect)', () => {
     expect(bridge.getCurrentTracks().audio).toBe(a);
   });
 });
+
+describe('sendAudio chunker (R3-C1)', () => {
+  it('flushes 6000-byte chunks and carries remainder', async () => {
+    const { bridge } = await driveOpenWithBothTracks();
+    // Feed 1000 bytes (carries) then 5500 bytes (total 6500 → one 6000-byte
+    // flush + 500-byte carry).
+    bridge.sendAudio(new Uint8Array(1000).fill(1).buffer);
+    expect(sdkState.audioCalls.length).toBe(0);
+    bridge.sendAudio(new Uint8Array(5500).fill(2).buffer);
+    expect(sdkState.audioCalls.length).toBe(1);
+    expect(sdkState.audioCalls[0].byteLength).toBe(6000);
+    // Next 5500 → 5500 + 500 carry = 6000 → exactly one more flush.
+    bridge.sendAudio(new Uint8Array(5500).fill(3).buffer);
+    expect(sdkState.audioCalls.length).toBe(2);
+    expect(sdkState.audioCalls[1].byteLength).toBe(6000);
+  });
+
+  it('cancel() drops the carry so prior turn does not bleed', async () => {
+    const { bridge } = await driveOpenWithBothTracks();
+    bridge.sendAudio(new Uint8Array(3000).fill(7).buffer);
+    expect(sdkState.audioCalls.length).toBe(0);
+    bridge.cancel();
+    expect(sdkState.clearBufferCalls).toBeGreaterThanOrEqual(1);
+    bridge.sendAudio(new Uint8Array(6000).fill(9).buffer);
+    expect(sdkState.audioCalls.length).toBe(1);
+    // Verify the flushed chunk is all 9s — no 7s leaked from prior turn.
+    expect(sdkState.audioCalls[0].every((b) => b === 9)).toBe(true);
+  });
+});
+
+async function driveOpenWithBothTracks() {
+  const { createSimliBridge } = await import('./simli-bridge');
+  const bridge = createSimliBridge({});
+  const openPromise = bridge.open({
+    replicaId: 'r-test',
+    preMintedSessionToken: 'tok-test',
+    videoEl: videoEl as unknown as HTMLVideoElement,
+    audioEl: audioEl as unknown as HTMLAudioElement,
+  });
+  for (let i = 0; i < 50 && !sdkState.startResolve; i++) {
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  const stream = new FakeMediaStream();
+  const v = new FakeMediaStreamTrack('video');
+  const a = new FakeMediaStreamTrack('audio');
+  stream.addVideo(v); stream.addAudio(a);
+  videoEl.srcObject = stream; audioEl.srcObject = stream;
+  videoEl.fireLoadedMetadata(); audioEl.fireLoadedMetadata();
+  sdkState.startResolve?.();
+  await openPromise;
+  return { bridge };
+}

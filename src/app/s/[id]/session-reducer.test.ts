@@ -246,3 +246,45 @@ describe('session-reducer — invariants', () => {
     expect(isPipeWarm(s)).toBe(false); // reconnecting
   });
 });
+
+describe('cartesia reconnecting (R3-Missing-6)', () => {
+  function ready(): SessionState {
+    let s = boot();
+    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'avatar_ready' });
+    return s;
+  }
+  it('sets cartesiaReconnecting flag without changing phase', () => {
+    let s = ready();
+    expect(s.phase).toBe('ready');
+    s = reduce(s, { kind: 'cartesia_reconnecting' });
+    expect(s.cartesiaReconnecting).toBe(true);
+    expect(s.phase).toBe('ready');
+    s = reduce(s, { kind: 'cartesia_reconnected' });
+    expect(s.cartesiaReconnecting).toBe(false);
+    expect(s.phase).toBe('ready');
+  });
+});
+
+describe('video_autoplay_lost (R4-M5)', () => {
+  function ready(): SessionState {
+    let s = boot();
+    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'avatar_ready' });
+    return s;
+  }
+  it('flips phase to reconnecting + bumps prompt count', () => {
+    let s = ready();
+    const before = s.reconnectPromptCount;
+    s = reduce(s, { kind: 'video_autoplay_lost' });
+    expect(s.phase).toBe('reconnecting');
+    expect(s.reconnectPromptCount).toBe(before + 1);
+  });
+  it('is no-op when already closed', () => {
+    let s = boot();
+    s = reduce(s, { kind: 'fatal_error', message: 'x' });
+    const before = s;
+    s = reduce(s, { kind: 'video_autoplay_lost' });
+    expect(s).toBe(before);
+  });
+});

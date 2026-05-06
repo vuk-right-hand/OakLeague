@@ -1,0 +1,224 @@
+// SIMLI_WIREUP §B1 / R3-C3 — typed WebSocket client for the Fly voice proxy.
+//
+// Wraps the /voice/spike-a binary-frame contract (server/voice-proxy/index.js).
+// Used by use-session-pipe.ts when NEXT_PUBLIC_VOICE_PROXY_PATH=1.
+//
+// Wire contract (mirrors proxy ws.on('message')):
+//   client → proxy:
+//     binary  = PCM16 LE 16k mono mic frame
+//     text    = control JSON: { type:'turn_start' | 'turn_end' | 'cancel' }
+//   proxy → client:
+//     binary  = audio_out PCM frame (sample rate per session — for cutover
+//               this is 16k, ready to feed SimliBridge.sendAudio directly)
+//     text    = ready / error / warning / tts_reconnected / tts_reconnecting
+//
+// Overlap swap (R3-C3): swapTo(newTicket) opens a NEW WS, then drains the
+// OLD WS for ≤2s as read-only-no-send. Mic frames go to the NEW WS only
+// from the moment newWs is open. Audio_out frames from BOTH WSs are routed
+// to the consumer's onAudioOut handler — Simli's chunker tolerates the
+// brief overlap. After 2s the old WS is force-closed.
+
+'use client';
+
+const OVERLAP_DRAIN_MS = 2000;
+
+export type ProxyClientHandlers = {
+  onReady?: (msg: { sessionId: string; useCartesia: boolean; build: string }) => void;
+  onAudioOut?: (bytes: ArrayBuffer) => void;
+  onError?: (code: string, detail?: string) => void;
+  onWarning?: (code: string) => void;
+  onTtsReconnecting?: () => void;
+  onTtsReconnected?: () => void;
+  onClose?: (code: number, reason: string, wasClean: boolean) => void;
+};
+
+export type ProxyClientOpenArgs = {
+  proxyUrl: string;       // e.g. wss://oakleague-voice-proxy.fly.dev
+  ticket: string;
+  modelWire: string;      // e.g. 'gemini-3.1-flash-live-preview'
+};
+
+export type ProxyClient = {
+  /** Open the WS. Resolves on `ready` from the server, rejects on early close. */
+  open(args: ProxyClientOpenArgs): Promise<void>;
+  /** Send mic PCM16 16k binary frame. No-op when not OPEN. */
+  sendAudio(pcm16le16k: ArrayBuffer): void;
+  /** Send a control message: turn_start / turn_end / cancel. */
+  sendControl(msg: Record<string, unknown>): void;
+  /**
+   * Overlap-swap to a new ticket (R3-C3). Opens new WS, routes mic to new
+   * from t=0, drains old's audio_out for ≤2s, then closes old. Mic invariant:
+   * frames go to the NEW socket only — never both. Resolves when new WS
+   * receives `ready`.
+   */
+  swapTo(args: ProxyClientOpenArgs): Promise<void>;
+  /** Idempotent close. */
+  close(reason?: string): void;
+  /** True if the active socket is OPEN. */
+  isOpen(): boolean;
+};
+
+type Sock = {
+  ws: WebSocket;
+  readonly: boolean;          // true = drain-only, do NOT send mic / control
+};
+
+export function createProxyClient(handlers: ProxyClientHandlers): ProxyClient {
+  let active: Sock | null = null;
+  let draining: Sock | null = null;
+  let drainTimer: ReturnType<typeof setTimeout> | null = null;
+  let closed = false;
+
+  function buildUrl(args: ProxyClientOpenArgs): string {
+    const u = new URL(args.proxyUrl);
+    u.pathname = '/voice/spike-a';
+    u.searchParams.set('ticket', args.ticket);
+    u.searchParams.set('model', args.modelWire);
+    return u.toString();
+  }
+
+  function attachListeners(sock: Sock): void {
+    const ws = sock.ws;
+    ws.binaryType = 'arraybuffer';
+    ws.addEventListener('message', (ev) => {
+      if (closed) return;
+      if (typeof ev.data === 'string') {
+        let msg: Record<string, unknown>;
+        try { msg = JSON.parse(ev.data); } catch { return; }
+        const type = msg.type as string | undefined;
+        if (type === 'ready') {
+          handlers.onReady?.({
+            sessionId: String(msg.sessionId ?? ''),
+            useCartesia: Boolean(msg.useCartesia),
+            build: String(msg.build ?? ''),
+          });
+        } else if (type === 'error') {
+          handlers.onError?.(String(msg.code ?? 'unknown'), msg.detail as string | undefined);
+        } else if (type === 'warning') {
+          handlers.onWarning?.(String(msg.code ?? 'unknown'));
+        } else if (type === 'tts_reconnecting') {
+          handlers.onTtsReconnecting?.();
+        } else if (type === 'tts_reconnected') {
+          handlers.onTtsReconnected?.();
+        }
+        return;
+      }
+      // Binary = audio_out from Cartesia. Both active and draining sockets
+      // forward; Simli chunker dedupes by virtue of feeding sequentially.
+      if (ev.data instanceof ArrayBuffer) {
+        handlers.onAudioOut?.(ev.data);
+      } else if (ev.data && typeof (ev.data as Blob).arrayBuffer === 'function') {
+        // Safari may surface Blob even when binaryType=arraybuffer pre-handshake.
+        (ev.data as Blob).arrayBuffer().then((buf) => {
+          if (!closed) handlers.onAudioOut?.(buf);
+        }).catch(() => { /* drop */ });
+      }
+    });
+    ws.addEventListener('close', (ev) => {
+      // Only the ACTIVE socket's close drives consumer state. Drain socket
+      // closes silently.
+      if (sock === active) {
+        handlers.onClose?.(ev.code, ev.reason, ev.wasClean);
+        active = null;
+      } else if (sock === draining) {
+        draining = null;
+        if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+      }
+    });
+    ws.addEventListener('error', () => {
+      // 'error' is followed by 'close'; let close drive the consumer signal.
+    });
+  }
+
+  async function openSocket(args: ProxyClientOpenArgs, opts: { readonly: boolean }): Promise<Sock> {
+    const url = buildUrl(args);
+    const ws = new WebSocket(url);
+    const sock: Sock = { ws, readonly: opts.readonly };
+    attachListeners(sock);
+    return new Promise<Sock>((resolve, reject) => {
+      let settled = false;
+      const onReadyOnce = (ev: MessageEvent) => {
+        if (typeof ev.data !== 'string') return;
+        try {
+          const msg = JSON.parse(ev.data) as { type?: string };
+          if (msg.type === 'ready') {
+            settled = true;
+            ws.removeEventListener('message', onReadyOnce);
+            resolve(sock);
+          }
+        } catch { /* ignore */ }
+      };
+      ws.addEventListener('message', onReadyOnce);
+      ws.addEventListener('close', (ev) => {
+        if (!settled) {
+          settled = true;
+          reject(new Error(`proxy ws closed ${ev.code} ${ev.reason}`));
+        }
+      });
+      ws.addEventListener('error', () => {
+        if (!settled) {
+          settled = true;
+          reject(new Error('proxy ws error'));
+        }
+      });
+    });
+  }
+
+  async function open(args: ProxyClientOpenArgs): Promise<void> {
+    if (closed) throw new Error('proxy-client: open() after close()');
+    if (active) throw new Error('proxy-client: already open');
+    active = await openSocket(args, { readonly: false });
+  }
+
+  function sendAudio(pcm16le16k: ArrayBuffer): void {
+    if (closed || !active) return;
+    if (active.ws.readyState !== WebSocket.OPEN) return;
+    try { active.ws.send(pcm16le16k); } catch { /* drop */ }
+  }
+
+  function sendControl(msg: Record<string, unknown>): void {
+    if (closed || !active) return;
+    if (active.ws.readyState !== WebSocket.OPEN) return;
+    try { active.ws.send(JSON.stringify(msg)); } catch { /* drop */ }
+  }
+
+  async function swapTo(args: ProxyClientOpenArgs): Promise<void> {
+    if (closed) throw new Error('proxy-client: swapTo() after close()');
+    // R3-C3 — overlap-swap. Open the new socket FIRST so audio_out from
+    // the new pipe can start flowing instantly. Mic invariant: as soon as
+    // we flip `active` to the new sock, ALL future sendAudio calls go to
+    // new. The old sock becomes drain-only (readonly=true).
+    const newSock = await openSocket(args, { readonly: false });
+    const oldActive = active;
+    active = newSock;
+    if (oldActive) {
+      oldActive.readonly = true;
+      draining = oldActive;
+      if (drainTimer) clearTimeout(drainTimer);
+      drainTimer = setTimeout(() => {
+        if (draining) {
+          try { draining.ws.close(1000, 'overlap_drain_done'); } catch { /* already closed */ }
+          draining = null;
+        }
+        drainTimer = null;
+      }, OVERLAP_DRAIN_MS);
+    }
+  }
+
+  function close(reason?: string): void {
+    if (closed) return;
+    closed = true;
+    const r = (reason ?? 'client_close').slice(0, 60);
+    if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+    try { active?.ws.close(1000, r); } catch { /* already */ }
+    try { draining?.ws.close(1000, r); } catch { /* already */ }
+    active = null;
+    draining = null;
+  }
+
+  function isOpen(): boolean {
+    return !!active && active.ws.readyState === WebSocket.OPEN;
+  }
+
+  return { open, sendAudio, sendControl, swapTo, close, isOpen };
+}

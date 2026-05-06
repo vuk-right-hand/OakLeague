@@ -45,6 +45,10 @@ export type SessionState = {
   // When paused began (performance.now()), cleared on resume. Pure bookkeeping
   // for the reducer; paused_seconds_total lives server-side.
   pausedAtMs: number | null;
+  // R3-Missing-6 — Cartesia upstream is mid-reconnect. Avatar pipe stays
+  // warm; UI surfaces a "Voice catching up…" banner. Cleared on
+  // cartesia_reconnected.
+  cartesiaReconnecting: boolean;
 };
 
 export type Action =
@@ -78,7 +82,14 @@ export type Action =
   | { kind: 'fatal_error'; message: string }
   // Proxy closed WS with 1011 reason=cogs_rpc_failed. Distinct from
   // fatal_error so analytics can count it; surfaces a retry-friendly copy.
-  | { kind: 'cogs_failed' };
+  | { kind: 'cogs_failed' }
+  // R3-Missing-6 — Cartesia upstream momentarily disconnected; proxy
+  // auto-reconnects. Avatar stays visible muted; UI shows a banner.
+  | { kind: 'cartesia_reconnecting' }
+  | { kind: 'cartesia_reconnected' }
+  // R4-M5 — silent <video>.play() rejection on iOS WebKit after a track
+  // rebind without a fresh user activation. UX shows tap-to-resume overlay.
+  | { kind: 'video_autoplay_lost' };
 
 export const initialState: SessionState = {
   phase: 'idle',
@@ -92,6 +103,7 @@ export const initialState: SessionState = {
   maxSessionSeconds: 900,
   openedAtMs: null,
   pausedAtMs: null,
+  cartesiaReconnecting: false,
 };
 
 function bothPipesReady(s: SessionState): boolean {
@@ -241,6 +253,28 @@ export function reduce(state: SessionState, action: Action): SessionState {
         ...state,
         phase: 'closed',
         errorMessage: 'Cost accounting is unavailable. Please retry in a moment.',
+      };
+
+    case 'cartesia_reconnecting':
+      // R3-Missing-6 — momentary upstream blip. Avatar pipe stays warm
+      // (Simli RTC unaffected); UI surfaces a banner. Phase unchanged —
+      // forcing 'reconnecting' would surface a tap-to-reconnect overlay
+      // for what's actually a sub-second blip.
+      return { ...state, cartesiaReconnecting: true };
+
+    case 'cartesia_reconnected':
+      return { ...state, cartesiaReconnecting: false };
+
+    case 'video_autoplay_lost':
+      // R4-M5 — silent <video>.play() rejection on iOS WebKit after a
+      // track rebind. Surface tap-to-resume overlay via 'reconnecting'
+      // — same UX shape, distinct telemetry already captured by the
+      // session-client watcher.
+      if (state.phase === 'closed' || state.phase === 'closing') return state;
+      return {
+        ...state,
+        phase: 'reconnecting',
+        reconnectPromptCount: state.reconnectPromptCount + 1,
       };
   }
 }

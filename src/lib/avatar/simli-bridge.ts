@@ -98,6 +98,19 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
   let firstAudioFired = false;
   let firstAudioAtMs = 0;
   let lipsyncLatencyFired = false;
+  // R3-M3 — minute-accrual reconciliation. Set on first successful start();
+  // wall-clock seconds(now() - openedAtMs) is sent via onMinuteAccrual on close().
+  let openedAtMs = 0;
+  let minuteAccrualFired = false;
+  // R3-Missing-4 — video stats poll handle. Cleared on close.
+  let videoStatsTimer: ReturnType<typeof setInterval> | null = null;
+  // R3-C1 — ring-buffer chunker enforcing Simli's 6000-byte cadence. Cartesia
+  // emits arbitrary-sized PCM frames; flushing per Cartesia chunk = drift.
+  // Buffer accumulates incoming bytes; flush in 6000-byte chunks; carry the
+  // remainder for the next sendAudio call. cancel()/close() drop the carry
+  // (do NOT flush partial — would leak prior turn into next).
+  const SIMLI_CHUNK_BYTES = 6000;
+  let chunkerBuf = new Uint8Array(0);
 
   // Track cache for late subscribers + renegotiation re-fire (Plan §23.4, §25.5).
   // Updated by refreshVideoTrack / refreshAudioTrack on initial loadedmetadata
@@ -159,6 +172,17 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
     if (!track || track === currentVideoTrack) return;
     currentVideoTrack = track;
     track.addEventListener('ended', refreshVideoTrack, { once: true });
+    // R2-C4 — iOS WebKit re-evaluates autoplay against the current
+    // user-activation on every track rebind (ICE restart, WiFi↔LTE
+    // handoff, simulcast layer change). Activation may have expired;
+    // try play() and rely on the consumer's video_autoplay_lost watcher
+    // (R4-YC-Day) to surface the failure if rejected. Optional-chain the
+    // call so an environment without HTMLVideoElement.play (test fake)
+    // is a no-op rather than a TypeError.
+    try {
+      const p = (videoEl as HTMLVideoElement & { play?: () => Promise<void> }).play?.();
+      if (p && typeof p.catch === 'function') p.catch(() => { /* watcher catches */ });
+    } catch { /* SSR / non-browser env */ }
     try { handlers.onVideoTrack?.(track); } catch { /* callback threw */ }
   }
 
@@ -369,6 +393,23 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
 
     // start() resolving means the session is established and ready for audio.
     if (!closed) {
+      openedAtMs = Date.now();
+      // R3-Missing-4 — kick off video-stats poll. 5s cadence; consumer
+      // diffs vs prior sample for interval-rate. Pause is implicit via
+      // the closed/!videoEl guards.
+      videoStatsTimer = setInterval(() => {
+        if (closed || !videoEl) return;
+        const v = videoEl as HTMLVideoElement & { getVideoPlaybackQuality?: () => { droppedVideoFrames: number; totalVideoFrames: number } };
+        const q = v.getVideoPlaybackQuality?.();
+        if (!q) return; // Safari < 17 etc.
+        try {
+          handlers.onVideoStats?.({
+            droppedFrames: q.droppedVideoFrames,
+            totalFrames: q.totalVideoFrames,
+            sampledAtMs: Date.now(),
+          });
+        } catch { /* callback threw */ }
+      }, 5000);
       handlers.onReady?.();
     }
   }
@@ -399,32 +440,88 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
         try { handlers.onLipsyncLatency?.(0); } catch { /* callback threw */ }
       }
     }
-    try {
-      client.sendAudioData(new Uint8Array(pcm16le16k));
-    } catch (e) {
-      fail({
-        code: 'audio_format_rejected',
-        message: 'simli rejected audio chunk',
-        recoverable: false,
-        cause: { provider, raw: e },
-      });
+    // R3-C1 — ring-buffer chunker. Cartesia emits arbitrary-sized PCM
+    // frames; Simli wants ~6000-byte cadence (187.5ms @ 16k). Mismatched
+    // cadence = lipsync drift indistinguishable from the original bug.
+    const incoming = new Uint8Array(pcm16le16k);
+    if (incoming.byteLength === 0) return;
+    const merged = new Uint8Array(chunkerBuf.byteLength + incoming.byteLength);
+    merged.set(chunkerBuf, 0);
+    merged.set(incoming, chunkerBuf.byteLength);
+    let offset = 0;
+    while (merged.byteLength - offset >= SIMLI_CHUNK_BYTES) {
+      const slice = merged.subarray(offset, offset + SIMLI_CHUNK_BYTES);
+      try {
+        client.sendAudioData(slice);
+      } catch (e) {
+        fail({
+          code: 'audio_format_rejected',
+          message: 'simli rejected audio chunk',
+          recoverable: false,
+          cause: { provider, raw: e },
+        });
+        return;
+      }
+      offset += SIMLI_CHUNK_BYTES;
     }
+    // Carry remainder for next call. Slice (not subarray) to detach from
+    // `merged` so `merged` can be GC'd.
+    chunkerBuf = offset < merged.byteLength
+      ? merged.slice(offset)
+      : new Uint8Array(0);
   }
 
   function cancel(): void {
     if (!client || closed) return;
+    // R3-C1 — drop the chunker carry so a barge-in doesn't bleed prior-
+    // turn audio into the next turn's first 6000 bytes.
+    chunkerBuf = new Uint8Array(0);
     try { client.ClearBuffer(); } catch { /* SDK tolerates repeated clears */ }
+  }
+
+  // R2-C4 / R3-M2 — full re-bind of video element source. Used by the
+  // reconnect overlay's tap handler to acquire a fresh user-activation
+  // for autoplay on iOS WebKit (calling play() on the existing srcObject
+  // doesn't re-evaluate autoplay policy — only a fresh srcObject does).
+  // Caller MUST invoke from within a user gesture handler.
+  async function rebindMediaSource(): Promise<void> {
+    if (closed || !videoEl) return;
+    const stream = readVideoStream();
+    if (!stream) return;
+    try {
+      videoEl.srcObject = null;
+      videoEl.srcObject = stream;
+      const p = (videoEl as HTMLVideoElement & { play?: () => Promise<void> }).play?.();
+      if (p) await p;
+    } catch {
+      // Play rejection bubbles to the consumer via the
+      // video_autoplay_lost reconnect overlay (R4-M5).
+    }
   }
 
   function close(): void {
     if (closed) return;
     intentionalClose = true;
     closed = true;
+    // R3-Missing-4 — stop the video-stats poll.
+    if (videoStatsTimer !== null) {
+      clearInterval(videoStatsTimer);
+      videoStatsTimer = null;
+    }
+    // R3-M3 — emit minute accrual exactly once. Fire BEFORE we tear
+    // down — consumer reads it synchronously and POSTs server-side.
+    // openedAtMs == 0 means start() never resolved; nothing to bill.
+    if (!minuteAccrualFired && openedAtMs > 0) {
+      minuteAccrualFired = true;
+      const seconds = Math.max(0, (Date.now() - openedAtMs) / 1000);
+      try { handlers.onMinuteAccrual?.(seconds); } catch { /* callback threw */ }
+    }
     try { void client?.stop(); } catch { /* already stopped */ }
     // Detach addtrack listeners before nulling stream refs (audit M4 leak fix).
     rebindVideoStream(null);
     rebindAudioStream(null);
     detachOwnedElements();
+    chunkerBuf = new Uint8Array(0);
     client = null;
     videoEl = null;
     audioEl = null;
@@ -441,5 +538,5 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
     applyLocalPlayback();
   }
 
-  return { provider, open, sendAudio, cancel, close, getCurrentTracks, setLocalPlayback };
+  return { provider, open, sendAudio, cancel, close, getCurrentTracks, setLocalPlayback, rebindMediaSource };
 }

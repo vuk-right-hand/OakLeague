@@ -138,6 +138,19 @@ export type AvatarBridgeHandlers = {
   // provider video frame arriving (via loadedmetadata / srcObject populated).
   // Production session client logs this to PostHog as `simli_lipsync_latency_ms`.
   onLipsyncLatency?: (ms: number) => void;
+  // R3-Missing-4 — video frame health. Polled at 5s cadence via
+  // HTMLVideoElement.getVideoPlaybackQuality(). droppedVideoFrames /
+  // totalVideoFrames are monotonic so the consumer should diff vs the
+  // prior sample to compute interval-rate. Consumer flushes p50/p95
+  // ratio as PostHog event simli_video_stats every 30s.
+  onVideoStats?: (stats: { droppedFrames: number; totalFrames: number; sampledAtMs: number }) => void;
+  // R3-M3 — minute-level reconciliation. Fired exactly once on close()
+  // with the wall-clock seconds the bridge was open. Consumer POSTs to
+  // /api/sessions/simli-accrual which writes the cogs_log row with
+  // operation simli.video_minutes_bridge_close (R4-M3 — distinct from
+  // the reaper-derived row so the aggregator can MAX(bridge_close,
+  // reaper) per session and never sum).
+  onMinuteAccrual?: (seconds: number) => void;
 };
 
 export interface AvatarBridge {
@@ -181,6 +194,16 @@ export interface AvatarBridge {
   // 'live'` before piping into AudioMixer / MediaRecorder, regardless of
   // tier. The recording-controller is the canonical place for that check.
   getCurrentTracks(): { video: MediaStreamTrack | null; audio: MediaStreamTrack | null };
+
+  // R2-C4 / R3-M2 — full re-bind of video element source. Used by the
+  // reconnect overlay's tap handler on iOS where simply calling
+  // videoEl.play() on an existing srcObject won't re-trigger autoplay
+  // policy evaluation. Bridge does:
+  //   videoEl.srcObject = null; videoEl.srcObject = currentStream;
+  //   await videoEl.play();
+  // Caller MUST invoke this from within a fresh user-activation gesture
+  // (overlay tap). No-op if the bridge is closed or has no live track.
+  rebindMediaSource(): Promise<void>;
 
   // Runtime audible-output toggle. When false, bridge ensures the provider's
   // <audio> element is silenced so the consumer's AudioContext destination

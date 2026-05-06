@@ -1,0 +1,59 @@
+{
+  "_doc": "SIMLI_WIREUP §6 / R4-M7 — source-controlled Sentry alert config. Apply via `sentry-cli alerts apply sentry/alerts/lipsync.json` after `sentry-cli login` (deferred to follow-up if not yet wired in CI). Until then, configure these by hand in the Sentry UI to match.",
+  "_two_metrics": "We track TWO related metrics (R2-M5 / R4-S clarification): `simli_lipsync_latency_ms` (bridge t1 → first video frame; Simli-health) feeds the 1200ms regression alert. `user_perceived_response_ms` (mic-tap-release → first audio_out; UX) feeds the Phase-E 800ms ship gate but does NOT page on alert (UX measurement, not infrastructure failure).",
+  "alerts": [
+    {
+      "name": "simli_lipsync_latency_p95_regression",
+      "type": "metric_alert",
+      "dataset": "events",
+      "query": "event_type:simli_lipsync_latency_ms",
+      "aggregate": "p95(ms)",
+      "time_window_minutes": 10,
+      "trigger": {
+        "label": "lipsync_p95_over_1200",
+        "alert_threshold_ms": 1200,
+        "min_session_count": 10
+      },
+      "comment": "Floor of 10 sessions/10min prevents single-user noise from paging on day-1 traffic."
+    },
+    {
+      "name": "simli_video_paused_with_track_high",
+      "type": "metric_alert",
+      "dataset": "events",
+      "query": "event_type:simli_video_paused_with_track",
+      "aggregate": "count_per_session()",
+      "time_window_minutes": 30,
+      "trigger": {
+        "label": "video_autoplay_lost_2pct",
+        "ratio_threshold": 0.02,
+        "min_session_count": 50
+      },
+      "comment": "R4-YC-Day demo-day failure mode. >2% rate = iOS autoplay rebind regression."
+    },
+    {
+      "name": "simli_clock_drift_p95_regression",
+      "type": "metric_alert",
+      "dataset": "events",
+      "query": "event_type:simli_clock_drift_ms",
+      "aggregate": "p95(abs(drift_ms))",
+      "time_window_minutes": 30,
+      "trigger": {
+        "label": "drift_p95_over_400",
+        "alert_threshold_ms": 400,
+        "min_session_count": 20
+      },
+      "comment": "Threshold raised from R3 200ms to 400ms (above Cartesia's own 187.5ms chunk cadence — R4-S)."
+    },
+    {
+      "name": "simli_mint_replica_not_found_high",
+      "type": "issue_alert",
+      "query": "event.type:error error.value:replica_not_found service:simli",
+      "trigger": {
+        "label": "replica_not_found_3_in_10min",
+        "count_threshold": 3,
+        "time_window_minutes": 10
+      },
+      "comment": "GDPR-erasure / force-retrain race surfaces as replica_not_found mid-session. >3 in 10min = a worker-vs-session race we missed."
+    }
+  ]
+}

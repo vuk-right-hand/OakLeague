@@ -129,6 +129,45 @@ function LiveSession(props: LiveProps) {
     }
   }, [pipe.state.phase, router]);
 
+  // R4-YC-Day — black-square watcher. The most-likely demo-day failure
+  // is iOS PWA autoplay across LTE↔WiFi handoff during Simli mint:
+  // prime / rebind play / full-rebind each silently no-op on rejection,
+  // so "video has a track but is paused" goes uncaught. This 1Hz check
+  // dispatches video_autoplay_lost after 2s of paused-with-track, which
+  // surfaces the reconnect overlay (tap = fresh activation = play()).
+  useEffect(() => {
+    if (pipe.state.phase !== 'ready' && pipe.state.phase !== 'listening' && pipe.state.phase !== 'speaking') {
+      return;
+    }
+    let pausedSinceMs = 0;
+    let firedThisRun = false;
+    const id = window.setInterval(() => {
+      const v = pipe.videoRef.current;
+      if (!v || !v.srcObject) {
+        pausedSinceMs = 0;
+        return;
+      }
+      if (v.paused) {
+        if (pausedSinceMs === 0) pausedSinceMs = Date.now();
+        else if (!firedThisRun && Date.now() - pausedSinceMs >= 2000) {
+          firedThisRun = true;
+          captureSafe('simli_video_paused_with_track', {
+            session_id: props.envelope.session_id,
+            elapsed_ms: Date.now() - pausedSinceMs,
+          });
+          // R4-M5 — flip reducer to 'reconnecting' so the existing
+          // tap-to-resume overlay surfaces. The retry button calls
+          // pipe.retryAfterGesture → bridge.rebindMediaSource (R3-M2).
+          pipe.notifyVideoAutoplayLost();
+        }
+      } else {
+        pausedSinceMs = 0;
+        firedThisRun = false;
+      }
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [pipe.state.phase, pipe.videoRef, props.envelope.session_id]);
+
   const phase = pipe.state.phase;
   const showReconnect = shouldShowReconnectOverlay(pipe.state);
   const isOpening = phase === 'opening';
@@ -224,7 +263,14 @@ function LiveSession(props: LiveProps) {
           muted
           style={{ width: '100%', height: '100%', objectFit: 'cover' }}
         />
-        <audio ref={pipe.audioRef} autoPlay style={{ display: 'none' }} />
+        {/* R3-S3 — `display:none` causes iOS Safari to deprioritize/pause
+            hidden audio after backgrounding. 1×1 in-flow + opacity:0 keeps
+            the element layout-active without visible footprint. */}
+        <audio
+          ref={pipe.audioRef}
+          autoPlay
+          style={{ width: 1, height: 1, opacity: 0, pointerEvents: 'none' }}
+        />
 
         {/* Top bar — creator + end */}
         <div
@@ -270,6 +316,21 @@ function LiveSession(props: LiveProps) {
         {/* Overlays */}
         {isOpening && !isRollingOver && <OverlayCenter label="Connecting…" />}
         {isRollingOver && <OverlayCenter label="Reconnecting…" />}
+        {/* R3-Missing-6 — Cartesia-down banner. Avatar pipe stays warm
+            (Simli RTC unaffected); user sees a small badge instead of the
+            full-screen reconnect overlay. */}
+        {pipe.state.cartesiaReconnecting && (
+          <div
+            style={{
+              position: 'absolute', top: 60, left: '50%', transform: 'translateX(-50%)',
+              background: 'rgba(0,0,0,0.65)', color: '#fff',
+              padding: '6px 12px', borderRadius: 16, fontSize: 12,
+              pointerEvents: 'none',
+            }}
+          >
+            Voice catching up…
+          </div>
+        )}
         {showReconnect && (
           <OverlayCenter
             label="Connection interrupted"

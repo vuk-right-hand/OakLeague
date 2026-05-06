@@ -315,5 +315,11 @@ export function createTavusBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
     }
   }
 
-  return { provider, open, sendAudio, cancel, close, getCurrentTracks, setLocalPlayback };
+  // R2-C4 / R3-M2 — Tavus rebindMediaSource is a no-op stub. daily-js
+  // owns its own video element internals; the iOS autoplay-rebind path
+  // is irrelevant here. Tavus is scrapped post-Spike-B; satisfying the
+  // interface is enough.
+  async function rebindMediaSource(): Promise<void> { /* no-op */ }
+
+  return { provider, open, sendAudio, cancel, close, getCurrentTracks, setLocalPlayback, rebindMediaSource };
 }
