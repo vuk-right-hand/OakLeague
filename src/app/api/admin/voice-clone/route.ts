@@ -40,6 +40,7 @@ import { assertAdminFromSession, AuthGuardError } from '@/lib/auth-guards';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import { probeWav } from '@/lib/voice/wav-probe';
 import { isVoiceCloneMime } from '@/lib/voice/voice-clone-mimes';
+import { currentVoiceIdEnv, voiceIdColumn } from '@/lib/voice/env-scoped-voice-id';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -85,6 +86,22 @@ export async function POST(req: Request) {
   // 3. Cartesia env present?
   const cartesiaKey = process.env.CARTESIA_API_KEY || '';
   if (!cartesiaKey) return jsonError(500, 'cartesia_misconfig', 'CARTESIA_API_KEY unset');
+
+  // SIMLI_WIREUP §12a.1 / R3-Missing-1 / R4-M6 / Auditor C2 —
+  // production-only gate. The voice_clone_finalize_locked RPC writes to
+  // creators.voice_id (the prod column). Allowing preview/dev to call
+  // this route + post-process to relocate would leave a non-atomic gap
+  // where prod reads see a non-prod clone UUID. Until an env-aware
+  // finalize RPC ships, refuse here.
+  const voiceEnv = currentVoiceIdEnv();
+  if (voiceEnv !== 'production') {
+    const targetCol = voiceIdColumn(voiceEnv);
+    return jsonError(
+      503,
+      'voice_clone_only_in_production',
+      `voice-clone admin route is production-only until env-aware finalize RPC ships; populate ${targetCol} manually for ${voiceEnv} testing`,
+    );
+  }
 
   // S-C1 — Content-Length pre-check BEFORE req.formData() so a 50 MB
   // upload can't allocate a 50 MB ArrayBuffer in memory just to be
@@ -157,10 +174,14 @@ export async function POST(req: Request) {
   // admin has legitimately exhausted retries. Audit row still writes,
   // so cleanup is visible. Flip the env, redeploy Vercel, do the work,
   // unset the env. Documented in CLAUDE.md.
-  const bypassList = (process.env.VOICE_CLONE_RATE_LIMIT_BYPASS || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
+  // FACE_UI_PLAN R2-M1: env name alias cycle. New name is
+  // CREATOR_CLONE_RATE_LIMIT_BYPASS (covers voice + face). Old name
+  // VOICE_CLONE_RATE_LIMIT_BYPASS still read for one cycle. Both routes
+  // read the union.
+  const bypassList = (
+    (process.env.CREATOR_CLONE_RATE_LIMIT_BYPASS || '') + ',' +
+    (process.env.VOICE_CLONE_RATE_LIMIT_BYPASS || '')
+  ).split(',').map((s) => s.trim()).filter(Boolean);
   const isBypassAdmin = bypassList.includes(admin.userId);
 
   const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
@@ -330,6 +351,10 @@ export async function POST(req: Request) {
     }
     return jsonError(500, 'finalize_failed', finalizeErr.code || 'unknown');
   }
+
+  // SIMLI_WIREUP §12a.1 / R3-Missing-1 — production-env gate is enforced
+  // upstream at step 3a so finalize can write directly to creators.voice_id
+  // without a post-hoc relocate (Auditor C2 fix).
 
   // 11. R4-M3 — defer DELETE of the prior Cartesia voice id by 60s.
   // Vercel can't survive a setTimeout post-response, so we enqueue and

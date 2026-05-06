@@ -51,6 +51,8 @@ next-env.d.ts
 # Supabase
 supabase/.branches/
 supabase/.temp/
+# Studio scratch SQL — local one-off queries (e.g. data cleanups). Not source.
+supabase/snippets/
 
 # Keys that must never be committed
 *.pem
@@ -60,3 +62,13 @@ supabase/.temp/
 # outputs. Large media, provider-identifying content. Shared via Supabase
 # Storage signed URLs (bucket `spike-b-clips`, 12h TTL), not git.
 artifacts/spike-b/
+
+# Spike output / test artifacts. Local-only.
+.spike-output/
+
+# Local Phase 0 face-upload verifier inputs. scripts/face-phase0-verify.mjs
+# reads an image path; admins typically save trial photos at the repo root.
+# Keep them out of git (some are PII — actual creator face photos).
+/face-test*.png
+/face-test*.jpg
+/face-test*.jpeg

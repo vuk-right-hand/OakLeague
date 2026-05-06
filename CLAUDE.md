@@ -1,6 +1,6 @@
 # OakLeague
 
-Interactive video mentorship. Vertical 9:16 hooks → tap → conversational AI avatar of the creator answers in real time. PWA v1. YC S26 application due **2026-05-06**.
+Interactive video mentorship. Vertical 9:16 hooks → tap → conversational AI avatar of the creator answers in real time. PWA v1. **YC S26 application submitted 2026-05-06.** No deadline pressure remaining — fix critical / medium / small findings the right way, not the fast way.
 
 **Production from line one.** No hardcoded founder. No `is_founder` flags. No "v2 becomes real later." Schema, auth, RLS, creator onboarding, and admin console all built as if creator #50 signs up in week three. We seed v1 with Vuk as creator #1 *via the real invite → application → approval flow*, not via a hardcoded migration row.
 

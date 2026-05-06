@@ -2,6 +2,7 @@ import 'server-only';
 import { notFound } from 'next/navigation';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import { VoiceCloneUpload } from './voice-clone-upload';
+import { FaceUpload } from './face-upload';
 
 export const dynamic = 'force-dynamic';
 
@@ -50,6 +51,18 @@ type VoiceUpload = {
   created_at: string;
 };
 
+type PendingFaceUpload = {
+  id: number;
+  vendor_face_id: string | null;
+  created_at: string;
+};
+
+type TimeoutOrphanUpload = {
+  id: number;
+  created_at: string;
+  last_error: string | null;
+};
+
 export default async function AdminCreatorDetail({
   params,
 }: {
@@ -89,6 +102,36 @@ export default async function AdminCreatorDetail({
     .limit(5);
   const uploadRows = (uploads ?? []) as VoiceUpload[];
   const latestUpload = uploadRows[0] ?? null;
+
+  // Auditor R2-M1 — surface the most recent pending face upload so the
+  // FaceUpload cell can resume polling after a tab close / page refresh.
+  // Indexed by face_clone_uploads_creator_pending_idx.
+  const { data: pendingFace } = await sb
+    .from('face_clone_uploads')
+    .select('id, vendor_face_id, created_at')
+    .eq('creator_id', id)
+    .eq('state', 'pending')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle<PendingFaceUpload>();
+
+  // Path C — surface failed-timeout rows so the FaceUpload cell can offer
+  // recovery (admin pastes the orphan face_id from Simli Studio). Only
+  // looking at last 24h to keep stale ancient timeouts off the UI.
+  const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const { data: orphanRows } = await sb
+    .from('face_clone_uploads')
+    .select('id, created_at, last_error')
+    .eq('creator_id', id)
+    .eq('state', 'failed')
+    .gt('created_at', since)
+    .ilike('last_error', '%timeout%')
+    .is('vendor_face_id', null)
+    .order('created_at', { ascending: false })
+    .limit(1);
+  const orphan = (orphanRows && orphanRows.length > 0)
+    ? (orphanRows[0] as TimeoutOrphanUpload)
+    : null;
 
   // Per-topic sample counts: sample.topic_tags[] may include multiple slugs.
   // Count a sample toward a topic if that topic's slug is in topic_tags.
@@ -154,6 +197,21 @@ export default async function AdminCreatorDetail({
             </ul>
           </details>
         )}
+        <FaceUpload
+          creatorId={creator.id}
+          hasExistingFace={!!creator.simli_face_id}
+          existingFaceId={creator.simli_face_id}
+          pendingUpload={pendingFace && pendingFace.vendor_face_id ? {
+            uploadId: pendingFace.id,
+            vendorFaceId: pendingFace.vendor_face_id,
+            createdAt: pendingFace.created_at,
+          } : null}
+          timeoutOrphan={orphan ? {
+            uploadId: orphan.id,
+            createdAt: orphan.created_at,
+            lastError: orphan.last_error,
+          } : null}
+        />
       </section>
 
       <section style={{ marginBottom: 32 }}>

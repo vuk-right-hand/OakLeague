@@ -39,6 +39,8 @@ import { CartesiaTTSBridge } from './cartesia-bridge.js';
 import { decideQuotaGate } from './quota-gate.js';
 import { makeLogTurnCogs, installReaper, VOICE_CARTESIA_ENABLED, getCartesiaPricing } from './proxy-handlers.js';
 import { makeVoiceDeleteWorker } from './voice-delete-worker.js';
+import { makeSimliFaceDeleteWorker } from './simli-face-delete-worker.js';
+import { makeFaceUploadReaper } from './face-upload-reaper.js';
 
 const PORT = Number(process.env.PORT || 8080);
 const BUILD = process.env.FLY_MACHINE_ID || 'local';
@@ -48,6 +50,10 @@ const SUPABASE_SERVICE_KEY  = requireEnv('SUPABASE_SERVICE_ROLE_KEY');
 const GEMINI_API_KEY        = requireEnv('GEMINI_API_KEY');
 // CARTESIA_API_KEY is required only when VOICE_CARTESIA_ENABLED=1.
 const CARTESIA_API_KEY      = process.env.CARTESIA_API_KEY || '';
+// SIMLI_API_KEY drives the simli-face-delete-worker (R3-Missing-3).
+// Optional — worker no-ops if absent. Set in Fly secrets when /s/[id]
+// cutover ships.
+const SIMLI_API_KEY         = process.env.SIMLI_API_KEY || '';
 if (VOICE_CARTESIA_ENABLED) {
   if (!CARTESIA_API_KEY) {
     console.error('FATAL: CARTESIA_API_KEY missing while VOICE_CARTESIA_ENABLED=1');
@@ -63,14 +69,15 @@ const CARTESIA_COMPATIBLE_MODELS = new Set([
   'gemini-3.1-flash-live-preview',
 ]);
 
-// R3-C2 / S-M7 user-WS backpressure cap.
-// Per-session: 2 MB ≈ 42s of 24kHz s16le.
-// Per-VM aggregate: 32 MB. With 200 concurrent sessions a 2 MB per-session
-// cap could in principle hit 400 MB heap on a Fly small instance — well
-// past the OOM line. The aggregate cap closes the OLDEST session with
-// >=1 MB buffered when the VM total breaches.
-const USER_WS_BACKPRESSURE_MAX_BYTES = 2 * 1024 * 1024;
-const USER_WS_BACKPRESSURE_WARN_BYTES = 1 * 1024 * 1024;
+// R3-C2 / S-M7 / R2-M3 user-WS backpressure cap.
+// Tightened from 2 MB → 1.4 MB to keep the seconds-of-audio invariant
+// honest across BOTH sample rates (R3-M1 introduced per-session 16k):
+//   * 24 kHz s16le: 1.4 MB ≈ 30s buffer (was ~42s)
+//   * 16 kHz s16le: 1.4 MB ≈ 44s buffer
+// At 16k, a 2 MB cap masked slow-client problems for ~64s — too long.
+// Per-VM aggregate stays 32 MB; aggregate-breach closes oldest offender.
+const USER_WS_BACKPRESSURE_MAX_BYTES = Math.floor(1.4 * 1024 * 1024);
+const USER_WS_BACKPRESSURE_WARN_BYTES = Math.floor(0.7 * 1024 * 1024);
 const USER_WS_AGGREGATE_MAX_BYTES = 32 * 1024 * 1024;
 
 // sessionId → { ws, openedAt }. Used to compute aggregate bufferedAmount
@@ -143,6 +150,12 @@ async function consumeTicket(ticketId, uaHash) {
   // Atomic single-use consume — see plan §Ticket-based WS auth. service-role
   // bypasses RLS so the RETURNING clause reflects only the row this UPDATE
   // won (Postgres UPDATE is atomic per-row).
+  //
+  // SIMLI_WIREUP §2 — session_id is the cutover discriminator:
+  //   * NULL → legacy admin spike-a path: proxy creates its own session row.
+  //   * UUID → /s/[id] cutover path: proxy attaches to the pre-opened row.
+  // expected_tier is read so we don't have to round-trip sessions for the
+  // CartesiaTTSBridge per-session sample-rate decision (R3-M1).
   const { data, error } = await supabase
     .from('voice_tickets')
     .update({ consumed_at: new Date().toISOString() })
@@ -150,13 +163,51 @@ async function consumeTicket(ticketId, uaHash) {
     .is('consumed_at', null)
     .gt('expires_at', new Date().toISOString())
     .eq('bound_ua_hash', uaHash)
-    .select('user_id, creator_id')
+    .select('user_id, creator_id, session_id, expected_tier, purpose')
     .maybeSingle();
   if (error || !data) return null;
   // creator_id is NOT NULL by CHECK on new rows (migration 0041). A null here
   // means a pre-migration ticket leaked in — refuse rather than guess.
   if (!data.creator_id) return null;
-  return { userId: data.user_id, creatorId: data.creator_id };
+  return {
+    userId:       data.user_id,
+    creatorId:    data.creator_id,
+    sessionId:    data.session_id || null,
+    expectedTier: data.expected_tier || null,
+    purpose:      data.purpose || 'voice_session',
+  };
+}
+
+// SIMLI_WIREUP §2 — attach to a pre-opened session row (cutover path).
+// Verifies the session is still active + owned by the ticket's user; flips
+// status='active' + bumps last_heartbeat_at. Replaces openSession() for
+// /s/[id] tickets.
+async function attachToSession({ sessionId, userId, creatorId, expectedTier }) {
+  // Defense-in-depth: filter by creator_id too. The
+  // voice_tickets_session_user_match trigger guarantees user_id alignment,
+  // but does NOT cross-check creator_id between ticket and session row.
+  // A craftily-minted ticket pointing at a stranger's open session would
+  // fail user_id match — so this is belt-and-suspenders.
+  //
+  // Auditor C4 — additionally verify tier_at_session matches the ticket's
+  // expected_tier. CLAUDE.md mandates tier never changes mid-session,
+  // so a mismatch indicates either a bug or a tampered ticket; refuse.
+  let q = supabase
+    .from('sessions')
+    .update({ status: 'active', last_heartbeat_at: new Date().toISOString() })
+    .eq('id', sessionId)
+    .eq('user_id', userId)
+    .eq('creator_id', creatorId)
+    .is('ended_at', null);
+  if (expectedTier) q = q.eq('tier_at_session', expectedTier);
+  const { data, error } = await q.select('id, tier_at_session').maybeSingle();
+  if (error) {
+    console.error('[session-attach]', error);
+    captureException(error, { op: 'session-attach', userId, sessionId });
+    return { err: 'upstream_error' };
+  }
+  if (!data) return { err: 'session_not_attachable' };
+  return { sessionId: data.id, tier: data.tier_at_session };
 }
 
 async function openSession({ userId, creatorId, modelWire }) {
@@ -360,16 +411,67 @@ wss.on('connection', async (ws, req) => {
 
   const consumed = await consumeTicket(ticket, uaHash);
   if (!consumed) { console.log(`[ws ${connId}] invalid_ticket`); return closeWs(ws, 4001, 'invalid_ticket'); }
-  const { userId, creatorId } = consumed;
-  console.log(`[ws ${connId}] ticket ok user=${userId.slice(0,8)} creator=${creatorId.slice(0,8)}`);
+  const { userId, creatorId, sessionId: ticketSessionId } = consumed;
+  // SIMLI_WIREUP §2 — attach path is the /s/[id] cutover; legacy openSession
+  // is the admin spike-a path.
+  const isAttachPath = !!ticketSessionId;
+  console.log(`[ws ${connId}] ticket ok user=${userId.slice(0,8)} creator=${creatorId.slice(0,8)} attach=${isAttachPath}`);
 
-  const sess = await openSession({ userId, creatorId, modelWire });
+  let sess;
+  if (isAttachPath) {
+    sess = await attachToSession({
+      sessionId: ticketSessionId,
+      userId,
+      creatorId,
+      expectedTier: consumed.expectedTier,
+    });
+  } else {
+    sess = await openSession({ userId, creatorId, modelWire });
+  }
   if (sess.err) { console.log(`[ws ${connId}] session err=${sess.err}`); }
   if (sess.err === 'session_already_active') return closeWs(ws, 4002, 'session_already_active');
   if (sess.err === 'kill_switch_fired')      return closeWs(ws, 4003, 'kill_switch_fired');
+  if (sess.err === 'session_not_attachable') return closeWs(ws, 4001, 'session_not_attachable');
   if (sess.err === 'upstream_error')         return closeWs(ws, 4005, 'upstream_error');
   const sessionId = sess.sessionId;
   console.log(`[ws ${connId}] session ok id=${sessionId.slice(0,8)}`);
+
+  // R4-C1 — single-WS-per-session enforcement. If a takeover (R3-C2)
+  // re-mints a ticket against an existing active session and BOTH tabs
+  // open WSs, mic frames would be duplicated → double Gemini billing,
+  // undefined turn state. Evict the older WS first; new attach wins.
+  //
+  // Auditor C3 fix — `ws.close()` is async on the wire but the OLD WS
+  // would keep firing 'message' events until the close handshake
+  // propagates (tens of ms on desktop, seconds on iOS Safari TLS-close).
+  // During that window the OLD bridge accepts mic frames + pays Gemini
+  // tokens. Synchronously removing all message listeners stops mic-frame
+  // processing immediately; the close handler still fires for teardown().
+  const existing = wsRegistry.get(sessionId);
+  if (existing && existing.ws !== ws) {
+    console.warn(`[ws ${connId}] evicting prior WS for session=${sessionId.slice(0,8)}`);
+    try {
+      existing.ws.send(JSON.stringify({ type: 'error', code: 'session_evicted', at: Date.now() }));
+    } catch {}
+    // Synchronous: stop mic frames + control messages from reaching the
+    // old bridge BEFORE the async close completes.
+    try { existing.ws.removeAllListeners('message'); } catch {}
+    try { existing.ws.close(4002, 'session_already_active'); } catch {}
+    // Audit row in cogs_log so ops can see how often this fires.
+    try {
+      await supabase.from('cogs_log').insert({
+        user_id: userId,
+        session_id: sessionId,
+        service: 'gemini',
+        operation: 'voice_ws_evicted',
+        units: 1,
+        unit_label: 'event',
+        cost_usd: 0,
+        environment: 'production',
+        metadata: { reason: 'r4_c1_dual_ws_attach', conn_id: connId },
+      });
+    } catch (e) { captureException(e, { op: 'voice_ws_evicted_audit', sessionId }); }
+  }
   sessionToWs.set(sessionId, ws);
   wsRegistry.set(sessionId, { ws, openedAt: Date.now() });
 
@@ -454,9 +556,16 @@ wss.on('connection', async (ws, req) => {
 
   if (useCartesia) {
     try {
+      // SIMLI_WIREUP R3-M1 — per-session sample rate. Cutover (/s/[id]
+      // attach path) feeds Simli, which requires PCM16 LE @ 16kHz. Legacy
+      // admin spike-a stays at 24kHz so existing harness fixtures and
+      // Phase-0 verification stay green. cartesia-bridge constructor
+      // already takes sampleRate (defaults to 24000).
+      const cartesiaSampleRate = isAttachPath ? 16000 : 24000;
       cartesia = new CartesiaTTSBridge({
         apiKey: CARTESIA_API_KEY,
         voiceId: creatorVoiceId,
+        sampleRate: cartesiaSampleRate,
       });
       const t0 = Date.now();
       await cartesia.open();
@@ -835,6 +944,8 @@ wss.on('connection', async (ws, req) => {
 
 let reaperHandle = null;
 let voiceDeleteHandle = null;
+let simliFaceDeleteHandle = null;
+let faceUploadReaperHandle = null;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`voice-proxy listening on :${PORT} (build=${BUILD})`);
   // Reaper: 20s cadence + 60s threshold (RPC default). Fires once at boot for
@@ -846,14 +957,29 @@ server.listen(PORT, '0.0.0.0', () => {
     voiceDeleteHandle = makeVoiceDeleteWorker({ supabase, cartesiaApiKey: CARTESIA_API_KEY })
       .install().handle;
   }
+  // SIMLI_WIREUP §12a.3 / R3-Missing-3 — Simli face-delete worker.
+  // Drains simli_face_delete_queue rows (creator deletion + force-retrain).
+  // No-op without SIMLI_API_KEY; queue rows accumulate harmlessly until
+  // the env is set + Fly redeploys.
+  if (SIMLI_API_KEY) {
+    simliFaceDeleteHandle = makeSimliFaceDeleteWorker({ supabase, simliApiKey: SIMLI_API_KEY })
+      .install().handle;
+  } else {
+    console.warn('[boot] SIMLI_API_KEY missing — simli-face-delete-worker disabled');
+  }
+  // Auditor R3-NC2 — stale-pending face-upload reaper. No vendor key
+  // needed; just calls the SECURITY DEFINER RPC. Always on.
+  faceUploadReaperHandle = makeFaceUploadReaper({ supabase }).install().handle;
 });
 
 // Graceful shutdown — stop the reaper interval so node exits cleanly when the
 // http server's connections drain. SIGTERM is what Fly sends on deploy.
 function shutdown(signal) {
-  console.log(`[shutdown] ${signal} — clearing reaper + voice-delete worker`);
+  console.log(`[shutdown] ${signal} — clearing reaper + delete workers`);
   if (reaperHandle) clearInterval(reaperHandle);
   if (voiceDeleteHandle) clearInterval(voiceDeleteHandle);
+  if (simliFaceDeleteHandle) clearInterval(simliFaceDeleteHandle);
+  if (faceUploadReaperHandle) clearInterval(faceUploadReaperHandle);
   server.close(() => process.exit(0));
   // Hard-exit after 5s if connections won't drain.
   setTimeout(() => process.exit(0), 5000).unref();
