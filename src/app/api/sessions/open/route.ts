@@ -133,6 +133,60 @@ export async function POST(req: NextRequest) {
 
   // RPC under the cookie-bound client so auth.uid() resolves to the caller.
   const sb = await supabaseServer();
+
+  // Pre-mint daily/weekly/monthly cap check (use-session-pipe rewire R2-C1).
+  // voice_usage_ticket_check takes p_user_id only — runs BEFORE session_open
+  // so a capped user never creates a session row we'd then have to close.
+  // Surfaces a structured 429 instead of falling through to the proxy-WS-side
+  // 4006 close after a wasted mint round-trip.
+  //
+  // Auditor C1: the migration REVOKEs EXECUTE from `authenticated`. Call
+  // via the service-role admin client — the function's SECURITY DEFINER body
+  // short-circuits the auth.uid() check when JWT role is service_role, and
+  // we already authenticated the caller via getCallerUserId() above.
+  const { data: capRows, error: capErr } = await admin.rpc('voice_usage_ticket_check', {
+    p_user_id: callerUserId,
+  });
+  if (capErr) {
+    // Map the function's P0002 'user not found' (raised when no profiles
+    // row matches p_user_id) to 409 — a brand-new auth user whose profile
+    // trigger hasn't materialised yet should retry, not see a 500.
+    const pgCode = (capErr as { code?: string }).code;
+    if (pgCode === 'P0002') {
+      return json(409, { error: 'profile_not_ready' });
+    }
+    Sentry.captureException(capErr, { extra: { op: 'sessions_open_cap_check', user_id: callerUserId } });
+    return json(500, { error: 'cap_check_failed' });
+  }
+  // Auditor S1: numeric columns deserialise as string in supabase-js. Coerce
+  // every numeric so the wire response is consistent and client comparisons
+  // don't fail string-vs-number.
+  type CapRowRaw = {
+    remaining_seconds: number | string | null;
+    daily_used:   number | string | null; daily_cap:   number | null;
+    weekly_used:  number | string | null; weekly_cap:  number | null;
+    monthly_used: number | string | null; monthly_cap: number | null;
+  };
+  const capRowRaw = (Array.isArray(capRows) ? capRows[0] : capRows) as CapRowRaw | null;
+  if (!capRowRaw) {
+    return json(500, { error: 'cap_check_empty' });
+  }
+  const numOrNull = (v: number | string | null | undefined): number | null =>
+    v == null ? null : (typeof v === 'number' ? v : Number(v));
+  const remainingSeconds = Math.max(0, Math.floor(Number(capRowRaw.remaining_seconds ?? 0)));
+  if (remainingSeconds <= 0) {
+    return json(429, {
+      error: 'daily_cap_hit',
+      remaining_seconds: 0,
+      daily_used:   numOrNull(capRowRaw.daily_used),
+      daily_cap:    capRowRaw.daily_cap,
+      weekly_used:  numOrNull(capRowRaw.weekly_used),
+      weekly_cap:   capRowRaw.weekly_cap,
+      monthly_used: numOrNull(capRowRaw.monthly_used),
+      monthly_cap:  capRowRaw.monthly_cap,
+    });
+  }
+
   const { data: openRows, error: openErr } = await sb.rpc('session_open', {
     p_creator_id: creatorId,
     p_hook_id: hookId,
@@ -174,10 +228,12 @@ export async function POST(req: NextRequest) {
     }
     sessionId = live.id;
     tier = live.tier_at_session;
-    // Daily-limit-remaining isn't returned in the takeover path; estimate
-    // conservatively as full Gemini cap and let server-side enforcement
-    // gate. For the avatar TTL clamp, we use 600s default in mintSimli.
-    dailyLimitRemaining = GEMINI_MAX_SESSION_S;
+    // Auditor M1: cap RPC ran above against the same caller. Use its
+    // remaining_seconds as the takeover-path estimate so the loser tab's
+    // max_duration_s reflects actual headroom, not a 900s overestimate.
+    // Server-side kill-switch backstops anyway, but a tighter client clamp
+    // surfaces the limit earlier and avoids a wasted in-session kill.
+    dailyLimitRemaining = Math.min(GEMINI_MAX_SESSION_S, remainingSeconds);
     isTakeover = true;
     try {
       await admin.from('cogs_log').insert({
@@ -431,14 +487,15 @@ export async function POST(req: NextRequest) {
     return json(502, { error: 'gemini_mint_failed' });
   }
 
-  // ── Mint voice ticket (cutover proxy WS auth) ─────────────────────────
+  // ── Mint voice ticket (proxy WS auth — fatal on failure) ─────────────
   // SIMLI_WIREUP §2 — pre-mint a UA-bound, session-pinned ticket so the
-  // browser can open the proxy WS without a second client RTT. Failure
-  // here is non-fatal for the flag-off path: the legacy direct-Gemini
-  // codepath ignores `voice_ticket`. For the flag-on cutover path a
-  // missing ticket means the WS open will fail, surfaced via the
-  // session-client UX shell.
-  let voiceTicket: { ticket: string; expiresAt: string } | null = null;
+  // browser can open the proxy WS without a second client RTT.
+  //
+  // Failure is FATAL after use-session-pipe rewire (round-2 audit). A
+  // session without a voice_ticket cannot reach the proxy WS, so leaving
+  // a session row open without a ticket only orphans the row and burns
+  // the user's one-active slot. Close the session before returning.
+  let voiceTicket: { ticket: string; expiresAt: string };
   try {
     voiceTicket = await mintVoiceTicket({
       userId:        callerUserId,
@@ -456,12 +513,43 @@ export async function POST(req: NextRequest) {
     });
   } catch (e) {
     Sentry.captureException(e, { extra: { op: 'sessions_open_voice_ticket', session_id: sessionId } });
-    if (e instanceof VoiceTicketMintError && e.code === 'too_many_tickets') {
-      // Don't close session — user just needs to back off. The legacy
-      // path (flag-off) doesn't need the ticket anyway.
+    // Close the orphaned session row so the user's one-active slot frees
+    // for an immediate retry. R3-C2 takeover guard: skip close on a row
+    // that belongs to another tab.
+    if (!isTakeover) {
+      try {
+        await sb.rpc('session_close', {
+          p_session_id: sessionId,
+          p_end_reason: 'voice_ticket_mint_failed',
+        });
+      } catch (closeErr) {
+        Sentry.captureException(closeErr, {
+          extra: { op: 'sessions_open_voice_ticket_close', session_id: sessionId },
+        });
+      }
     }
-    // For other ticket-mint failures, log and return without ticket.
-    // Cutover path will show "Service unavailable" via session-client.
+    // Auditor C3: defensive instanceof — Next 15 server bundling can produce
+    // separate class identities. Match on the error name as a fallback so a
+    // bundle re-shape doesn't silently downgrade specific codes to a generic
+    // 502.
+    const isVTM = e instanceof VoiceTicketMintError
+      || (e != null && typeof e === 'object'
+          && (e as { name?: unknown }).name === 'VoiceTicketMintError'
+          && typeof (e as { httpStatus?: unknown }).httpStatus === 'number');
+    if (isVTM) {
+      const ve = e as VoiceTicketMintError;
+      // Auditor C2: bad_ua / bad_avatar_provider fire only when the route
+      // failed to pass valid args — programmer-error, not user-error. Mask
+      // them as 500 so the client doesn't see a 400 they cannot recover from.
+      if (ve.code === 'bad_ua' || ve.code === 'bad_avatar_provider') {
+        Sentry.captureException(e, {
+          extra: { op: 'sessions_open_voice_ticket_programmer_error', code: ve.code, session_id: sessionId },
+        });
+        return json(500, { error: 'voice_ticket_mint_failed' });
+      }
+      return json(ve.httpStatus, { error: ve.code });
+    }
+    return json(502, { error: 'voice_ticket_mint_failed' });
   }
 
   // Day 4 — first_session credit via Next 15 `after()` so the work runs
