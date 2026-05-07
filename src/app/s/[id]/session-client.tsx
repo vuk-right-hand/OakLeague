@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useSessionPipe, type OpenEnvelope } from './use-session-pipe';
+import { isValidEnvelope } from '@/lib/avatar/avatar-envelope';
 import { shouldShowReconnectOverlay } from './session-reducer';
 import { captureSafe } from '@/lib/posthog-safe-capture';
 import { ReactButton } from '@/components/recording/ReactButton';
@@ -42,9 +43,42 @@ function readEnvelope(sessionId: string): OpenEnvelope | null {
   try {
     const raw = sessionStorage.getItem(envelopeStorageKey(sessionId));
     if (!raw) return null;
-    const parsed = JSON.parse(raw) as OpenEnvelope;
+    const parsed: unknown = JSON.parse(raw);
     // Consume: remove after read to prevent replay on navigate-back.
     sessionStorage.removeItem(envelopeStorageKey(sessionId));
+    // PR-2: stale-shape guard. A pre-deploy tab can write the old
+    // envelope shape (gemini.token, nullable voice_ticket); the new
+    // build's reader rejects it and falls through to the existing
+    // "Session expired" screen.
+    if (!isValidEnvelope(parsed)) {
+      // Round-2 audit C2: a stale-shape envelope means the OLD writer
+      // already POSTed /api/sessions/open and created a server-side row
+      // (sessions_one_active_per_user partial-unique index will block
+      // the user's next /open until the reaper runs ~60s later). Free
+      // the slot proactively. Best-effort fire-and-forget.
+      const stale = parsed as { session_id?: unknown };
+      const staleId = typeof stale?.session_id === 'string' ? stale.session_id : null;
+      if (staleId) {
+        try {
+          if (typeof navigator !== 'undefined' && 'sendBeacon' in navigator) {
+            const blob = new Blob(
+              [JSON.stringify({ session_id: staleId, end_reason: 'envelope_shape_mismatch' })],
+              { type: 'application/json' },
+            );
+            navigator.sendBeacon('/api/sessions/close', blob);
+          } else {
+            void fetch('/api/sessions/close', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ session_id: staleId, end_reason: 'envelope_shape_mismatch' }),
+              keepalive: true,
+            }).catch(() => { /* best-effort */ });
+          }
+        } catch { /* sendBeacon blocked — reaper covers in 60s */ }
+      }
+      return null;
+    }
     if (parsed.session_id !== sessionId) return null;
     return parsed;
   } catch {
@@ -171,7 +205,7 @@ function LiveSession(props: LiveProps) {
   const phase = pipe.state.phase;
   const showReconnect = shouldShowReconnectOverlay(pipe.state);
   const isOpening = phase === 'opening';
-  const isRollingOver = phase === 'opening' && pipe.state.openedAtMs !== null && pipe.state.geminiReady === false && pipe.state.avatarReady === false;
+  const isRollingOver = phase === 'opening' && pipe.state.openedAtMs !== null && pipe.state.brainReady === false && pipe.state.avatarReady === false;
 
   // ── Recording wiring (Day 3) ──────────────────────────────────────────
   // Mount ReactButton on Ask scene. Kill-switch via NEXT_PUBLIC_REACT_CAPTURE_
@@ -492,13 +526,17 @@ function friendlyErrorLabel(raw: string | null | undefined): string {
     case 'tts_failed':
     case 'cogs_misconfig':
       return "Voice couldn't connect";
-    case 'gemini_connect_failed':
-    case 'gemini_reopen_failed':
     case 'proxy_connect_failed':
-    case 'voice_ticket_missing':
-    case 'rollover_voice_ticket_missing':
+    case 'proxy_swap_failed':
+    case 'voice_ticket_mint_failed':
+    case 'rollover_502':
+    case 'rollover_503':
+    case 'rollover_network':
       return "Couldn't reach the assistant";
     default:
+      // rollover_${status} covers other server-mapped errors (404, 410,
+      // 500). Fall through to the generic copy.
+      if (code.startsWith('rollover_')) return "Couldn't reach the assistant";
       return 'Session ended';
   }
 }

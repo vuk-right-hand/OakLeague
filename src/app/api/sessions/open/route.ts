@@ -573,6 +573,28 @@ export async function POST(req: NextRequest) {
     });
   }
 
+  // Proxy URL is required after the use-session-pipe rewire — the only
+  // path is via the proxy WS. If the env var is unset, refuse to open
+  // rather than ship a half-formed envelope the client can't act on.
+  const proxyUrl = process.env.NEXT_PUBLIC_VOICE_PROXY_URL;
+  if (!proxyUrl) {
+    Sentry.captureMessage('sessions_open_proxy_url_unconfigured', {
+      level: 'error',
+      extra: { session_id: sessionId },
+    });
+    if (!isTakeover) {
+      try {
+        await sb.rpc('session_close', {
+          p_session_id: sessionId,
+          p_end_reason: 'proxy_url_unconfigured',
+        });
+      } catch (e) {
+        Sentry.captureException(e, { extra: { op: 'sessions_open_proxy_url_close', session_id: sessionId } });
+      }
+    }
+    return json(503, { error: 'proxy_url_unconfigured' });
+  }
+
   return json(200, {
     session_id: sessionId,
     tier,
@@ -583,12 +605,13 @@ export async function POST(req: NextRequest) {
     avatar_provider: avatarProvider,
     avatar,
     avatar_status: avatarStatus,
-    // gemini.token kept during the flag-on/off window (R2-C3). Cleanup PR
-    // after 24h-green deletes the field together with the @google/genai
-    // import in use-session-pipe.
-    gemini: { token: token.token, model: token.model },
+    // Wire-form model name only — proxy holds the Gemini API key server-
+    // side and the voice_ticket auths the WS, so no token leaks past
+    // /api/sessions/open. The wire-form is what proxy-client passes as
+    // `modelWire` when opening the WS.
+    voice: { model: token.model },
     voice_ticket: voiceTicket,
-    proxy_url: process.env.NEXT_PUBLIC_VOICE_PROXY_URL ?? null,
+    proxy_url: proxyUrl,
     max_duration_s: dailyLimitRemaining,
     max_session_s: GEMINI_MAX_SESSION_S,
     is_takeover: isTakeover,

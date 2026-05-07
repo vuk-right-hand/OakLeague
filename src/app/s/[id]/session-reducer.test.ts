@@ -36,9 +36,9 @@ describe('session-reducer — opening gate', () => {
     expect(s2).toBe(s1);
   });
 
-  it('needs BOTH gemini_setup_complete AND avatar_ready to reach ready', () => {
+  it('needs BOTH brain_ready AND avatar_ready to reach ready', () => {
     let s = boot();
-    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'brain_ready' });
     expect(s.phase).toBe('opening'); // still waiting for avatar
     s = reduce(s, { kind: 'avatar_ready' });
     expect(s.phase).toBe('ready');
@@ -47,7 +47,7 @@ describe('session-reducer — opening gate', () => {
 
   it('avatar_not_expected satisfies the avatar side of the gate', () => {
     let s = boot();
-    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'brain_ready' });
     s = reduce(s, { kind: 'avatar_not_expected' });
     expect(s.phase).toBe('ready');
   });
@@ -62,7 +62,7 @@ describe('session-reducer — opening gate', () => {
 describe('session-reducer — turn lifecycle', () => {
   function ready(): SessionState {
     let s = boot();
-    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'brain_ready' });
     s = reduce(s, { kind: 'avatar_ready' });
     return s;
   }
@@ -72,24 +72,24 @@ describe('session-reducer — turn lifecycle', () => {
     expect(s.phase).toBe('listening');
   });
 
-  it('gemini_audio_chunk: listening → speaking', () => {
+  it('tts_audio_chunk: listening → speaking', () => {
     let s = reduce(ready(), { kind: 'mic_started' });
-    s = reduce(s, { kind: 'gemini_audio_chunk' });
+    s = reduce(s, { kind: 'tts_audio_chunk' });
     expect(s.phase).toBe('speaking');
   });
 
-  it('gemini_turn_complete: speaking → ready', () => {
+  it('turn_complete: speaking → ready', () => {
     let s = reduce(ready(), { kind: 'mic_started' });
-    s = reduce(s, { kind: 'gemini_audio_chunk' });
-    s = reduce(s, { kind: 'gemini_turn_complete' });
+    s = reduce(s, { kind: 'tts_audio_chunk' });
+    s = reduce(s, { kind: 'turn_complete' });
     expect(s.phase).toBe('ready');
   });
 
-  it('gemini_interrupted does NOT change phase (barge-in keeps pipe warm)', () => {
+  it('barge_in does NOT change phase (barge-in keeps pipe warm)', () => {
     let s = reduce(ready(), { kind: 'mic_started' });
-    s = reduce(s, { kind: 'gemini_audio_chunk' });
+    s = reduce(s, { kind: 'tts_audio_chunk' });
     const before = s.phase;
-    s = reduce(s, { kind: 'gemini_interrupted' });
+    s = reduce(s, { kind: 'barge_in' });
     expect(s.phase).toBe(before);
     // isPipeWarm invariant holds across barge-in
     expect(isPipeWarm(s)).toBe(true);
@@ -99,7 +99,7 @@ describe('session-reducer — turn lifecycle', () => {
 describe('session-reducer — visibility', () => {
   function ready(): SessionState {
     let s = boot();
-    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'brain_ready' });
     s = reduce(s, { kind: 'avatar_ready' });
     return s;
   }
@@ -127,7 +127,7 @@ describe('session-reducer — visibility', () => {
 describe('session-reducer — reconnection', () => {
   function ready(): SessionState {
     let s = boot();
-    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'brain_ready' });
     s = reduce(s, { kind: 'avatar_ready' });
     return s;
   }
@@ -153,7 +153,7 @@ describe('session-reducer — reconnection', () => {
 describe('session-reducer — rollover (15-min cap)', () => {
   function ready(): SessionState {
     let s = boot();
-    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'brain_ready' });
     s = reduce(s, { kind: 'avatar_ready' });
     return s;
   }
@@ -170,7 +170,7 @@ describe('session-reducer — rollover (15-min cap)', () => {
     });
     expect(s.phase).toBe('opening');
     expect(s.sessionId).toBe('sess-2');
-    expect(s.geminiReady).toBe(false);
+    expect(s.brainReady).toBe(false);
     expect(s.avatarReady).toBe(false);
   });
 
@@ -185,7 +185,7 @@ describe('session-reducer — rollover (15-min cap)', () => {
     });
     expect(s.avatarReady).toBe(true);
     // Gemini still needs to re-setup.
-    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'brain_ready' });
     expect(s.phase).toBe('ready');
   });
 
@@ -199,7 +199,7 @@ describe('session-reducer — rollover (15-min cap)', () => {
 describe('session-reducer — close', () => {
   function ready(): SessionState {
     let s = boot();
-    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'brain_ready' });
     s = reduce(s, { kind: 'avatar_ready' });
     return s;
   }
@@ -220,7 +220,7 @@ describe('session-reducer — close', () => {
   it('all events after closed are no-ops', () => {
     let s = reduce(ready(), { kind: 'fatal_error', message: 'boom' });
     const before = s;
-    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'brain_ready' });
     expect(s.phase).toBe('closed');
     s = reduce(s, { kind: 'visibility_hidden' });
     expect(s.phase).toBe('closed');
@@ -235,12 +235,12 @@ describe('session-reducer — invariants', () => {
   it('isPipeWarm holds for ready/listening/speaking/paused, false for opening/reconnecting/closed', () => {
     let s = boot();
     expect(isPipeWarm(s)).toBe(false); // opening
-    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'brain_ready' });
     s = reduce(s, { kind: 'avatar_ready' });
     expect(isPipeWarm(s)).toBe(true); // ready
     s = reduce(s, { kind: 'mic_started' });
     expect(isPipeWarm(s)).toBe(true); // listening
-    s = reduce(s, { kind: 'gemini_audio_chunk' });
+    s = reduce(s, { kind: 'tts_audio_chunk' });
     expect(isPipeWarm(s)).toBe(true); // speaking
     s = reduce(s, { kind: 'pc_degraded' });
     expect(isPipeWarm(s)).toBe(false); // reconnecting
@@ -250,7 +250,7 @@ describe('session-reducer — invariants', () => {
 describe('cartesia reconnecting (R3-Missing-6)', () => {
   function ready(): SessionState {
     let s = boot();
-    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'brain_ready' });
     s = reduce(s, { kind: 'avatar_ready' });
     return s;
   }
@@ -269,7 +269,7 @@ describe('cartesia reconnecting (R3-Missing-6)', () => {
 describe('video_autoplay_lost (R4-M5)', () => {
   function ready(): SessionState {
     let s = boot();
-    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'brain_ready' });
     s = reduce(s, { kind: 'avatar_ready' });
     return s;
   }

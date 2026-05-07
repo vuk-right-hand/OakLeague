@@ -1,37 +1,37 @@
-// use-session-pipe — wires the pure reducer to Simli + Gemini + mic capture.
+// use-session-pipe — wires the pure reducer to the avatar bridge + the
+// Fly voice proxy + mic capture.
 //
 // Flow at the hook level:
 //   1. Caller already POSTed /api/sessions/open; hands us the envelope.
-//   2. Hook opens SimliBridge (pre-minted token path — R3-C2/P0-5) in parallel
-//      with Gemini GoogleGenAI.live.connect.
+//   2. Hook opens the avatar bridge (Simli/HeyGen, pre-minted) in parallel
+//      with the Fly proxy WS (which fronts Gemini Live + Cartesia TTS).
 //   3. Both pipes hit 'ready' → reducer flips to 'ready'; UI enables mic.
-//   4. press-and-hold mic → activityStart + stream worklet frames → activityEnd.
-//   5. Gemini onmessage audio part → base64 → PCM16 bytes → simliBridge.sendAudio.
-//   6. Gemini interrupted → simliBridge.cancel() (pipe stays warm — R2-M4).
+//   4. press-and-hold mic → turn_start → stream worklet frames → turn_end.
+//   5. Proxy onAudioOut PCM bytes → bridge.sendAudio (cloned-voice TTS).
+//   6. Proxy onError(barge_in) → bridge.cancel() (pipe stays warm).
 //   7. Heartbeat every 20s → /api/sessions/heartbeat; 410 → fatal_error.
 //   8. visibilitychange → reducer; effect POSTs pause/resume.
-//   9. Ticker: at maxSessionSeconds → POST /api/sessions/rollover; replace tokens.
+//   9. Ticker: at maxSessionSeconds → POST /api/sessions/rollover; overlap-
+//      swap proxy WS via ProxyClient.swapTo.
 //
-// Tokens never enter React state. They live on a ref. PostHog captures go
+// Tickets never enter React state. They live on a ref. PostHog captures go
 // through captureSafe (R3-S2).
+//
+// PR-2 (use-session-pipe rewire) deleted the legacy direct-Gemini path
+// previously gated on NEXT_PUBLIC_VOICE_PROXY_PATH — the proxy WS is now
+// the only path, the envelope no longer carries gemini.token, and the
+// reducer's brain-side action kinds are renamed from gemini_* to brain_*
+// / tts_* / turn_complete / barge_in.
 
 'use client';
 
 import { useCallback, useEffect, useReducer, useRef } from 'react';
-import { GoogleGenAI, Modality, type LiveServerMessage, type Session } from '@google/genai';
 import * as Sentry from '@sentry/nextjs';
 import { createSimliBridge } from '@/lib/avatar/simli-bridge';
 import { createHeygenBridge } from '@/lib/avatar/heygen-bridge';
 import type { AvatarBridge, AvatarBridgeHandlers, AvatarOpenOptions, AvatarError } from '@/lib/avatar/avatar-bridge';
 import { captureSafe } from '@/lib/posthog-safe-capture';
 import { createProxyClient, type ProxyClient } from '@/lib/voice/proxy-client';
-
-// SIMLI_WIREUP §7 / R2-C3 — flag-gated cutover. When 1, mic+brain+TTS go
-// through the Fly proxy WS (Pipeline α' end-to-end). When unset/0, the
-// legacy direct-Gemini path runs (broken-by-design — feeds Gemini stock
-// voice into Simli at wrong sample rate — but stable for rollback).
-const USE_PROXY_PATH =
-  typeof process !== 'undefined' && process.env.NEXT_PUBLIC_VOICE_PROXY_PATH === '1';
 import {
   initialState,
   reduce,
@@ -93,19 +93,6 @@ const AUDIO_CONTEXT_RESUME_VERIFY_MS = 300;
 // iOS WebKit: verify AudioContext.state === 'running' 300ms after resume()
 // (R3-M4 — visibilitychange is not a user gesture).
 
-function base64ToBytes(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
-function bytesToBase64(bytes: Uint8Array): string {
-  let s = '';
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-  return btoa(s);
-}
-
 export type PipeHandle = {
   state: SessionState;
   videoRef: React.RefObject<HTMLVideoElement | null>;
@@ -160,9 +147,8 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   // Refs for things that must not trigger re-renders and must survive
   // reducer updates. Tokens live HERE (never in state).
   const bridgeRef = useRef<AvatarBridge | null>(null);
-  const geminiRef = useRef<Session | null>(null);
-  // SIMLI_WIREUP — proxy WS client (cutover path). Owns mic-frame upload +
-  // audio_out routing into the bridge. Null on flag-off path.
+  // Proxy WS client — owns mic-frame upload + audio_out routing into the
+  // bridge. The only brain transport after PR-2.
   const proxyRef = useRef<ProxyClient | null>(null);
   // R3-M7 — t0 for user_perceived_response_ms. Set on mic_stopped (start
   // of "user is waiting for answer"); cleared on first audio_out frame.
@@ -194,8 +180,10 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   const micStreamPromiseRef = useRef<Promise<MediaStream> | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
-  const ephemeralTokenRef = useRef<string>(args.envelope.gemini.token);
-  const modelRef = useRef<string>(args.envelope.gemini.model);
+  // Wire-form model name passed to ProxyClient.open / swapTo as `modelWire`.
+  // The proxy holds the Gemini API key server-side — the client never sees
+  // a token after PR-2.
+  const modelRef = useRef<string>(args.envelope.voice.model);
   // Simli/Tavus path retains a pre-minted compose token for legacy code
   // paths. HeyGen has its own session_boot envelope and doesn't go through
   // this ref. Discriminate on provider before reading.
@@ -365,22 +353,10 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       const pcm = ev.data?.pcm as ArrayBuffer | undefined;
       if (!pcm) return;
       // Drop frames whenever the mic isn't logically engaged (between
-      // turns the mic is captured but should not feed Gemini).
+      // turns the mic is captured but should not feed the proxy).
       if (!micActiveRef.current) return;
-      if (USE_PROXY_PATH) {
-        try { proxyRef.current?.sendAudio(pcm); }
-        catch { /* WS closed mid-frame — heartbeat / close will reconcile */ }
-        return;
-      }
-      if (!geminiRef.current) return;
-      try {
-        geminiRef.current.sendRealtimeInput({
-          audio: {
-            data: bytesToBase64(new Uint8Array(pcm)),
-            mimeType: 'audio/pcm;rate=16000',
-          },
-        });
-      } catch { /* WS closed mid-frame — next visibility tick will reconcile */ }
+      try { proxyRef.current?.sendAudio(pcm); }
+      catch { /* WS closed mid-frame — heartbeat / close will reconcile */ }
     };
     src.connect(node);
     // Do NOT connect to ctx.destination — would loop mic back to speakers.
@@ -621,94 +597,15 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       }
     }
 
-    // 2. Gemini Live WS — @google/genai live.connect.
-    async function openGemini(): Promise<void> {
-      try {
-        const client = new GoogleGenAI({
-          apiKey: ephemeralTokenRef.current,
-          httpOptions: { apiVersion: 'v1alpha' },
-        });
-        const session = await client.live.connect({
-          model: modelRef.current,
-          config: {
-            responseModalities: [Modality.AUDIO],
-            systemInstruction:
-              args.systemInstruction ??
-              'You are a helpful mentor. Answer in concise spoken English.',
-            // Server-VAD (automatic) — user taps and holds mic, but Gemini
-            // decides when they stopped. Simpler than manual VAD in-browser.
-            realtimeInputConfig: { automaticActivityDetection: { disabled: false } },
-          },
-          callbacks: {
-            onopen: () => { /* WS open — wait for setupComplete */ },
-            onmessage: (m: LiveServerMessage) => {
-              if (cancelled) return;
-              if (m.setupComplete) {
-                dispatchRef({ kind: 'gemini_setup_complete' });
-                captureSafe('session_ready', { surface: 'gemini', session_id: sessionIdRef.current });
-                return;
-              }
-              // Interruption: Gemini cancels its in-flight response. We keep
-              // the pipe warm: simli.cancel() clears its playback buffer.
-              if (m.serverContent?.interrupted) {
-                dispatchRef({ kind: 'gemini_interrupted' });
-                try { bridgeRef.current?.cancel(); } catch { /* bridge already closed */ }
-                captureSafe('barge_in', { session_id: sessionIdRef.current });
-              }
-              const parts = m.serverContent?.modelTurn?.parts ?? [];
-              let gotAudio = false;
-              for (const p of parts) {
-                if (p.inlineData?.mimeType?.startsWith('audio/pcm') && p.inlineData.data) {
-                  gotAudio = true;
-                  const bytes = base64ToBytes(p.inlineData.data);
-                  try { bridgeRef.current?.sendAudio(bytes.buffer as ArrayBuffer); } catch { /* bridge closed */ }
-                }
-              }
-              if (gotAudio) dispatchRef({ kind: 'gemini_audio_chunk' });
-              if (m.serverContent?.turnComplete) {
-                // Post-build C2 — HeyGen requires explicit speak_end at
-                // turn boundary. Simli/Tavus leave commitUtterance undefined.
-                try { bridgeRef.current?.commitUtterance?.(); } catch { /* */ }
-                dispatchRef({ kind: 'gemini_turn_complete' });
-              }
-            },
-            onerror: (ev: ErrorEvent) => {
-              if (cancelled) return;
-              Sentry.captureException(new Error(ev?.message ?? 'gemini_ws_error'), {
-                extra: { session_id: sessionIdRef.current },
-              });
-              dispatchRef({ kind: 'ws_closed', wasClean: false });
-            },
-            onclose: (ev: CloseEvent) => {
-              if (cancelled) return;
-              dispatchRef({ kind: 'ws_closed', wasClean: ev.wasClean });
-            },
-          },
-        });
-        geminiRef.current = session;
-      } catch (e) {
-        Sentry.captureException(e, { extra: { session_id: sessionIdRef.current, op: 'gemini_open' } });
-        dispatchRef({ kind: 'fatal_error', message: 'gemini_connect_failed' });
-      }
-    }
-
-    // SIMLI_WIREUP §B4 — flag-gated: cutover opens proxy WS instead of
-    // direct-Gemini. Voice ticket + proxy_url come from the envelope
-    // (mint at /api/sessions/open).
+    // Open the Fly proxy WS — the only brain transport. Voice ticket +
+    // proxy_url come from the envelope (minted at /api/sessions/open and
+    // required server-side after PR-2).
     async function openProxy(): Promise<void> {
-      if (!args.envelope.voice_ticket || !args.envelope.proxy_url) {
-        // Cutover requires both. If missing, surface a fatal — flag-on
-        // path can't degrade silently to broken-direct-Gemini.
-        dispatchRef({ kind: 'fatal_error', message: 'voice_ticket_missing' });
-        return;
-      }
       const proxy = createProxyClient({
         onReady: () => {
           if (cancelled) return;
-          // Proxy ready ≈ Gemini setup-complete in the legacy path; flips
-          // the same reducer state.
-          dispatchRef({ kind: 'gemini_setup_complete' });
-          captureSafe('session_ready', { surface: 'proxy', session_id: sessionIdRef.current });
+          dispatchRef({ kind: 'brain_ready' });
+          captureSafe('session_ready', { surface: 'voice', session_id: sessionIdRef.current });
         },
         onAudioOut: (bytes) => {
           if (cancelled) return;
@@ -721,27 +618,23 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
             captureSafe('user_perceived_response_ms', { ms, session_id: sessionIdRef.current });
           }
           try { bridgeRef.current?.sendAudio(bytes); } catch { /* bridge closed */ }
-          dispatchRef({ kind: 'gemini_audio_chunk' });
+          dispatchRef({ kind: 'tts_audio_chunk' });
         },
-        // Post-build C2 — Gemini turnComplete signals the boundary that
-        // HeyGen requires for `agent.speak_end`. Simli/Tavus bridges leave
-        // commitUtterance undefined (no-op via optional chaining).
+        // HeyGen requires explicit speak_end at turn boundary; Simli/Tavus
+        // bridges leave commitUtterance undefined (no-op via optional chain).
         // The minor tail of Cartesia PCM frames after this point flows
         // into the next utterance buffer — accepted slop for v1; revisit
-        // if Phase 0.5 testing shows turn-boundary lipsync glitches.
+        // if turn-boundary lipsync glitches surface in testing.
         //
-        // Phase 0.5 fix (2026-05-07): MUST dispatch gemini_turn_complete
-        // here so the reducer transitions speaking→ready. Without this
-        // the proxy path stays stuck at 'speaking' forever after turn 1
-        // — every subsequent startMic took the barge-in branch and fired
-        // cancel → turn_start, gluing silent worklet frames + a phantom
-        // barge-in onto Gemini's ongoing turn until auto-VAD couldn't
-        // recover. Symptom: "avatar can't hear a single word from turn 2."
-        // Direct-Gemini path already dispatches this; only proxy path was
-        // missing it.
+        // Phase 0.5 fix (2026-05-07): dispatch turn_complete here so the
+        // reducer transitions speaking→ready. Without this the proxy path
+        // stays stuck at 'speaking' forever after turn 1 — every subsequent
+        // startMic took the barge-in branch and fired cancel → turn_start,
+        // gluing silent worklet frames + a phantom barge-in onto Gemini's
+        // ongoing turn until auto-VAD couldn't recover.
         onTurnComplete: () => {
           try { bridgeRef.current?.commitUtterance?.(); } catch { /* */ }
-          dispatchRef({ kind: 'gemini_turn_complete' });
+          dispatchRef({ kind: 'turn_complete' });
         },
         onError: (code, detail) => {
           if (cancelled) return;
@@ -806,11 +699,7 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     // Pre-warm failure (denied permission, iOS rejecting resume w/o
     // gesture, etc.) is non-fatal: avatar still opens, voice-only
     // fallback works, and startMic's lazy path retries on first hold.
-    if (USE_PROXY_PATH) {
-      void openProxy();
-    } else {
-      void openGemini();
-    }
+    void openProxy();
     void (async () => {
       await preWarmAudio();
       if (cancelled) return;
@@ -900,6 +789,39 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     return () => document.removeEventListener('visibilitychange', onVisibility);
   }, []);
 
+  // POST /api/sessions/rollover. Server is responsible for closing any
+  // half-formed new row on its own failure paths (voice-ticket mint or
+  // proxy_url misconfig) — round-2 audit M2 ruled out client-side retry
+  // because session_rollover's "old row dead" check makes a second
+  // rollover always fail with P0006. So this is one shot: success →
+  // envelope, failure → dispatch rollover_failed and stop.
+  async function postRollover(): Promise<OpenEnvelope | null> {
+    const body = JSON.stringify({
+      old_session_id: sessionIdRef.current,
+      creator_id: args.creatorId,
+      hook_id: args.hookId,
+      model: modelRef.current,
+    });
+    let r: Response;
+    try {
+      r = await fetch('/api/sessions/rollover', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body,
+      });
+    } catch (e) {
+      Sentry.captureException(e, { extra: { op: 'rollover_fetch', session_id: sessionIdRef.current } });
+      dispatchRef({ kind: 'rollover_failed', message: 'rollover_network' });
+      return null;
+    }
+    if (!r.ok) {
+      dispatchRef({ kind: 'rollover_failed', message: `rollover_${r.status}` });
+      return null;
+    }
+    return (await r.json()) as OpenEnvelope;
+  }
+
   // ── Rollover timer (15-min Gemini cap) ─────────────────────────────────────
   useEffect(() => {
     if (!state.openedAtMs || state.phase === 'closed' || state.phase === 'closing') return;
@@ -911,37 +833,18 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       dispatchRef({ kind: 'rollover_requested' });
       (async () => {
         try {
-          // R1-M5 — pipe-warm rollover. The Simli bridge stays open
+          // R1-M5 — pipe-warm rollover. The avatar bridge stays open
           // across the boundary; only the brain/TTS pipe is swapped.
-          // R3-C3 overlap is handled by ProxyClient.swapTo (cutover path)
-          // OR by sequential close+reopen on the legacy direct-Gemini path.
-          if (!USE_PROXY_PATH) {
-            try { geminiRef.current?.close(); } catch {}
-            geminiRef.current = null;
-          }
-          // Bridge is preserved (do NOT close) — that's the whole point
-          // of pipe-warm. If a future Simli compose-token expiry forces a
-          // mid-session re-mint, that's handled separately (out of scope
-          // for this rollover path).
-          const r = await fetch('/api/sessions/rollover', {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              old_session_id: sessionIdRef.current,
-              creator_id: args.creatorId,
-              hook_id: args.hookId,
-              model: modelRef.current,
-            }),
-          });
-          if (!r.ok) {
-            dispatchRef({ kind: 'rollover_failed', message: `rollover_${r.status}` });
-            return;
-          }
-          const env = (await r.json()) as OpenEnvelope;
-          // Swap in new tokens + session id on the refs.
-          ephemeralTokenRef.current = env.gemini.token;
-          modelRef.current = env.gemini.model;
+          // ProxyClient.swapTo handles R3-C3 overlap (new WS routes mic
+          // immediately, old WS drains read-only ≤2s).
+          //
+          // Server owns orphan-row cleanup on any failure path inside
+          // /api/sessions/rollover (voice-ticket mint, proxy_url
+          // unconfigured, etc.) — see route.ts. Client's job is just to
+          // dispatch rollover_failed so the reducer terminates cleanly.
+          const env = await postRollover();
+          if (!env) return; // dispatch already happened in postRollover
+          modelRef.current = env.voice.model;
           sessionIdRef.current = env.session_id;
           preMintedSimliRef.current =
             env.avatar && (env.avatar.provider === 'simli' || env.avatar.provider === 'tavus')
@@ -954,8 +857,6 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
             avatarStatus: env.avatar_status,
             maxSessionSeconds: env.max_session_s,
           });
-          // Re-open both pipes with the new tokens. Inline here so the
-          // rollingOverRef gate applies.
           await reopenAfterRollover(env);
         } catch (e) {
           Sentry.captureException(e, { extra: { op: 'rollover', session_id: sessionIdRef.current } });
@@ -1013,75 +914,20 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       // new session_id boundary so the readiness gate doesn't deadlock.
       dispatchRef({ kind: 'avatar_ready' });
     }
-    // SIMLI_WIREUP §4 / R3-C3 — overlap swap on the proxy path. Mic
-    // invariant: ProxyClient.swapTo flips `active` to the new socket
-    // immediately so future sendAudio calls go to new only; old WS is
-    // drained read-only for ≤2s.
-    if (USE_PROXY_PATH) {
-      if (!env.voice_ticket || !env.proxy_url) {
-        dispatchRef({ kind: 'fatal_error', message: 'rollover_voice_ticket_missing' });
-        return;
+    // R3-C3 overlap swap. Mic invariant: ProxyClient.swapTo flips `active`
+    // to the new socket immediately so future sendAudio calls go to new
+    // only; old WS is drained read-only for ≤2s.
+    if (proxyRef.current) {
+      try {
+        await proxyRef.current.swapTo({
+          proxyUrl: env.proxy_url,
+          ticket: env.voice_ticket.ticket,
+          modelWire: env.voice.model,
+        });
+      } catch (e) {
+        Sentry.captureException(e, { extra: { op: 'rollover_proxy_swap', session_id: sessionIdRef.current } });
+        dispatchRef({ kind: 'fatal_error', message: 'proxy_swap_failed' });
       }
-      if (proxyRef.current) {
-        try {
-          await proxyRef.current.swapTo({
-            proxyUrl: env.proxy_url,
-            ticket: env.voice_ticket.ticket,
-            modelWire: env.gemini.model,
-          });
-        } catch (e) {
-          Sentry.captureException(e, { extra: { op: 'rollover_proxy_swap', session_id: sessionIdRef.current } });
-          dispatchRef({ kind: 'fatal_error', message: 'proxy_swap_failed' });
-        }
-      }
-      return;
-    }
-    // Gemini re-open (legacy path only)
-    try {
-      const client = new GoogleGenAI({
-        apiKey: env.gemini.token,
-        httpOptions: { apiVersion: 'v1alpha' },
-      });
-      const session = await client.live.connect({
-        model: env.gemini.model,
-        config: {
-          responseModalities: [Modality.AUDIO],
-          systemInstruction:
-            args.systemInstruction ??
-            'You are a helpful mentor. Answer in concise spoken English.',
-          realtimeInputConfig: { automaticActivityDetection: { disabled: false } },
-        },
-        callbacks: {
-          onopen: () => { /* wait for setupComplete */ },
-          onmessage: (m: LiveServerMessage) => {
-            if (m.setupComplete) { dispatchRef({ kind: 'gemini_setup_complete' }); return; }
-            if (m.serverContent?.interrupted) {
-              dispatchRef({ kind: 'gemini_interrupted' });
-              try { bridgeRef.current?.cancel(); } catch {}
-            }
-            const parts = m.serverContent?.modelTurn?.parts ?? [];
-            let got = false;
-            for (const p of parts) {
-              if (p.inlineData?.mimeType?.startsWith('audio/pcm') && p.inlineData.data) {
-                got = true;
-                const bytes = base64ToBytes(p.inlineData.data);
-                try { bridgeRef.current?.sendAudio(bytes.buffer as ArrayBuffer); } catch {}
-              }
-            }
-            if (got) dispatchRef({ kind: 'gemini_audio_chunk' });
-            if (m.serverContent?.turnComplete) {
-              try { bridgeRef.current?.commitUtterance?.(); } catch { /* */ }
-              dispatchRef({ kind: 'gemini_turn_complete' });
-            }
-          },
-          onerror: () => dispatchRef({ kind: 'ws_closed', wasClean: false }),
-          onclose: (ev: CloseEvent) => dispatchRef({ kind: 'ws_closed', wasClean: ev.wasClean }),
-        },
-      });
-      geminiRef.current = session;
-    } catch (e) {
-      Sentry.captureException(e, { extra: { session_id: sessionIdRef.current, op: 'rollover_reopen_gemini' } });
-      dispatchRef({ kind: 'fatal_error', message: 'gemini_reopen_failed' });
     }
   }
 
@@ -1091,24 +937,22 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     if (micActiveRef.current) return; // Already started this press cycle.
     micActiveRef.current = true;
     dispatchRef({ kind: 'mic_started' });
-    // SIMLI_WIREUP §B4 — proxy turn boundary + barge-in. mic-tap during
-    // 'speaking' is a barge-in: cancel the in-flight TTS playback locally
-    // (Simli buffer) and tell proxy so Cartesia stops synthesizing.
-    if (USE_PROXY_PATH) {
-      // Order matters: on barge-in (mic tap during 'speaking') we must
-      // cancel the OLD turn FIRST, then start the NEW one. The original
-      // order (turn_start → cancel) made cartesia.turnStart set a fresh
-      // contextId which the immediately-following cancel then cleared,
-      // leaving Cartesia with _currentContextId=null. The user's eventual
-      // mic-release fired turn_end → cartesia.turnEnd threw 'turnEnd
-      // before turnStart' → bridge state poisoned → stopped responding
-      // after 2-3 turns (Phase 0.5 testing 2026-05-07).
-      if (state.phase === 'speaking') {
-        try { bridgeRef.current?.cancel(); } catch {}
-        try { proxyRef.current?.sendControl({ type: 'cancel' }); } catch {}
-      }
-      try { proxyRef.current?.sendControl({ type: 'turn_start' }); } catch {}
+    // Proxy turn boundary + barge-in. mic-tap during 'speaking' is a
+    // barge-in: cancel the in-flight TTS playback locally (avatar buffer)
+    // and tell proxy so Cartesia stops synthesizing.
+    //
+    // Order matters: on barge-in we cancel the OLD turn FIRST, then start
+    // the NEW one. The reverse order (turn_start → cancel) made
+    // cartesia.turnStart set a fresh contextId which the immediately-
+    // following cancel then cleared, leaving Cartesia with
+    // _currentContextId=null. The user's eventual mic-release fired
+    // turn_end → cartesia.turnEnd threw 'turnEnd before turnStart' →
+    // bridge state poisoned (Phase 0.5 testing 2026-05-07).
+    if (state.phase === 'speaking') {
+      try { bridgeRef.current?.cancel(); } catch {}
+      try { proxyRef.current?.sendControl({ type: 'cancel' }); } catch {}
     }
+    try { proxyRef.current?.sendControl({ type: 'turn_start' }); } catch {}
     (async () => {
       try {
         // Pre-warm should have already done acquireMicStream + acquireAudioGraph
@@ -1151,9 +995,7 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     // R3-M7 — user_perceived_response_ms t0 = mic-tap-release. Cleared
     // when first proxy audio_out frame arrives.
     userPerceivedT0Ref.current = performance.now();
-    if (USE_PROXY_PATH) {
-      try { proxyRef.current?.sendControl({ type: 'turn_end' }); } catch {}
-    }
+    try { proxyRef.current?.sendControl({ type: 'turn_end' }); } catch {}
     try { micStreamRef.current?.getTracks().forEach((t) => (t.enabled = false)); } catch {}
   }, []);
 
@@ -1169,8 +1011,6 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     micStreamRef.current = null;
     try { await audioCtxRef.current?.close(); } catch {}
     audioCtxRef.current = null;
-    try { geminiRef.current?.close(); } catch {}
-    geminiRef.current = null;
     try { proxyRef.current?.close('user_ended'); } catch {}
     proxyRef.current = null;
     // bridge.close() fires onMinuteAccrual → POST /api/sessions/simli-accrual
@@ -1215,9 +1055,9 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     // React 18 dev StrictMode double-mounts every effect (setup → cleanup
     // → setup). Without this reset, the StrictMode cleanup latches
     // closedRef.current=true permanently, and every subsequent dispatch
-    // (avatar_ready, gemini_setup_complete) is silently dropped by
-    // dispatchRef → phase never leaves 'opening' → "Connecting…" forever.
-    // Production has no double-mount; this is a no-op there.
+    // (avatar_ready, brain_ready) is silently dropped by dispatchRef →
+    // phase never leaves 'opening' → "Connecting…" forever. Production
+    // has no double-mount; this is a no-op there.
     closedRef.current = false;
     return () => {
       if (!closedRef.current) {
@@ -1226,7 +1066,6 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
         try { workletNodeRef.current?.disconnect(); } catch {}
         try { micStreamRef.current?.getTracks().forEach((t) => t.stop()); } catch {}
         try { audioCtxRef.current?.close(); } catch {}
-        try { geminiRef.current?.close(); } catch {}
         try { proxyRef.current?.close('unmount'); } catch {}
         try { bridgeRef.current?.close(); } catch {}
         // Audit C2 (2026-05-07). Null the refs AFTER closing. Without this,
@@ -1240,7 +1079,6 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
         micStreamRef.current = null;
         micStreamPromiseRef.current = null;
         audioCtxRef.current = null;
-        geminiRef.current = null;
         proxyRef.current = null;
         bridgeRef.current = null;
         // Best-effort close so we don't orphan the row. beacon-style because

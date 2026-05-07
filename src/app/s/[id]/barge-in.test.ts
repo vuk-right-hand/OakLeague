@@ -8,7 +8,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { isPipeWarm, reduce, initialState } from './session-reducer';
 
 describe('barge-in contract (R2-M4)', () => {
-  it('reducer stays in warm phase on gemini_interrupted', () => {
+  it('reducer stays in warm phase on barge_in', () => {
     let s = reduce(initialState, { kind: 'boot_started' });
     s = reduce(s, {
       kind: 'boot_envelope',
@@ -17,17 +17,17 @@ describe('barge-in contract (R2-M4)', () => {
       avatarStatus: 'minted',
       maxSessionSeconds: 900,
     });
-    s = reduce(s, { kind: 'gemini_setup_complete' });
+    s = reduce(s, { kind: 'brain_ready' });
     s = reduce(s, { kind: 'avatar_ready' });
     s = reduce(s, { kind: 'mic_started' });
-    s = reduce(s, { kind: 'gemini_audio_chunk' });
+    s = reduce(s, { kind: 'tts_audio_chunk' });
     expect(s.phase).toBe('speaking');
     expect(isPipeWarm(s)).toBe(true);
 
     // Barge-in: reducer phase unchanged; cancel/close are side-effects
     // the hook handles — we assert the reducer doesn't accidentally drop
     // the pipe.
-    const after = reduce(s, { kind: 'gemini_interrupted' });
+    const after = reduce(s, { kind: 'barge_in' });
     expect(after.phase).toBe(s.phase);
     expect(isPipeWarm(after)).toBe(true);
   });

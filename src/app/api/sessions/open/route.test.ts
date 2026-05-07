@@ -10,7 +10,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 // ── Module mocks (hoisted) ────────────────────────────────────────────────
-vi.mock('@sentry/nextjs', () => ({ captureException: vi.fn() }));
+vi.mock('@sentry/nextjs', () => ({
+  captureException: vi.fn(),
+  captureMessage: vi.fn(),
+  addBreadcrumb: vi.fn(),
+}));
 
 vi.mock('@/lib/auth-guards', () => ({
   getCallerUserId: vi.fn(async () => 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa'),
@@ -208,8 +212,9 @@ describe('/api/sessions/open — pre-mint cap RPC (use-session-pipe rewire R2-C1
     rateLimitResult = { data: true, error: null };
     mockMintVoiceTicket.mockReset();
     mockMintVoiceTicket.mockResolvedValue({ ticket: 'ticket-1', expiresAt: new Date(Date.now() + 120_000).toISOString() });
+    process.env.NEXT_PUBLIC_VOICE_PROXY_URL = 'wss://test-proxy.fly.dev/voice/spike-a';
   });
-  afterEach(() => { vi.clearAllMocks(); });
+  afterEach(() => { vi.clearAllMocks(); delete process.env.NEXT_PUBLIC_VOICE_PROXY_URL; });
 
   it('returns 429 daily_cap_hit when remaining_seconds=0, BEFORE session_open', async () => {
     capRpcResult = {
@@ -289,8 +294,9 @@ describe('/api/sessions/open — voice-ticket mint is fatal (use-session-pipe re
     rateLimitResult = { data: true, error: null };
     sessionCloseResult = { data: null, error: null };
     mockMintVoiceTicket.mockReset();
+    process.env.NEXT_PUBLIC_VOICE_PROXY_URL = 'wss://test-proxy.fly.dev/voice/spike-a';
   });
-  afterEach(() => { vi.clearAllMocks(); });
+  afterEach(() => { vi.clearAllMocks(); delete process.env.NEXT_PUBLIC_VOICE_PROXY_URL; });
 
   it('on too_many_tickets: closes session + returns mapped 429 (httpStatus from VoiceTicketMintError)', async () => {
     mockMintVoiceTicket.mockRejectedValue(new VoiceTicketMintError('too_many_tickets', 429));
@@ -354,14 +360,28 @@ describe('/api/sessions/open — voice-ticket mint is fatal (use-session-pipe re
     takeoverLookupResult = { data: null, error: null };
   });
 
-  it('on success: returns 200 envelope with voice_ticket', async () => {
+  it('on success: returns 200 envelope with voice + voice_ticket + proxy_url, no gemini key', async () => {
     mockMintVoiceTicket.mockResolvedValue({ ticket: 'ticket-1', expiresAt: new Date(Date.now() + 120_000).toISOString() });
     const res = await POST(makeReq());
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.voice_ticket).toEqual({ ticket: 'ticket-1', expiresAt: expect.any(String) });
     expect(body.session_id).toBe('bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb');
+    // PR-2: envelope carries `voice: {model}` not `gemini: {token, model}`.
+    expect(body.voice).toEqual({ model: 'gemini-3.1-flash-live-preview' });
+    expect(body.gemini).toBeUndefined();
+    expect(body.proxy_url).toBe('wss://test-proxy.fly.dev/voice/spike-a');
     // session_close NOT called on the success path.
     expect(rpcCalls.filter((c) => c.name === 'session_close').length).toBe(0);
+  });
+
+  it('PR-2: returns 503 proxy_url_unconfigured when env unset + closes session', async () => {
+    delete process.env.NEXT_PUBLIC_VOICE_PROXY_URL;
+    mockMintVoiceTicket.mockResolvedValue({ ticket: 'ticket-1', expiresAt: new Date(Date.now() + 120_000).toISOString() });
+    const res = await POST(makeReq());
+    expect(res.status).toBe(503);
+    expect((await res.json()).error).toBe('proxy_url_unconfigured');
+    // Must close the orphaned session row to free the user's slot.
+    expect(rpcCalls.filter((c) => c.name === 'session_close').length).toBe(1);
   });
 });

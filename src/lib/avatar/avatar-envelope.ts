@@ -50,16 +50,50 @@ export type AvatarStatus =
   | 'not_applicable';
 
 // The full /api/sessions/open + /rollover response shape.
+//
+// use-session-pipe rewire (PR-2): legacy direct-Gemini path is gone, so
+// `gemini.token` is no longer in the envelope (the proxy holds the Gemini
+// API key server-side and the voice_ticket auths the WS). Only the model
+// wire-form is needed client-side, which is renamed `voice.model`.
+//
+// `voice_ticket` and `proxy_url` are required — the proxy WS is the ONLY
+// path. /api/sessions/open closes the session row on ticket-mint failure
+// and returns an error status; the success envelope therefore always has
+// both. /rollover does the same, with a 503 retry contract that includes
+// the new session_id so the client can clean up on second-failure.
 export type OpenEnvelope = {
   session_id: string;
   tier: 'free' | 'premium' | 'boardroom';
   avatar_provider: AvatarProvider | null;
   avatar: AvatarEnvelope | null;
   avatar_status: AvatarStatus;
-  gemini: { token: string; model: string };
-  voice_ticket: { ticket: string; expiresAt: string } | null;
-  proxy_url: string | null;
+  voice: { model: string };
+  voice_ticket: { ticket: string; expiresAt: string };
+  proxy_url: string;
   max_duration_s: number;
   max_session_s: number;
   is_takeover?: boolean;
 };
+
+// Stale-envelope shape guard. Catches envelopes written by an old client
+// build still running in a pre-deploy tab — old shape has `gemini.token`
+// but no `voice.model`. Wired into session-client.tsx readEnvelope so a
+// stale envelope surfaces the existing "Session expired" screen instead
+// of crashing the hook with `args.envelope.voice.model` reads.
+const VALID_TIERS = new Set(['free', 'premium', 'boardroom']);
+const VALID_AVATAR_STATUSES = new Set([
+  'pending', 'minted', 'skipped_tier', 'failed_mint', 'failed_connect', 'not_applicable',
+]);
+export function isValidEnvelope(env: unknown): env is OpenEnvelope {
+  if (!env || typeof env !== 'object') return false;
+  const e = env as Record<string, unknown>;
+  if (typeof e.session_id !== 'string') return false;
+  if (typeof e.tier !== 'string' || !VALID_TIERS.has(e.tier)) return false;
+  if (typeof e.avatar_status !== 'string' || !VALID_AVATAR_STATUSES.has(e.avatar_status)) return false;
+  const voice = e.voice as { model?: unknown } | undefined;
+  if (!voice || typeof voice.model !== 'string') return false;
+  const ticket = e.voice_ticket as { ticket?: unknown; expiresAt?: unknown } | undefined;
+  if (!ticket || typeof ticket.ticket !== 'string' || typeof ticket.expiresAt !== 'string') return false;
+  if (typeof e.proxy_url !== 'string') return false;
+  return true;
+}

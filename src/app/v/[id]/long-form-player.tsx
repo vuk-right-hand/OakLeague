@@ -8,6 +8,7 @@ import { recordFeedEvent } from '@/lib/feed/client-events';
 import { useDeviceId } from '@/lib/feed/device-id';
 import { AskErrorPill } from '@/lib/feed/ask-error-pill';
 import { envelopeStorageKey } from '@/app/s/[id]/session-client';
+import type { OpenEnvelope } from '@/lib/avatar/avatar-envelope';
 import { ReactButton } from '@/components/recording/ReactButton';
 import { RecordingPreview } from '@/components/recording/RecordingPreview';
 import { useRecordingController } from '@/lib/recording/recording-controller';
@@ -329,15 +330,7 @@ export function LongFormPlayer({
         setAskError(body?.error ?? `error_${r.status}`);
         return;
       }
-      const env = (await r.json()) as {
-        session_id: string;
-        tier: string;
-        avatar: unknown;
-        avatar_status: string;
-        gemini: { token: string; model: string };
-        max_duration_s: number;
-        max_session_s: number;
-      };
+      const env = (await r.json()) as OpenEnvelope;
       recordFeedEvent({
         event_name: 'mic_tap',
         hook_id: entryHookId ?? undefined,

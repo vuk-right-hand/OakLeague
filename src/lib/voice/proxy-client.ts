@@ -1,7 +1,7 @@
 // SIMLI_WIREUP §B1 / R3-C3 — typed WebSocket client for the Fly voice proxy.
 //
 // Wraps the /voice/spike-a binary-frame contract (server/voice-proxy/index.js).
-// Used by use-session-pipe.ts when NEXT_PUBLIC_VOICE_PROXY_PATH=1.
+// The brain WS transport for use-session-pipe.ts.
 //
 // Wire contract (mirrors proxy ws.on('message')):
 //   client → proxy:

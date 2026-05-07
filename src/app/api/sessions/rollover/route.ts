@@ -30,7 +30,7 @@ import { mintHeygenSessionToken, HeygenMintError } from '@/lib/avatar/mint-heyge
 import { resolveAvatarProvider } from '@/lib/avatar/resolver';
 import type { AvatarProvider } from '@/lib/avatar/avatar-bridge';
 import type { AvatarEnvelope } from '@/lib/avatar/avatar-envelope';
-import { mintVoiceTicket } from '@/lib/voice/mint-voice-ticket';
+import { mintVoiceTicket, VoiceTicketMintError } from '@/lib/voice/mint-voice-ticket';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -245,11 +245,13 @@ export async function POST(req: NextRequest) {
     return json(502, { error: 'gemini_mint_failed' });
   }
 
-  // SIMLI_WIREUP §4 / R3-C3 — overlap rollover requires a fresh voice
-  // ticket pinned to the new session_id. Mint failure isn't fatal — the
-  // legacy direct-Gemini path still works without a ticket; the cutover
-  // path will surface "service unavailable" via session-client.
-  let voiceTicket: { ticket: string; expiresAt: string } | null = null;
+  // Voice-ticket mint is fatal on rollover (use-session-pipe rewire PR-2,
+  // round-2 audit M2). An earlier draft returned 503 {retry:true} for the
+  // client to retry — but session_rollover's "old row dead" check
+  // (migration 20260502000002 line 301) makes a second-rollover always
+  // fail with P0006. So a retry can never succeed after voice-ticket
+  // mint fails. Close the orphan new row + return mapped error code.
+  let voiceTicket: { ticket: string; expiresAt: string };
   try {
     voiceTicket = await mintVoiceTicket({
       userId:         callerUserId,
@@ -262,6 +264,44 @@ export async function POST(req: NextRequest) {
     });
   } catch (e) {
     Sentry.captureException(e, { extra: { op: 'sessions_rollover_voice_ticket', session_id: newSessionId } });
+    try {
+      await sb.rpc('session_close', {
+        p_session_id: newSessionId,
+        p_end_reason: 'voice_ticket_mint_failed',
+      });
+    } catch (closeErr) {
+      Sentry.captureException(closeErr, {
+        extra: { op: 'sessions_rollover_voice_ticket_close', session_id: newSessionId },
+      });
+    }
+    if (e instanceof VoiceTicketMintError) {
+      // Mask programmer errors (audit C2) — bad_ua / bad_avatar_provider
+      // mean the route forgot to pass valid args, not a user error.
+      if (e.code === 'bad_ua' || e.code === 'bad_avatar_provider') {
+        return json(500, { error: 'voice_ticket_mint_failed' });
+      }
+      return json(e.httpStatus, { error: e.code });
+    }
+    return json(502, { error: 'voice_ticket_mint_failed' });
+  }
+
+  // Proxy URL required, same as /api/sessions/open. Failing here is a
+  // deploy-config bug, not a transient. Close the new row + 503.
+  const proxyUrl = process.env.NEXT_PUBLIC_VOICE_PROXY_URL;
+  if (!proxyUrl) {
+    Sentry.captureMessage('sessions_rollover_proxy_url_unconfigured', {
+      level: 'error',
+      extra: { session_id: newSessionId },
+    });
+    try {
+      await sb.rpc('session_close', {
+        p_session_id: newSessionId,
+        p_end_reason: 'proxy_url_unconfigured',
+      });
+    } catch (e) {
+      Sentry.captureException(e, { extra: { op: 'sessions_rollover_proxy_url_close', session_id: newSessionId } });
+    }
+    return json(503, { error: 'proxy_url_unconfigured' });
   }
 
   return json(200, {
@@ -270,9 +310,9 @@ export async function POST(req: NextRequest) {
     avatar_provider: avatarProvider,
     avatar,
     avatar_status: avatarStatus,
-    gemini: { token: token.token, model: token.model },
+    voice: { model: token.model },
     voice_ticket: voiceTicket,
-    proxy_url: process.env.NEXT_PUBLIC_VOICE_PROXY_URL ?? null,
+    proxy_url: proxyUrl,
     max_duration_s: dailyLimitRemaining,
     max_session_s: GEMINI_MAX_SESSION_S,
   });
