@@ -258,6 +258,32 @@ No proxy-vs-legacy assumptions. **No change.** Tavus cleanup is a separate ticke
 
 ---
 
+## 8.5 Whole-build audit follow-ups (filed as separate tickets — NOT blocking PR-3)
+
+The pre-merge whole-build audit surfaced three items that pre-date the
+use-session-pipe rewire (the rewire amplifies but does not introduce
+them). They are tracked here so they don't slip:
+
+1. **HeyGen rollover orphans server-side sessions every 15 minutes.**
+   `reopenAfterRollover` keeps the existing avatar bridge alive
+   (pipe-warm) on rollover. For HeyGen that means the freshly-minted
+   HeyGen session — created by the rollover route's
+   `mintHeygenSessionToken` call — is never joined, never heartbeated,
+   and times out at 120s burning credits with zero playback. Pre-rewire
+   tech debt; the rewire didn't change rollover semantics. Fix path:
+   either skip HeyGen mint when `bridgeRef.current` is alive, or tear
+   down + rebuild HeyGen on rollover and accept the avatar gap.
+2. **`isValidEnvelope` does not deep-validate `avatar` discriminated
+   union.** A pre-HeyGen-deploy stale envelope sails through the guard
+   and crashes `heygen-bridge.ts` with `requires opts.heygenSessionBoot`.
+   Add per-provider field-shape checks to the guard.
+3. **Rollover route does not re-run the `voice_usage_ticket_check` cap
+   gate.** A user 14:30 into a 15-min session whose accrual just pushed
+   them past the daily cap will roll over, get a fresh ticket, and the
+   proxy WS will then 4006-close the new session within seconds —
+   re-spending Simli/HeyGen mint cost on a session that can't be used.
+   Add the same pre-mint cap check to `/api/sessions/rollover`.
+
 ## 9. Open questions (resolve before implementation)
 
 1. **(Resolved by round-2 audit C1.)** `voice_usage_ticket_check` RPC is **not** called by `mintVoiceTicket` today. §4.3a now adds the explicit pre-mint RPC call.

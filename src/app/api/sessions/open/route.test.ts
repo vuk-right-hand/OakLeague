@@ -85,7 +85,11 @@ vi.mock('@/lib/recording/referral-token', () => ({
   isValidTokenPlaintext: vi.fn(() => false),
 }));
 
-vi.mock('@/lib/posthog-server', () => ({ captureServerSafe: vi.fn() }));
+const mockCaptureServerSafe = vi.fn();
+vi.mock('@/lib/posthog-server', () => ({
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  captureServerSafe: (...args: any[]) => mockCaptureServerSafe(...args),
+}));
 
 // next/server's `after` is a thin wrapper; vitest doesn't ship the runtime,
 // so stub it as a sync no-op invoker.
@@ -217,6 +221,7 @@ describe('/api/sessions/open — pre-mint cap RPC (use-session-pipe rewire R2-C1
   afterEach(() => { vi.clearAllMocks(); delete process.env.NEXT_PUBLIC_VOICE_PROXY_URL; });
 
   it('returns 429 daily_cap_hit when remaining_seconds=0, BEFORE session_open', async () => {
+    mockCaptureServerSafe.mockClear();
     capRpcResult = {
       data: [{ remaining_seconds: 0, daily_used: 300, daily_cap: 300, weekly_used: 800, weekly_cap: 900, monthly_used: null, monthly_cap: null }],
       error: null,
@@ -233,6 +238,16 @@ describe('/api/sessions/open — pre-mint cap RPC (use-session-pipe rewire R2-C1
     expect(names).toContain('voice_usage_ticket_check');
     expect(names).not.toContain('session_open');
     expect(names).not.toContain('session_close');
+    // Whole-build audit C4: telemetry fires so we can measure conversion.
+    const fired = mockCaptureServerSafe.mock.calls.find(
+      (c: unknown[]) => c[1] === 'daily_cap_hit_fired',
+    );
+    expect(fired).toBeTruthy();
+    expect(fired?.[2]).toMatchObject({
+      surface: 'sessions_open',
+      daily_used: 300,
+      daily_cap: 300,
+    });
   });
 
   it('returns 500 cap_check_failed on generic RPC error', async () => {

@@ -30,10 +30,10 @@ export type ProxyClientHandlers = {
   onTtsReconnecting?: () => void;
   onTtsReconnected?: () => void;
   onClose?: (code: number, reason: string, wasClean: boolean) => void;
-  // Server-emitted Gemini turn boundary. Used by the HeyGen bridge path
+  // Server-emitted brain turn boundary. Used by the HeyGen bridge path
   // to dispatch commitUtterance() at end-of-turn — without it the
   // server silently drops the next utterance (Phase 0 §7).
-  // Simli/Tavus consumers can ignore. Fires even on legacy paths.
+  // Simli/Tavus consumers can ignore.
   onTurnComplete?: () => void;
 };
 

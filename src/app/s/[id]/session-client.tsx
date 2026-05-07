@@ -51,18 +51,27 @@ function readEnvelope(sessionId: string): OpenEnvelope | null {
     // build's reader rejects it and falls through to the existing
     // "Session expired" screen.
     if (!isValidEnvelope(parsed)) {
-      // Round-2 audit C2: a stale-shape envelope means the OLD writer
-      // already POSTed /api/sessions/open and created a server-side row
-      // (sessions_one_active_per_user partial-unique index will block
-      // the user's next /open until the reaper runs ~60s later). Free
-      // the slot proactively. Best-effort fire-and-forget.
+      // Round-2 audit C2 + whole-build audit C1/C2: a stale-shape envelope
+      // means the OLD writer already POSTed /api/sessions/open and created
+      // a server-side row (sessions_one_active_per_user partial-unique
+      // index will block the user's next /open until the reaper runs
+      // ~60s later). Free the slot proactively + emit telemetry so the
+      // post-deploy stale-tab rate is measurable (plan AC #9).
       const stale = parsed as { session_id?: unknown };
       const staleId = typeof stale?.session_id === 'string' ? stale.session_id : null;
+      // /api/sessions/close ALLOWED_USER_END_REASONS only accepts
+      // user_ended | user_zombie_cleanup | client_error — pass
+      // 'client_error' for the proactive close (a custom string would
+      // 400 and leave the orphan open).
+      captureSafe('envelope_shape_mismatch', {
+        session_id: staleId ?? null,
+        had_session_id: staleId !== null,
+      });
       if (staleId) {
         try {
           if (typeof navigator !== 'undefined' && 'sendBeacon' in navigator) {
             const blob = new Blob(
-              [JSON.stringify({ session_id: staleId, end_reason: 'envelope_shape_mismatch' })],
+              [JSON.stringify({ session_id: staleId, end_reason: 'client_error' })],
               { type: 'application/json' },
             );
             navigator.sendBeacon('/api/sessions/close', blob);
@@ -71,7 +80,7 @@ function readEnvelope(sessionId: string): OpenEnvelope | null {
               method: 'POST',
               credentials: 'same-origin',
               headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ session_id: staleId, end_reason: 'envelope_shape_mismatch' }),
+              body: JSON.stringify({ session_id: staleId, end_reason: 'client_error' }),
               keepalive: true,
             }).catch(() => { /* best-effort */ });
           }

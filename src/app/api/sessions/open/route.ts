@@ -175,6 +175,18 @@ export async function POST(req: NextRequest) {
     v == null ? null : (typeof v === 'number' ? v : Number(v));
   const remainingSeconds = Math.max(0, Math.floor(Number(capRowRaw.remaining_seconds ?? 0)));
   if (remainingSeconds <= 0) {
+    // Whole-build audit C4: emit telemetry so we can compare HTTP-layer
+    // pre-mint cap firing rate (PR-1) against the legacy proxy-WS-side
+    // 4006 cap close, and correlate to /upgrade?source=cap_hit clicks.
+    captureServerSafe(callerUserId, 'daily_cap_hit_fired', {
+      surface:      'sessions_open',
+      daily_used:   numOrNull(capRowRaw.daily_used),
+      daily_cap:    capRowRaw.daily_cap,
+      weekly_used:  numOrNull(capRowRaw.weekly_used),
+      weekly_cap:   capRowRaw.weekly_cap,
+      monthly_used: numOrNull(capRowRaw.monthly_used),
+      monthly_cap:  capRowRaw.monthly_cap,
+    });
     return json(429, {
       error: 'daily_cap_hit',
       remaining_seconds: 0,

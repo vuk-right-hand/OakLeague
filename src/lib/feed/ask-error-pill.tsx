@@ -34,6 +34,11 @@ const CAP_HIT_CODES = new Set([
   // Defensive: keep the legacy string the prior dead conditional checked
   // so a stale server build doesn't break the friendly copy.
   'kill_switch_fired',
+  // use-session-pipe rewire PR-1: /api/sessions/open now returns 429 with
+  // error: 'daily_cap_hit' BEFORE session_open RPC creates a row. Map
+  // it to the same friendly cap copy so the new HTTP-layer cap surface
+  // doesn't regress the cap UX.
+  'daily_cap_hit',
 ]);
 
 export function AskErrorPill({ error, style }: Props) {
