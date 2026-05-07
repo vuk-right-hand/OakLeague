@@ -11,16 +11,34 @@
 //
 // Lifecycle: main thread sends { type: 'stop' } to drain + exit.
 //
-// Decimation lives in mic-decimate.js (pure function, unit-tested). See
-// SPIKE_A_DEFERRED_FIXUP_PLAN.md §2A for the carry-fix rationale.
-//
-// iOS 15 worklet-module support: this file uses an ES-module `import` from a
-// sibling file under public/worklets/. Module workers landed in iOS 15.0;
-// AudioWorklet module imports landed in 16.4. If the target floor is iOS
-// 15.x and the import fails at addModule time, fall back to inlining
-// mic-decimate.js's contents here. Pre-deploy device check: see plan §2A.
+// Phase 0.5 (2026-05-07). The decimate3to1 helper used to live in a
+// sibling module imported via `import { decimate3to1 } from './mic-decimate.js'`.
+// AudioWorklet module imports only landed in iOS Safari 16.4 — older iOS
+// (15.x, 16.0–16.3) silently fail to load the worklet, no `mic.first_frame`
+// ever flows to the proxy, and the session looks like a frozen "avatar TTL
+// expired." Inlined the helper here so the worklet has zero imports and
+// loads on every iOS ≥15.0. Source-of-truth + unit tests still live in
+// public/worklets/mic-decimate.js — keep them in sync if you tweak.
 
-import { decimate3to1 } from './mic-decimate.js';
+function decimate3to1(input, state) {
+  const phase = state.phase | 0;
+  if (input.length === 0) {
+    return new Float32Array(0);
+  }
+  if (phase >= input.length) {
+    state.phase = phase - input.length;
+    return new Float32Array(0);
+  }
+  const outLen = Math.ceil((input.length - phase) / 3);
+  const out = new Float32Array(outLen);
+  let di = 0;
+  for (let i = phase; i < input.length; i += 3) {
+    out[di++] = input[i];
+  }
+  const remainder = (input.length - phase) % 3;
+  state.phase = (3 - remainder) % 3;
+  return out;
+}
 
 class MicProcessor extends AudioWorkletProcessor {
   constructor() {

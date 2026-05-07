@@ -4,6 +4,7 @@
 
 import 'server-only';
 import { type NextRequest } from 'next/server';
+import { createClient } from '@supabase/supabase-js';
 import { supabaseServer } from '@/lib/supabase/server';
 import { getCallerUserId } from '@/lib/auth-guards';
 import { json, isSameOrigin, mapPgError } from '@/lib/session/http-helpers';
@@ -49,6 +50,38 @@ export async function POST(req: NextRequest) {
     return json(status, errBody);
   }
   const row = Array.isArray(data) ? data[0] : data;
+
+  // Defense-in-depth: stop the HeyGen-side session if any. The voice-proxy
+  // teardown also calls /v1/sessions/stop, but that fires only if the
+  // client opened a proxy WS — if a user opens then closes before tapping
+  // mic (proxy never opens) the HeyGen session would leak for the full
+  // 120s server-side silence timeout, burning ~2 credits per orphan.
+  // Idempotent per Phase 0 §11 — safe to call from both close paths.
+  // Service-role client because sessions_private has RLS+zero policies.
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (url && key) {
+    const admin = createClient(url, key, { auth: { persistSession: false } });
+    const { data: priv } = await admin
+      .from('sessions_private')
+      .select('heygen_session_id, heygen_session_token')
+      .eq('session_id', sessionId)
+      .maybeSingle<{ heygen_session_id: string | null; heygen_session_token: string | null }>();
+    if (priv?.heygen_session_id && priv?.heygen_session_token) {
+      // Fire-and-forget — don't block the user's close on HeyGen's API.
+      // If this fails, voice-proxy teardown is the second line; if both
+      // fail, HeyGen times out at 120s. Logged but not surfaced.
+      fetch('https://api.liveavatar.com/v1/sessions/stop', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'authorization': `Bearer ${priv.heygen_session_token}`,
+        },
+        body: JSON.stringify({ session_id: priv.heygen_session_id, reason: 'USER_CLOSED' }),
+      }).catch(() => { /* non-fatal — second line and 120s timeout backstop */ });
+    }
+  }
+
   return json(200, {
     session_id: sessionId,
     active_seconds: row?.active_seconds ?? 0,

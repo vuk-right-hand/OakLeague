@@ -17,6 +17,7 @@
 
 import 'server-only';
 import { type NextRequest } from 'next/server';
+import { randomUUID } from 'node:crypto';
 import * as Sentry from '@sentry/nextjs';
 import { supabaseServer } from '@/lib/supabase/server';
 import { supabaseAdmin } from '@/lib/supabase/admin';
@@ -25,6 +26,10 @@ import { json, isSameOrigin, mapPgError } from '@/lib/session/http-helpers';
 import { isAllowedWireModel, WIRE_TO_ENUM } from '@/lib/voice/model-map';
 import { mintEphemeral, MintError } from '@/lib/voice/mint-ephemeral';
 import { mintSimliSessionToken, SimliMintError } from '@/lib/avatar/mint-simli';
+import { mintHeygenSessionToken, HeygenMintError } from '@/lib/avatar/mint-heygen';
+import { resolveAvatarProvider } from '@/lib/avatar/resolver';
+import type { AvatarProvider } from '@/lib/avatar/avatar-bridge';
+import type { AvatarEnvelope } from '@/lib/avatar/avatar-envelope';
 import { mintVoiceTicket } from '@/lib/voice/mint-voice-ticket';
 
 export const runtime = 'nodejs';
@@ -62,12 +67,14 @@ export async function POST(req: NextRequest) {
   const admin = supabaseAdmin();
   const { data: creatorRow, error: creatorErr } = await admin
     .from('creators')
-    .select('id, simli_face_id')
+    .select('id, simli_face_id, heygen_avatar_id')
     .eq('id', creatorId)
-    .maybeSingle<{ id: string; simli_face_id: string | null }>();
+    .maybeSingle<{ id: string; simli_face_id: string | null; heygen_avatar_id: string | null }>();
   if (creatorErr) return json(500, { error: 'creator_lookup_failed' });
   if (!creatorRow) return json(404, { error: 'creator_not_found' });
-  if (!creatorRow.simli_face_id) return json(409, { error: 'creator_not_ready' });
+  // Per-provider readiness checked AFTER tier resolution below — same
+  // shape as sessions/open. Don't block on simli_face_id when tier
+  // routes through heygen.
 
   const sb = await supabaseServer();
   const { data: rollRows, error: rollErr } = await sb.rpc('session_rollover', {
@@ -86,27 +93,124 @@ export async function POST(req: NextRequest) {
   const tier = row.tier as 'free' | 'premium' | 'boardroom';
   const dailyLimitRemaining = (row.daily_limit_remaining_s as number) ?? 0;
 
-  const maxAvatarSeconds = Math.max(60, Math.min(GEMINI_MAX_SESSION_S, dailyLimitRemaining, 600));
-
-  let avatar: { session_token: string; expires_at: string; face_id: string } | null = null;
-  let avatarStatus: 'minted' | 'failed_mint' = 'failed_mint';
-  try {
-    const result = await mintSimliSessionToken({
-      faceId: creatorRow.simli_face_id,
-      maxSessionLength: maxAvatarSeconds,
-      audit: {
-        userId: callerUserId,
-        sessionId: newSessionId,
-        env: 'production',
-        ua: req.headers.get('user-agent'),
-      },
-    });
-    avatar = { session_token: result.sessionToken, expires_at: result.expiresAt, face_id: result.faceId };
-    avatarStatus = 'minted';
-  } catch (e) {
-    Sentry.captureException(e, { extra: { op: 'sessions_rollover_simli_mint', session_id: newSessionId } });
-    void (e instanceof SimliMintError);
+  // Avatar provider: read the OLD session's snapshot column (post-build
+  // audit M1). resolveAvatarProvider(tier) would re-evaluate via env,
+  // and an admin flip between original-open and rollover would silently
+  // swap providers (audit-r2 C2 violation). Sessions row carries the
+  // canonical provider since 20260509000005.
+  //
+  // Fallback chain: snapshot → env-resolve. Pre-migration sessions have
+  // no snapshot — tolerated by the env fallback to keep mid-deploy
+  // sessions alive.
+  const { data: oldRow, error: oldErr } = await admin
+    .from('sessions')
+    .select('avatar_provider')
+    .eq('id', oldId)
+    .maybeSingle<{ avatar_provider: AvatarProvider | null }>();
+  if (oldErr) {
+    Sentry.captureException(oldErr, { extra: { op: 'sessions_rollover_old_provider_lookup', old_id: oldId } });
   }
+  const avatarProvider: AvatarProvider | null = (oldRow?.avatar_provider ?? null) || resolveAvatarProvider(tier);
+  const providerAvatarId: string | null =
+    avatarProvider === 'simli'  ? creatorRow.simli_face_id :
+    avatarProvider === 'heygen' ? creatorRow.heygen_avatar_id :
+    avatarProvider === 'tavus'  ? creatorRow.simli_face_id :
+    null;
+  if (avatarProvider !== null && !providerAvatarId) {
+    return json(409, { error: 'creator_not_ready', avatar_provider: avatarProvider });
+  }
+
+  // Per-provider session-length clamp (heygen tighter default).
+  const maxAvatarSeconds = avatarProvider === 'heygen'
+    ? Math.max(60, Math.min(
+        GEMINI_MAX_SESSION_S,
+        dailyLimitRemaining,
+        Number(process.env.LIVEAVATAR_MAX_SESSION_S ?? 300),
+      ))
+    : Math.max(60, Math.min(GEMINI_MAX_SESSION_S, dailyLimitRemaining, 600));
+
+  // AvatarEnvelope hoisted to @/lib/avatar/avatar-envelope (final-audit S1).
+  let avatar: AvatarEnvelope | null = null;
+  let avatarStatus: 'minted' | 'failed_mint' = 'failed_mint';
+
+  if (avatarProvider === 'simli') {
+    try {
+      const result = await mintSimliSessionToken({
+        faceId: providerAvatarId!,
+        maxSessionLength: maxAvatarSeconds,
+        audit: {
+          userId: callerUserId,
+          sessionId: newSessionId,
+          env: 'production',
+          ua: req.headers.get('user-agent'),
+        },
+      });
+      avatar = { provider: 'simli', session_token: result.sessionToken, expires_at: result.expiresAt, face_id: result.faceId };
+      avatarStatus = 'minted';
+      try {
+        await admin
+          .from('sessions')
+          .update({ avatar_provider: 'simli' })
+          .eq('id', newSessionId);
+      } catch (e) {
+        Sentry.captureException(e, { extra: { op: 'sessions_rollover_simli_snapshot', session_id: newSessionId } });
+      }
+    } catch (e) {
+      Sentry.captureException(e, { extra: { op: 'sessions_rollover_simli_mint', session_id: newSessionId } });
+      void (e instanceof SimliMintError);
+    }
+  } else if (avatarProvider === 'heygen') {
+    try {
+      const result = await mintHeygenSessionToken({
+        avatarId: providerAvatarId!,
+        isSandbox: false,
+        maxSessionDurationSeconds: maxAvatarSeconds,
+        audit: {
+          userId: callerUserId,
+          sessionId: newSessionId,
+          env: 'production',
+          ua: req.headers.get('user-agent'),
+        },
+      });
+      avatar = {
+        provider: 'heygen',
+        expires_at: result.expiresAt,
+        face_id: providerAvatarId!,
+        heygen_session_id: result.sessionId,
+        heygen_session_boot: {
+          wsUrl: result.wsUrl,
+          livekitUrl: result.livekitUrl,
+          livekitClientToken: result.livekitClientToken,
+          livekitRoom: result.sessionId,
+          livekitIdentity: `oak:${callerUserId}:${newSessionId}:${randomUUID().slice(0, 8)}`,
+          maxSessionDurationSeconds: result.maxSessionDurationSeconds,
+        },
+      };
+      avatarStatus = 'minted';
+      try {
+        await admin
+          .from('sessions')
+          .update({ avatar_provider: 'heygen' })
+          .eq('id', newSessionId);
+        await admin
+          .from('sessions_private')
+          .upsert({
+            session_id: newSessionId,
+            heygen_session_id: result.sessionId,
+            heygen_session_token: result.sessionToken,
+          }, { onConflict: 'session_id' });
+      } catch (e) {
+        Sentry.captureException(e, { extra: { op: 'sessions_rollover_heygen_snapshot', session_id: newSessionId } });
+      }
+    } catch (e) {
+      Sentry.captureException(e, { extra: { op: 'sessions_rollover_heygen_mint', session_id: newSessionId } });
+      void (e instanceof HeygenMintError);
+    }
+  }
+  // avatarProvider === null (voice-only) or 'tavus' (deprecated) → leave
+  // avatar null and avatarStatus 'failed_mint'. Rollover continues; no
+  // FORCE_AVATAR_REQUIRED gate here (the original session cleared it at
+  // open-time).
 
   try {
     await sb.rpc('session_set_avatar_status', { p_session_id: newSessionId, p_status: avatarStatus });
@@ -148,12 +252,13 @@ export async function POST(req: NextRequest) {
   let voiceTicket: { ticket: string; expiresAt: string } | null = null;
   try {
     voiceTicket = await mintVoiceTicket({
-      userId:       callerUserId,
-      sessionId:    newSessionId,
+      userId:         callerUserId,
+      sessionId:      newSessionId,
       creatorId,
       hookId,
-      expectedTier: tier,
-      ua:           req.headers.get('user-agent') ?? '',
+      expectedTier:   tier,
+      avatarProvider: avatarProvider ?? 'simli',
+      ua:             req.headers.get('user-agent') ?? '',
     });
   } catch (e) {
     Sentry.captureException(e, { extra: { op: 'sessions_rollover_voice_ticket', session_id: newSessionId } });
@@ -162,6 +267,7 @@ export async function POST(req: NextRequest) {
   return json(200, {
     session_id: newSessionId,
     tier,
+    avatar_provider: avatarProvider,
     avatar,
     avatar_status: avatarStatus,
     gemini: { token: token.token, model: token.model },

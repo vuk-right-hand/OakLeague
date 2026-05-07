@@ -17,7 +17,7 @@ import type { AvatarProvider } from './avatar-bridge';
 
 export type UserTier = 'free' | 'premium' | 'boardroom';
 
-const ALLOWED: ReadonlySet<AvatarProvider> = new Set(['simli', 'tavus']);
+const ALLOWED: ReadonlySet<AvatarProvider> = new Set(['simli', 'tavus', 'heygen']);
 
 function coerceProvider(envValue: string | undefined, tier: UserTier): AvatarProvider | null {
   if (!envValue) return null;
@@ -30,7 +30,7 @@ function coerceProvider(envValue: string | undefined, tier: UserTier): AvatarPro
     if (process.env.NODE_ENV !== 'production') {
       throw new Error(
         `resolveAvatarProvider: invalid provider "${envValue}" for tier "${tier}". ` +
-          `Expected one of: simli, tavus, none.`,
+          `Expected one of: simli, tavus, heygen, none.`,
       );
     }
     return null;

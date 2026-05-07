@@ -342,7 +342,7 @@ function LiveSession(props: LiveProps) {
         )}
         {phase === 'closed' && (
           <OverlayCenter
-            label={pipe.state.errorMessage ?? 'Session ended'}
+            label={friendlyErrorLabel(pipe.state.errorMessage)}
             sublabel="Returning to feed…"
           />
         )}
@@ -394,6 +394,7 @@ function MicButton({
       onPointerUp={(e) => { e.preventDefault(); onPressEnd(); }}
       onPointerLeave={() => onPressEnd()}
       onPointerCancel={() => onPressEnd()}
+      onContextMenu={(e) => e.preventDefault()}
       aria-label="Hold to speak"
       style={{
         width: 84, height: 84, borderRadius: 42,
@@ -404,6 +405,10 @@ function MicButton({
         touchAction: 'none',
         transition: 'background-color 120ms ease',
         opacity: enabled ? 1 : 0.5,
+        userSelect: 'none',
+        WebkitUserSelect: 'none',
+        WebkitTouchCallout: 'none',
+        WebkitTapHighlightColor: 'transparent',
       }}
     >
       {active ? 'Listening' : 'Hold'}
@@ -464,6 +469,38 @@ function BootingScreen({ label }: { label: string }) {
       {label}
     </div>
   );
+}
+
+// Phase 0.5 (2026-05-07). Map raw reducer error codes to short, friendly
+// labels. The reducer stores e.g. 'mic_failed' or 'avatar: session_ttl_expired';
+// surfacing those literally to users is bad UX (and misleading — the TTL
+// path is often just a downstream symptom of an earlier mic / TTS failure
+// per the iOS investigation). Anything we don't recognize falls through to
+// a generic message rather than leaking a snake_case token.
+function friendlyErrorLabel(raw: string | null | undefined): string {
+  if (!raw) return 'Session ended';
+  // Strip the 'avatar: ' / 'proxy: ' prefixes the hook adds before mapping.
+  const code = raw.replace(/^(avatar|proxy):\s*/, '');
+  switch (code) {
+    case 'mic_failed':
+      return 'Microphone unavailable';
+    case 'session_ttl_expired':
+    case 'session_evicted':
+      return 'Session ended';
+    case 'session_dead':
+      return 'Connection lost';
+    case 'tts_failed':
+    case 'cogs_misconfig':
+      return "Voice couldn't connect";
+    case 'gemini_connect_failed':
+    case 'gemini_reopen_failed':
+    case 'proxy_connect_failed':
+    case 'voice_ticket_missing':
+    case 'rollover_voice_ticket_missing':
+      return "Couldn't reach the assistant";
+    default:
+      return 'Session ended';
+  }
 }
 
 function ExpiredScreen({ reason }: { reason: string }) {

@@ -85,6 +85,35 @@ test('inbound error maps voice_not_found → bad_voice_id with fatal flag', () =
   off();
 });
 
+test('inbound error "Invalid transcript" is recoverable: fatal=false, turnDead, contextId nulled, textSample included', () => {
+  const { bridge, sent } = makeStubBridge();
+  bridge.turnStart('sess-1:1');
+  // Stream some text so the bridge captures a sample for the eventual error.
+  bridge.sendText('Hello world this is a test transcript');
+  // Sanity: WS open, sendText went through.
+  assert.equal(sent.length, 1);
+  const events = [];
+  const off = bridge.on((e) => events.push(e));
+  bridge._onMessage(JSON.stringify({
+    type: 'error',
+    error_code: 'invalid_input',
+    title: 'Invalid transcript',
+    message: 'transcript validation failed',
+    status_code: 400,
+    context_id: 'sess-1:1',
+  }), false);
+  const errs = events.filter((e) => e.kind === 'error');
+  assert.equal(errs.length, 1);
+  assert.equal(errs[0].fatal, false, 'per-turn rejection must be recoverable');
+  assert.equal(typeof errs[0].textSample, 'string');
+  assert.ok(errs[0].textSample.includes('Hello world'), 'must include the offending sample');
+  // Turn must be dead so subsequent sendText/turnEnd is a no-op.
+  assert.equal(bridge._turnDead, true);
+  assert.equal(bridge._currentContextId, null);
+  // WS still open — bridge can be reused for next turn.
+  off();
+});
+
 test('cancel sets _turnDead synchronously before the cancel send', () => {
   const { bridge, sent } = makeStubBridge();
   bridge.turnStart('sess-1:1');

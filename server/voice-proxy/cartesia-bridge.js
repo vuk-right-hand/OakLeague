@@ -164,6 +164,11 @@ export class CartesiaTTSBridge extends EventEmitter {
     this._charsThisTurn = 0;
     this._audioBytesThisTurn = 0;
     this._sentFirstChunkOfTurn = false;
+    // Phase 0.5 (2026-05-07). Capture a bounded sample of what we send so a
+    // Cartesia-side "Invalid transcript" rejection lands in logs with the
+    // actual offending text (truncated). Without this we have no way to
+    // diagnose which character / pattern Cartesia is choking on.
+    this._currentTurnTextSample = '';
   }
 
   /** Streams a transcript chunk. Maintains continue:true. */
@@ -191,6 +196,9 @@ export class CartesiaTTSBridge extends EventEmitter {
     };
     this._charsThisTurn += text.length;
     this._sentFirstChunkOfTurn = true;
+    if (this._currentTurnTextSample.length < 500) {
+      this._currentTurnTextSample = (this._currentTurnTextSample + text).slice(0, 500);
+    }
     this._wsSend(msg);
   }
 
@@ -225,7 +233,14 @@ export class CartesiaTTSBridge extends EventEmitter {
     });
     if (this._closed || this._turnDead) return partialResult();
     if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return partialResult();
-    if (!this._currentContextId) throw new Error('turnEnd before turnStart');
+    // Defense-in-depth (Phase 0.5 2026-05-07). Previously threw 'turnEnd
+    // before turnStart' if a turn_end arrived without a live context — a
+    // legitimate state when a prior cancel cleared it. The throw bubbled
+    // out of the proxy WS message handler and poisoned subsequent turns
+    // (user reported "stopped hearing me after 2-3 messages"). Treat as
+    // a no-op partial: zero chars, zero audio, partial=false so cogs
+    // still log a clean turn.
+    if (!this._currentContextId) return { characters: 0, audioBytes: 0, audioSeconds: 0, partial: false };
 
     if (this._sentFirstChunkOfTurn) {
       // Match pipecat reference: full block on every message including the
@@ -384,14 +399,43 @@ export class CartesiaTTSBridge extends EventEmitter {
       this.emit('event', { kind: 'turn_done', at: Date.now(), contextId: msg.context_id });
     } else if (t === 'error') {
       const cartesiaCode = String(msg.error_code || '').toLowerCase();
+      const cartesiaMessage = String(msg.title || msg.message || 'cartesia_error').slice(0, 200);
       const mapped = CARTESIA_ERROR_MAP[cartesiaCode] || 'other';
+      // Phase 0.5 (2026-05-07). Cartesia returns errors at TWO scopes:
+      //   1. Connection-level (auth, rate-limit, model-not-found, voice-not-found)
+      //      — WS may close, session can't proceed → fatal.
+      //   2. Context-level (transcript rejected for content reasons,
+      //      "Invalid transcript", malformed continuation) — WS stays
+      //      open, only THIS turn is dead. Recoverable: kill the turn
+      //      locally, let the next turnStart get a fresh context.
+      // Without this distinction, a one-off transcript chunk Cartesia
+      // doesn't like teardowns the whole proxy WS, which closes HeyGen
+      // server-side, which surfaces to the user as a misleading
+      // "avatar TTL expired" message (proxy index.js teardown chain).
+      const isConnectionLevel =
+        cartesiaCode === 'voice_not_found' ||
+        cartesiaCode === 'model_not_found' ||
+        cartesiaCode === 'rate_limited' ||
+        cartesiaCode === 'unauthorized' ||
+        cartesiaCode === 'forbidden';
+      const fatal = isConnectionLevel;
+      // For per-turn rejections: kill the turn locally so subsequent
+      // sendText calls no-op and turnEnd resolves clean partial. WS
+      // stays open; next turnStart resets _turnDead and gets a fresh
+      // context_id (cartesia-bridge.js turnStart).
+      if (!fatal) {
+        this._turnDead = true;
+        this._currentContextId = null;
+      }
       this.emit('event', {
         kind: 'error',
         at: Date.now(),
         code: mapped,
-        // Truncate provider message to keep Sentry payloads small.
-        message: String(msg.title || msg.message || 'cartesia_error').slice(0, 200),
-        fatal: true,
+        message: cartesiaMessage,
+        fatal,
+        // Bounded — first 500 chars of what we sent this turn. Exists
+        // so ops can see the offending text instead of guessing.
+        textSample: this._currentTurnTextSample || '',
       });
     }
     // 'timestamps' and 'flush_done' currently ignored.

@@ -197,3 +197,24 @@ test("α': bridge without enableOutputTranscription ignores outputTranscription 
   assert.equal(bridge._currentTurnOutputTranscript, '');
   off();
 });
+
+test('sessionResume: stores newHandle from sessionResumptionUpdate', () => {
+  const bridge = makeBridgeWithStubSession();
+  assert.equal(bridge._sessionResumeHandle, null, 'starts null');
+  bridge._onMessage({ sessionResumptionUpdate: { newHandle: 'handle-1', resumable: true } });
+  assert.equal(bridge._sessionResumeHandle, 'handle-1');
+  // Subsequent updates overwrite (only freshest is kept).
+  bridge._onMessage({ sessionResumptionUpdate: { newHandle: 'handle-2', resumable: true } });
+  assert.equal(bridge._sessionResumeHandle, 'handle-2');
+});
+
+test('sessionResume: ignores empty / non-string newHandle', () => {
+  const bridge = makeBridgeWithStubSession();
+  bridge._sessionResumeHandle = 'preserved';
+  bridge._onMessage({ sessionResumptionUpdate: { newHandle: '' } });
+  assert.equal(bridge._sessionResumeHandle, 'preserved');
+  bridge._onMessage({ sessionResumptionUpdate: { newHandle: null } });
+  assert.equal(bridge._sessionResumeHandle, 'preserved');
+  bridge._onMessage({ sessionResumptionUpdate: {} });
+  assert.equal(bridge._sessionResumeHandle, 'preserved');
+});

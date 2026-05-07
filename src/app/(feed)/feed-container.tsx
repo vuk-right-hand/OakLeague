@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { FeedItem, VideoGroup, WelcomeHook } from './feed-types';
 import { groupByVideo } from './feed-types';
 import { VideoRow } from './video-row';
@@ -21,6 +21,75 @@ type Props = {
 };
 
 const EXCLUDE_WINDOW = 50;
+
+// Phase 0.5 (2026-05-07). Session-stable feed continuity.
+//
+// Cooldowns are computed at READ-time by feed_ranked_page from
+// feed_events_raw, so the moment a user taps Ask (mic_tap) or completes
+// a long-form quartile, the next feed fetch hides those hooks. Without
+// this layer the user navigates back from /s or /v and the video they
+// just watched is *gone* from their feed — wrong UX.
+//
+// Strategy: merge-don't-shrink.
+//   - Within a single tab session, the rendered list is preserved across
+//     mounts. Watched hook stays at its scroll position.
+//   - On hard reload OR pull-to-refresh, the snapshot is cleared and the
+//     server's freshly-cooldown'd page wins.
+//   - On full tab close → reopen, sessionStorage auto-clears → fresh page.
+//
+// Events still write to feed_events_raw in real-time; analytics + the
+// NEXT-session cooldowns are unaffected. This is purely a render-layer
+// continuity fix.
+const FEED_SESSION_KEY = 'oak_feed_session_v1';
+
+type FeedSessionSnapshot = {
+  items: FeedItem[];
+  cursorEpoch: number | null;
+  hasMore: boolean;
+};
+
+function isReloadNavigation(): boolean {
+  if (typeof performance === 'undefined') return false;
+  try {
+    const entries = performance.getEntriesByType('navigation');
+    if (!entries.length) return false;
+    const t = (entries[0] as PerformanceNavigationTiming).type;
+    return t === 'reload';
+  } catch { return false; }
+}
+
+function readFeedSession(): FeedSessionSnapshot | null {
+  if (typeof sessionStorage === 'undefined') return null;
+  try {
+    const raw = sessionStorage.getItem(FEED_SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as FeedSessionSnapshot;
+    if (!Array.isArray(parsed.items)) return null;
+    return parsed;
+  } catch { return null; }
+}
+
+function writeFeedSession(snap: FeedSessionSnapshot): void {
+  if (typeof sessionStorage === 'undefined') return;
+  try {
+    sessionStorage.setItem(FEED_SESSION_KEY, JSON.stringify(snap));
+  } catch { /* quota or serialization failure — next state change retries */ }
+}
+
+function clearFeedSession(): void {
+  if (typeof sessionStorage === 'undefined') return;
+  try { sessionStorage.removeItem(FEED_SESSION_KEY); } catch {}
+}
+
+/**
+ * Hard-reset hook for future pull-to-refresh wiring. Clears the session
+ * snapshot so the next render uses whatever the server returned. NOT
+ * called from inside FeedContainer today; PTR component should import
+ * this and invoke it before re-fetching.
+ */
+export function clearFeedSessionContinuity(): void {
+  clearFeedSession();
+}
 
 // Outer component — owns the provider so the inner can call
 // useFeedImpressionTracker for vertical-swipe attribution.
@@ -45,6 +114,50 @@ function FeedContainerInner({
   );
   const [hasMore, setHasMore] = useState<boolean>(initialHasMore);
   const [activeIdx, setActiveIdx] = useState(0);
+
+  // Phase 0.5 (2026-05-07). Hydrate from sessionStorage so a back-nav
+  // from /s or /v restores the user's mid-session list (cooldowns can't
+  // shrink the list within a tab session). Reload clears + uses the
+  // server's freshly-cooldown'd initialItems. useLayoutEffect runs
+  // synchronously after hydration but before paint — no flash.
+  // hydratedRef guards re-runs (StrictMode) and lets the persistence
+  // effect skip the very first paint with server values.
+  const hydratedRef = useRef(false);
+  useLayoutEffect(() => {
+    if (hydratedRef.current) return;
+    hydratedRef.current = true;
+    if (isReloadNavigation()) {
+      clearFeedSession();
+      // First-paint persist (post-2026-05-07 fix). The persistence effect
+      // below only fires on dep CHANGES; without this seed write, a user
+      // who taps Ask on one of the initial server-rendered hooks before
+      // scrolling far enough to trigger loadMore would have an empty
+      // sessionStorage on return → the cooldown'd fresh feed wins → the
+      // just-watched hook vanishes. Seeding here guarantees the snapshot
+      // exists from frame zero.
+      writeFeedSession({ items: initialItems, cursorEpoch: initialCursorEpoch, hasMore: initialHasMore });
+      return;
+    }
+    const stored = readFeedSession();
+    if (stored && stored.items.length > 0) {
+      setItems(stored.items);
+      setCursorEpoch(stored.cursorEpoch);
+      setHasMore(stored.hasMore);
+    } else {
+      // No prior snapshot (first visit this tab). Seed with the
+      // server-rendered initialItems immediately, same rationale as the
+      // reload branch above.
+      writeFeedSession({ items: initialItems, cursorEpoch: initialCursorEpoch, hasMore: initialHasMore });
+    }
+  }, []);
+
+  // Persist after hydration. Skips the SSR-matching first render so the
+  // initial paint doesn't overwrite any genuinely newer stored snapshot
+  // before the layout-effect reads it.
+  useEffect(() => {
+    if (!hydratedRef.current) return;
+    writeFeedSession({ items, cursorEpoch, hasMore });
+  }, [items, cursorEpoch, hasMore]);
   // Welcome open: lifted into FeedContainer so arrow-key nav can ignore
   // input while the overlay is showing (audit M3).
   const [welcomeOpen, setWelcomeOpen] = useState<boolean>(!!welcome);

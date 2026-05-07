@@ -163,18 +163,23 @@ async function consumeTicket(ticketId, uaHash) {
     .is('consumed_at', null)
     .gt('expires_at', new Date().toISOString())
     .eq('bound_ua_hash', uaHash)
-    .select('user_id, creator_id, session_id, expected_tier, purpose')
+    .select('user_id, creator_id, session_id, expected_tier, purpose, avatar_provider')
     .maybeSingle();
   if (error || !data) return null;
   // creator_id is NOT NULL by CHECK on new rows (migration 0041). A null here
   // means a pre-migration ticket leaked in — refuse rather than guess.
   if (!data.creator_id) return null;
   return {
-    userId:       data.user_id,
-    creatorId:    data.creator_id,
-    sessionId:    data.session_id || null,
-    expectedTier: data.expected_tier || null,
-    purpose:      data.purpose || 'voice_session',
+    userId:         data.user_id,
+    creatorId:      data.creator_id,
+    sessionId:      data.session_id || null,
+    expectedTier:   data.expected_tier || null,
+    purpose:        data.purpose || 'voice_session',
+    // Audit round 2 / C1 — drives Cartesia per-session sample-rate.
+    // Simli/Tavus → 16kHz; HeyGen → 24kHz. NULL is permitted only on
+    // voice_clone tickets (no avatar session); voice_session tickets
+    // are CHECK-enforced NOT NULL at the DB layer.
+    avatarProvider: data.avatar_provider || null,
   };
 }
 
@@ -200,14 +205,45 @@ async function attachToSession({ sessionId, userId, creatorId, expectedTier }) {
     .eq('creator_id', creatorId)
     .is('ended_at', null);
   if (expectedTier) q = q.eq('tier_at_session', expectedTier);
-  const { data, error } = await q.select('id, tier_at_session').maybeSingle();
+  // Read the public-safe columns. Privileged HeyGen tokens live on
+  // sessions_private (RLS service-role-only) — separate query below.
+  const { data, error } = await q
+    .select('id, tier_at_session, avatar_provider')
+    .maybeSingle();
   if (error) {
     console.error('[session-attach]', error);
     captureException(error, { op: 'session-attach', userId, sessionId });
     return { err: 'upstream_error' };
   }
   if (!data) return { err: 'session_not_attachable' };
-  return { sessionId: data.id, tier: data.tier_at_session };
+
+  // Heygen-only: fetch privileged tokens from the sibling table.
+  // Final-audit C1 fix — column-level RLS isn't a thing in Postgres, so
+  // these tokens live on a service-role-only sibling table.
+  let heygenSessionId = null;
+  let heygenSessionToken = null;
+  if (data.avatar_provider === 'heygen') {
+    const { data: priv, error: privErr } = await supabase
+      .from('sessions_private')
+      .select('heygen_session_id, heygen_session_token')
+      .eq('session_id', sessionId)
+      .maybeSingle();
+    if (privErr) {
+      console.error('[session-attach private]', privErr);
+      captureException(privErr, { op: 'session-attach-private', sessionId });
+    } else if (priv) {
+      heygenSessionId = priv.heygen_session_id ?? null;
+      heygenSessionToken = priv.heygen_session_token ?? null;
+    }
+  }
+
+  return {
+    sessionId: data.id,
+    tier: data.tier_at_session,
+    avatarProvider: data.avatar_provider ?? null,
+    heygenSessionId,
+    heygenSessionToken,
+  };
 }
 
 async function openSession({ userId, creatorId, modelWire }) {
@@ -483,6 +519,42 @@ wss.on('connection', async (ws, req) => {
   let turnNumber = 0;
   let cartesiaTurnDead = false; // R3-M1 / R4-S1 — relay-loop gate for barge-in
 
+  // Post-build audit C3 — HeyGen LiveAvatar Lite heartbeat.
+  // Server drops the WS at ~120s of voice silence (Phase 0 §9). The
+  // bridge can't fire keep-alive (browser doesn't have the privileged
+  // session JWT). Voice-proxy holds the snapshot from sessions row +
+  // hits /v1/sessions/keep-alive every 30s while the session is live.
+  // Sub-90s margin = comfortable; anything over 120s = silent drop.
+  let heygenHeartbeatInterval = null;
+  const heygenSessionId = consumed.sessionId && sess.heygenSessionId ? sess.heygenSessionId : null;
+  const heygenSessionToken = consumed.sessionId && sess.heygenSessionToken ? sess.heygenSessionToken : null;
+  const isHeygenSession = sess.avatarProvider === 'heygen' && !!heygenSessionToken && !!heygenSessionId;
+  if (isHeygenSession) {
+    const HEYGEN_HEARTBEAT_MS = Number(process.env.LIVEAVATAR_HEARTBEAT_MS ?? 30000);
+    heygenHeartbeatInterval = setInterval(async () => {
+      if (closed) return;
+      try {
+        const r = await fetch('https://api.liveavatar.com/v1/sessions/keep-alive', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'authorization': `Bearer ${heygenSessionToken}`,
+          },
+          body: JSON.stringify({ session_id: heygenSessionId }),
+        });
+        if (!r.ok) {
+          // 401/403 → session token expired or invalidated; nothing to
+          // do but let the bridge surface the WS drop. 5xx → transient,
+          // log and let the next tick retry.
+          console.warn(`[ws ${connId}] heygen-keepalive ${r.status} session=${heygenSessionId.slice(0, 8)}`);
+        }
+      } catch (e) {
+        captureException(e, { op: 'heygen_keepalive', connId, sessionId, heygen_session_id: heygenSessionId });
+      }
+    }, HEYGEN_HEARTBEAT_MS);
+    console.log(`[ws ${connId}] heygen heartbeat started every=${HEYGEN_HEARTBEAT_MS}ms heygen_session=${heygenSessionId.slice(0, 8)}`);
+  }
+
   // R3-A8 / R4-S8 — snapshot the rollback flag and model gate ONCE per
   // session. No mid-session re-read.
   const useCartesia = VOICE_CARTESIA_ENABLED;
@@ -491,6 +563,7 @@ wss.on('connection', async (ws, req) => {
     if (closed) return;
     closed = true;
     clearInterval(heartbeatInterval);
+    if (heygenHeartbeatInterval) clearInterval(heygenHeartbeatInterval);
     quotaCache.delete(sessionId);
     sessionToWs.delete(sessionId);
     wsRegistry.delete(sessionId);
@@ -499,6 +572,23 @@ wss.on('connection', async (ws, req) => {
     // null if the open path bailed early.
     try { if (cartesia) await cartesia.close(); } catch {}
     try { if (bridge)   await bridge.close();   } catch {}
+    // Post-build audit C3 — close the HeyGen session server-side. The
+    // bridge close()s the WebSocket but doesn't call /v1/sessions/stop
+    // (it has no JWT). Idempotent per Phase 0 §11.
+    if (isHeygenSession) {
+      try {
+        await fetch('https://api.liveavatar.com/v1/sessions/stop', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'authorization': `Bearer ${heygenSessionToken}`,
+          },
+          body: JSON.stringify({ session_id: heygenSessionId, reason: 'USER_CLOSED' }),
+        });
+      } catch (e) {
+        captureException(e, { op: 'heygen_session_stop', connId, sessionId });
+      }
+    }
     await endSession(sessionId, reason);
   };
 
@@ -556,12 +646,28 @@ wss.on('connection', async (ws, req) => {
 
   if (useCartesia) {
     try {
-      // SIMLI_WIREUP R3-M1 — per-session sample rate. Cutover (/s/[id]
-      // attach path) feeds Simli, which requires PCM16 LE @ 16kHz. Legacy
-      // admin spike-a stays at 24kHz so existing harness fixtures and
-      // Phase-0 verification stay green. cartesia-bridge constructor
-      // already takes sampleRate (defaults to 24000).
-      const cartesiaSampleRate = isAttachPath ? 16000 : 24000;
+      // Per-session sample rate driven by the ticket's avatar_provider
+      // (audit-r2 C1). Cartesia ships output_format.sample_rate per WS
+      // init; mismatched cadence to the avatar pipeline = chipmunk-pitch
+      // or hard-reject at the avatar's audio_buffer_appended.
+      //   simli   → 16 kHz (Trinity-1 SDK requires PCM16 LE @ 16k)
+      //   tavus   → 16 kHz (echo-mode parity with Simli)
+      //   heygen  → 24 kHz (LiveAvatar Lite, PHASE_0_HEYGEN.md §6)
+      // Legacy admin spike-a path (no ticketSessionId, no avatar_provider
+      // because the ticket was minted before this column existed OR is a
+      // voice_clone) defaults to 24 kHz so existing harness fixtures
+      // stay green.
+      let cartesiaSampleRate;
+      if (consumed.avatarProvider === 'heygen') {
+        cartesiaSampleRate = 24000;
+      } else if (consumed.avatarProvider === 'simli' || consumed.avatarProvider === 'tavus') {
+        cartesiaSampleRate = 16000;
+      } else {
+        // Fallback: legacy/admin paths. Preserve prior behavior:
+        //   attach path with no avatar_provider → 16k (Simli inferred).
+        //   spike-a (no session_id) → 24k (harness default).
+        cartesiaSampleRate = isAttachPath ? 16000 : 24000;
+      }
       cartesia = new CartesiaTTSBridge({
         apiKey: CARTESIA_API_KEY,
         voiceId: creatorVoiceId,
@@ -697,6 +803,17 @@ wss.on('connection', async (ws, req) => {
     } else if (e.kind === 'error') {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'error', at: e.at, message: e.message }));
     } else if (e.kind === 'closed') {
+      // Phase 0.5 fix (2026-05-07). Google's js-genai#707 closes the
+      // Gemini WS with code=1000 after a turn instead of holding it
+      // open. Pre-fix the proxy tore the whole session down here, which
+      // killed the user-WS and made my lazy-reopen in turn_start
+      // unreachable. Rule now: a 1000 close = "Google's quirk, recover
+      // on next turn_start via bridge.reopen()." Anything else (4xxx,
+      // 1006 abnormal, etc.) = real upstream failure → tear down.
+      if (e.code === 1000) {
+        console.log(`[ws ${connId}] gemini upstream 1000-close — staying open for lazy reopen on next turn_start`);
+        return;
+      }
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'upstream_closed', at: e.at, code: e.code, reason: e.reason }));
       teardown('upstream_closed').catch(() => {});
       closeWs(ws, 1011, 'upstream_closed');
@@ -719,7 +836,11 @@ wss.on('connection', async (ws, req) => {
         // Diagnostic 2026-05-04 — surface Cartesia error details to Fly logs
         // (Sentry is no-op until SENTRY_DSN is wired). Without this we only
         // see `tts_failed` at the harness with no upstream cause.
-        console.error(`[cartesia.error] code=${e.code} message=${e.message} fatal=${e.fatal}`);
+        // Phase 0.5 (2026-05-07): include textSample so we can see what
+        // Cartesia rejected.
+        console.error(
+          `[cartesia.error] code=${e.code} message=${e.message} fatal=${e.fatal} sample=${JSON.stringify((e.textSample || '').slice(0, 200))}`,
+        );
         if (e.fatal) {
           if (ws.readyState === ws.OPEN) {
             ws.send(JSON.stringify({ type: 'error', code: 'tts_failed', at: e.at, detail: e.code }));
@@ -729,9 +850,33 @@ wss.on('connection', async (ws, req) => {
             sessionId,
             cartesiaCode: e.code,
             detail: e.message,
+            textSample: e.textSample,
           });
           teardown('tts_failed').catch(() => {});
           closeWs(ws, 1011, 'tts_failed');
+        } else {
+          // Phase 0.5 (2026-05-07). Recoverable per-turn rejection
+          // ("Invalid transcript" et al). Bridge already killed the turn
+          // locally (_turnDead=true, contextId nulled). Kill the relay-loop
+          // gate so any in-flight Cartesia chunks for this dead turn are
+          // dropped, send a silent warning to the client (no UI surface —
+          // just telemetry), and continue. Next turn_start mints a fresh
+          // context. Session stays alive; HeyGen WS stays open; user sees
+          // no "avatar TTL expired" misleading message.
+          cartesiaTurnDead = true;
+          if (ws.readyState === ws.OPEN) {
+            try {
+              ws.send(JSON.stringify({ type: 'warning', code: 'tts_chunk_rejected', at: e.at, detail: e.code }));
+            } catch {}
+          }
+          captureException(new Error(`cartesia.${e.code}_recoverable`), {
+            level: 'warning',
+            op: 'cartesia.error_recoverable',
+            sessionId,
+            cartesiaCode: e.code,
+            detail: e.message,
+            textSample: e.textSample,
+          });
         }
       } else if (e.kind === 'closed') {
         // Idle-window close handled by the bridge's auto-reconnect
@@ -765,7 +910,13 @@ wss.on('connection', async (ws, req) => {
     if (closed) return;
     if (isBinary) {
       try { bridge.sendAudio({ bytes: data, mimeType: 'audio/pcm;rate=16000' }); }
-      catch (e) { console.error('[send-audio]', e); }
+      catch (e) {
+        // Send-audio failures are usually a closed-mid-frame race (1000-close
+        // workaround handles via lazy reopen on next turn_start). Keep the
+        // error log: a sustained burst here means bridge_not_open in steady
+        // state, which is a real bug.
+        console.error(`[ws ${connId}] [send-audio] FAIL:`, e?.message || e);
+      }
       return;
     }
     let msg;
@@ -784,6 +935,29 @@ wss.on('connection', async (ws, req) => {
         // turnStart so any race with a stale chunk in the WS receive
         // buffer drops cleanly. (Was post-turnStart; moved per audit C3.)
         cartesiaTurnDead = false;
+        // Phase 0.5 fix (2026-05-07). Google's 3.1 Live preview sometimes
+        // closes the WS with code=1000 after a turn instead of holding it
+        // open (js-genai#707). The [google-live-workaround] in
+        // gemini-bridge synthesizes a turn_complete so the CURRENT turn
+        // resolves, but subsequent turn_starts then throw bridge_not_open.
+        // Symptom: "stops hearing me after turn 1." Lazy-reopen here so
+        // multi-turn conversations survive the upstream bug. Cost: brief
+        // (~200ms) reconnect latency on the affected turn + fresh Gemini
+        // context (no history). Acceptable until Google fixes upstream.
+        if (bridge._closed) {
+          try {
+            await bridge.reopen();
+            console.log(`[ws ${connId}] gemini.reopen ok`);
+          } catch (e) {
+            console.error(`[ws ${connId}] gemini.reopen FAIL:`, e?.message || e);
+            captureException(e, { op: 'bridge-reopen', connId, sessionId });
+            await teardown('bridge_reopen_failed');
+            return closeWs(ws, 4005, 'upstream_error');
+          }
+          // Re-attach event handler — the new ai.live.connect emits via
+          // the SAME EventEmitter instance (this.emit) so existing
+          // bridge.on() handler stays wired. No re-registration needed.
+        }
         bridge.turnStart();
         // R4-M2 / U-C5 — cartesia.turnStart can throw `tts_reconnecting`
         // synchronously when the bridge is in the auto-reconnect window.

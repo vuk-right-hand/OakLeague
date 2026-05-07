@@ -116,9 +116,21 @@ export async function POST(req: NextRequest) {
     await admin.from('voice_tickets').delete().lt('created_at', cutoff);
   }
 
+  // avatar_provider is REQUIRED on voice_session tickets since migration
+  // 20260509000001 (CHECK voice_tickets_avatar_provider_purpose_match).
+  // Spike-A is a voice-pin measurement harness — no avatar — but the
+  // ticket purpose still defaults to 'voice_session'. Pass 'simli' as a
+  // benign default so the proxy's per-session rate selection picks 16k
+  // (matches the legacy attach-path behavior pre-migration). Without
+  // this, every spike-a mint 500s with SQLSTATE 23514. (Post-build audit C4.)
   const { data, error } = await admin
     .from('voice_tickets')
-    .insert({ user_id: session.userId, bound_ua_hash: uaHash, creator_id: creatorId })
+    .insert({
+      user_id: session.userId,
+      bound_ua_hash: uaHash,
+      creator_id: creatorId,
+      avatar_provider: 'simli',
+    })
     .select('ticket_id, expires_at')
     .single<{ ticket_id: string; expires_at: string }>();
 

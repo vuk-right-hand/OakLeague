@@ -68,9 +68,25 @@ export class GeminiBridge extends EventEmitter {
     // it ever needs per-turn attribution (Day 8). For Spike-A we just emit
     // the raw last-seen metadata.
     this._currentTurnUsage = null;
+    // Phase 0.5 (2026-05-07). sessionResume handle for js-genai#707 reopens.
+    // Gemini Live emits `sessionResumptionUpdate.newHandle` periodically;
+    // we keep only the freshest. On reopen() we pass the handle in
+    // `sessionResumption.handle` so Google replays the conversation
+    // history server-side. Without this, every post-turn 1000-close
+    // reopen drops context — avatar forgets what the user just said,
+    // which is fatal UX for a mentorship product. Stored only in memory:
+    // resumability across explicit user-close is intentionally OUT of
+    // scope (different teardown path). Memory-only also means a proxy
+    // crash drops the handle, which is fine — fresh session starts clean.
+    this._sessionResumeHandle = null;
   }
 
   async open({ model, sessionId, systemInstruction }) {
+    // Phase 0.5 fix (2026-05-07). Capture open args so reopen() can
+    // re-call with identical params on Google's documented post-turn
+    // 1000-close bug (js-genai#707). Without this, after Gemini closes
+    // the pipe is dead and turn 2+ silently fail with bridge_not_open.
+    this._lastOpenArgs = { model, sessionId, systemInstruction };
     const ai = client(this._apiKey);
     this._sessionId = sessionId;
     this._model = model;
@@ -78,6 +94,14 @@ export class GeminiBridge extends EventEmitter {
     const config = {
       responseModalities: [Modality.AUDIO],
       systemInstruction: systemInstruction || DEFAULT_SYSTEM,
+      // Phase 0.5 (2026-05-07). Opt into session resumption so Gemini
+      // emits sessionResumptionUpdate handles. Empty object = "enable;
+      // start fresh." When reopen() runs after a js-genai#707 1000-close,
+      // we set `handle` to the stored value so the conversation context
+      // carries over. Without this opt-in, no handles are emitted at all.
+      sessionResumption: this._sessionResumeHandle
+        ? { handle: this._sessionResumeHandle }
+        : {},
     };
     if (this._enableOutputTranscription) {
       // Pipeline α': we read serverContent.outputTranscription.text and
@@ -193,6 +217,21 @@ export class GeminiBridge extends EventEmitter {
         totalTokenCount:    typeof um.totalTokenCount    === 'number' ? um.totalTokenCount    : null,
       };
     }
+    // Phase 0.5 (2026-05-07). sessionResumptionUpdate. Gemini emits
+    // these periodically while the session is alive (typically once
+    // per turn after generation completes). `resumable:true` means the
+    // handle is safe to use; we keep only the freshest. Stored in
+    // memory; survives WS-level reopens (js-genai#707 1000-close →
+    // proxy lazy reopen → bridge.reopen() → bridge.open() → new
+    // ai.live.connect with this handle), drops on explicit user-close
+    // (which is correct — fresh session next time).
+    const sru = m?.sessionResumptionUpdate;
+    if (sru && typeof sru.newHandle === 'string' && sru.newHandle.length > 0) {
+      // The SDK exposes resumable as a hint; default true unless explicitly
+      // false. Store regardless — Google's worst case is they reject the
+      // handle on reopen, in which case we just start fresh (same as today).
+      this._sessionResumeHandle = sru.newHandle;
+    }
     if (m?.serverContent?.interrupted) {
       this.emit('event', { kind: 'interrupted', at: Date.now() });
     }
@@ -298,6 +337,40 @@ export class GeminiBridge extends EventEmitter {
     if (this._closed) return;
     try { this._session?.close(); } catch {}
     this._closed = true;
+    // Mark user-initiated so reopen() refuses (don't rebuild a closed-on-purpose bridge).
+    this._userClosed = true;
+    // Audit C4 (2026-05-07). Drop the resumption handle on explicit close
+    // so it can never be replayed across a user-driven session boundary.
+    this._sessionResumeHandle = null;
+  }
+
+  // Re-open after Google's post-turn 1000-close (js-genai#707). Called
+  // lazily from the proxy on next turn_start when _closed=true and
+  // _userClosed=false. Re-runs ai.live.connect with the original args
+  // (which also sets sessionResumption.handle so conversation context
+  // carries across the WS bounce — see open()).
+  async reopen() {
+    if (this._userClosed) throw new Error('bridge_user_closed');
+    if (!this._lastOpenArgs) throw new Error('bridge_never_opened');
+    if (!this._closed) return; // already open
+    this._closed = false;
+    this._currentTurnReceivedContent = false;
+    this._currentTurnUsage = null;
+    try {
+      await this.open(this._lastOpenArgs);
+    } catch (err) {
+      // Audit M5 (2026-05-07). open() failed — restore _closed=true so
+      // sendAudio/turnStart correctly report bridge_not_open instead of
+      // pretending the bridge is alive against a stale _session ref.
+      this._closed = true;
+      // Audit C4 (2026-05-07). If Google rejected our resumption handle
+      // (replay attack guard, expired, server-side eviction), the same
+      // handle WILL keep failing. Drop it so the next reopen attempt
+      // starts fresh — losing context is strictly better than an
+      // infinite reopen-fail loop.
+      this._sessionResumeHandle = null;
+      throw err;
+    }
   }
 
   totals() {

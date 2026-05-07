@@ -62,12 +62,23 @@ export const AVATAR_ERROR_CODES = [
   // and mint 429s surface at /api/sessions/open, not here. Do NOT wire this code
   // into the production error map. (R4-S2, R3-S1)
   'session_killed',
+  // HeyGen-specific (PHASE_0_HEYGEN.md §7): server SILENTLY drops a new
+  // utterance if the prior one didn't get agent.speak_end. Bridge surfaces
+  // this when an agent.audio_buffer_appended doesn't arrive within the
+  // ack window — it almost always means the bridge skipped the
+  // interrupt→speak_ended handshake before the new utterance.
+  'silent_drop_no_speak_end',
+  // HeyGen-specific (PHASE_0_HEYGEN.md known unknown): concurrent-session
+  // cap per account. Mapped from /v1/sessions/start when the response
+  // implies "no slot available." Distinct from quota_exceeded (which is
+  // about credits/$$, not slot count).
+  'session_capacity',
   'other',
 ] as const;
 
 export type AvatarErrorCode = (typeof AVATAR_ERROR_CODES)[number];
 
-export type AvatarProvider = 'simli' | 'tavus';
+export type AvatarProvider = 'simli' | 'tavus' | 'heygen';
 
 export type AvatarOpenOptions = {
   // Opaque replica identifier. Both providers use opaque strings, not uuids.
@@ -88,8 +99,32 @@ export type AvatarOpenOptions = {
   audioEl?: HTMLAudioElement;
   // Pre-minted Simli compose token from /api/sessions/open envelope. When
   // present, SimliBridge SKIPS the /api/spike-b/session fetch (R3-C2/P0-5).
-  // Ignored by TavusBridge.
+  // Ignored by TavusBridge / HeygenBridge.
   preMintedSessionToken?: string;
+  // HeyGen boot envelope from /api/sessions/open or /api/spike-b/session.
+  // The mint route does the two-call boot server-side (mint-heygen.ts).
+  //
+  // Token-permissions reality (Phase 0 §10 + revised plan):
+  // The `livekitClientToken` is HeyGen-issued and PRIVILEGED (canPublish:true,
+  // canPublishData:true, roomJoin:true). HeyGen does NOT expose a subscribe-
+  // only mint API and our own LIVEKIT_API_KEY/SECRET sign tokens for OUR
+  // LiveKit Cloud account, not HeyGen's instance — so re-minting subscribe-
+  // only against HeyGen's room is architecturally impossible. We accept the
+  // privileged token under the same trust model as Simli's compose token:
+  //   * Same-origin HTTPS delivery only.
+  //   * No localStorage / cookie persistence — memory only, dies with tab.
+  //   * Bound to session TTL (HeyGen JWT expires; we don't extend).
+  //   * Bridge never calls room.localParticipant.publishTrack — the publish
+  //     capability is unused even though the JWT permits it.
+  // Ignored by SimliBridge / TavusBridge.
+  heygenSessionBoot?: {
+    wsUrl: string;
+    livekitUrl: string;
+    livekitClientToken: string;          // PRIVILEGED — see above
+    livekitRoom: string;                 // room name (matches ws_url path uuid)
+    livekitIdentity: string;             // collision-safe identity (audit-r2 M1)
+    maxSessionDurationSeconds: number;
+  };
 };
 
 export type AvatarError = {
@@ -162,16 +197,32 @@ export interface AvatarBridge {
   // may attach the track to a <video>.
   open(opts: AvatarOpenOptions): Promise<void>;
 
-  // Push one chunk of PCM16 LE mono @ 16kHz. Bridges are responsible for any
-  // provider-specific reframing (Tavus path is currently WS-less echo; Simli
-  // path sends via the Simli JS SDK). MUST NOT block the caller — if the
-  // provider is not ready, drop the chunk and surface via onError if chronic.
-  sendAudio(pcm16le16k: ArrayBuffer): void;
+  // Push one chunk of PCM16 LE mono. SAMPLE RATE IS PROVIDER-DEFINED:
+  //   * simli  — 16 kHz (Trinity-1 SDK requires PCM16 LE @ 16k).
+  //   * tavus  — 16 kHz (echo-mode parity with Simli).
+  //   * heygen — 24 kHz (LiveAvatar Lite, PHASE_0_HEYGEN.md §6).
+  // Caller MUST emit the rate matching the provider — bridges DO NOT
+  // resample. The voice-proxy reads `voice_tickets.avatar_provider` and
+  // configures Cartesia output_format.sample_rate accordingly.
+  // MUST NOT block the caller — if the provider is not ready, drop the
+  // chunk and surface via onError if chronic.
+  sendAudio(pcm16le: ArrayBuffer): void;
 
   // Barge-in: signal the provider to stop any in-flight TTS playback. Simli
-  // sends SKIP on the control WS; Tavus uses conversation.interrupt via daily.
+  // sends SKIP on the control WS; Tavus uses conversation.interrupt via daily;
+  // Heygen sends agent.interrupt and then waits for speak_ended before
+  // accepting the next utterance.
   // Pipe stays warm — do NOT close the connection here.
   cancel(): void;
+
+  // OPTIONAL — end-of-utterance signal for providers that REQUIRE explicit
+  // turn-boundary closure (HeyGen agent.speak_end). Without this call,
+  // HeyGen's server silently drops the next utterance because the prior
+  // one wasn't terminated (PHASE_0_HEYGEN.md §7). Simli / Tavus do not
+  // require an end-of-utterance signal — those bridges leave this method
+  // undefined. Consumer (recording-controller) must call commitUtterance
+  // at every Cartesia turn boundary IF defined.
+  commitUtterance?(): void;
 
   // Tear down. Idempotent. Safe to call multiple times. Closes the RTC peer
   // connection and any associated control channels.

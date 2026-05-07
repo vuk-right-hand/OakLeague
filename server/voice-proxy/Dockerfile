@@ -24,7 +24,7 @@ COPY package.json package-lock.json ./
 # of false leads. Lockfile is now load-bearing — keep it committed.
 RUN npm ci --omit=dev --no-audit --no-fund
 
-COPY index.js gemini-bridge.js cartesia-bridge.js quota-gate.js sentry.js proxy-handlers.js voice-delete-worker.js ./
+COPY index.js gemini-bridge.js cartesia-bridge.js quota-gate.js sentry.js proxy-handlers.js voice-delete-worker.js simli-face-delete-worker.js face-upload-reaper.js ./
 
 ENV NODE_ENV=production
 ENV PORT=8080

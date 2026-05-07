@@ -18,10 +18,12 @@
 import 'server-only';
 import { createHash } from 'node:crypto';
 import { supabaseAdmin } from '@/lib/supabase/admin';
+import type { AvatarProvider } from '@/lib/avatar/avatar-bridge';
 
 export class VoiceTicketMintError extends Error {
   readonly code:
     | 'bad_ua'
+    | 'bad_avatar_provider'
     | 'creator_not_found'
     | 'session_not_owned'
     | 'ticket_mint_failed'
@@ -41,6 +43,13 @@ export type MintVoiceTicketArgs = {
   creatorId: string;
   hookId: string | null;
   expectedTier: 'free' | 'premium' | 'boardroom';
+  // Audit round 2 / C1 — load-bearing field for the voice-proxy's
+  // Cartesia per-session sample-rate selection. Simli/Tavus → 16kHz;
+  // HeyGen → 24kHz. NULL is rejected at the boundary because the
+  // voice_tickets_avatar_provider_purpose_match CHECK enforces NOT NULL
+  // for purpose='voice_session' (this mint helper only mints
+  // voice_session — voice_clone has its own mint path).
+  avatarProvider: AvatarProvider;
   ua: string;
 };
 
@@ -54,6 +63,13 @@ const TTL_SECONDS = 120;
 export async function mintVoiceTicket(args: MintVoiceTicketArgs): Promise<MintVoiceTicketResult> {
   if (!args.ua || args.ua.length < 1 || args.ua.length > 2048) {
     throw new VoiceTicketMintError('bad_ua', 400);
+  }
+  // AvatarProvider type guard. Belt-and-suspenders: TS already constrains
+  // the arg, but a misuse from JS via npm/Babel transpilation could slip
+  // a bad value past — the DB CHECK would catch it (CHECK on enum), but
+  // surfacing 400 here is cleaner than a 500 from a deferred PG error.
+  if (args.avatarProvider !== 'simli' && args.avatarProvider !== 'tavus' && args.avatarProvider !== 'heygen') {
+    throw new VoiceTicketMintError('bad_avatar_provider', 400);
   }
   const uaHash = createHash('sha256').update(args.ua).digest('hex');
 
@@ -79,16 +95,17 @@ export async function mintVoiceTicket(args: MintVoiceTicketArgs): Promise<MintVo
   const { data, error } = await admin
     .from('voice_tickets')
     .insert({
-      user_id:        args.userId,
-      bound_ua_hash:  uaHash,
-      creator_id:     args.creatorId,
-      session_id:     args.sessionId,
-      hook_id:        args.hookId,
-      expected_tier:  args.expectedTier,
+      user_id:         args.userId,
+      bound_ua_hash:   uaHash,
+      creator_id:      args.creatorId,
+      session_id:      args.sessionId,
+      hook_id:         args.hookId,
+      expected_tier:   args.expectedTier,
+      avatar_provider: args.avatarProvider,
       // pipeline_kind defaults to 'native_audio' per migration 0045 — the
       // α' wire format is native_audio + Cartesia layered server-side.
       // purpose defaults to 'voice_session'.
-      expires_at:     expiresAt,
+      expires_at:      expiresAt,
     })
     .select('ticket_id, expires_at')
     .single<{ ticket_id: string; expires_at: string }>();

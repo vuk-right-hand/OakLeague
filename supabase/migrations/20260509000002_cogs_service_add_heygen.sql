@@ -1,0 +1,30 @@
+-- 20260509000002 — cogs_service ENUM gains 'heygen'
+--
+-- HeyGen wireup, migration 2 of 4. Standalone — no other DDL in this file.
+--
+-- Postgres restriction (the reason this migration is alone in its file):
+--   `ALTER TYPE … ADD VALUE` cannot be issued in the same transaction as
+--   any other statement that references the new value. Supabase migration
+--   tooling commits per-file, so isolating this ALTER as the sole
+--   statement guarantees the value is committed and visible by the time
+--   the NEXT migration's CHECK / function bodies that reference 'heygen'
+--   are parsed and applied. See migration 20260509000003 for those.
+--
+-- Pre-flight verification:
+--   * `face_vendor` enum already carries 'heygen' since migration
+--     20260508000001:23. Reused for voice_tickets.avatar_provider
+--     (migration 20260509000001) — no migration needed there.
+--   * `cogs_service` enum has NOT had 'heygen' until this migration.
+--     Source: migration 20260420000001:18.
+--   * Audit round 2 / C2: this is the load-bearing add. Without it,
+--     mintHeygenSessionToken's audit insert and the bridge's
+--     `cogs_insert_avatar_turn` call would fail with SQLSTATE 22P02
+--     `invalid input value for enum cogs_service: "heygen"`.
+--
+-- Forbidden interleaving rule for the next ~2-3 migrations after this
+-- one: NO migration may reference 'heygen' as a literal in CHECK,
+-- function bodies, or DML until 20260509000003 (which the Supabase CLI
+-- guarantees is committed AFTER this file because of monotonic
+-- timestamp ordering and per-file tx commits).
+
+ALTER TYPE public.cogs_service ADD VALUE IF NOT EXISTS 'heygen';

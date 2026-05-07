@@ -21,7 +21,8 @@ import { useCallback, useEffect, useReducer, useRef } from 'react';
 import { GoogleGenAI, Modality, type LiveServerMessage, type Session } from '@google/genai';
 import * as Sentry from '@sentry/nextjs';
 import { createSimliBridge } from '@/lib/avatar/simli-bridge';
-import type { AvatarBridge, AvatarError } from '@/lib/avatar/avatar-bridge';
+import { createHeygenBridge } from '@/lib/avatar/heygen-bridge';
+import type { AvatarBridge, AvatarBridgeHandlers, AvatarOpenOptions, AvatarError } from '@/lib/avatar/avatar-bridge';
 import { captureSafe } from '@/lib/posthog-safe-capture';
 import { createProxyClient, type ProxyClient } from '@/lib/voice/proxy-client';
 
@@ -39,22 +40,11 @@ import {
 } from './session-reducer';
 
 // Envelope shape returned by POST /api/sessions/open and /api/sessions/rollover.
-export type OpenEnvelope = {
-  session_id: string;
-  tier: 'free' | 'premium' | 'boardroom';
-  avatar: { session_token: string; expires_at: string; face_id: string } | null;
-  avatar_status: 'pending' | 'minted' | 'skipped_tier' | 'failed_mint' | 'failed_connect' | 'not_applicable';
-  gemini: { token: string; model: string };
-  // SIMLI_WIREUP — cutover (flag-on) path uses these. Both nullable so the
-  // legacy flag-off path stays compilable + rollback-safe (R2-C3).
-  voice_ticket: { ticket: string; expiresAt: string } | null;
-  proxy_url: string | null;
-  max_duration_s: number;
-  max_session_s: number;
-  // R3-C2 — set when /api/sessions/open returned an existing session due
-  // to multi-tab takeover. Informational; client doesn't change behavior.
-  is_takeover?: boolean;
-};
+// Re-export the wire types from the shared single-source-of-truth module
+// (final-audit S1). Existing imports of `OpenEnvelope` from this file
+// keep working — see src/lib/avatar/avatar-envelope.ts.
+import type { AvatarEnvelope, OpenEnvelope } from '@/lib/avatar/avatar-envelope';
+export type { AvatarEnvelope, OpenEnvelope };
 
 export type UseSessionPipeArgs = {
   envelope: OpenEnvelope;
@@ -69,6 +59,35 @@ export type UseSessionPipeArgs = {
 
 const HEARTBEAT_MS = 20_000;
 // Rate-limit-floor on the server is 10s; we poll at 20s to stay well clear.
+
+// Provider-aware bridge factory + open-opts builder (post-build audit C1).
+// Returns a bridge instance plus the AvatarOpenOptions that bridge.open()
+// needs. Caller wires DOM elements + provider-specific session boot info.
+function buildBridge(
+  envelope: OpenEnvelope,
+  handlers: AvatarBridgeHandlers,
+  videoEl: HTMLVideoElement | null,
+  audioEl: HTMLAudioElement | null,
+): { bridge: AvatarBridge; openOpts: AvatarOpenOptions } | null {
+  if (!envelope.avatar) return null;
+  const av = envelope.avatar;
+  const baseOpts: AvatarOpenOptions = {
+    replicaId: av.face_id,
+    videoEl: videoEl ?? undefined,
+    audioEl: audioEl ?? undefined,
+  };
+  if (av.provider === 'heygen') {
+    return {
+      bridge: createHeygenBridge(handlers),
+      openOpts: { ...baseOpts, heygenSessionBoot: av.heygen_session_boot },
+    };
+  }
+  // simli or tavus
+  return {
+    bridge: createSimliBridge(handlers),
+    openOpts: { ...baseOpts, preMintedSessionToken: av.session_token },
+  };
+}
 
 const AUDIO_CONTEXT_RESUME_VERIFY_MS = 300;
 // iOS WebKit: verify AudioContext.state === 'running' 300ms after resume()
@@ -160,11 +179,31 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   const driftBytesRef = useRef<number>(0);
   const driftFlushAtRef = useRef<number>(Date.now());
   const micStreamRef = useRef<MediaStream | null>(null);
+  // Phase 0.5 fix (2026-05-07). Mic-tap button fires multiple pointer
+  // events on release: onPointerUp + onPointerLeave + onPointerCancel
+  // all call stopMic. Without this latch, each fired turn_end on the
+  // proxy WS — Cartesia received doubled turn_ends with mic frames in
+  // between, accumulated bad state, and died with "Invalid transcript"
+  // by turn 4. Tracks "is the mic currently engaged this turn" so
+  // start/stop fire exactly once per press-and-hold cycle.
+  const micActiveRef = useRef<boolean>(false);
+  // Phase 0.5 (2026-05-07). In-flight getUserMedia promise — used by
+  // BOTH the room-mount pre-warm and the lazy startMic path so a fast
+  // first-press can't fire a second concurrent permission prompt.
+  // Whichever caller hits first creates the promise; the other awaits it.
+  const micStreamPromiseRef = useRef<Promise<MediaStream> | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const ephemeralTokenRef = useRef<string>(args.envelope.gemini.token);
   const modelRef = useRef<string>(args.envelope.gemini.model);
-  const preMintedSimliRef = useRef<string | null>(args.envelope.avatar?.session_token ?? null);
+  // Simli/Tavus path retains a pre-minted compose token for legacy code
+  // paths. HeyGen has its own session_boot envelope and doesn't go through
+  // this ref. Discriminate on provider before reading.
+  const preMintedSimliRef = useRef<string | null>(
+    args.envelope.avatar && (args.envelope.avatar.provider === 'simli' || args.envelope.avatar.provider === 'tavus')
+      ? args.envelope.avatar.session_token
+      : null,
+  );
   const sessionIdRef = useRef<string>(args.envelope.session_id);
   const closedRef = useRef<boolean>(false);
   const rollingOverRef = useRef<boolean>(false);
@@ -196,6 +235,236 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   function dispatchRef(a: Action) {
     if (closedRef.current && a.kind !== 'closed_ack') return;
     dispatch(a);
+  }
+
+  // Phase 0.5 (2026-05-07). Single-flight mic acquisition.
+  // The room-mount pre-warm effect AND startMic both call this. First
+  // caller fires getUserMedia; subsequent callers await the same promise
+  // (no second permission prompt). Returned stream has all tracks
+  // disabled so no audio leaks until startMic enables them.
+  // Audit C1 / C5 (2026-05-07). True if at least one audio track is live —
+  // not muted-by-OS, not ended-by-backgrounding. Used both to gate the
+  // cache (a getUserMedia that resolves with already-ended tracks must
+  // NOT be cached) and by the visibility handler to detect tracks killed
+  // by iOS during long backgrounding.
+  function isStreamLive(stream: MediaStream | null): boolean {
+    if (!stream) return false;
+    return stream.getAudioTracks().some((t) => t.readyState === 'live');
+  }
+
+  // Audit C5 (2026-05-07). Tear down the entire mic/audio graph so the next
+  // acquireMicStream + acquireAudioGraph builds fresh. Called when the
+  // visibility handler detects iOS killed our mic tracks during backgrounding.
+  function invalidateAudioGraph(): void {
+    try { workletNodeRef.current?.disconnect(); } catch {}
+    workletNodeRef.current = null;
+    try { micStreamRef.current?.getTracks().forEach((t) => t.stop()); } catch {}
+    micStreamRef.current = null;
+    micStreamPromiseRef.current = null;
+    // Don't close audioCtx — it's reusable and iOS limits concurrent
+    // contexts. acquireAudioGraph will rebuild source + worklet on top.
+  }
+
+  function acquireMicStream(): Promise<MediaStream> {
+    if (micStreamRef.current && isStreamLive(micStreamRef.current)) {
+      return Promise.resolve(micStreamRef.current);
+    }
+    // Dead/null cache — clear so the new getUserMedia call wins.
+    if (micStreamRef.current) {
+      try { micStreamRef.current.getTracks().forEach((t) => t.stop()); } catch {}
+      micStreamRef.current = null;
+    }
+    if (micStreamPromiseRef.current) return micStreamPromiseRef.current;
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices) {
+      return Promise.reject(new Error('mediaDevices_unavailable'));
+    }
+    const p = navigator.mediaDevices
+      .getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        video: false,
+      })
+      .then((stream) => {
+        // Audit C1 (2026-05-07). iOS Safari can resolve getUserMedia with
+        // a stream whose tracks are ALREADY ended (page was backgrounded
+        // during the permission prompt). Refuse to cache a dead stream
+        // — null the promise so the next caller retries fresh.
+        if (!isStreamLive(stream)) {
+          try { stream.getTracks().forEach((t) => t.stop()); } catch {}
+          micStreamPromiseRef.current = null;
+          throw new Error('mic_stream_ended_at_acquire');
+        }
+        // Phase 0.5 (2026-05-07). Tracks stay ENABLED.
+        //
+        // Earlier this disabled tracks for "no audio leak pre-press." That
+        // assumption was wrong AND it broke iOS: WebKit's
+        // MediaStreamAudioSourceNode freezes track-enabled state at
+        // construction time. If startMic later re-enables the track, the
+        // already-built source node never sees the change, the worklet's
+        // process() keeps getting empty inputs, no frames ever reach the
+        // proxy → "session ended immediately" on iPhone (matches Fly logs:
+        // turn_start arrives, no mic.first_frame ever).
+        //
+        // The "leak" defense was theatre anyway: with no AudioContext +
+        // source-node graph yet, the captured audio has no path to anywhere.
+        // The real frame-suppression gate is `micActiveRef` inside the
+        // worklet's port.onmessage handler.
+        micStreamRef.current = stream;
+        return stream;
+      })
+      .catch((e) => {
+        // Clear so a future caller can retry (e.g. after the user grants
+        // permission via the browser's site settings).
+        micStreamPromiseRef.current = null;
+        throw e;
+      });
+    micStreamPromiseRef.current = p;
+    return p;
+  }
+
+  // Phase 0.5 (2026-05-07). iOS WebKit AVAudioSession-category fix.
+  //
+  // HeyGen pipes avatar audio over a LiveKit RTC peer connection
+  // (heygen-bridge.ts) into <audio>.srcObject. iOS Safari runs everything
+  // through AVAudioSession; while WebRTC is playing, the session category
+  // is "playback". Creating `new AudioContext()` later forces a flip to
+  // "playAndRecord", and on WebKit specifically that flip *interrupts the
+  // WebRTC peer's media* — LiveKit fires disconnect → heygen-bridge maps
+  // the WS close to `session_ttl_expired` → reducer flips to closed →
+  // "session ended immediately on first hold." Reproduced on iOS 17.6.1.
+  //
+  // The trick: build the AudioContext + worklet + source graph during
+  // pre-warm, BEFORE HeyGen's LiveKit room joins. iOS sets
+  // playAndRecord up front; HeyGen's later peer connect is born into
+  // that category and never gets ripped. Context stays `suspended` —
+  // the actual `resume()` happens inside the user-gesture click handler
+  // for first hold. No graph mutation on press → no later category flip.
+  //
+  // Builds are idempotent; subsequent presses skip straight to resume().
+  // If pre-warm path fails (e.g., iOS rejects context creation without an
+  // active gesture), startMic's catch retries via this same helper from
+  // inside the gesture — same code path, recovered.
+  async function acquireAudioGraph(stream: MediaStream): Promise<void> {
+    if (workletNodeRef.current && audioCtxRef.current) return;
+    if (!audioCtxRef.current) {
+      const Ctx: typeof AudioContext =
+        (window as unknown as { AudioContext: typeof AudioContext; webkitAudioContext?: typeof AudioContext })
+          .AudioContext ??
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      audioCtxRef.current = new Ctx();
+    }
+    const ctx = audioCtxRef.current;
+    if (workletNodeRef.current) return;
+    await ctx.audioWorklet.addModule('/worklets/mic-processor.js');
+    // Tracks must be enabled BEFORE createMediaStreamSource on iOS WebKit
+    // (frozen-at-construction quirk fixed earlier). acquireMicStream
+    // already leaves tracks enabled, but cheap to enforce here.
+    stream.getTracks().forEach((t) => (t.enabled = true));
+    const src = ctx.createMediaStreamSource(stream);
+    const node = new AudioWorkletNode(ctx, 'mic-processor');
+    node.port.onmessage = (ev) => {
+      const pcm = ev.data?.pcm as ArrayBuffer | undefined;
+      if (!pcm) return;
+      // Drop frames whenever the mic isn't logically engaged (between
+      // turns the mic is captured but should not feed Gemini).
+      if (!micActiveRef.current) return;
+      if (USE_PROXY_PATH) {
+        try { proxyRef.current?.sendAudio(pcm); }
+        catch { /* WS closed mid-frame — heartbeat / close will reconcile */ }
+        return;
+      }
+      if (!geminiRef.current) return;
+      try {
+        geminiRef.current.sendRealtimeInput({
+          audio: {
+            data: bytesToBase64(new Uint8Array(pcm)),
+            mimeType: 'audio/pcm;rate=16000',
+          },
+        });
+      } catch { /* WS closed mid-frame — next visibility tick will reconcile */ }
+    };
+    src.connect(node);
+    // Do NOT connect to ctx.destination — would loop mic back to speakers.
+    workletNodeRef.current = node;
+  }
+
+  // Phase 0.5 (2026-05-07). Idempotent end-to-end pre-warm.
+  //   1. acquireMicStream — popup OS permission prompt, retain MediaStream.
+  //   2. acquireAudioGraph — build AudioContext + worklet + source (suspended).
+  //   3. ctx.resume() — flip iOS AVAudioSession to playAndRecord NOW.
+  //
+  // Step 3 is the load-bearing one for iOS: the avatar's LiveKit RTC peer
+  // must NOT already be connected when the audio-session category flips,
+  // or WebKit interrupts the peer and the session looks "dead on first
+  // press." Boot effect awaits this before calling openAvatar().
+  //
+  // All three steps swallow errors and breadcrumb. Avatar still opens
+  // even if pre-warm couldn't fully complete (e.g., user denied mic);
+  // startMic's catch-block retries the same code path from inside a
+  // gesture handler if needed.
+  async function preWarmAudio(): Promise<void> {
+    let stream: MediaStream | null = null;
+    try {
+      stream = await acquireMicStream();
+    } catch (e) {
+      Sentry.addBreadcrumb({
+        category: 'voice',
+        level: 'warning',
+        message: 'pre-warm getUserMedia rejected',
+        data: { error: (e as Error)?.message ?? String(e) },
+      });
+      return;
+    }
+    try {
+      await acquireAudioGraph(stream);
+    } catch (e) {
+      Sentry.addBreadcrumb({
+        category: 'voice',
+        level: 'warning',
+        message: 'pre-warm acquireAudioGraph failed',
+        data: { error: (e as Error)?.message ?? String(e) },
+      });
+      return;
+    }
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+    // Audit M6 (2026-05-07). On iOS, `new AudioContext()` outside a fresh
+    // gesture can land in `closed` or `interrupted` state instead of
+    // `suspended`. The original early-return on `state !== 'suspended'`
+    // silently masked this — pre-warm reported success but AVAudioSession
+    // never primed → openAvatar joined into `playback` mode → first Hold
+    // ripped the LiveKit peer (the bug we already shipped a fix for).
+    // Force-rebuild via the gesture-bound startMic path on this branch.
+    if (ctx.state === 'closed' || ctx.state === 'interrupted') {
+      Sentry.addBreadcrumb({
+        category: 'voice',
+        level: 'warning',
+        message: 'pre-warm AudioContext landed non-resumable; will rebuild on first hold',
+        data: { state: ctx.state },
+      });
+      audioCtxRef.current = null;
+      // workletNode is bound to the dead ctx; null it so acquireAudioGraph
+      // rebuilds the entire chain inside startMic's gesture handler.
+      try { workletNodeRef.current?.disconnect(); } catch {}
+      workletNodeRef.current = null;
+      return;
+    }
+    if (ctx.state !== 'suspended') return; // already 'running'
+    try {
+      await ctx.resume();
+      Sentry.addBreadcrumb({
+        category: 'voice',
+        level: 'info',
+        message: 'audio-context resumed during pre-warm (iOS AVAudioSession primed)',
+        data: { state: ctx.state },
+      });
+    } catch (e) {
+      Sentry.addBreadcrumb({
+        category: 'voice',
+        level: 'warning',
+        message: 'pre-warm resume rejected; iOS may rip LiveKit on first hold',
+        data: { error: (e as Error)?.message ?? String(e) },
+      });
+    }
   }
 
   // R3-Missing-4 — video stats: diff vs prior, accumulate ratios, flush
@@ -300,7 +569,7 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       if (!args.envelope.avatar || args.envelope.avatar_status !== 'minted') {
         return; // voice-only
       }
-      const bridge = createSimliBridge({
+      const handlers: AvatarBridgeHandlers = {
         onReady: () => {
           if (cancelled) return;
           dispatchRef({ kind: 'avatar_ready' });
@@ -309,35 +578,46 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
         onError: (err: AvatarError) => {
           if (cancelled) return;
           Sentry.captureException(new Error(`avatar_${err.code}`), {
-            extra: { session_id: sessionIdRef.current, err_code: err.code, recoverable: err.recoverable },
+            extra: { session_id: sessionIdRef.current, err_code: err.code, recoverable: err.recoverable, provider: args.envelope.avatar?.provider },
           });
+          // post-build M4: silent_drop_no_speak_end is recoverable — log
+          // but don't fail the session (the bridge already chose not to
+          // tear down). Future audit: surface a UI banner.
+          if (err.recoverable && err.code === 'silent_drop_no_speak_end') return;
           dispatchRef({ kind: 'fatal_error', message: `avatar: ${err.code}` });
         },
         onLipsyncLatency: (ms) => {
           lipsyncLatencyRef.current = ms;
           captureSafe('simli_lipsync_latency_ms', { ms, session_id: sessionIdRef.current });
         },
-        // Day 3 — broadcast initial track + LiveKit renegotiation re-fires to
-        // recording-controller subscribers.
         onVideoTrack: (t) => { lastTracksRef.current.video = t; broadcastTracks(); },
         onAudioTrack: (t) => { lastTracksRef.current.audio = t; broadcastTracks(); },
-        // R3-Missing-4 — video stats accumulator (5s cadence from bridge).
         onVideoStats: handleVideoStats,
-        // R3-M3 — minute accrual on close. Browser POSTs to
-        // /api/sessions/simli-accrual which writes the cogs row.
         onMinuteAccrual: handleMinuteAccrual,
-      });
-      bridgeRef.current = bridge;
+      };
+      // Provider-aware factory + opts builder.
+      const built = buildBridge(args.envelope, handlers, videoRef.current, audioRef.current);
+      if (!built) return;
+      // Audit C3 (2026-05-07). Hold the bridge LOCALLY until open()
+      // resolves, then publish to the ref. Otherwise: in StrictMode dev
+      // (or any rapid sub-1s back-nav in prod), Mount #1 starts the
+      // LiveKit RTC connect, gets cancelled mid-await, Mount #2's bridge
+      // overwrites the ref → bridge1's connect eventually completes
+      // unobserved, the LiveKit room joins with no listener, and the
+      // HeyGen session credit + WebRTC peer leak until tab close. By
+      // gating on `cancelled` after the await, we explicitly close the
+      // orphan and never expose it to the rest of the hook.
       try {
-        await bridge.open({
-          replicaId: args.envelope.avatar.face_id,
-          preMintedSessionToken: preMintedSimliRef.current ?? undefined,
-          videoEl: videoRef.current ?? undefined,
-          audioEl: audioRef.current ?? undefined,
-        });
+        await built.bridge.open(built.openOpts);
+        if (cancelled) {
+          try { await built.bridge.close(); } catch { /* */ }
+          return;
+        }
+        bridgeRef.current = built.bridge;
       } catch (e) {
-        // onError path already dispatched; nothing to do here.
-        Sentry.captureException(e, { extra: { session_id: sessionIdRef.current, op: 'simli_open' } });
+        // open() rejected; ensure no half-connected resources linger.
+        try { await built.bridge.close(); } catch { /* */ }
+        Sentry.captureException(e, { extra: { session_id: sessionIdRef.current, op: `${args.envelope.avatar?.provider}_open` } });
       }
     }
 
@@ -386,6 +666,9 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
               }
               if (gotAudio) dispatchRef({ kind: 'gemini_audio_chunk' });
               if (m.serverContent?.turnComplete) {
+                // Post-build C2 — HeyGen requires explicit speak_end at
+                // turn boundary. Simli/Tavus leave commitUtterance undefined.
+                try { bridgeRef.current?.commitUtterance?.(); } catch { /* */ }
                 dispatchRef({ kind: 'gemini_turn_complete' });
               }
             },
@@ -440,6 +723,26 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
           try { bridgeRef.current?.sendAudio(bytes); } catch { /* bridge closed */ }
           dispatchRef({ kind: 'gemini_audio_chunk' });
         },
+        // Post-build C2 — Gemini turnComplete signals the boundary that
+        // HeyGen requires for `agent.speak_end`. Simli/Tavus bridges leave
+        // commitUtterance undefined (no-op via optional chaining).
+        // The minor tail of Cartesia PCM frames after this point flows
+        // into the next utterance buffer — accepted slop for v1; revisit
+        // if Phase 0.5 testing shows turn-boundary lipsync glitches.
+        //
+        // Phase 0.5 fix (2026-05-07): MUST dispatch gemini_turn_complete
+        // here so the reducer transitions speaking→ready. Without this
+        // the proxy path stays stuck at 'speaking' forever after turn 1
+        // — every subsequent startMic took the barge-in branch and fired
+        // cancel → turn_start, gluing silent worklet frames + a phantom
+        // barge-in onto Gemini's ongoing turn until auto-VAD couldn't
+        // recover. Symptom: "avatar can't hear a single word from turn 2."
+        // Direct-Gemini path already dispatches this; only proxy path was
+        // missing it.
+        onTurnComplete: () => {
+          try { bridgeRef.current?.commitUtterance?.(); } catch { /* */ }
+          dispatchRef({ kind: 'gemini_turn_complete' });
+        },
         onError: (code, detail) => {
           if (cancelled) return;
           Sentry.captureException(new Error(`proxy_${code}`), {
@@ -485,12 +788,34 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       }
     }
 
-    void openAvatar();
+    // Phase 0.5 (2026-05-07). iOS WebKit AVAudioSession sequencing.
+    //
+    // Order matters: complete mic + AudioContext + ctx.resume() FIRST,
+    // then open avatar (LiveKit RTC). The proxy WS opens in parallel —
+    // it's pure WebSocket, doesn't touch iOS's audio session.
+    //
+    // Why: iOS flips its AVAudioSession category from `playback` to
+    // `playAndRecord` the instant our AudioContext transitions to
+    // `running`. If LiveKit's RTC peer is already connected and playing
+    // avatar audio when that flip happens, WebKit interrupts the peer
+    // → LiveKit emits disconnect → heygen-bridge maps WS-close to
+    // `session_ttl_expired` → "session ended immediately" on first
+    // Hold press. By front-loading the audio-session change before any
+    // RTC peer exists, HeyGen joins INTO playAndRecord and stays alive.
+    //
+    // Pre-warm failure (denied permission, iOS rejecting resume w/o
+    // gesture, etc.) is non-fatal: avatar still opens, voice-only
+    // fallback works, and startMic's lazy path retries on first hold.
     if (USE_PROXY_PATH) {
       void openProxy();
     } else {
       void openGemini();
     }
+    void (async () => {
+      await preWarmAudio();
+      if (cancelled) return;
+      void openAvatar();
+    })();
 
     return () => {
       cancelled = true;
@@ -535,7 +860,18 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
         }).catch(() => {});
       } else {
         dispatchRef({ kind: 'visibility_visible' });
-        try { micStreamRef.current?.getTracks().forEach((t) => (t.enabled = true)); } catch {}
+        // Audit C5 (2026-05-07). iOS Safari ends mic tracks after ~30-60s
+        // of backgrounding — `t.enabled = true` won't revive them. Detect
+        // the dead state and tear down the audio graph so the next
+        // startMic rebuilds fresh against a new getUserMedia. Without
+        // this, the user returns from the lock screen, presses Hold,
+        // and sees the same "no mic.first_frame ever" failure that the
+        // iPhone-cold-start fix addressed — just at a different entry point.
+        if (micStreamRef.current && !isStreamLive(micStreamRef.current)) {
+          invalidateAudioGraph();
+        } else {
+          try { micStreamRef.current?.getTracks().forEach((t) => (t.enabled = true)); } catch {}
+        }
         fetch('/api/sessions/resume', {
           method: 'POST',
           credentials: 'same-origin',
@@ -607,7 +943,10 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
           ephemeralTokenRef.current = env.gemini.token;
           modelRef.current = env.gemini.model;
           sessionIdRef.current = env.session_id;
-          preMintedSimliRef.current = env.avatar?.session_token ?? null;
+          preMintedSimliRef.current =
+            env.avatar && (env.avatar.provider === 'simli' || env.avatar.provider === 'tavus')
+              ? env.avatar.session_token
+              : null;
           dispatchRef({
             kind: 'rollover_complete',
             newSessionId: env.session_id,
@@ -635,12 +974,13 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     // The Simli compose token in the new envelope is held in case we
     // need it for a future mid-session re-mint path.
     if (!bridgeRef.current && env.avatar && env.avatar_status === 'minted') {
-      const bridge = createSimliBridge({
+      const handlers: AvatarBridgeHandlers = {
         onReady: () => dispatchRef({ kind: 'avatar_ready' }),
         onError: (err) => {
           Sentry.captureException(new Error(`avatar_${err.code}`), {
-            extra: { session_id: sessionIdRef.current, op: 'rollover_reopen' },
+            extra: { session_id: sessionIdRef.current, op: 'rollover_reopen', provider: env.avatar?.provider },
           });
+          if (err.recoverable && err.code === 'silent_drop_no_speak_end') return;
           dispatchRef({ kind: 'fatal_error', message: `avatar: ${err.code}` });
         },
         onLipsyncLatency: (ms) => { lipsyncLatencyRef.current = ms; },
@@ -648,16 +988,24 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
         onAudioTrack: (t) => { lastTracksRef.current.audio = t; broadcastTracks(); },
         onVideoStats: handleVideoStats,
         onMinuteAccrual: handleMinuteAccrual,
-      });
-      bridgeRef.current = bridge;
-      try {
-        await bridge.open({
-          replicaId: env.avatar.face_id,
-          preMintedSessionToken: env.avatar.session_token,
-          videoEl: videoRef.current ?? undefined,
-          audioEl: audioRef.current ?? undefined,
-        });
-      } catch { /* handled in onError */ }
+      };
+      const built = buildBridge(env, handlers, videoRef.current, audioRef.current);
+      if (built) {
+        // Audit C3 (2026-05-07). Same hold-bridge-locally-until-open-
+        // resolves pattern as the boot effect. closedRef serves as our
+        // cancelled gate here (component unmount path sets it true).
+        try {
+          await built.bridge.open(built.openOpts);
+          if (closedRef.current) {
+            try { await built.bridge.close(); } catch { /* */ }
+            return;
+          }
+          bridgeRef.current = built.bridge;
+        } catch {
+          try { await built.bridge.close(); } catch { /* */ }
+          /* onError path already dispatched */
+        }
+      }
     } else if (!bridgeRef.current) {
       dispatchRef({ kind: 'avatar_not_expected' });
     } else {
@@ -721,7 +1069,10 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
               }
             }
             if (got) dispatchRef({ kind: 'gemini_audio_chunk' });
-            if (m.serverContent?.turnComplete) dispatchRef({ kind: 'gemini_turn_complete' });
+            if (m.serverContent?.turnComplete) {
+              try { bridgeRef.current?.commitUtterance?.(); } catch { /* */ }
+              dispatchRef({ kind: 'gemini_turn_complete' });
+            }
           },
           onerror: () => dispatchRef({ kind: 'ws_closed', wasClean: false }),
           onclose: (ev: CloseEvent) => dispatchRef({ kind: 'ws_closed', wasClean: ev.wasClean }),
@@ -737,63 +1088,43 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   // ── Mic ────────────────────────────────────────────────────────────────────
   const startMic = useCallback((): void => {
     if (state.phase !== 'ready' && state.phase !== 'speaking') return;
+    if (micActiveRef.current) return; // Already started this press cycle.
+    micActiveRef.current = true;
     dispatchRef({ kind: 'mic_started' });
     // SIMLI_WIREUP §B4 — proxy turn boundary + barge-in. mic-tap during
     // 'speaking' is a barge-in: cancel the in-flight TTS playback locally
     // (Simli buffer) and tell proxy so Cartesia stops synthesizing.
     if (USE_PROXY_PATH) {
-      try { proxyRef.current?.sendControl({ type: 'turn_start' }); } catch {}
+      // Order matters: on barge-in (mic tap during 'speaking') we must
+      // cancel the OLD turn FIRST, then start the NEW one. The original
+      // order (turn_start → cancel) made cartesia.turnStart set a fresh
+      // contextId which the immediately-following cancel then cleared,
+      // leaving Cartesia with _currentContextId=null. The user's eventual
+      // mic-release fired turn_end → cartesia.turnEnd threw 'turnEnd
+      // before turnStart' → bridge state poisoned → stopped responding
+      // after 2-3 turns (Phase 0.5 testing 2026-05-07).
       if (state.phase === 'speaking') {
         try { bridgeRef.current?.cancel(); } catch {}
         try { proxyRef.current?.sendControl({ type: 'cancel' }); } catch {}
       }
+      try { proxyRef.current?.sendControl({ type: 'turn_start' }); } catch {}
     }
     (async () => {
       try {
-        if (!audioCtxRef.current) {
-          const Ctx: typeof AudioContext =
-            (window as unknown as { AudioContext: typeof AudioContext; webkitAudioContext?: typeof AudioContext })
-              .AudioContext ??
-            (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-          audioCtxRef.current = new Ctx();
-        }
+        // Pre-warm should have already done acquireMicStream + acquireAudioGraph
+        // at room-mount. Both are single-flight + idempotent; calling here
+        // recovers any path where pre-warm couldn't run (iOS gesture rejection,
+        // permission still pending, etc.).
+        const micStream = micStreamRef.current ?? (await acquireMicStream());
+        await acquireAudioGraph(micStream);
         const ctx = audioCtxRef.current;
+        if (!ctx) throw new Error('audio_ctx_missing_after_acquire');
+        // First-press resume() runs INSIDE the click handler's user-gesture
+        // window — required by iOS WebKit. Subsequent presses no-op.
         if (ctx.state === 'suspended') await ctx.resume();
-        if (!micStreamRef.current) {
-          micStreamRef.current = await navigator.mediaDevices.getUserMedia({
-            audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
-            video: false,
-          });
-        }
-        if (!workletNodeRef.current) {
-          await ctx.audioWorklet.addModule('/worklets/mic-processor.js');
-          const src = ctx.createMediaStreamSource(micStreamRef.current);
-          const node = new AudioWorkletNode(ctx, 'mic-processor');
-          node.port.onmessage = (ev) => {
-            const pcm = ev.data?.pcm as ArrayBuffer | undefined;
-            if (!pcm) return;
-            // SIMLI_WIREUP §B4 — flag-on path routes mic to proxy WS.
-            // Flag-off path keeps the legacy direct-Gemini route.
-            if (USE_PROXY_PATH) {
-              try { proxyRef.current?.sendAudio(pcm); }
-              catch { /* WS closed mid-frame — heartbeat / close will reconcile */ }
-              return;
-            }
-            if (!geminiRef.current) return;
-            try {
-              geminiRef.current.sendRealtimeInput({
-                audio: {
-                  data: bytesToBase64(new Uint8Array(pcm)),
-                  mimeType: 'audio/pcm;rate=16000',
-                },
-              });
-            } catch { /* WS closed mid-frame — next visibility tick will reconcile */ }
-          };
-          src.connect(node);
-          // Do NOT connect node to ctx.destination — would loop mic back.
-          workletNodeRef.current = node;
-        }
-        micStreamRef.current.getTracks().forEach((t) => (t.enabled = true));
+        // Tracks should already be enabled (pre-warm leaves them on); cheap
+        // to re-assert in case visibility-pause flipped them off.
+        micStream.getTracks().forEach((t) => (t.enabled = true));
       } catch (e) {
         Sentry.captureException(e, { extra: { op: 'start_mic', session_id: sessionIdRef.current } });
         dispatchRef({ kind: 'fatal_error', message: 'mic_failed' });
@@ -802,7 +1133,20 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   }, [state.phase]);
 
   const stopMic = useCallback((): void => {
-    if (state.phase !== 'listening') return;
+    // Phase 0.5 fix (2026-05-07). Original guard was
+    //   `if (state.phase !== 'listening') return;`
+    // which short-circuited everything when Gemini's server-VAD turn-
+    // completed BEFORE the user released the mouse. Phase had already
+    // transitioned listening→speaking→ready, so stopMic returned without
+    // disabling the mic OR sending turn_end. Always release mic + always
+    // fire turn_end (server is idempotent post-cartesia-bridge fix).
+    //
+    // Idempotency latch: button release fires onPointerUp + onPointerLeave
+    // + onPointerCancel — all three call stopMic. Without micActiveRef,
+    // the WS got duplicate turn_end messages → Cartesia state poisoned
+    // → "Invalid transcript" by turn 4 → session died.
+    if (!micActiveRef.current) return;
+    micActiveRef.current = false;
     dispatchRef({ kind: 'mic_stopped' });
     // R3-M7 — user_perceived_response_ms t0 = mic-tap-release. Cleared
     // when first proxy audio_out frame arrives.
@@ -811,7 +1155,7 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       try { proxyRef.current?.sendControl({ type: 'turn_end' }); } catch {}
     }
     try { micStreamRef.current?.getTracks().forEach((t) => (t.enabled = false)); } catch {}
-  }, [state.phase]);
+  }, []);
 
   // ── End session ────────────────────────────────────────────────────────────
   const endSession = useCallback(async (reason: 'user_ended' | 'client_error') => {
@@ -868,6 +1212,13 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
 
   // Unmount cleanup.
   useEffect(() => {
+    // React 18 dev StrictMode double-mounts every effect (setup → cleanup
+    // → setup). Without this reset, the StrictMode cleanup latches
+    // closedRef.current=true permanently, and every subsequent dispatch
+    // (avatar_ready, gemini_setup_complete) is silently dropped by
+    // dispatchRef → phase never leaves 'opening' → "Connecting…" forever.
+    // Production has no double-mount; this is a no-op there.
+    closedRef.current = false;
     return () => {
       if (!closedRef.current) {
         closedRef.current = true;
@@ -878,6 +1229,20 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
         try { geminiRef.current?.close(); } catch {}
         try { proxyRef.current?.close('unmount'); } catch {}
         try { bridgeRef.current?.close(); } catch {}
+        // Audit C2 (2026-05-07). Null the refs AFTER closing. Without this,
+        // StrictMode's simulated re-mount sees stale-but-truthy refs and
+        // acquireAudioGraph's early-return treats the dead graph as alive,
+        // leaving the user with a closed AudioContext and no worklet.
+        // Pure dev-mode hygiene — production never re-mounts the same
+        // hook instance, so these nulls are no-ops there. Also helps if
+        // any future code reads a ref post-cleanup (e.g., logging).
+        workletNodeRef.current = null;
+        micStreamRef.current = null;
+        micStreamPromiseRef.current = null;
+        audioCtxRef.current = null;
+        geminiRef.current = null;
+        proxyRef.current = null;
+        bridgeRef.current = null;
         // Best-effort close so we don't orphan the row. beacon-style because
         // the effect cleanup may run during pagehide.
         if (typeof navigator !== 'undefined' && 'sendBeacon' in navigator) {

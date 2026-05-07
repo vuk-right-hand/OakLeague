@@ -6,6 +6,7 @@ import { supabaseAdmin } from '@/lib/supabase/admin';
 import { ceilingUsdPerMin, estimatedRunCostUsd } from '@/lib/avatar/cost';
 import type { AvatarProvider } from '@/lib/avatar/avatar-bridge';
 import { mintSimliSessionToken, SimliMintError } from '@/lib/avatar/mint-simli';
+import { mintHeygenSessionToken, HeygenMintError } from '@/lib/avatar/mint-heygen';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -47,13 +48,24 @@ function startOfUtcDayIso(): string {
   return d.toISOString();
 }
 
-const VALID_PROVIDERS: ReadonlySet<AvatarProvider> = new Set(['simli', 'tavus']);
+const VALID_PROVIDERS: ReadonlySet<AvatarProvider> = new Set(['simli', 'tavus', 'heygen']);
 const REPLICA_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 type Body = {
   provider?: unknown;
   replica_id?: unknown;
+  // HeyGen-only: if omitted, defaults to true (sandbox/free, Wayne avatar).
+  // Admin can flip to false for paid prod-rate measurements via this same
+  // route (gated by admin auth + spike-b kill-switch). Sandbox runs IGNORE
+  // replica_id and pin Wayne (post-build audit M3).
+  is_sandbox?: unknown;
 };
+
+// HeyGen sandbox is exclusively bound to the Wayne avatar (PHASE_0_HEYGEN.md
+// §12). Hard-pin server-side so admin's accidentally-passed UUID doesn't
+// surface as a confusing replica_not_found — we just route it to Wayne.
+const HEYGEN_SANDBOX_AVATAR_ID = 'dd73ea75-1218-4ef3-92ce-606d5f7fbc0a';
 
 export async function POST(req: NextRequest) {
   if (!isSameOrigin(req)) return json(403, { error: 'bad_origin' });
@@ -92,7 +104,7 @@ export async function POST(req: NextRequest) {
   const { data: rows, error: costErr } = await admin
     .from('cogs_log')
     .select('cost_usd')
-    .in('service', ['simli', 'tavus'])
+    .in('service', ['simli', 'tavus', 'heygen'])
     .eq('environment', 'spike_b')
     .gte('created_at', startOfUtcDayIso());
   if (costErr) {
@@ -124,11 +136,72 @@ export async function POST(req: NextRequest) {
         expires_at: result.expiresAt,
       });
     }
+    if (provider === 'heygen') {
+      // Default sandbox (free, Wayne-pinned). Admin overrides via
+      // body.is_sandbox=false for prod-rate measurements.
+      const isSandbox = body.is_sandbox !== false;
+      // Sandbox: hard-pin Wayne, ignore replicaId (post-build audit M3).
+      // Prod: validate replica_id as UUID.
+      let avatarId: string;
+      if (isSandbox) {
+        avatarId = HEYGEN_SANDBOX_AVATAR_ID;
+      } else {
+        if (!UUID_RE.test(replicaId)) {
+          return json(400, { error: 'bad_replica_id' });
+        }
+        avatarId = replicaId;
+      }
+      const result = await mintHeygenSessionToken({
+        avatarId,
+        isSandbox,
+        audit: {
+          userId: session.userId,
+          sessionId: null, // spike-b does not write to public.sessions
+          env: 'spike_b',
+          ua: req.headers.get('user-agent'),
+        },
+      });
+      // Build the heygen_session_boot envelope the bridge consumes via
+      // opts.heygenSessionBoot. We pass through HeyGen's livekit_client_token
+      // verbatim — no subscribe-only re-mint is possible against their
+      // LiveKit instance (avatar-bridge.ts heygenSessionBoot comment).
+      // Identity is collision-safe per audit-r2 M1 — a future second tab
+      // takeover gets a distinct identity so LiveKit doesn't kick the
+      // first tab. Spike-B has no concept of "session_id" so we use a
+      // run-scoped nonce.
+      const nonce = crypto.randomUUID();
+      return json(200, {
+        provider: 'heygen' as const,
+        // Echo the OakLeague-side session token (HeyGen's session JWT) so
+        // the consumer can drive /v1/sessions/keep-alive and stop. In
+        // spike-b harness, no voice-proxy heartbeat — the harness session
+        // is short and ends with /api/spike-b/record.
+        session_token: result.sessionToken,
+        heygen_session_id: result.sessionId,
+        heygen_session_boot: {
+          wsUrl: result.wsUrl,
+          livekitUrl: result.livekitUrl,
+          livekitClientToken: result.livekitClientToken,
+          livekitRoom: result.sessionId, // ws_url path UUID == livekit room name
+          livekitIdentity: `spike-b:${session.userId}:${nonce}`,
+          maxSessionDurationSeconds: result.maxSessionDurationSeconds,
+        },
+        expires_at: result.expiresAt,
+      });
+    }
     return json(200, await mintTavus(replicaId));
   } catch (e) {
     Sentry.captureException(e, { extra: { op: 'spike_b_session_mint', provider } });
     if (e instanceof SimliMintError) {
       const status = [401, 403, 404, 409, 429].includes(e.httpStatus) ? e.httpStatus : 502;
+      return json(status, {
+        error: e.code,
+        ceiling_rate: ceilingUsdPerMin(provider as AvatarProvider),
+        admin_user: session.userId,
+      });
+    }
+    if (e instanceof HeygenMintError) {
+      const status = [400, 401, 403, 404, 409, 429].includes(e.httpStatus) ? e.httpStatus : 502;
       return json(status, {
         error: e.code,
         ceiling_rate: ceilingUsdPerMin(provider as AvatarProvider),

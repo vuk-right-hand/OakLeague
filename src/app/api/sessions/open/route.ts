@@ -30,9 +30,13 @@ import { json, isSameOrigin, mapPgError } from '@/lib/session/http-helpers';
 import { isAllowedWireModel, WIRE_TO_ENUM } from '@/lib/voice/model-map';
 import { mintEphemeral, MintError } from '@/lib/voice/mint-ephemeral';
 import { mintSimliSessionToken, SimliMintError } from '@/lib/avatar/mint-simli';
+import { mintHeygenSessionToken, HeygenMintError } from '@/lib/avatar/mint-heygen';
+import { resolveAvatarProvider } from '@/lib/avatar/resolver';
+import type { AvatarProvider } from '@/lib/avatar/avatar-bridge';
+import type { AvatarEnvelope } from '@/lib/avatar/avatar-envelope';
 import { mintVoiceTicket, VoiceTicketMintError } from '@/lib/voice/mint-voice-ticket';
 import { resolveVoiceId } from '@/lib/voice/env-scoped-voice-id';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { candidateTokenHashes, isValidTokenPlaintext } from '@/lib/recording/referral-token';
 import { captureServerSafe } from '@/lib/posthog-server';
 import { getProxyVoiceConfig } from '@/lib/voice/voice-config';
@@ -99,11 +103,12 @@ export async function POST(req: NextRequest) {
   // resolveVoiceId() picks the env-appropriate value.
   const { data: creatorRow, error: creatorErr } = await admin
     .from('creators')
-    .select('id, simli_face_id, voice_id, voice_id_preview, voice_id_dev, published_at')
+    .select('id, simli_face_id, heygen_avatar_id, voice_id, voice_id_preview, voice_id_dev, published_at')
     .eq('id', creatorId)
     .maybeSingle<{
       id: string;
       simli_face_id: string | null;
+      heygen_avatar_id: string | null;
       voice_id: string | null;
       voice_id_preview: string | null;
       voice_id_dev: string | null;
@@ -111,7 +116,10 @@ export async function POST(req: NextRequest) {
     }>();
   if (creatorErr) return json(500, { error: 'creator_lookup_failed' });
   if (!creatorRow) return json(404, { error: 'creator_not_found' });
-  if (!creatorRow.simli_face_id) return json(409, { error: 'creator_not_ready' });
+  // Avatar provider readiness is checked AFTER tier resolution below —
+  // a free-tier user routed through Simli needs simli_face_id; a heygen
+  // user needs heygen_avatar_id. Don't block here on a missing simli id
+  // when the user might be on heygen.
   const envVoiceId = resolveVoiceId(creatorRow);
   // U-C1 pre-WS gate: when the proxy's α' path is on, a session against a
   // creator with no env-scoped voice_id will die at 4009 cartesia_no_voice
@@ -186,6 +194,30 @@ export async function POST(req: NextRequest) {
     } catch (e) {
       Sentry.captureException(e, { extra: { op: 'sessions_open_takeover_audit', session_id: sessionId } });
     }
+    // Final-audit C2: takeover re-mints HeyGen below and overwrites the
+    // session_private row, orphaning the old HeyGen-side session. Stop
+    // the old one server-side before the re-mint clobbers our handle to
+    // its token. Idempotent per Phase 0 §11. Fire-and-forget — even if
+    // the stop call fails, the new session re-mint shouldn't block.
+    try {
+      const { data: oldPriv } = await admin
+        .from('sessions_private')
+        .select('heygen_session_id, heygen_session_token')
+        .eq('session_id', sessionId)
+        .maybeSingle<{ heygen_session_id: string | null; heygen_session_token: string | null }>();
+      if (oldPriv?.heygen_session_id && oldPriv?.heygen_session_token) {
+        await fetch('https://api.liveavatar.com/v1/sessions/stop', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'authorization': `Bearer ${oldPriv.heygen_session_token}`,
+          },
+          body: JSON.stringify({ session_id: oldPriv.heygen_session_id, reason: 'USER_CLOSED' }),
+        }).catch(() => { /* non-fatal */ });
+      }
+    } catch (e) {
+      Sentry.captureException(e, { extra: { op: 'sessions_open_takeover_heygen_stop', session_id: sessionId } });
+    }
   } else {
     const openRow = Array.isArray(openRows) ? openRows[0] : openRows;
     if (!openRow?.session_id) return json(500, { error: 'session_open_empty' });
@@ -194,36 +226,149 @@ export async function POST(req: NextRequest) {
     dailyLimitRemaining = (openRow.daily_limit_remaining_s as number) ?? 0;
   }
 
-  // ── Mint Simli FIRST (R3-M2) ────────────────────────────────────────────
-  // Session length clamped to min(15min, remaining daily quota, 600s) so the
-  // Simli pipe TTL ≤ Gemini audio cap. Any clamp below 60s is a bug — the
-  // user already crossed kill-switch threshold; session_open should have
-  // raised. Still defensively floor at 60s for sanity.
-  const maxAvatarSeconds = Math.max(60, Math.min(GEMINI_MAX_SESSION_S, dailyLimitRemaining, 600));
+  // ── Resolve avatar provider for this tier (audit-r1 C1) ────────────────
+  // Tier locks the provider for the session's duration (CLAUDE.md
+  // §Voice — "tier routing at session-open only, never mid-session").
+  const avatarProvider: AvatarProvider | null = resolveAvatarProvider(tier);
 
-  let avatar: { session_token: string; expires_at: string; face_id: string } | null = null;
+  // Per-provider face/avatar id readiness. Each provider has its own column
+  // on creators (simli_face_id vs heygen_avatar_id). NULL means the creator
+  // hasn't trained this provider's avatar yet → 'creator_not_ready' parity
+  // with the prior Simli-only check.
+  const providerAvatarId: string | null =
+    avatarProvider === 'simli'  ? creatorRow.simli_face_id :
+    avatarProvider === 'heygen' ? creatorRow.heygen_avatar_id :
+    avatarProvider === 'tavus'  ? creatorRow.simli_face_id : // Tavus deprecated; reuse simli for legacy paths
+    null;
+  if (avatarProvider !== null && !providerAvatarId) {
+    return json(409, { error: 'creator_not_ready', avatar_provider: avatarProvider });
+  }
+
+  // Session length clamp. Provider-aware:
+  //   simli/tavus: min(15min Gemini cap, dailyLimitRemaining, 600s).
+  //   heygen:      min(LIVEAVATAR_MAX_SESSION_S env or 300s default,
+  //                    Gemini cap, dailyLimitRemaining).
+  // Heygen Lite docs cap at 1200s; we keep the per-session clamp tighter.
+  // (Audit-r2 C4 — kill-switch must use clamped seconds, not the
+  // provider's max — and r2 S1 — heygen default 300 to keep one runaway
+  // session from burning ~7 of 10 free-tier credits.)
+  const maxAvatarSeconds = avatarProvider === 'heygen'
+    ? Math.max(60, Math.min(
+        GEMINI_MAX_SESSION_S,
+        dailyLimitRemaining,
+        Number(process.env.LIVEAVATAR_MAX_SESSION_S ?? 300),
+      ))
+    : Math.max(60, Math.min(GEMINI_MAX_SESSION_S, dailyLimitRemaining, 600));
+
+  // AvatarEnvelope hoisted to @/lib/avatar/avatar-envelope (final-audit S1).
+  let avatar: AvatarEnvelope | null = null;
   let avatarStatus: 'minted' | 'failed_mint' = 'failed_mint';
   let avatarError: string | null = null;
-  try {
-    const result = await mintSimliSessionToken({
-      faceId: creatorRow.simli_face_id,
-      maxSessionLength: maxAvatarSeconds,
-      audit: {
-        userId: callerUserId,
-        sessionId,
-        env: 'production',
-        ua: req.headers.get('user-agent'),
-      },
-    });
-    avatar = {
-      session_token: result.sessionToken,
-      expires_at: result.expiresAt,
-      face_id: result.faceId,
-    };
-    avatarStatus = 'minted';
-  } catch (e) {
-    Sentry.captureException(e, { extra: { op: 'sessions_open_simli_mint', session_id: sessionId } });
-    avatarError = e instanceof SimliMintError ? e.code : 'simli_unknown';
+
+  if (avatarProvider === null) {
+    // Voice-only mode (env AVATAR_PROVIDER_<tier>=none / unset). No avatar
+    // mint attempt; downstream FORCE_AVATAR_REQUIRED gate decides 503.
+    avatarStatus = 'failed_mint';
+    avatarError = 'avatar_provider_disabled';
+  } else if (avatarProvider === 'simli') {
+    try {
+      const result = await mintSimliSessionToken({
+        faceId: providerAvatarId!,
+        maxSessionLength: maxAvatarSeconds,
+        audit: {
+          userId: callerUserId,
+          sessionId,
+          env: 'production',
+          ua: req.headers.get('user-agent'),
+        },
+      });
+      avatar = {
+        provider: 'simli',
+        session_token: result.sessionToken,
+        expires_at: result.expiresAt,
+        face_id: result.faceId,
+      };
+      avatarStatus = 'minted';
+      // Snapshot provider so a future env flip doesn't silently swap
+      // providers on rollover (post-build audit M1).
+      try {
+        await admin
+          .from('sessions')
+          .update({ avatar_provider: 'simli' })
+          .eq('id', sessionId);
+      } catch (e) {
+        Sentry.captureException(e, { extra: { op: 'sessions_open_simli_snapshot', session_id: sessionId } });
+      }
+    } catch (e) {
+      Sentry.captureException(e, { extra: { op: 'sessions_open_simli_mint', session_id: sessionId } });
+      avatarError = e instanceof SimliMintError ? e.code : 'simli_unknown';
+    }
+  } else if (avatarProvider === 'heygen') {
+    try {
+      const result = await mintHeygenSessionToken({
+        avatarId: providerAvatarId!,
+        // Production traffic — never sandbox here. Sandbox is admin-gated
+        // through /api/spike-b/session.
+        isSandbox: false,
+        maxSessionDurationSeconds: maxAvatarSeconds,
+        audit: {
+          userId: callerUserId,
+          sessionId,
+          env: 'production',
+          ua: req.headers.get('user-agent'),
+        },
+      });
+      avatar = {
+        provider: 'heygen',
+        expires_at: result.expiresAt,
+        face_id: providerAvatarId!,
+        heygen_session_id: result.sessionId,
+        heygen_session_boot: {
+          wsUrl: result.wsUrl,
+          livekitUrl: result.livekitUrl,
+          // Privileged token by design — see avatar-bridge.ts heygenSessionBoot
+          // comment block. Same trust model as Simli compose token.
+          livekitClientToken: result.livekitClientToken,
+          livekitRoom: result.sessionId,
+          // Collision-safe identity (audit-r2 M1) — second tab takeover
+          // gets a distinct LiveKit identity so neither tab gets kicked.
+          livekitIdentity: `oak:${callerUserId}:${sessionId}:${randomUUID().slice(0, 8)}`,
+          maxSessionDurationSeconds: result.maxSessionDurationSeconds,
+        },
+      };
+      avatarStatus = 'minted';
+
+      // Snapshot provider on the public sessions row + privileged tokens
+      // on the service-role-only sibling sessions_private (final post-fix
+      // audit C1: column-level RLS doesn't exist in Postgres, so privileged
+      // tokens MUST live on a sibling with zero policies).
+      try {
+        await admin
+          .from('sessions')
+          .update({ avatar_provider: 'heygen' })
+          .eq('id', sessionId);
+        await admin
+          .from('sessions_private')
+          .upsert({
+            session_id: sessionId,
+            heygen_session_id: result.sessionId,
+            heygen_session_token: result.sessionToken,
+          }, { onConflict: 'session_id' });
+      } catch (e) {
+        // Non-fatal: voice-only path still works (heygen heartbeat just
+        // can't fire, session won't survive past ~120s without keep-alive).
+        Sentry.captureException(e, { extra: { op: 'sessions_open_heygen_snapshot', session_id: sessionId } });
+      }
+    } catch (e) {
+      Sentry.captureException(e, { extra: { op: 'sessions_open_heygen_mint', session_id: sessionId } });
+      avatarError = e instanceof HeygenMintError ? e.code : 'heygen_unknown';
+    }
+  } else {
+    // Tavus deprecated (CLAUDE.md project memory). resolveAvatarProvider
+    // still tolerates the value for env-flag flexibility but no mint path
+    // exists today. Surface as failed_mint with a distinct code.
+    avatarStatus = 'failed_mint';
+    avatarError = 'tavus_scrapped';
   }
 
   // Persist the avatar_status transition. Non-fatal on failure — we prefer
@@ -296,12 +441,18 @@ export async function POST(req: NextRequest) {
   let voiceTicket: { ticket: string; expiresAt: string } | null = null;
   try {
     voiceTicket = await mintVoiceTicket({
-      userId:       callerUserId,
+      userId:        callerUserId,
       sessionId,
       creatorId,
       hookId,
-      expectedTier: tier,
-      ua:           req.headers.get('user-agent') ?? '',
+      expectedTier:  tier,
+      // Drives the voice-proxy's per-session Cartesia sample-rate
+      // selection (audit-r2 C1). When avatarProvider is null (voice-only
+      // tier or kill-switch), we fall back to 'simli' as the safest
+      // historical default — the voice-proxy will use 16kHz, matching
+      // the legacy attach-path behavior.
+      avatarProvider: avatarProvider ?? 'simli',
+      ua:            req.headers.get('user-agent') ?? '',
     });
   } catch (e) {
     Sentry.captureException(e, { extra: { op: 'sessions_open_voice_ticket', session_id: sessionId } });
@@ -337,6 +488,11 @@ export async function POST(req: NextRequest) {
   return json(200, {
     session_id: sessionId,
     tier,
+    // avatar_provider discriminator — client uses this to pick the bridge
+    // factory. avatar.provider holds the same value but is also discriminated
+    // for the typed envelope; avatar_provider is the top-level signal that's
+    // present even when avatar mint failed.
+    avatar_provider: avatarProvider,
     avatar,
     avatar_status: avatarStatus,
     // gemini.token kept during the flag-on/off window (R2-C3). Cleanup PR
