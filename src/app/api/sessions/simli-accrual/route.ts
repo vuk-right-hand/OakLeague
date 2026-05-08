@@ -7,6 +7,16 @@
 // MAX(bridge_close, reaper) per session — never sum (a rollover yields
 // two bridge_close rows, but they represent two non-overlapping pipes).
 //
+// WHY NOT cogs_insert_avatar_turn (B4.3 audit clarification):
+//   The avatar-turn RPC (migration 20260502000003) is for PER-TURN
+//   lipsync writes — its CHECK constraint enforces `p_duration_s > 0
+//   AND <= 60`. This route is SESSION-LEVEL accrual: onMinuteAccrual
+//   fires once per pipe-close with TOTAL session seconds, validated 0
+//   to 7200 (2 hours). Routing through the RPC would 22003 every
+//   write longer than 60s. Different cadence, different op, different
+//   constraints. Cost ceiling enforcement here lives in
+//   clampReportedCostUsd(...) — same ceiling values as the RPC.
+//
 // Idempotency: NOT enforced via cogs_log_turn_idempotency partial unique
 // index — that index is `WHERE turn_number IS NOT NULL` and we MUST keep
 // `turn_number` NULL here. Reason (R4-M3 + auditor C1): a rollover yields
@@ -23,6 +33,10 @@
 //
 // Cost: BEST_ESTIMATE_USD_PER_MIN.simli * (seconds/60), clamped to the
 // daily ceiling via ceilingUsdPerMin (cost.ts).
+//
+// Grace window (Phase C B4.3): mirrors cogs_insert_avatar_turn's 60s
+// threshold from migration 20260502000003. Protects against stale
+// client-side replay POSTing accrual long after session_close ran.
 
 import 'server-only';
 import { type NextRequest } from 'next/server';
@@ -48,6 +62,10 @@ export async function POST(req: NextRequest) {
   const callerUserId = await getCallerUserId();
   if (!callerUserId) return json(401, { error: 'unauthorized' });
 
+  // Phase C B3.5: per-request Sentry user tag. See sessions/open route for
+  // rationale.
+  Sentry.setUser({ id: callerUserId });
+
   let body: Body;
   try { body = (await req.json()) as Body; } catch { return json(400, { error: 'bad_json' }); }
 
@@ -64,11 +82,19 @@ export async function POST(req: NextRequest) {
   // Verify session ownership before billing. Service-role bypasses RLS.
   const { data: session, error: sessErr } = await admin
     .from('sessions')
-    .select('id, user_id')
+    .select('id, user_id, ended_at')
     .eq('id', sessionId)
-    .maybeSingle<{ id: string; user_id: string }>();
+    .maybeSingle<{ id: string; user_id: string; ended_at: string | null }>();
   if (sessErr) return json(500, { error: 'session_lookup_failed' });
   if (!session || session.user_id !== callerUserId) return json(403, { error: 'not_owner' });
+
+  // Grace window (Phase C B4.3) — mirrors cogs_insert_avatar_turn's 60s
+  // threshold (migration 20260502000003:65-70). Reject accrual POSTed
+  // long after session_close ran (replay defense). ended_at IS NULL
+  // means session is live or just closed; accept either way.
+  if (session.ended_at && new Date(session.ended_at).getTime() < Date.now() - 60_000) {
+    return json(410, { error: 'session_closed' });
+  }
 
   const minutes = seconds / 60;
   const rawCost = BEST_ESTIMATE_USD_PER_MIN.simli * minutes;

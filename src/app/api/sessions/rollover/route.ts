@@ -51,6 +51,12 @@ export async function POST(req: NextRequest) {
   const callerUserId = await getCallerUserId();
   if (!callerUserId) return json(401, { error: 'unauthorized' });
 
+  // Phase C B3.5: tag every Sentry event in this request with the caller's
+  // user id. Sentry v10 isolation scope is per-request in the Next.js App
+  // Router integration, so this attaches to all subsequent captureException
+  // calls in the handler without per-call extras edits.
+  Sentry.setUser({ id: callerUserId });
+
   let body: Body;
   try { body = (await req.json()) as Body; } catch { return json(400, { error: 'bad_json' }); }
 

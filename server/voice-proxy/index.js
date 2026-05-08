@@ -28,7 +28,7 @@
 
 // Sentry must init before any other import can throw to be useful; side-effect only.
 import './sentry.js';
-import { captureException } from './sentry.js';
+import { captureException, captureMessage } from './sentry.js';
 
 import http from 'node:http';
 import { createHash } from 'node:crypto';
@@ -979,9 +979,18 @@ wss.on('connection', async (ws, req) => {
           try {
             await bridge.reopen();
             console.log(`[ws ${connId}] gemini.reopen ok`);
+            // Phase C B3.4: surface success-path frequency to Sentry as
+            // info-level event. js-genai#707 reopen rate is invisible
+            // today (only failures captured) — frequency feeds into
+            // memory project_voice_session_history_loss for triage. Tagged
+            // with userId per B3.5.
+            captureMessage('gemini.reopen ok', 'info', {
+              op: 'bridge-reopen-success', connId, sessionId, userId, turnNumber,
+            });
           } catch (e) {
             console.error(`[ws ${connId}] gemini.reopen FAIL:`, e?.message || e);
-            captureException(e, { op: 'bridge-reopen', connId, sessionId });
+            // B3.5: include userId so Sentry can group / filter by user.
+            captureException(e, { op: 'bridge-reopen', connId, sessionId, userId });
             await teardown('bridge_reopen_failed');
             return closeWs(ws, 4005, 'upstream_error');
           }

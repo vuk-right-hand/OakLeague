@@ -24,6 +24,13 @@ export const GEMINI_OUTPUT_USD_PER_SEC_FALLBACK = Number(process.env.GEMINI_OUTP
 // Empirical mean from Phase 0.1 A3 when ≥100 truth rows; otherwise 50 placeholder.
 // `GEMINI_TOKENS_PER_SEC_FALLBACK_SOURCE` is the provenance tag written to
 // metadata.fallback_constant_source so the dashboard surfaces the imprecision.
+//
+// Phase C B4.4 (deferred — needs prod data): the 50 default may be 2× off
+// from measured rates. To re-calibrate: SELECT mean(usage_metadata->>'output_tokens'
+// / NULLIF(units,0)) FROM cogs_log WHERE service='gemini' AND operation='voice_audio_out_tokens'
+// AND metadata->>'fallback_constant_source' = 'default-50' AND created_at > now() - interval '7 days'
+// — once ≥100 rows, set GEMINI_TOKENS_PER_SEC_FALLBACK on Fly to the measured
+// value and bump GEMINI_TOKENS_PER_SEC_FALLBACK_SOURCE to e.g. 'measured-2026-05-Q2'.
 export const GEMINI_TOKENS_PER_SEC_FALLBACK     = Number(process.env.GEMINI_TOKENS_PER_SEC_FALLBACK     ?? 50);
 export const GEMINI_TOKENS_PER_SEC_FALLBACK_SOURCE = process.env.GEMINI_TOKENS_PER_SEC_FALLBACK_SOURCE ?? 'default-50';
 

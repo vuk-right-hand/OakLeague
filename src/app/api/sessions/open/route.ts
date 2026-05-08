@@ -61,6 +61,12 @@ export async function POST(req: NextRequest) {
   const callerUserId = await getCallerUserId();
   if (!callerUserId) return json(401, { error: 'unauthorized' });
 
+  // Phase C B3.5: tag every Sentry event in this request with the caller's
+  // user id. Sentry v10 isolation scope is per-request in the Next.js App
+  // Router integration, so this attaches to all subsequent captureException
+  // calls in the handler without per-call extras edits.
+  Sentry.setUser({ id: callerUserId });
+
   // R5-M4: per-user rate-limit BEFORE the paid provider mints. Normal use is
   // <1 open per 5min (session length). 10/min is >10× headroom but caps a
   // run-away client loop at ~$0.05/min of Simli mint spend per attacker.
