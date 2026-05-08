@@ -3,6 +3,7 @@ import { notFound } from 'next/navigation';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import { VoiceCloneUpload } from './voice-clone-upload';
 import { FaceUpload } from './face-upload';
+import { BrainRecompileButton } from './brain-recompile-button';
 
 export const dynamic = 'force-dynamic';
 
@@ -25,6 +26,9 @@ type Creator = {
   updated_at: string;
   application_id: string | null;
   bio: string | null;
+  // Brain wire-up PR-3.
+  system_prompt: string | null;
+  brain_compiled_at: string | null;
 };
 
 type Topic = {
@@ -73,7 +77,7 @@ export default async function AdminCreatorDetail({
 
   const [{ data: creator }, { data: topics }, { data: samples }] = await Promise.all([
     sb.from('creators')
-      .select('id, handle, display_name, creator_type, brain_status, voice_id, simli_face_id, published_at, created_at, updated_at, application_id, bio')
+      .select('id, handle, display_name, creator_type, brain_status, voice_id, simli_face_id, published_at, created_at, updated_at, application_id, bio, system_prompt, brain_compiled_at')
       .eq('id', id)
       .maybeSingle<Creator>(),
     sb.from('creator_topics')
@@ -166,7 +170,24 @@ export default async function AdminCreatorDetail({
           <StatusCell label="brain_status" value={creator.brain_status} />
           <StatusCell label="published_at" value={creator.published_at ? new Date(creator.published_at).toLocaleString() : '—'} />
           <StatusCell label="updated_at" value={new Date(creator.updated_at).toLocaleString()} />
+          <StatusCell
+            label="system_prompt"
+            value={creator.system_prompt
+              ? `${Buffer.byteLength(creator.system_prompt, 'utf8')} bytes`
+              : '— (not compiled)'}
+          />
+          <StatusCell
+            label="brain_compiled_at"
+            value={creator.brain_compiled_at ? new Date(creator.brain_compiled_at).toLocaleString() : '— (never)'}
+          />
         </div>
+        <BrainRecompileButton
+          creatorId={creator.id}
+          initialCompiledAt={creator.brain_compiled_at}
+          initialPromptLength={creator.system_prompt
+            ? Buffer.byteLength(creator.system_prompt, 'utf8')
+            : null}
+        />
       </section>
 
       <section style={{ marginBottom: 32 }}>

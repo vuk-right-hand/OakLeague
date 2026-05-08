@@ -1,6 +1,8 @@
 'use server';
 
 import { revalidatePath } from 'next/cache';
+import { after } from 'next/server';
+import * as Sentry from '@sentry/nextjs';
 import { z } from 'zod';
 import { getCreatorForCaller } from '@/lib/creator/get-creator';
 import { AuthGuardError } from '@/lib/auth-guards';
@@ -103,6 +105,65 @@ function revalidateCreatorPaths() {
   revalidatePath('/creator');
 }
 
+// Brain wire-up PR-3 (R1 audit M7). After every successful topic /
+// sample mutation we recompile the creator's persona via
+// _creator_brain_compile_unsafe so creators.system_prompt stays fresh
+// without a manual admin step. Deferred via Next 15 `after()` so the
+// recompile happens AFTER the response is committed — the user never
+// waits on it.
+//
+// Pattern:
+//   * Single round-trip from server action to Supabase (via admin
+//     client + service-role _unsafe path).
+//   * Errors swallowed to Sentry — recompile-fail must NEVER fail the
+//     user's mutation. Brain plan §Phase 5.
+//   * Concurrency-safe via pg_advisory_xact_lock inside _unsafe
+//     (serialized per creator_id; PR-1 audit C3).
+function recompileBrainAfterResponse(creatorId: string): void {
+  // PR-3 audit M3: outer try/catch around after() itself in case the
+  // Next runtime synchronously throws scheduling the callback (e.g. the
+  // request-context boundary). Logging here lives, even if the deferred
+  // body never runs.
+  try {
+    after(async () => {
+      try {
+        const admin = supabaseAdmin();
+        const { error } = await admin.rpc('_creator_brain_compile_unsafe', {
+          p_creator_id: creatorId,
+        });
+        if (error) {
+          // Sentry + console fallback (audit small) — Sentry delivery
+          // isn't guaranteed (DSN throttle, network drop), and recompile
+          // failures are operationally important.
+          console.error('[creator-brain-recompile-after]', error);
+          Sentry.captureException(error, {
+            extra: { op: 'creator_brain_recompile_after', creator_id: creatorId },
+          });
+        } else {
+          // PR-3 audit C3: revalidate AGAIN post-recompile so admin views
+          // and any RSC-cached pages see the fresh persona/timestamp on
+          // next render. The synchronous revalidate inside the action
+          // happens BEFORE the recompile lands, so without this second
+          // call the admin page renders the old brain_compiled_at for
+          // one cycle.
+          revalidatePath('/admin/creators');
+          revalidatePath(`/admin/creators/${creatorId}`);
+        }
+      } catch (e) {
+        console.error('[creator-brain-recompile-after-throw]', e);
+        Sentry.captureException(e, {
+          extra: { op: 'creator_brain_recompile_after_throw', creator_id: creatorId },
+        });
+      }
+    });
+  } catch (e) {
+    console.error('[creator-brain-recompile-after-schedule]', e);
+    Sentry.captureException(e, {
+      extra: { op: 'creator_brain_recompile_after_schedule', creator_id: creatorId },
+    });
+  }
+}
+
 export async function addTopic(
   input: z.input<typeof addTopicSchema>,
 ): Promise<Result<{ id: string }>> {
@@ -151,6 +212,7 @@ export async function addTopic(
   if (!data) return { ok: false, error: 'insert_failed' };
 
   revalidateCreatorPaths();
+  recompileBrainAfterResponse(caller.creatorId);
   return { ok: true, data: { id: data.id as string } };
 }
 
@@ -211,6 +273,7 @@ export async function deleteTopic(
   }
 
   revalidateCreatorPaths();
+  recompileBrainAfterResponse(caller.creatorId);
   return { ok: true, data: null };
 }
 
@@ -281,6 +344,7 @@ export async function addSampleContent(
   if (!data) return { ok: false, error: 'insert_failed' };
 
   revalidateCreatorPaths();
+  recompileBrainAfterResponse(caller.creatorId);
   return { ok: true, data: { id: data.id as string } };
 }
 
@@ -306,5 +370,6 @@ export async function deleteSampleContent(
   if (!data || data.length === 0) return { ok: false, error: 'not_found' };
 
   revalidateCreatorPaths();
+  recompileBrainAfterResponse(caller.creatorId);
   return { ok: true, data: null };
 }
