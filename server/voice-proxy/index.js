@@ -163,7 +163,7 @@ async function consumeTicket(ticketId, uaHash) {
     .is('consumed_at', null)
     .gt('expires_at', new Date().toISOString())
     .eq('bound_ua_hash', uaHash)
-    .select('user_id, creator_id, session_id, expected_tier, purpose, avatar_provider')
+    .select('user_id, creator_id, session_id, expected_tier, purpose, avatar_provider, system_prompt, prefix_turns')
     .maybeSingle();
   if (error || !data) return null;
   // creator_id is NOT NULL by CHECK on new rows (migration 0041). A null here
@@ -180,6 +180,18 @@ async function consumeTicket(ticketId, uaHash) {
     // voice_clone tickets (no avatar session); voice_session tickets
     // are CHECK-enforced NOT NULL at the DB layer.
     avatarProvider: data.avatar_provider || null,
+    // Brain wire-up (PR-2). NULL when the route couldn't compile a
+    // persona or the hook had no overlapping sample_content. Bridge
+    // falls back to DEFAULT_SYSTEM in that case.
+    systemPrompt:   data.system_prompt || null,
+    prefixTurns:    (() => {
+      if (data.prefix_turns == null) return null;
+      if (Array.isArray(data.prefix_turns)) return data.prefix_turns;
+      // PR-2 audit M1: future schema change wrapping the array would
+      // silently coerce to null otherwise.
+      console.warn(`[ws] prefix_turns shape unexpected (type=${typeof data.prefix_turns}); dropping`);
+      return null;
+    })(),
   };
 }
 
@@ -598,6 +610,25 @@ wss.on('connection', async (ws, req) => {
     sessionToWs.delete(sessionId);
     wsRegistry.delete(sessionId);
     dropCogsSession(sessionId);
+    // Brain wire-up (PR-2 / R3 audit M5). Surface always-replay token
+    // cost. Logged structured + Sentry breadcrumb so reseed frequency
+    // is operator-visible. PostHog `brain_prefix_reseeded` (Vercel-side
+    // captureServerSafe) is not wired from the proxy — the structured
+    // log line and Sentry are sufficient for v1; pipe to PostHog later
+    // if reseed×byteSize becomes a material cost.
+    if (bridge) {
+      try {
+        const m = bridge.getSeedMetrics();
+        if (m.replayCount > 0) {
+          console.log(`[ws ${connId}] brain.prefix_reseeded count=${m.replayCount} bytes=${m.lastByteSize} reason=${reason} session=${sessionId.slice(0,8)}`);
+          captureMessage('brain.prefix_reseeded', 'info', {
+            connId, sessionId, replayCount: m.replayCount, lastByteSize: m.lastByteSize, reason,
+          });
+        }
+      } catch (metricsErr) {
+        captureException(metricsErr, { op: 'brain_seed_metrics', connId, sessionId });
+      }
+    }
     // R4-M1 — null-check INSTANCES, not booleans. Either bridge may be
     // null if the open path bailed early.
     try { if (cartesia) await cartesia.close(); } catch {}
@@ -665,8 +696,18 @@ wss.on('connection', async (ws, req) => {
     });
     console.log(`[ws ${connId}] gemini.open start (cartesia=${useCartesia})`);
     const t0 = Date.now();
-    await bridge.open({ model: modelWire, sessionId });
-    console.log(`[ws ${connId}] gemini.open ok in ${Date.now() - t0}ms`);
+    // Brain wire-up (PR-2). systemInstruction + brainPrefix ride the
+    // ticket; bridge.open() seeds prefix_turns post-setupComplete with
+    // turnComplete:false (R2 audit C2). Replays on every reopen via
+    // _lastOpenArgs (R2 C3 / R3 M5). NULL when route couldn't compile
+    // — bridge falls through to DEFAULT_SYSTEM in that case.
+    await bridge.open({
+      model: modelWire,
+      sessionId,
+      systemInstruction: consumed.systemPrompt || undefined,
+      brainPrefix: consumed.prefixTurns || null,
+    });
+    console.log(`[ws ${connId}] gemini.open ok in ${Date.now() - t0}ms (sysprompt=${consumed.systemPrompt ? consumed.systemPrompt.length : 0}c prefix=${consumed.prefixTurns ? 'y' : 'n'})`);
   } catch (e) {
     console.error(`[ws ${connId}] gemini-open FAIL:`, e?.message || e);
     captureException(e, { op: 'bridge-open', connId, modelWire, sessionId });

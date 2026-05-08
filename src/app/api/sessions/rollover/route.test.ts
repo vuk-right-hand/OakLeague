@@ -96,8 +96,59 @@ function makeAdmin() {
           select: () => ({
             eq: () => ({
               maybeSingle: async () => ({
-                data: { id: 'cccccccc-3333-4333-8333-cccccccccccc', simli_face_id: 'face-1', heygen_avatar_id: null },
+                data: {
+                  id: 'cccccccc-3333-4333-8333-cccccccccccc',
+                  simli_face_id: 'face-1',
+                  heygen_avatar_id: null,
+                  // Brain wire-up (PR-2). Mock a ready creator with a
+                  // populated persona so the new gate at the top of the
+                  // route doesn't 409 these test cases.
+                  system_prompt: 'You are Test Creator. Topics: x. Answer briefly.',
+                  brain_status: 'ready',
+                },
                 error: null,
+              }),
+            }),
+          }),
+        };
+      }
+      if (table === 'hooks') {
+        // Brain wire-up (PR-2): hook↔creator binding pre-check.
+        return {
+          select: () => ({
+            eq: () => ({
+              maybeSingle: async () => ({
+                data: {
+                  id: 'dddddddd-4444-4444-8444-dddddddddddd',
+                  video: { creator_id: 'cccccccc-3333-4333-8333-cccccccccccc' },
+                },
+                error: null,
+              }),
+            }),
+          }),
+        };
+      }
+      if (table === 'sample_content') {
+        // Brain wire-up (PR-2): buildBrainPrefix reads this. Empty result
+        // → brain_prefix_skipped (no_overlap), null prefix sent to mint.
+        return {
+          select: () => ({
+            eq: () => ({
+              overlaps: () => ({
+                order: () => ({
+                  limit: async () => ({ data: [], error: null }),
+                }),
+              }),
+            }),
+          }),
+        };
+      }
+      if (table === 'admin_roles') {
+        return {
+          select: () => ({
+            eq: () => ({
+              is: () => ({
+                maybeSingle: async () => ({ data: null, error: null }),
               }),
             }),
           }),

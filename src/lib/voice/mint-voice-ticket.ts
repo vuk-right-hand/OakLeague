@@ -19,6 +19,7 @@ import 'server-only';
 import { createHash } from 'node:crypto';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import type { AvatarProvider } from '@/lib/avatar/avatar-bridge';
+import type { PrefixTurn } from '@/lib/voice/brain-prefix';
 
 export class VoiceTicketMintError extends Error {
   readonly code:
@@ -51,6 +52,15 @@ export type MintVoiceTicketArgs = {
   // voice_session — voice_clone has its own mint path).
   avatarProvider: AvatarProvider;
   ua: string;
+  // Brain wire-up (PR-2). Both optional; null/undefined when:
+  //   * Persona missing on creator (creator pre-compile)
+  //   * Hook has no overlapping sample_content
+  //   * Builder errored (Sentry breadcrumb upstream)
+  // Pre-DB length+size guards live in the route — by contract these
+  // are within bounds (≤2000 octets / encodedBytes < 90KB) when set,
+  // so the DB CHECKs are defense-in-depth and won't fire.
+  systemPrompt?: string | null;
+  prefixTurns?: PrefixTurn[] | null;
 };
 
 export type MintVoiceTicketResult = {
@@ -106,13 +116,33 @@ export async function mintVoiceTicket(args: MintVoiceTicketArgs): Promise<MintVo
       // α' wire format is native_audio + Cartesia layered server-side.
       // purpose defaults to 'voice_session'.
       expires_at:      expiresAt,
+      // Brain wire-up (PR-2). Per-session payload riding the ticket so
+      // the proxy gets system_prompt + paired prefix_turns in the same
+      // atomic consume — no extra Supabase read inside the WS open hot
+      // path. NULL when missing; the proxy will pass undefined to the
+      // Gemini bridge and falls back to DEFAULT_SYSTEM (degraded mode;
+      // route emits brain_not_ready 409 before reaching mint when the
+      // creator is unready, so this NULL path is rare).
+      system_prompt:   args.systemPrompt ?? null,
+      prefix_turns:    args.prefixTurns  ?? null,
     })
     .select('ticket_id, expires_at')
     .single<{ ticket_id: string; expires_at: string }>();
 
   if (error || !data) {
-    // 23503 = FK miss; check_violation = session_user_match trigger.
-    // Both surface as session_not_owned so the route returns 403 not 500.
+    // SQLSTATE map (post-PR-2):
+    //   23503 = FK miss (session_id → sessions)
+    //   23514 = check_violation. Three sources:
+    //     * voice_tickets_session_user_match trigger (legacy session_id mismatch)
+    //     * voice_tickets_system_prompt_len_chk (pre-DB-guarded; should never fire)
+    //     * voice_tickets_prefix_turns_size_chk (pre-DB-guarded; should never fire)
+    //   The CHECK constraints can ONLY trip if the route's pre-DB size
+    //   guards drift out of sync with the DB constraints — at which point
+    //   "session_not_owned" is misleading but tolerable, since the right
+    //   answer (drop the prefix and retry) is the same correctness fix.
+    //   When that drift surfaces, see brain-prefix.ts ENCODED_BYTE_CAP and
+    //   creators_system_prompt_len_chk in migration 20260511000001 to
+    //   re-align.
     const code = (error as { code?: string } | null)?.code;
     if (code === '23503' || code === '23514') {
       throw new VoiceTicketMintError('session_not_owned', 403, error?.message);

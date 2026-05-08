@@ -31,6 +31,11 @@ import { resolveAvatarProvider } from '@/lib/avatar/resolver';
 import type { AvatarProvider } from '@/lib/avatar/avatar-bridge';
 import type { AvatarEnvelope } from '@/lib/avatar/avatar-envelope';
 import { mintVoiceTicket, VoiceTicketMintError } from '@/lib/voice/mint-voice-ticket';
+import { buildBrainPrefix } from '@/lib/voice/brain-prefix';
+import { captureServerSafe } from '@/lib/posthog-server';
+import { resolveVoiceId } from '@/lib/voice/env-scoped-voice-id';
+import { getProxyVoiceConfig } from '@/lib/voice/voice-config';
+import { shouldEmitBrainNotReady } from '@/lib/voice/brain-not-ready-dedupe';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -71,13 +76,97 @@ export async function POST(req: NextRequest) {
   const enumModel = WIRE_TO_ENUM[wireModel];
 
   const admin = supabaseAdmin();
+
+  // R3 audit C1 (brain wire-up): hook ↔ creator binding pre-check.
+  // PR-2 audit C1: normalize PostgREST embed shape (object|array).
+  type EmbedShape = { creator_id?: string };
+  let hookBindingCreatorId: string | null = null;
+  try {
+    const { data: hookBinding, error: bindingErr } = await admin
+      .from('hooks')
+      .select('id, video:videos!inner(creator_id)')
+      .eq('id', hookId)
+      .maybeSingle<{ id: string; video: EmbedShape | EmbedShape[] | null }>();
+    if (bindingErr) {
+      Sentry.captureException(bindingErr, { extra: { op: 'sessions_rollover_hook_binding', hook_id: hookId } });
+      return json(500, { error: 'hook_lookup_failed' });
+    }
+    if (!hookBinding) return json(400, { error: 'hook_creator_mismatch' });
+    const v = hookBinding.video;
+    hookBindingCreatorId = Array.isArray(v) ? (v[0]?.creator_id ?? null) : (v?.creator_id ?? null);
+  } catch (e) {
+    Sentry.captureException(e, { extra: { op: 'sessions_rollover_hook_binding_throw', hook_id: hookId } });
+    return json(500, { error: 'hook_lookup_failed' });
+  }
+  if (hookBindingCreatorId !== creatorId) {
+    return json(400, { error: 'hook_creator_mismatch' });
+  }
+
   const { data: creatorRow, error: creatorErr } = await admin
     .from('creators')
-    .select('id, simli_face_id, heygen_avatar_id')
+    .select('id, simli_face_id, heygen_avatar_id, voice_id, voice_id_preview, voice_id_dev, system_prompt, brain_status')
     .eq('id', creatorId)
-    .maybeSingle<{ id: string; simli_face_id: string | null; heygen_avatar_id: string | null }>();
+    .maybeSingle<{
+      id: string;
+      simli_face_id: string | null;
+      heygen_avatar_id: string | null;
+      voice_id: string | null;
+      voice_id_preview: string | null;
+      voice_id_dev: string | null;
+      system_prompt: string | null;
+      brain_status: 'pending' | 'queued' | 'training' | 'ready' | 'errored';
+    }>();
   if (creatorErr) return json(500, { error: 'creator_lookup_failed' });
   if (!creatorRow) return json(404, { error: 'creator_not_found' });
+
+  // PR-2 audit C3: pre-gate Cartesia voice_id on rollover, mirror open
+  // route. Without this, a creator whose voice clone was deleted between
+  // session-open and rollover dies at proxy-WS 4009 cartesia_no_voice
+  // mid-conversation. User hits the 15-min cap and gets a hard cut.
+  const envVoiceId = resolveVoiceId(creatorRow);
+  const { useCartesia } = await getProxyVoiceConfig();
+  if (useCartesia && !envVoiceId) {
+    return json(409, { error: 'creator_voice_not_trained' });
+  }
+
+  // Brain readiness gate (R3 audit M1) — same shape as sessions/open.
+  // A rollover from a previously-ready creator into a now-not-ready
+  // creator is impossible (brain_status doesn't regress in v1) but we
+  // still gate defensively. Admin-preview bypass mirrors open route.
+  const brainReady =
+    creatorRow.brain_status === 'ready' && creatorRow.system_prompt !== null;
+  if (!brainReady) {
+    const { data: adminRow } = await admin
+      .from('admin_roles')
+      .select('user_id')
+      .eq('user_id', callerUserId)
+      .is('revoked_at', null)
+      .maybeSingle();
+    if (!adminRow) {
+      if (shouldEmitBrainNotReady(creatorId)) {
+        Sentry.captureMessage('brain.not_ready', {
+          level: 'error',
+          extra: {
+            path: 'rollover',
+            creator_id: creatorId,
+            brain_status: creatorRow.brain_status,
+            system_prompt_present: creatorRow.system_prompt !== null,
+          },
+        });
+      }
+      return json(409, {
+        error: 'brain_not_ready',
+        creator_id: creatorId,
+        brain_status: creatorRow.brain_status,
+      });
+    }
+    captureServerSafe(callerUserId, 'brain_admin_preview', {
+      admin_user_id: callerUserId,
+      creator_id: creatorId,
+      brain_status_at_open: creatorRow.brain_status,
+    });
+  }
+
   // Per-provider readiness checked AFTER tier resolution below — same
   // shape as sessions/open. Don't block on simli_face_id when tier
   // routes through heygen.
@@ -257,6 +346,42 @@ export async function POST(req: NextRequest) {
   // (migration 20260502000002 line 301) makes a second-rollover always
   // fail with P0006. So a retry can never succeed after voice-ticket
   // mint fails. Close the orphan new row + return mapped error code.
+  // Brain prefix build for the new session (PR-2). Mirror sessions/open.
+  let brainPrefix: Awaited<ReturnType<typeof buildBrainPrefix>> = null;
+  try {
+    brainPrefix = await buildBrainPrefix({
+      supabaseAdmin: admin,
+      creatorId,
+      hookId,
+    });
+    if (brainPrefix) {
+      captureServerSafe(callerUserId, 'brain_prefix_built', {
+        creator_id: creatorId,
+        hook_id: hookId,
+        source_count: brainPrefix.sourceCount,
+        total_raw_chars: brainPrefix.totalRawChars,
+        encoded_bytes: brainPrefix.encodedBytes,
+        selected_topic_count: brainPrefix.selectedTopicSlugs.length,
+      });
+    } else {
+      captureServerSafe(callerUserId, 'brain_prefix_skipped', {
+        creator_id: creatorId,
+        hook_id: hookId,
+        reason: 'no_overlap',
+      });
+    }
+  } catch (prefixErr) {
+    Sentry.captureException(prefixErr, {
+      extra: { op: 'sessions_rollover_brain_prefix', creator_id: creatorId, hook_id: hookId },
+    });
+    captureServerSafe(callerUserId, 'brain_prefix_skipped', {
+      creator_id: creatorId,
+      hook_id: hookId,
+      reason: 'builder_error',
+    });
+    brainPrefix = null;
+  }
+
   let voiceTicket: { ticket: string; expiresAt: string };
   try {
     voiceTicket = await mintVoiceTicket({
@@ -267,6 +392,8 @@ export async function POST(req: NextRequest) {
       expectedTier:   tier,
       avatarProvider: avatarProvider ?? 'simli',
       ua:             req.headers.get('user-agent') ?? '',
+      systemPrompt:   creatorRow.system_prompt,
+      prefixTurns:    brainPrefix?.prefixTurns ?? null,
     });
   } catch (e) {
     Sentry.captureException(e, { extra: { op: 'sessions_rollover_voice_ticket', session_id: newSessionId } });

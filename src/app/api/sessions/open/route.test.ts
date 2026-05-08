@@ -123,6 +123,17 @@ let creatorLookupResult: { data: unknown; error: unknown } = {
     voice_id_preview: null,
     voice_id_dev: null,
     published_at: '2026-01-01T00:00:00Z',
+    // Brain wire-up (PR-2). Mock a ready creator with persona populated
+    // so the new brain_not_ready 409 gate doesn't fire on these tests.
+    system_prompt: 'You are Test Creator. Topics: x. Answer briefly.',
+    brain_status: 'ready',
+  },
+  error: null,
+};
+let hookBindingLookupResult: { data: unknown; error: unknown } = {
+  data: {
+    id: 'dddddddd-4444-4444-8444-dddddddddddd',
+    video: { creator_id: 'cccccccc-3333-4333-8333-cccccccccccc' },
   },
   error: null,
 };
@@ -156,6 +167,42 @@ function makeAdmin() {
           select: () => ({
             eq: () => ({
               maybeSingle: async () => creatorLookupResult,
+            }),
+          }),
+        };
+      }
+      if (table === 'hooks') {
+        // Brain wire-up (PR-2): hook↔creator binding pre-check.
+        return {
+          select: () => ({
+            eq: () => ({
+              maybeSingle: async () => hookBindingLookupResult,
+            }),
+          }),
+        };
+      }
+      if (table === 'sample_content') {
+        // Brain wire-up (PR-2): buildBrainPrefix reads this. Empty
+        // result → brain_prefix_skipped (no_overlap), null prefix sent.
+        return {
+          select: () => ({
+            eq: () => ({
+              overlaps: () => ({
+                order: () => ({
+                  limit: async () => ({ data: [], error: null }),
+                }),
+              }),
+            }),
+          }),
+        };
+      }
+      if (table === 'admin_roles') {
+        return {
+          select: () => ({
+            eq: () => ({
+              is: () => ({
+                maybeSingle: async () => ({ data: null, error: null }),
+              }),
             }),
           }),
         };
@@ -405,5 +452,106 @@ describe('/api/sessions/open — voice-ticket mint is fatal (use-session-pipe re
     expect((await res.json()).error).toBe('proxy_url_unconfigured');
     // Must close the orphaned session row to free the user's slot.
     expect(rpcCalls.filter((c) => c.name === 'session_close').length).toBe(1);
+  });
+});
+
+// Brain wire-up (PR-2) — new gates added by the route.
+describe('/api/sessions/open — brain wire-up gates (R3 audit C1 + M1)', () => {
+  beforeEach(() => {
+    rpcCalls = [];
+    capRpcResult = { data: [{ remaining_seconds: 9999, daily_used: 0, daily_cap: 300, weekly_used: 0, weekly_cap: 900, monthly_used: null, monthly_cap: null }], error: null };
+    sessionOpenResult = { data: [{ session_id: 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb', tier: 'free', daily_limit_remaining_s: 600 }], error: null };
+    rateLimitResult = { data: true, error: null };
+    sessionCloseResult = { data: null, error: null };
+    mockMintVoiceTicket.mockReset();
+    mockMintVoiceTicket.mockResolvedValue({ ticket: 'ticket-1', expiresAt: new Date(Date.now() + 120_000).toISOString() });
+    process.env.NEXT_PUBLIC_VOICE_PROXY_URL = 'wss://test-proxy.fly.dev/voice/spike-a';
+    // Reset to defaults for this suite.
+    creatorLookupResult = {
+      data: {
+        id: 'cccccccc-3333-4333-8333-cccccccccccc',
+        simli_face_id: 'face-1',
+        heygen_avatar_id: null,
+        voice_id: 'voice-1',
+        voice_id_preview: null,
+        voice_id_dev: null,
+        published_at: '2026-01-01T00:00:00Z',
+        system_prompt: 'You are Test Creator. Topics: x. Answer briefly.',
+        brain_status: 'ready',
+      },
+      error: null,
+    };
+    hookBindingLookupResult = {
+      data: {
+        id: 'dddddddd-4444-4444-8444-dddddddddddd',
+        video: { creator_id: 'cccccccc-3333-4333-8333-cccccccccccc' },
+      },
+      error: null,
+    };
+  });
+  afterEach(() => { vi.clearAllMocks(); delete process.env.NEXT_PUBLIC_VOICE_PROXY_URL; });
+
+  it('returns 400 hook_creator_mismatch when hook belongs to a different creator (R3 C1)', async () => {
+    hookBindingLookupResult = {
+      data: {
+        id: 'dddddddd-4444-4444-8444-dddddddddddd',
+        video: { creator_id: 'eeeeeeee-9999-4999-8999-eeeeeeeeeeee' }, // different creator
+      },
+      error: null,
+    };
+    const res = await POST(makeReq());
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe('hook_creator_mismatch');
+    // Must NOT proceed to session_open RPC.
+    expect(rpcCalls.map((c) => c.name)).not.toContain('session_open');
+  });
+
+  it('returns 400 hook_creator_mismatch when hook does not exist', async () => {
+    hookBindingLookupResult = { data: null, error: null };
+    const res = await POST(makeReq());
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe('hook_creator_mismatch');
+  });
+
+  it('returns 409 brain_not_ready when system_prompt is null (R3 M1)', async () => {
+    creatorLookupResult = {
+      data: {
+        ...((creatorLookupResult.data ?? {}) as Record<string, unknown>),
+        system_prompt: null,
+        brain_status: 'training',
+      },
+      error: null,
+    };
+    const res = await POST(makeReq());
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toBe('brain_not_ready');
+    expect(body.brain_status).toBe('training');
+    // Must NOT proceed to session_open RPC for non-admin caller.
+    expect(rpcCalls.map((c) => c.name)).not.toContain('session_open');
+  });
+
+  it('returns 409 brain_not_ready when brain_status != ready', async () => {
+    creatorLookupResult = {
+      data: {
+        ...((creatorLookupResult.data ?? {}) as Record<string, unknown>),
+        system_prompt: 'You are X.',
+        brain_status: 'errored',
+      },
+      error: null,
+    };
+    const res = await POST(makeReq());
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe('brain_not_ready');
+  });
+
+  it('passes system_prompt + null prefixTurns through to mintVoiceTicket on ready creator', async () => {
+    const res = await POST(makeReq());
+    expect(res.status).toBe(200);
+    expect(mockMintVoiceTicket).toHaveBeenCalledTimes(1);
+    const callArgs = mockMintVoiceTicket.mock.calls[0][0] as Record<string, unknown>;
+    expect(callArgs.systemPrompt).toBe('You are Test Creator. Topics: x. Answer briefly.');
+    // No sample_content rows in mock → prefixTurns null.
+    expect(callArgs.prefixTurns).toBeNull();
   });
 });

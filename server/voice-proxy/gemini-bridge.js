@@ -28,6 +28,25 @@ function client(apiKey) {
 
 const DEFAULT_SYSTEM = 'You are a helpful mentor. Answer in one concise sentence.';
 
+// Brain wire-up (PR-2 / R3 audit M7). Margin between sendClientContent
+// (paired prefix_turns seed) and the bridge resolving open(). The proxy
+// sends `ready` to the client right after open() resolves; the user's
+// first mic-audio frame must NOT race the server-side ingest of the
+// seed — auto-VAD would treat mid-prefix audio as a turn boundary and
+// the model would respond to a fragment.
+//
+// Pre-merge spike (scripts/brain-seed-ingest-latency-spike.mjs) measures
+// p99 across 1KB / 30KB / 90KB payloads on desktop + cellular and pins
+// this constant to (p99 + 50ms). 250 is the placeholder; set the
+// measured value via env BRAIN_SEED_MARGIN_MS_OVERRIDE if you've run
+// the spike. If p99 measures > 1s, switch to a server-observable
+// signal (e.g. wait for first usageMetadata after seed) instead.
+const BRAIN_SEED_MARGIN_MS = (() => {
+  const override = parseInt(process.env.BRAIN_SEED_MARGIN_MS_OVERRIDE || '', 10);
+  // PR-2 audit S1: floor at 50ms — 0 guarantees the audio-vs-seed race.
+  return Number.isFinite(override) && override >= 50 && override <= 5000 ? override : 250;
+})();
+
 // R3-C4 — per-turn transcript cap. Chosen so the worst-case Cartesia bill
 // per turn (4000 chars × CARTESIA_USD_PER_CHAR ceiling) stays bounded AND
 // the per-turn second sum (input + cartesia_audio_seconds) stays under the
@@ -79,14 +98,36 @@ export class GeminiBridge extends EventEmitter {
     // scope (different teardown path). Memory-only also means a proxy
     // crash drops the handle, which is fine — fresh session starts clean.
     this._sessionResumeHandle = null;
+    // Brain wire-up (PR-2 / R3 audit M5). Number of times we've
+    // re-seeded `brainPrefix` via sendClientContent — increments on
+    // every successful (re)connect that has a non-empty brainPrefix.
+    // Always-replay is intentional (R2 C3): the bridge cannot
+    // distinguish "valid resume — server has history" from "handle
+    // silently rejected — server is fresh", so we re-seed every time
+    // and accept the duplicate-history token cost on valid resumes.
+    // The brain_prefix_reseeded PostHog event at session-end makes the
+    // cost operator-visible.
+    this._seedReplayCount = 0;
+    this._lastSeedByteSize = 0;
   }
 
-  async open({ model, sessionId, systemInstruction }) {
+  // Brain wire-up (PR-2). Surface seed-replay metrics to the proxy at
+  // session-end so brain_prefix_reseeded PostHog event can carry them.
+  getSeedMetrics() {
+    return {
+      replayCount: this._seedReplayCount,
+      lastByteSize: this._lastSeedByteSize,
+    };
+  }
+
+  async open({ model, sessionId, systemInstruction, brainPrefix }) {
     // Phase 0.5 fix (2026-05-07). Capture open args so reopen() can
     // re-call with identical params on Google's documented post-turn
     // 1000-close bug (js-genai#707). Without this, after Gemini closes
     // the pipe is dead and turn 2+ silently fail with bridge_not_open.
-    this._lastOpenArgs = { model, sessionId, systemInstruction };
+    // Brain wire-up (PR-2): brainPrefix rides _lastOpenArgs so the
+    // existing reopen() path replays it on every connect (R2 C3).
+    this._lastOpenArgs = { model, sessionId, systemInstruction, brainPrefix };
     const ai = client(this._apiKey);
     this._sessionId = sessionId;
     this._model = model;
@@ -148,6 +189,33 @@ export class GeminiBridge extends EventEmitter {
       };
       this.on('event', h);
     });
+
+    // Brain wire-up (PR-2). Seed paired user/model history via
+    // sendClientContent BEFORE returning from open(). turnComplete:false
+    // so the server holds inference until the user's first audio frame
+    // triggers auto-VAD turn-end (R2 C2). 250ms margin to give the
+    // server time to ingest before the proxy signals 'ready' to the
+    // client (R3 M7 — pre-merge spike measures p99 across payload sizes
+    // and pins this constant; 250ms is the placeholder).
+    if (Array.isArray(brainPrefix) && brainPrefix.length > 0) {
+      try {
+        this._session.sendClientContent({
+          turns: brainPrefix,
+          turnComplete: false,
+        });
+        this._seedReplayCount += 1;
+        try {
+          this._lastSeedByteSize = Buffer.byteLength(
+            JSON.stringify(brainPrefix), 'utf8',
+          );
+        } catch { /* ignore */ }
+        await new Promise((r) => setTimeout(r, BRAIN_SEED_MARGIN_MS));
+      } catch (seedErr) {
+        // Don't fatal-fail the connect on seed error — degrade to
+        // persona-only. The proxy emits a Sentry breadcrumb upstream.
+        console.warn(`[gemini-bridge] sendBrainPrefix failed: ${seedErr?.message || seedErr}`);
+      }
+    }
   }
 
   _onMessage(m) {

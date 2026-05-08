@@ -35,6 +35,8 @@ import { resolveAvatarProvider } from '@/lib/avatar/resolver';
 import type { AvatarProvider } from '@/lib/avatar/avatar-bridge';
 import type { AvatarEnvelope } from '@/lib/avatar/avatar-envelope';
 import { mintVoiceTicket, VoiceTicketMintError } from '@/lib/voice/mint-voice-ticket';
+import { buildBrainPrefix } from '@/lib/voice/brain-prefix';
+import { shouldEmitBrainNotReady } from '@/lib/voice/brain-not-ready-dedupe';
 import { resolveVoiceId } from '@/lib/voice/env-scoped-voice-id';
 import { createHash, randomUUID } from 'node:crypto';
 import { candidateTokenHashes, isValidTokenPlaintext } from '@/lib/recording/referral-token';
@@ -100,16 +102,56 @@ export async function POST(req: NextRequest) {
   if (!isAllowedWireModel(wireModel)) return json(400, { error: 'model_not_allowed' });
   const enumModel = WIRE_TO_ENUM[wireModel];
 
-  // Resolve the creator's simli_face_id + env-scoped voice_id before
-  // opening the session. No row → 404 early. We read with the service-role
-  // client because `creators` public SELECT is "published only" — drafts
-  // still need to route (admin preview).
+  // R3 audit C1 (brain wire-up): hook ↔ creator binding pre-check.
+  // session_open RPC also enforces this at migration 20260511000000;
+  // doing it here as well returns a clean 400 typed error before the
+  // RPC round-trip.
+  //
+  // PR-2 audit C1: PostgREST `videos!inner` embed can return the joined
+  // resource as either an object OR an array depending on FK cardinality
+  // detection. hooks.video_id → videos.id is many-to-one so we expect
+  // an object today, but normalize defensively. Wrapped in try/catch so
+  // a future schema regression surfaces as 500 with Sentry context, not
+  // a TypeError leaking through.
+  type EmbedShape = { creator_id?: string };
+  let hookBindingCreatorId: string | null = null;
+  try {
+    const { data: hookBinding, error: bindingErr } = await admin
+      .from('hooks')
+      .select('id, video:videos!inner(creator_id)')
+      .eq('id', hookId)
+      .maybeSingle<{ id: string; video: EmbedShape | EmbedShape[] | null }>();
+    if (bindingErr) {
+      Sentry.captureException(bindingErr, { extra: { op: 'sessions_open_hook_binding', hook_id: hookId } });
+      return json(500, { error: 'hook_lookup_failed' });
+    }
+    if (!hookBinding) {
+      return json(400, { error: 'hook_creator_mismatch' });
+    }
+    const v = hookBinding.video;
+    hookBindingCreatorId = Array.isArray(v) ? (v[0]?.creator_id ?? null) : (v?.creator_id ?? null);
+  } catch (e) {
+    Sentry.captureException(e, { extra: { op: 'sessions_open_hook_binding_throw', hook_id: hookId } });
+    return json(500, { error: 'hook_lookup_failed' });
+  }
+  if (hookBindingCreatorId !== creatorId) {
+    return json(400, { error: 'hook_creator_mismatch' });
+  }
+
+  // Resolve the creator's simli_face_id + env-scoped voice_id + brain
+  // payload before opening the session. No row → 404 early. We read with
+  // the service-role client because `creators` public SELECT is
+  // "published only" — drafts still need to route (admin preview).
   //
   // R3-Missing-1 / R4-M6 — three voice_id columns scoped by VERCEL_ENV.
   // resolveVoiceId() picks the env-appropriate value.
+  //
+  // Brain wire-up (PR-2): SELECT system_prompt + brain_status alongside
+  // existing columns so the route can hard-fail unready creators with
+  // 409 brain_not_ready (R3 audit M1).
   const { data: creatorRow, error: creatorErr } = await admin
     .from('creators')
-    .select('id, simli_face_id, heygen_avatar_id, voice_id, voice_id_preview, voice_id_dev, published_at')
+    .select('id, simli_face_id, heygen_avatar_id, voice_id, voice_id_preview, voice_id_dev, published_at, system_prompt, brain_status')
     .eq('id', creatorId)
     .maybeSingle<{
       id: string;
@@ -119,9 +161,62 @@ export async function POST(req: NextRequest) {
       voice_id_preview: string | null;
       voice_id_dev: string | null;
       published_at: string | null;
+      system_prompt: string | null;
+      brain_status: 'pending' | 'queued' | 'training' | 'ready' | 'errored';
     }>();
   if (creatorErr) return json(500, { error: 'creator_lookup_failed' });
   if (!creatorRow) return json(404, { error: 'creator_not_found' });
+
+  // Brain readiness gate (R3 audit M1 — hard-fail decision).
+  // The plan exists to prevent generic-mentor fallback in the cloned
+  // voice. If the creator's persona isn't compiled OR brain_status
+  // hasn't graduated to 'ready', refuse the session with a 409 so it
+  // surfaces as a visible product error, not silently degraded.
+  //
+  // Admin-preview escape: if the caller has an active admin role,
+  // bypass the gate so admins can test against in-flight creators.
+  // Logged as `brain.admin_preview` Sentry breadcrumb so the bypass is
+  // observable in production.
+  const brainReady =
+    creatorRow.brain_status === 'ready' && creatorRow.system_prompt !== null;
+  if (!brainReady) {
+    const { data: adminRow } = await admin
+      .from('admin_roles')
+      .select('user_id')
+      .eq('user_id', callerUserId)
+      .is('revoked_at', null)
+      .maybeSingle();
+    if (!adminRow) {
+      // PR-2 audit C4: dedupe per-creator with 5min TTL so a single
+      // misconfigured creator can't pump 1000 Sentry events/min.
+      if (shouldEmitBrainNotReady(creatorId)) {
+        Sentry.captureMessage('brain.not_ready', {
+          level: 'error',
+          extra: {
+            creator_id: creatorId,
+            brain_status: creatorRow.brain_status,
+            system_prompt_present: creatorRow.system_prompt !== null,
+          },
+        });
+      }
+      return json(409, {
+        error: 'brain_not_ready',
+        creator_id: creatorId,
+        brain_status: creatorRow.brain_status,
+      });
+    }
+    Sentry.addBreadcrumb({
+      category: 'brain',
+      level: 'info',
+      message: 'admin_preview',
+      data: { creator_id: creatorId, brain_status: creatorRow.brain_status },
+    });
+    captureServerSafe(callerUserId, 'brain_admin_preview', {
+      admin_user_id: callerUserId,
+      creator_id: creatorId,
+      brain_status_at_open: creatorRow.brain_status,
+    });
+  }
   // Avatar provider readiness is checked AFTER tier resolution below —
   // a free-tier user routed through Simli needs simli_face_id; a heygen
   // user needs heygen_avatar_id. Don't block here on a missing simli id
@@ -505,6 +600,53 @@ export async function POST(req: NextRequest) {
     return json(502, { error: 'gemini_mint_failed' });
   }
 
+  // ── Brain prefix build (PR-2) ───────────────────────────────────────
+  // Pulls sample_content rows whose topic_tags overlap hook.topic_tags
+  // and packages them as paired user/model `prefixTurns`. Server-only
+  // (sample_content can carry PII; never reaches the client). On any
+  // error, degrade to persona-only (system_prompt without prefix) and
+  // breadcrumb so we can find detachment in production.
+  let brainPrefix: Awaited<ReturnType<typeof buildBrainPrefix>> = null;
+  try {
+    brainPrefix = await buildBrainPrefix({
+      supabaseAdmin: admin,
+      creatorId,
+      hookId,
+    });
+    if (brainPrefix) {
+      captureServerSafe(callerUserId, 'brain_prefix_built', {
+        creator_id: creatorId,
+        hook_id: hookId,
+        source_count: brainPrefix.sourceCount,
+        total_raw_chars: brainPrefix.totalRawChars,
+        encoded_bytes: brainPrefix.encodedBytes,
+        selected_topic_count: brainPrefix.selectedTopicSlugs.length,
+      });
+    } else {
+      captureServerSafe(callerUserId, 'brain_prefix_skipped', {
+        creator_id: creatorId,
+        hook_id: hookId,
+        reason: 'no_overlap',
+      });
+      Sentry.addBreadcrumb({
+        category: 'brain',
+        level: 'info',
+        message: 'partial_prefix',
+        data: { creator_id: creatorId, hook_id: hookId },
+      });
+    }
+  } catch (prefixErr) {
+    Sentry.captureException(prefixErr, {
+      extra: { op: 'sessions_open_brain_prefix', creator_id: creatorId, hook_id: hookId },
+    });
+    captureServerSafe(callerUserId, 'brain_prefix_skipped', {
+      creator_id: creatorId,
+      hook_id: hookId,
+      reason: 'builder_error',
+    });
+    brainPrefix = null;
+  }
+
   // ── Mint voice ticket (proxy WS auth — fatal on failure) ─────────────
   // SIMLI_WIREUP §2 — pre-mint a UA-bound, session-pinned ticket so the
   // browser can open the proxy WS without a second client RTT.
@@ -528,6 +670,14 @@ export async function POST(req: NextRequest) {
       // the legacy attach-path behavior.
       avatarProvider: avatarProvider ?? 'simli',
       ua:            req.headers.get('user-agent') ?? '',
+      // Brain wire-up (PR-2). Both already pre-validated:
+      //   * system_prompt: octet_length ≤ 2000 enforced by creators
+      //     CHECK at compile time
+      //   * prefixTurns: encodedBytes < 90KB enforced by buildBrainPrefix
+      //     before return
+      // The DB CHECKs on voice_tickets are defense-in-depth.
+      systemPrompt: creatorRow.system_prompt,
+      prefixTurns:  brainPrefix?.prefixTurns ?? null,
     });
   } catch (e) {
     Sentry.captureException(e, { extra: { op: 'sessions_open_voice_ticket', session_id: sessionId } });

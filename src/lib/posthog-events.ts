@@ -76,6 +76,13 @@ export const ServerEvents = {
   daily_cap_hit_fired:    'daily_cap_hit_fired',
   referral_first_session: 'referral_first_session',
   referral_landing:       'referral_landing',
+  // Brain wire-up (PR-2). Fire from session-open + rollover routes.
+  brain_prefix_built:     'brain_prefix_built',
+  brain_prefix_skipped:   'brain_prefix_skipped',
+  brain_admin_preview:    'brain_admin_preview',
+  // Brain wire-up (PR-2). Fired by proxy at session-end so the
+  // always-replay token cost (R3 audit M5/R6) is operator-visible.
+  brain_prefix_reseeded:  'brain_prefix_reseeded',
 } as const;
 
 // ── Type unions ─────────────────────────────────────────────────────────────
