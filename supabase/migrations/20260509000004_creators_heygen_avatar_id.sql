@@ -2,9 +2,15 @@
 --
 -- HeyGen wireup, migration 4 of 4. Adds the per-creator HeyGen avatar
 -- identifier, parallel to creators.simli_face_id (migration
--- 20260420000011:25). Set once per creator at the end of the HeyGen
--- face-upload flow (face_clone_uploads.vendor='heygen' → state='ready'
--- → finalize hook copies vendor_face_id into this column).
+-- 20260420000011:25).
+--
+-- Provisioning today: manual SQL only. As of 2026-05-08 there is NO
+-- admin UI / API that writes this column. `/api/admin/face-upload` is
+-- Simli-only (Trinity-1 image clone). Until a HeyGen face-upload path
+-- is wired (planned: extend `face_clone_uploads.vendor` to 'heygen' +
+-- finalize hook copies vendor_face_id here), HeyGen is unreachable for
+-- any creator without a hand-rolled UPDATE. See Phase C punch list
+-- B2.6 for the wiring plan.
 --
 -- Format: HeyGen avatar IDs are UUID v4. NOT enforced as a CHECK here
 -- because face_clone_uploads.vendor_face_id has the canonical 1–128 char

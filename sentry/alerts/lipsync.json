@@ -54,6 +54,50 @@
         "time_window_minutes": 10
       },
       "comment": "GDPR-erasure / force-retrain race surfaces as replica_not_found mid-session. >3 in 10min = a worker-vs-session race we missed."
+    },
+    {
+      "name": "proxy_session_evicted_high",
+      "type": "issue_alert",
+      "query": "event.type:error error.value:proxy_session_evicted",
+      "trigger": {
+        "label": "session_evicted_5_in_10min",
+        "count_threshold": 5,
+        "time_window_minutes": 10
+      },
+      "comment": "Single-WS-per-session enforcement (R4-C1) evicted the prior tab's WS. Fires on the OLD client as the {type:'error',code:'session_evicted'} text frame at server/voice-proxy/index.js:490 — surfaces the iOS Safari WS-close-then-reconnect race per memory `project_ios_4002_reconnect`. The pre-session 4002 close on the NEW client is silent today (no captureSafe('ws_close',...) at use-session-pipe.ts:769); coverage of that side waits on Phase C punch-list B1.3."
+    },
+    {
+      "name": "proxy_quota_state_inconsistent_any",
+      "type": "issue_alert",
+      "query": "event.type:error error.value:proxy_quota_state_inconsistent",
+      "trigger": {
+        "label": "quota_state_inconsistent_1_in_60min",
+        "count_threshold": 1,
+        "time_window_minutes": 60
+      },
+      "comment": "P0002 from voice_check_quota / voice_accumulate_seconds OR R4-C2 22003 oob — real consistency bug, never a cap hit. Any occurrence pages."
+    },
+    {
+      "name": "proxy_kill_switch_fired_high",
+      "type": "issue_alert",
+      "query": "event.type:error error.value:proxy_kill_switch_fired",
+      "trigger": {
+        "label": "kill_switch_3_in_60min",
+        "count_threshold": 3,
+        "time_window_minutes": 60
+      },
+      "comment": "150% daily-cap latch fired (sessions_enforce_tier_and_kill_switch trigger). Per-user it is rare-by-design. >3/hr across users = pricing math drift or trigger misconfig. Coverage = MID-SESSION ONLY: turn_start gate at server/voice-proxy/index.js:928 emits {type:'error',code:'kill_switch_fired'} which use-session-pipe.ts:641 captures as `proxy_kill_switch_fired`. Pre-session 4003 close at server/voice-proxy/index.js:469 is silent today; that side waits on Phase C punch-list B1.3."
+    },
+    {
+      "name": "user_ws_backpressure_cap_high",
+      "type": "issue_alert",
+      "query": "event.type:error error.value:user_ws_backpressure_cap",
+      "trigger": {
+        "label": "backpressure_3_in_10min",
+        "count_threshold": 3,
+        "time_window_minutes": 10
+      },
+      "comment": "User WS bufferedAmount > 2 MB (R3-C2). One-off = bad network; sustained = relay loop not draining. Captured at server/voice-proxy/index.js:721 as bare `user_ws_backpressure_cap` (no `proxy_` prefix because it's a server-side, not client-side, capture)."
     }
   ]
 }
