@@ -36,8 +36,24 @@ describe('priorityList', () => {
   it('desktop-safari also leads with mp4', () => {
     expect(priorityList('desktop-safari')[0]).toMatch(/^video\/mp4/);
   });
-  it('android leads with webm/vp9', () => {
-    expect(priorityList('android')[0]).toBe('video/webm;codecs=vp9,opus');
+  it('android leads with mp4 (avc1+aac) — WhatsApp/etc refuse webm', () => {
+    const list = priorityList('android');
+    expect(list[0]).toMatch(/^video\/mp4/);
+    // WebM still in the chain as last-resort fallback for old devices.
+    expect(list).toContain('video/webm;codecs=vp9,opus');
+    expect(list.indexOf('video/webm;codecs=vp9,opus')).toBeGreaterThan(list.indexOf('video/mp4;codecs=avc1.42E01E,mp4a.40.2'));
+  });
+  it('android falls back to webm if mp4 is not supported (degenerate browser)', () => {
+    const supported = new Set(['video/webm;codecs=vp9,opus']);
+    const result = pickMime(priorityList('android'), (m) => supported.has(m));
+    expect(result?.container).toBe('webm');
+  });
+  it('android with full mp4+webm support picks mp4 (WhatsApp regression 2026-05-08)', () => {
+    // Modern Android Chrome 113+ supports both — assert mp4 wins.
+    const result = pickMime(priorityList('android'), () => true);
+    expect(result?.container).toBe('mp4');
+    expect(result?.mimeType).toBe('video/mp4;codecs=avc1.42E01E,mp4a.40.2');
+    expect(result?.extension).toBe('mp4');
   });
   it('desktop leads with webm/vp9', () => {
     expect(priorityList('desktop')[0]).toBe('video/webm;codecs=vp9,opus');

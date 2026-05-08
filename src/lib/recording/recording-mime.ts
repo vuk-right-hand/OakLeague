@@ -5,15 +5,14 @@
 //
 // Browser priorities:
 //   iOS Safari 17+   prefers mp4 (avc1+aac).
-//   Android Chrome   prefers webm (vp9+opus).
-//   Desktop Chrome   prefers webm (vp9+opus).
+//   Android Chrome   prefers mp4 (avc1+aac) — WhatsApp on Android refuses
+//                    WebM containers entirely (verified 2026-05-08, both
+//                    direct-share and Photos→WhatsApp paths). Android Chrome
+//                    113+ supports MP4 in MediaRecorder; we fall back to
+//                    WebM only if the device probe says MP4 is unsupported.
+//   Desktop Chrome   prefers webm (vp9+opus) — desktop downloads, never
+//                    shares to a mobile messenger directly.
 //   Desktop Safari   prefers mp4.
-//
-// Web Share API on iOS accepts mp4 natively. Android Chrome's share sheet
-// accepts webm to most apps but TT/IG/X often re-encode anyway. Plan §6 is
-// explicit that v1 ships a "Save & Share" CTA on Android (download the
-// webm, user shares via system) rather than blocking on cross-container
-// transcode.
 
 export type RecordingMime = {
   /** The full MediaRecorder mimeType string with codec params. */
@@ -24,11 +23,13 @@ export type RecordingMime = {
   container: 'mp4' | 'webm';
 };
 
-// Priority list — iOS gets mp4 first; everywhere else, webm/vp9 leads.
-// Each entry is probed against MediaRecorder.isTypeSupported in order.
-// Empty-string fallback at the end means "let MediaRecorder pick"; we
-// don't actually use it in v1 because partial-codec MIMEs without a
-// concrete container produce inconsistent blobs.
+// Priority list — mobile share surfaces (iOS, desktop-Safari, Android) get
+// mp4 first; desktop/unknown lead with webm/vp9 because they download rather
+// than share to a chat app. Each entry is probed against
+// MediaRecorder.isTypeSupported in order. The controller iterates the
+// supported subset, attempting MediaRecorder construction on each — some
+// Android Chrome forks return true from isTypeSupported but throw
+// NotSupportedError from the constructor for the same string.
 const MP4_AVCC_AAC = 'video/mp4;codecs=avc1.42E01E,mp4a.40.2';
 const MP4_AVC1_AAC = 'video/mp4;codecs=avc1,mp4a.40.2';
 const WEBM_VP9_OPUS = 'video/webm;codecs=vp9,opus';
@@ -58,10 +59,14 @@ export function classifyPlatform(userAgent: string): Platform {
  *  Exported separately so tests can assert ordering without monkey-patching
  *  MediaRecorder. */
 export function priorityList(platform: Platform): string[] {
-  if (platform === 'ios' || platform === 'desktop-safari') {
+  // mp4-first for every mobile-share surface. Android joined the mp4-first
+  // list 2026-05-08 because WhatsApp on Android refuses webm — and TT/IG/X/FB
+  // all accept mp4 too, so there's no mobile-share surface left where webm
+  // beats mp4.
+  if (platform === 'ios' || platform === 'desktop-safari' || platform === 'android') {
     return [MP4_AVCC_AAC, MP4_AVC1_AAC, MP4_BARE, WEBM_VP9_OPUS, WEBM_VP8_OPUS, WEBM_BARE];
   }
-  // android, desktop, unknown — webm-first.
+  // desktop, unknown — webm-first (desktop downloads, doesn't share to chat apps).
   return [WEBM_VP9_OPUS, WEBM_VP8_OPUS, WEBM_BARE, MP4_AVCC_AAC, MP4_AVC1_AAC, MP4_BARE];
 }
 
@@ -81,12 +86,29 @@ export function pickMime(
   return null;
 }
 
-/** Top-level entry. Reads navigator.userAgent + MediaRecorder.isTypeSupported.
- *  Returns null when MediaRecorder is unavailable OR no candidate is supported
- *  (iOS Safari < 14.3 falls in the "no candidate" bucket and the controller
- *  surfaces 'unsupported' to the user). */
-export function selectRecordingMime(): RecordingMime | null {
-  if (typeof MediaRecorder === 'undefined' || typeof navigator === 'undefined') return null;
+/** Top-level entry. Reads navigator.userAgent + MediaRecorder.isTypeSupported,
+ *  returning the classified platform and ALL supported MIMEs in priority
+ *  order. Controller iterates `mimes` and tries MediaRecorder construction
+ *  on each — `isTypeSupported` returning true is necessary but not
+ *  sufficient on some Android Chrome forks. `platform` flows into telemetry
+ *  so we can split webm vs mp4 outcomes by surface after a rollout. */
+export function probeRecording(): { platform: Platform; mimes: RecordingMime[] } {
+  if (typeof MediaRecorder === 'undefined' || typeof navigator === 'undefined') {
+    return { platform: 'unknown', mimes: [] };
+  }
   const platform = classifyPlatform(navigator.userAgent || '');
-  return pickMime(priorityList(platform), (mime) => MediaRecorder.isTypeSupported(mime));
+  const mimes: RecordingMime[] = [];
+  for (const candidate of priorityList(platform)) {
+    if (MediaRecorder.isTypeSupported(candidate)) {
+      const container = candidate.startsWith('video/mp4') ? 'mp4' : 'webm';
+      mimes.push({ mimeType: candidate, extension: container, container });
+    }
+  }
+  return { platform, mimes };
+}
+
+/** First-supported helper preserved for callers that don't need the full list
+ *  or platform classification. */
+export function selectRecordingMime(): RecordingMime | null {
+  return probeRecording().mimes[0] ?? null;
 }

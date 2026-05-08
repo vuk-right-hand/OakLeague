@@ -43,7 +43,7 @@ import {
   releaseStream,
   requestMediaPermission,
 } from './permission';
-import { selectRecordingMime } from './recording-mime';
+import { probeRecording, type RecordingMime } from './recording-mime';
 import {
   MAX_RECORDING_MS,
   type RecordingPhase,
@@ -346,7 +346,12 @@ export function useRecordingController(
     const tapAtMs = performance.now();
     dispatch({ type: 'TAP', nowMs: tapAtMs });
     sessionModeRef.current = mode;
-    captureSafe('react_tap', { mode });
+
+    // Probe at TAP so `platform` is available for ALL telemetry below
+    // (permission_denied / capture_error / armed / stopped). Pure function;
+    // no side effects, safe to call before permission grant.
+    const { platform, mimes: supportedMimes } = probeRecording();
+    captureSafe('react_tap', { mode, platform });
 
     // 1) Permission. Hook/longform: video+audio. Ask: video only — mic is
     //    borrowed from the Ask scene (audit C4 Day 3). Camera is still ours
@@ -366,12 +371,12 @@ export function useRecordingController(
     } catch (e) {
       const code = e instanceof RecordingPermissionError ? e.code : 'unknown';
       if (code === 'denied' || code === 'security') {
-        captureSafe('react_permission_denied', { mode, reason: code });
+        captureSafe('react_permission_denied', { mode, reason: code, platform });
         dispatch({ type: 'PERMISSION_DENIED', nowMs: performance.now() });
       } else if (code === 'disabled' || code === 'unsupported') {
         dispatch({ type: 'CAP_HIT', reason: code === 'disabled' ? 'feature_disabled' : 'unsupported', nowMs: performance.now() });
       } else {
-        captureSafe('react_capture_error', { mode, code });
+        captureSafe('react_capture_error', { mode, code, platform });
         dispatch({ type: 'RECORDER_ERROR', nowMs: performance.now(), message: String(code) });
       }
       return;
@@ -406,9 +411,8 @@ export function useRecordingController(
     try { await camEl.play(); } catch { /* expected — see above */ }
     camVideoElRef.current = camEl;
 
-    // 4) MIME probe.
-    const mime = selectRecordingMime();
-    if (!mime) {
+    // 4) MIME probe (already done at TAP — see `supportedMimes` above).
+    if (supportedMimes.length === 0) {
       dispatch({ type: 'CAP_HIT', reason: 'unsupported', nowMs: performance.now() });
       teardown();
       return;
@@ -638,15 +642,35 @@ export function useRecordingController(
     const audioTrack = mixer.recordingStream.getAudioTracks()[0];
     if (audioTrack) videoStream.addTrack(audioTrack);
 
-    let recorder: MediaRecorder;
-    try {
-      recorder = new MediaRecorder(videoStream, {
-        mimeType: mime.mimeType,
-        videoBitsPerSecond: 2_000_000,
-        audioBitsPerSecond: 128_000,
-      });
-    } catch (e) {
-      dispatch({ type: 'RECORDER_ERROR', nowMs: performance.now(), message: (e as Error).message });
+    // Constructor fallback (audit M3 2026-05-08): some Android Chrome forks
+    // return true from `MediaRecorder.isTypeSupported(<mp4 with codec params>)`
+    // but throw NotSupportedError from the constructor for the same string.
+    // Walk the supported list until one constructs successfully; only fail if
+    // every candidate throws.
+    let recorder: MediaRecorder | null = null;
+    let mime: RecordingMime | null = null;
+    let lastErr: unknown = null;
+    for (const candidate of supportedMimes) {
+      try {
+        recorder = new MediaRecorder(videoStream, {
+          mimeType: candidate.mimeType,
+          videoBitsPerSecond: 2_000_000,
+          audioBitsPerSecond: 128_000,
+        });
+        mime = candidate;
+        break;
+      } catch (e) {
+        lastErr = e;
+        captureSafe('react_recorder_construct_failed', {
+          mode,
+          platform,
+          attempted_mime: candidate.mimeType,
+          error: (e as Error)?.message ?? 'unknown',
+        });
+      }
+    }
+    if (!recorder || !mime) {
+      dispatch({ type: 'RECORDER_ERROR', nowMs: performance.now(), message: (lastErr as Error)?.message ?? 'no candidate constructible' });
       teardown();
       return;
     }
@@ -681,6 +705,9 @@ export function useRecordingController(
         duration_ms: durationMs,
         stop_reason: stopReason,
         blob_size: blob.size,
+        mime_type: mime.mimeType,
+        container: mime.container,
+        platform,
       });
       dispatch({ type: 'PREVIEW_ARRIVED', nowMs: performance.now(), durationMs });
       try { onStopRef.current?.(previewRef.current); } catch (e) {
@@ -710,6 +737,9 @@ export function useRecordingController(
     captureSafe('react_armed', {
       mode,
       ms_to_arm: Math.round(armedAtMs - tapAtMs),
+      mime_type: mime.mimeType,
+      container: mime.container,
+      platform,
     });
     dispatch({ type: 'PERMISSION_GRANTED', nowMs: armedAtMs });
     // Schedule the end-card rising edge precisely (audit M2): setTimeout

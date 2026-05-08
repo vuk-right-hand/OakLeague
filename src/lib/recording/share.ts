@@ -10,6 +10,12 @@
 // Android Chrome typically accepts the file but the receiving app often
 // re-encodes (TT/IG/X). That's the user's responsibility, not ours.
 //
+// WhatsApp on Android is the load-bearing exception: it REJECTS WebM files
+// outright (verified 2026-05-08, both direct-share AND Photos→WhatsApp
+// paths fail). That's why recording-mime.ts puts mp4 first on Android too.
+// This file is MIME-driven (extensionForMime) so the share path follows
+// whatever MediaRecorder produced; no Android-specific code lives here.
+//
 // Desktop / unsupported: trigger a blob-URL download. The user gets a file
 // they can drag into their preferred channel.
 //

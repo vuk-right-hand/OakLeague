@@ -157,4 +157,24 @@ describe('shareOrSave — Web Share path', () => {
     expect(r.kind).toBe('downloaded');
     expect(downloads).toHaveLength(1);
   });
+
+  it('mp4 input yields a File with bare video/mp4 type and .mp4 extension (Android WhatsApp regression 2026-05-08)', async () => {
+    // The bug this guards: WhatsApp on Android refuses WebM and refuses MP4
+    // files whose `type` carries codec params. We strip the params (via
+    // stripCodecParams) and the extension comes from extensionForMime.
+    const { sharedWith } = installFakeDom({
+      share: () => {},
+      canShare: () => true,
+    });
+    await shareOrSave({
+      blob: new Blob([new Uint8Array([1, 2, 3])], { type: 'video/mp4' }),
+      mimeType: 'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+      shortId: 'WHATSAPP',
+    });
+    expect(sharedWith).toHaveLength(1);
+    const file = (sharedWith[0].files ?? [])[0] as File | undefined;
+    expect(file).toBeDefined();
+    expect(file!.type).toBe('video/mp4'); // bare — no codec params
+    expect(file!.name).toBe('oakleague-WHATSAPP.mp4');
+  });
 });
