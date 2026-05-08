@@ -353,6 +353,31 @@ async function checkQuotaOk(sessionId) {
   return gate;
 }
 
+// Phase C B4.5: System B (voice_usage_daily/weekly) counter writer.
+// Parallel to accumulateSeconds (which writes System A's daily_quotas).
+// Different currency by design: System A sums mic + assistant talk
+// (broad usage); System B is just assistant talk seconds — Cartesia
+// audio when available, Gemini outputSeconds fallback. Migration
+// 20260428000002 §"WHY seconds as the currency" treats Cartesia
+// voice_tts_audio_seconds as the authoritative cap meter.
+//
+// Idempotent at the RPC level (PK on user_id, session_id, turn_number);
+// a retry from a transient Postgres error is a no-op. Non-fatal: if the
+// counter row fails the user gets an under-count for the turn, but
+// System A's 150% latch is the backstop.
+async function recordVoiceUsage({ userId, sessionId, turnNumber, seconds, turnStartedAt }) {
+  if (!Number.isFinite(seconds) || seconds < 0) return;
+  if (!turnNumber || turnNumber <= 0) return;
+  const { error } = await supabase.rpc('voice_usage_record', {
+    p_user_id: userId,
+    p_session_id: sessionId,
+    p_turn_number: turnNumber,
+    p_seconds: Number(seconds.toFixed(4)),
+    p_turn_started_at: turnStartedAt ? new Date(turnStartedAt).toISOString() : null,
+  });
+  if (error) throw error;
+}
+
 // Returns { ok, fatal, reason }. fatal=true → caller must teardown WS with
 // a distinct code (quota-state inconsistency). Round-2 audit C5: previously
 // swallowed ALL errors, including P0002 "no daily_quotas row" which grants
@@ -518,6 +543,11 @@ wss.on('connection', async (ws, req) => {
   let heartbeatInterval = null;
   let turnNumber = 0;
   let cartesiaTurnDead = false; // R3-M1 / R4-S1 — relay-loop gate for barge-in
+  // Phase C B4.5: wall-clock turn-start anchor for voice_usage_record's
+  // day-bucketing. A turn that begins at 23:58 → 00:05 books to the day
+  // it began (matches user intuition; admin "usage per day" reports use
+  // the same anchor). Reset at every turn_start.
+  let turnStartedAt = null;
 
   // Post-build audit C3 — HeyGen LiveAvatar Lite heartbeat.
   // Server drops the WS at ~120s of voice silence (Phase 0 §9). The
@@ -931,6 +961,7 @@ wss.on('connection', async (ws, req) => {
           return closeWs(ws, closeCode, gate.reason);
         }
         turnNumber += 1;
+        turnStartedAt = Date.now(); // Phase C B4.5 — voice_usage_record day anchor
         // R3-M1 / U-C5 — clear the relay-loop barge-in flag BEFORE bridge
         // turnStart so any race with a stale chunk in the WS receive
         // buffer drops cleanly. (Was post-turnStart; moved per audit C3.)
@@ -1090,6 +1121,50 @@ wss.on('connection', async (ws, req) => {
             // should be handling, but we want to see it.
             captureException(e, { level: 'warning', op: 'accumulateSeconds', sessionId });
           });
+
+        // Phase C B4.5 — System B counter (voice_usage_daily/weekly).
+        // Currency = "audio the user actually heard" (migration
+        // 20260428000002 §"WHY seconds as the currency"). When useCartesia,
+        // cartesiaMetrics.audioSeconds is the truth — even on partial:true
+        // it reports delivered audio bytes / sample rate, so it accurately
+        // captures the partial-delivered seconds. We DO NOT fall back to
+        // Gemini's outputSeconds on Cartesia partial (audit C1): outputSeconds
+        // is the DISCARDED Gemini audio in Pipeline α' — billing the user
+        // for audio they never heard would create support tickets. System
+        // A's quotaSeconds above intentionally over-bills on partial as a
+        // kill-switch safety; System B is the user-facing cap contract
+        // and must under-bill on uncertainty.
+        //
+        // Without this write, voice_usage_ticket_check at /api/sessions/open
+        // reads counters always at 0 → returns full remaining → 5min/15min
+        // cap never enforces.
+        //
+        // M1: dropped the `> 0` guard so zero-second turns still write the
+        // idempotency row. voice_usage_turns is the per-turn audit ledger;
+        // a missing row would mean a duplicate turn-end retry could re-claim.
+        //
+        // M2 follow-up: on R4-C1 WS-eviction the new WS reuses sessionId
+        // but starts turnNumber=0 → PK collision with the evicted WS's
+        // entries silently drops counter increments via ON CONFLICT DO
+        // NOTHING. Rare in practice (user opens second tab during own
+        // session). Tracked as Phase C punch-list item; fix is a
+        // MAX(turn_number)+1 lookup on connection setup.
+        let assistantSeconds;
+        if (useCartesia) {
+          assistantSeconds = cartesiaMetrics?.audioSeconds || 0;
+        } else {
+          assistantSeconds = metrics?.outputSeconds || 0;
+        }
+        recordVoiceUsage({
+          userId, sessionId, turnNumber,
+          seconds: assistantSeconds,
+          turnStartedAt,
+        }).catch((e) => {
+          // Non-fatal: counter undercount for this turn. System A's
+          // 150% latch (now correctly anchored to profile cap after
+          // 20260510000001) is the backstop.
+          captureException(e, { level: 'warning', op: 'voice_usage_record', sessionId });
+        });
       } else if (msg.type === 'cancel') {
         // R3-M1 / R4-S1 — set the relay-loop flag SYNCHRONOUSLY before
         // any await, then ws-send cancel to Cartesia. Bridge.cancel
