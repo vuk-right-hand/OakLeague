@@ -105,13 +105,7 @@ export function LongFormPlayer({
     (q: Quartile) => {
       if (firedRef.current.has(q)) return;
       firedRef.current.add(q);
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (window as any).posthog?.capture?.('long_form_quartile', {
-          video_id: videoId,
-          quartile: q,
-        });
-      } catch { /* noop */ }
+      captureSafe('long_form_quartile', { video_id: videoId, quartile: q });
       recordFeedEvent({
         event_name: 'full_video_quartile',
         hook_id: entryHookId ?? undefined,
@@ -127,13 +121,7 @@ export function LongFormPlayer({
   // array is intentionally [] — re-firing on a navigation revisit is the
   // right semantic (each visit is a fresh "open" event).
   useEffect(() => {
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (window as any).posthog?.capture?.('long_form_open', {
-        video_id: videoId,
-        entry_hook_id: entryHookId,
-      });
-    } catch { /* noop */ }
+    captureSafe('long_form_open', { video_id: videoId, entry_hook_id: entryHookId });
     recordFeedEvent({
       event_name: 'full_video_open',
       hook_id: entryHookId ?? undefined,
@@ -270,14 +258,11 @@ export function LongFormPlayer({
   //     non-2xx (audit M7).
   const onAsk = useCallback(async () => {
     if (asking) return;
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (window as any).posthog?.capture?.('long_form_ask_clicked', {
-        video_id: videoId,
-        creator_id: creatorId,
-        authenticated: isAuthenticated,
-      });
-    } catch { /* noop */ }
+    captureSafe('long_form_ask_clicked', {
+      video_id: videoId,
+      creator_id: creatorId,
+      authenticated: isAuthenticated,
+    });
 
     if (!isAuthenticated) {
       recordFeedEvent({

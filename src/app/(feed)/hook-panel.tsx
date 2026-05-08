@@ -268,8 +268,7 @@ export function HookPanel({
     // PostHog capture deferred to a dedicated client helper — stubbed here.
     // See plan §7 observability (hook_view_start).
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (window as any).posthog?.capture?.('hook_view_start', {
+      captureSafe('hook_view_start', {
         hook_id: hook.hook_id,
         video_id: hook.video_id,
         creator_id: hook.creator_id,
@@ -582,14 +581,11 @@ export function HookPanel({
         onClick={async (e) => {
           e.stopPropagation();
           if (asking) return;
-          try {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            (window as any).posthog?.capture?.('hook_ask_clicked', {
-              hook_id: hook.hook_id,
-              creator_id: hook.creator_id,
-              authenticated: isAuthenticated,
-            });
-          } catch { /* noop */ }
+          captureSafe('hook_ask_clicked', {
+            hook_id: hook.hook_id,
+            creator_id: hook.creator_id,
+            authenticated: isAuthenticated,
+          });
 
           // Anon path: skip the API entirely. Record the auth_required
           // mic_tap so the algo sees signed-out interest, then full-page

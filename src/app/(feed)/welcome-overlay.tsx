@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import MuxPlayer from '@mux/mux-player-react';
 import type { WelcomeHook } from './feed-types';
+import { captureSafe } from '@/lib/posthog-safe-capture';
 
 type Props = {
   welcome: WelcomeHook;
@@ -41,14 +42,7 @@ export function WelcomeOverlay({ welcome, onVisibilityChange }: Props) {
     } catch {
       /* noop */
     }
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (window as any).posthog?.capture?.('welcome_dismissed', {
-        welcome_id: welcome.id,
-      });
-    } catch {
-      /* noop */
-    }
+    captureSafe('welcome_dismissed', { welcome_id: welcome.id });
   };
 
   // Audit M4: if the viewer prefers reduced motion, don't autoplay — wait

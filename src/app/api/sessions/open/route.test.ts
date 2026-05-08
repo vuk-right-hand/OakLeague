@@ -87,8 +87,14 @@ vi.mock('@/lib/recording/referral-token', () => ({
 
 const mockCaptureServerSafe = vi.fn();
 vi.mock('@/lib/posthog-server', () => ({
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  captureServerSafe: (...args: any[]) => mockCaptureServerSafe(...args),
+  // Phase C B3.1 audit fix C2: typed signature mirrors the production
+  // captureServerSafe so a mock call with an unregistered event name fails
+  // typecheck rather than silently passing while production typechecks fail.
+  captureServerSafe: (
+    distinctId: string,
+    event: import('@/lib/posthog-events').ServerPostHogEvent,
+    props?: Record<string, unknown>,
+  ) => mockCaptureServerSafe(distinctId, event, props),
 }));
 
 // next/server's `after` is a thin wrapper; vitest doesn't ship the runtime,

@@ -1,6 +1,7 @@
 import 'server-only';
 import { PostHog } from 'posthog-node';
 import { scrub } from './posthog-scrub';
+import type { ServerPostHogEvent } from './posthog-events';
 
 let client: PostHog | null = null;
 
@@ -28,7 +29,7 @@ export function posthogServer(): PostHog | null {
  */
 export async function captureServerSafe(
   distinctId: string,
-  event: string,
+  event: ServerPostHogEvent,
   props?: Record<string, unknown>,
 ): Promise<void> {
   try {
