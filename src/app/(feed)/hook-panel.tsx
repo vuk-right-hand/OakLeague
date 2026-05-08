@@ -8,6 +8,7 @@ import type { FeedItem, VideoGroup } from './feed-types';
 import { envelopeStorageKey } from '@/app/s/[id]/session-client';
 import type { OpenEnvelope } from '@/lib/avatar/avatar-envelope';
 import { recordFeedEvent } from '@/lib/feed/client-events';
+import { captureSafe } from '@/lib/posthog-safe-capture';
 import { useDeviceId } from '@/lib/feed/device-id';
 import { AskErrorPill } from '@/lib/feed/ask-error-pill';
 import { useFeedImpressionTracker } from './feed-impression-context';
@@ -633,6 +634,20 @@ export function HookPanel({
                 creator_id: hook.creator_id,
                 payload: { mic_tap_outcome: outcome },
               });
+              // Phase C B1.4: cap-hit funnel signal (cap → /upgrade). Fires
+              // ONLY for the new HTTP-429 'daily_cap_hit' surface introduced
+              // by the rewire's pre-mint cap RPC — distinct from the 5-live-
+              // tickets `rate_limited` 429 (which is abuse-rate-limit, not
+              // cap exhaustion). Funnel measurement is on PostHog where the
+              // upgrade conversion is tracked; recordFeedEvent above stays
+              // for feed-side analytics.
+              if (body?.error === 'daily_cap_hit') {
+                captureSafe('daily_cap_hit', {
+                  surface: 'hook',
+                  creator_id: hook.creator_id,
+                  hook_id: hook.hook_id,
+                });
+              }
               // CLAUDE.md hard rule: auth-affecting nav must full-page reload.
               // Cookie state can be stale post-login otherwise.
               if (r.status === 401) { window.location.href = '/login'; return; }

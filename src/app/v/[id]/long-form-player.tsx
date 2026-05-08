@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import * as Sentry from '@sentry/nextjs';
 import MuxVideo from '@mux/mux-video-react';
 import { recordFeedEvent } from '@/lib/feed/client-events';
+import { captureSafe } from '@/lib/posthog-safe-capture';
 import { useDeviceId } from '@/lib/feed/device-id';
 import { AskErrorPill } from '@/lib/feed/ask-error-pill';
 import { envelopeStorageKey } from '@/app/s/[id]/session-client';
@@ -323,6 +324,18 @@ export function LongFormPlayer({
           creator_id: creatorId,
           payload: { mic_tap_outcome: outcome },
         });
+        // Phase C B1.4: cap-hit funnel signal (cap → /upgrade). Mirrors the
+        // hook-panel emit. Distinct from `rate_limited` 429 (5-live-tickets
+        // abuse-rate-limit). PostHog event so the upgrade conversion can
+        // be funneled against this surface.
+        if (body?.error === 'daily_cap_hit') {
+          captureSafe('daily_cap_hit', {
+            surface: 'long_form',
+            creator_id: creatorId,
+            video_id: videoId,
+            hook_id: entryHookId ?? null,
+          });
+        }
         if (r.status === 401) { window.location.href = '/login'; return; }
         // Audit M7: resume play on non-auth failure so the user isn't
         // stuck on a paused frame staring at an error pill.

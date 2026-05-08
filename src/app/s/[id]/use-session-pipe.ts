@@ -196,6 +196,16 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   const closedRef = useRef<boolean>(false);
   const rollingOverRef = useRef<boolean>(false);
   const lipsyncLatencyRef = useRef<number | null>(null);
+  // Phase C B1.2: enrich session_close with last close code + duration so
+  // post-deploy regressions can be split by reason (AC #5: ±10% baseline
+  // is meaningless without per-reason breakdown). Stamped at brain_ready
+  // so duration_ms measures session-truly-started → close, NOT
+  // mount → close — pre-brain-ready failures (proxy connect, voice ticket)
+  // report duration_ms=null which the dashboard buckets separately from
+  // real session lengths. Wall-clock; clock skew across visibility-change
+  // suspends doesn't matter at this granularity.
+  const sessionStartedAtRef = useRef<number | null>(null);
+  const lastCloseCodeRef = useRef<number | null>(null);
   // Day 3 — track-update subscribers (recording controller subscribes for
   // mid-recording LiveKit renegotiation handling). Plain Set so add/remove
   // is constant-time; subscriber callbacks fire SYNCHRONOUSLY when the bridge
@@ -604,6 +614,13 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       const proxy = createProxyClient({
         onReady: () => {
           if (cancelled) return;
+          // Phase C B1.2: stamp session-truly-started for duration_ms
+          // accounting. First-set wins — in a rollover the second proxy
+          // reaches onReady but we don't reset (would lie about session
+          // length to the user-perceived clock).
+          if (sessionStartedAtRef.current === null) {
+            sessionStartedAtRef.current = Date.now();
+          }
           dispatchRef({ kind: 'brain_ready' });
           captureSafe('session_ready', { surface: 'voice', session_id: sessionIdRef.current });
         },
@@ -659,8 +676,34 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
           captureSafe('cartesia_reconnected', { session_id: sessionIdRef.current });
           dispatchRef({ kind: 'cartesia_reconnected' });
         },
-        onClose: (code, _reason, wasClean) => {
+        onClose: (code, reason, wasClean) => {
           if (cancelled) return;
+          // Phase C B1.3: surface every WS close to PostHog so 4002/4006/
+          // 4009/4010/4011/4012 are countable. Pre-rewire we discarded
+          // `code` here and only the proxy's `{type:'error',code}` text
+          // frames (mid-session) reached Sentry — pre-session and
+          // server-initiated closes were silent. Refs feed B1.2's
+          // session_close enrichment.
+          //
+          // Pairing note: a normal session emits one `ws_close` (the
+          // proxy WS close) and one `session_close` (endSession() →
+          // captureSafe at the end of the hook). Dashboards must join on
+          // session_id to dedupe — `ws_close` count > `session_close`
+          // count is not a regression.
+          //
+          // Reason cardinality: WS close reason is technically arbitrary,
+          // but the proxy emits a bounded set (server/voice-proxy/index.js
+          // header table). Defense-in-depth clamp to 64 chars in case a
+          // future provider error path forwards user-derived text.
+          lastCloseCodeRef.current = code;
+          const safeReason = reason ? String(reason).slice(0, 64) : null;
+          captureSafe('ws_close', {
+            code,
+            reason: safeReason,
+            was_clean: wasClean,
+            session_id: sessionIdRef.current,
+            tier: args.envelope.tier,
+          });
           dispatchRef({ kind: 'ws_closed', wasClean });
           if (code === 4002) {
             // session_already_active = R4-C1 eviction by another tab. Fatal.
@@ -1025,7 +1068,16 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
         body: JSON.stringify({ session_id: sessionIdRef.current, end_reason: reason }),
       });
     } catch { /* best-effort — reaper catches orphans */ }
-    captureSafe('session_close', { end_reason: reason, session_id: sessionIdRef.current });
+    captureSafe('session_close', {
+      end_reason: reason,
+      session_id: sessionIdRef.current,
+      tier: args.envelope.tier,
+      last_close_code: lastCloseCodeRef.current,
+      // null when the session never reached brain_ready (proxy connect
+      // failed, voice ticket fatal, etc.) — dashboard buckets these
+      // separately from real session lengths.
+      duration_ms: sessionStartedAtRef.current !== null ? Date.now() - sessionStartedAtRef.current : null,
+    });
     dispatch({ kind: 'closed_ack' });
   }, []);
 
