@@ -42,13 +42,15 @@ function makeMockAdmin(opts: {
         return {
           select: () => ({
             eq: () => ({
-              overlaps: (_col: string, tags: string[]) => ({
-                order: () => ({
-                  limit: async () => ({
-                    data: samples.filter((s) =>
-                      s.topic_tags.some((t) => tags.includes(t)),
-                    ),
-                    error: null,
+              neq: () => ({
+                overlaps: (_col: string, tags: string[]) => ({
+                  order: () => ({
+                    limit: async () => ({
+                      data: samples.filter((s) =>
+                        s.topic_tags.some((t) => tags.includes(t)),
+                      ),
+                      error: null,
+                    }),
                   }),
                 }),
               }),

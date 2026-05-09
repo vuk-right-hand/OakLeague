@@ -131,12 +131,15 @@ function makeAdmin() {
       if (table === 'sample_content') {
         // Brain wire-up (PR-2): buildBrainPrefix reads this. Empty result
         // → brain_prefix_skipped (no_overlap), null prefix sent to mint.
+        // .neq() chained for whole-build M1 fetch_status='errored' filter.
         return {
           select: () => ({
             eq: () => ({
-              overlaps: () => ({
-                order: () => ({
-                  limit: async () => ({ data: [], error: null }),
+              neq: () => ({
+                overlaps: () => ({
+                  order: () => ({
+                    limit: async () => ({ data: [], error: null }),
+                  }),
                 }),
               }),
             }),

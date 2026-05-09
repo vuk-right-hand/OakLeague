@@ -683,6 +683,21 @@ wss.on('connection', async (ws, req) => {
       await teardown('cartesia_no_voice');
       return closeWs(ws, 4009, 'cartesia_no_voice');
     }
+    // Whole-build audit M4: fail loud when useCartesia is on but the
+    // ticket carries no system_prompt. The cloned voice attached to a
+    // generic-mentor brain is the worst-of-both fallback the entire
+    // brain wire-up exists to prevent. The route's brain_not_ready 409
+    // gate normally catches this upstream, but if a future code path
+    // (admin preview, regression, RLS misconfiguration) bypasses it,
+    // refuse the WS rather than silently degrade. Close code 4013 is
+    // new — distinct from cartesia_no_voice so dashboards can tell
+    // brain-detached from voice-detached.
+    if (!consumed.systemPrompt) {
+      console.log(`[ws ${connId}] brain_unset_with_cartesia creator=${creatorId.slice(0,8)} ticket=${ticket.slice(0,8)}`);
+      captureMessage('brain.unset_with_cartesia', 'warning', { connId, sessionId, creatorId });
+      await teardown('brain_unset_with_cartesia');
+      return closeWs(ws, 4013, 'brain_unset_with_cartesia');
+    }
   }
 
   // R3-C3 / R4-S8 — SERIAL open: Gemini first (it doesn't accept user

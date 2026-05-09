@@ -184,12 +184,15 @@ function makeAdmin() {
       if (table === 'sample_content') {
         // Brain wire-up (PR-2): buildBrainPrefix reads this. Empty
         // result → brain_prefix_skipped (no_overlap), null prefix sent.
+        // .neq() chained for whole-build M1 fetch_status='errored' filter.
         return {
           select: () => ({
             eq: () => ({
-              overlaps: () => ({
-                order: () => ({
-                  limit: async () => ({ data: [], error: null }),
+              neq: () => ({
+                overlaps: () => ({
+                  order: () => ({
+                    limit: async () => ({ data: [], error: null }),
+                  }),
                 }),
               }),
             }),
@@ -513,7 +516,7 @@ describe('/api/sessions/open — brain wire-up gates (R3 audit C1 + M1)', () => 
     expect((await res.json()).error).toBe('hook_creator_mismatch');
   });
 
-  it('returns 409 brain_not_ready when system_prompt is null (R3 M1)', async () => {
+  it('returns 409 brain_not_ready when system_prompt is null (R3 M1 — gate semantic)', async () => {
     creatorLookupResult = {
       data: {
         ...((creatorLookupResult.data ?? {}) as Record<string, unknown>),
@@ -531,7 +534,7 @@ describe('/api/sessions/open — brain wire-up gates (R3 audit C1 + M1)', () => 
     expect(rpcCalls.map((c) => c.name)).not.toContain('session_open');
   });
 
-  it('returns 409 brain_not_ready when brain_status != ready', async () => {
+  it('returns 409 brain_not_ready when brain_status=errored (whole-build C1)', async () => {
     creatorLookupResult = {
       data: {
         ...((creatorLookupResult.data ?? {}) as Record<string, unknown>),
@@ -543,6 +546,22 @@ describe('/api/sessions/open — brain wire-up gates (R3 audit C1 + M1)', () => 
     const res = await POST(makeReq());
     expect(res.status).toBe(409);
     expect((await res.json()).error).toBe('brain_not_ready');
+  });
+
+  it('ALLOWS brain_status=training when persona populated (whole-build C1 — loosened gate)', async () => {
+    // Pre-fix: this would 409. Post-fix: training+persona is the
+    // post-approval steady state and should be allowed.
+    creatorLookupResult = {
+      data: {
+        ...((creatorLookupResult.data ?? {}) as Record<string, unknown>),
+        system_prompt: 'You are Test Creator. Topics: x. Answer briefly.',
+        brain_status: 'training',
+      },
+      error: null,
+    };
+    const res = await POST(makeReq());
+    expect(res.status).toBe(200);
+    expect(rpcCalls.map((c) => c.name)).toContain('session_open');
   });
 
   it('passes system_prompt + null prefixTurns through to mintVoiceTicket on ready creator', async () => {

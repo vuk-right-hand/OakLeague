@@ -167,18 +167,33 @@ export async function POST(req: NextRequest) {
   if (creatorErr) return json(500, { error: 'creator_lookup_failed' });
   if (!creatorRow) return json(404, { error: 'creator_not_found' });
 
-  // Brain readiness gate (R3 audit M1 — hard-fail decision).
-  // The plan exists to prevent generic-mentor fallback in the cloned
-  // voice. If the creator's persona isn't compiled OR brain_status
-  // hasn't graduated to 'ready', refuse the session with a 409 so it
-  // surfaces as a visible product error, not silently degraded.
+  // Brain readiness gate (R3 audit M1 — hard-fail decision; whole-build
+  // audit C1 — loosened semantic).
   //
-  // Admin-preview escape: if the caller has an active admin role,
-  // bypass the gate so admins can test against in-flight creators.
-  // Logged as `brain.admin_preview` Sentry breadcrumb so the bypass is
-  // observable in production.
+  // Goal: prevent the generic-mentor fallback that would let a cloned
+  // voice speak a generic AI script. The gate's job is "persona loadable
+  // and not in an error state." Voice clone (creator_voice_not_trained
+  // 409 above) and avatar provider readiness (creator_not_ready 409
+  // below) gate SEPARATELY at the points where they matter — they don't
+  // need to also block on brain_status here.
+  //
+  // Originally this required `brain_status === 'ready'`, but no v1
+  // code path flips 'training' → 'ready' (the v1.1 `creator_publish`
+  // RPC is deferred). approve_creator_application leaves brain_status
+  // at 'training' (R2 audit M1 — persona compile decoupled from
+  // publish-readiness), so a strict 'ready' gate would 409 every real
+  // session until manual SQL.
+  //
+  // Block: persona NULL (compile never ran) OR brain_status='errored'
+  //   (training pipeline explicitly failed; admin must investigate).
+  // Allow: persona populated AND brain_status IN ('pending','queued',
+  //   'training','ready'). 'pending'/'queued' allow because if a
+  //   persona row exists for those states, it's an admin/recompile
+  //   artifact and the persona itself is the source of truth.
+  //
+  // Admin-preview escape still applies for caller with active admin role.
   const brainReady =
-    creatorRow.brain_status === 'ready' && creatorRow.system_prompt !== null;
+    creatorRow.system_prompt !== null && creatorRow.brain_status !== 'errored';
   if (!brainReady) {
     const { data: adminRow } = await admin
       .from('admin_roles')

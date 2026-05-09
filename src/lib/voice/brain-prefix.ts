@@ -118,10 +118,17 @@ export async function buildBrainPrefix(args: {
   // 2. Read sample_content rows whose topic_tags overlap hook tags.
   //    `overlaps` translates to the `&&` array-operator in PostgREST.
   //    ASC chronological order; LIMIT 50 hard cap.
+  //    Whole-build audit M1: exclude `fetch_status='errored'` rows so
+  //    a paste that hit a fetch error (URL 404, processing failure)
+  //    doesn't surface to users as authoritative creator content. v1
+  //    has no fetch processor — most rows are 'pending' (raw_text
+  //    pasted directly), which is fine. 'errored' means the row was
+  //    flagged by a future job that did try to fetch and failed.
   const { data: samples, error: sampErr } = await admin
     .from('sample_content')
     .select('raw_text, topic_tags, created_at')
     .eq('creator_id', creatorId)
+    .neq('fetch_status', 'errored')
     .overlaps('topic_tags', hookTags)
     .order('created_at', { ascending: true })
     .limit(50);

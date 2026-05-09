@@ -129,12 +129,11 @@ export async function POST(req: NextRequest) {
     return json(409, { error: 'creator_voice_not_trained' });
   }
 
-  // Brain readiness gate (R3 audit M1) — same shape as sessions/open.
-  // A rollover from a previously-ready creator into a now-not-ready
-  // creator is impossible (brain_status doesn't regress in v1) but we
-  // still gate defensively. Admin-preview bypass mirrors open route.
+  // Brain readiness gate — same shape + semantics as sessions/open
+  // (whole-build audit C1 loosened). Block on persona NULL or
+  // brain_status='errored'; allow training/ready when persona exists.
   const brainReady =
-    creatorRow.brain_status === 'ready' && creatorRow.system_prompt !== null;
+    creatorRow.system_prompt !== null && creatorRow.brain_status !== 'errored';
   if (!brainReady) {
     const { data: adminRow } = await admin
       .from('admin_roles')

@@ -21,12 +21,23 @@
 --     (system_prompt populated AND brain_compiled_at >= max topic/sample
 --     updated_at). Avoids false-churn on dashboards that key off
 --     brain_compiled_at.
+--   * Whole-build audit C2 — target EVERY approved creator, not just
+--     `published_at IS NOT NULL`. The published_at column has a
+--     CHECK requiring brain_status='ready', and no v1 path flips
+--     status to 'ready' (creator_publish RPC is v1.1-deferred). So
+--     filtering by published_at would produce an empty target set
+--     and leave training-state creators with NULL system_prompt,
+--     which the new session-open gate (whole-build C1, loosened to
+--     "persona populated") would still allow — but only if the
+--     backfill ran. Drop the published_at filter; key off the
+--     existence of any creator_topics row (proxy for "has been
+--     through approval").
 --
 -- Verification (run after the DO-block):
 --   SELECT count(*) FILTER (WHERE system_prompt IS NULL) AS null_prompts,
 --          count(*) AS total
 --     FROM creators
---    WHERE published_at IS NOT NULL AND brain_status <> 'errored';
+--    WHERE brain_status <> 'errored';
 --   -- null_prompts MUST be 0.
 
 DO $$
@@ -39,8 +50,7 @@ DECLARE
 BEGIN
   FOR r IN
     SELECT id FROM creators
-     WHERE published_at IS NOT NULL
-       AND brain_status <> 'errored'
+     WHERE brain_status <> 'errored'
      ORDER BY id
   LOOP
     -- Staleness gate: skip when persona is already fresh.
