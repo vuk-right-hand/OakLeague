@@ -61,6 +61,11 @@ BEGIN
 
   -- 4) prefix_turns near cap (~80KB) accepted; prefix_turns far over (>96KB) rejected.
   --    Build an ~80KB jsonb to verify we pass under cap.
+  --    Wire shape: SINGLE user-role Content entry (post-2026-05-09 spike;
+  --    preview model rejects model-role turns w/ WS-1007). Don't insert
+  --    a second `role:'model'` element here even though the DB CHECK is
+  --    shape-agnostic — this file gets read by future engineers reaching
+  --    for "what does prefix_turns look like."
   DECLARE
     v_big_text text := repeat('a', 80000);
   BEGIN
@@ -71,10 +76,9 @@ BEGIN
       (gen_random_uuid(), v_user, v_creator, v_session, 'free', 'voice_session',
        'simli', now() + interval '120 seconds', repeat('a', 64),
        jsonb_build_array(
-         jsonb_build_object('role', 'user',  'parts', jsonb_build_array(jsonb_build_object('text', v_big_text))),
-         jsonb_build_object('role', 'model', 'parts', jsonb_build_array(jsonb_build_object('text', 'ack')))
+         jsonb_build_object('role', 'user', 'parts', jsonb_build_array(jsonb_build_object('text', v_big_text)))
        ));
-    RETURN NEXT ok(true, '4: ~80KB prefix_turns accepted (under 96KB cap)');
+    RETURN NEXT ok(true, '4: ~80KB prefix_turns (single user-turn) accepted (under 96KB cap)');
   END;
 END;
 $fn$;

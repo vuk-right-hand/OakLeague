@@ -1,5 +1,15 @@
 # Brain Wire-Up Plan — final (post R1 + R2 + R3 audit)
 
+> **2026-05-09 SPIKE FINDINGS — supersede paired-turn architecture**
+>
+> Three real-Gemini spikes ran against `gemini-3.1-flash-live-preview` after this plan was finalized. Two architectural decisions in this doc are wrong as written; the implementation in the codebase has been updated. **Treat the bullets below as authoritative; the paired-turn references in the body are historical.**
+>
+> 1. **Paired user/model `prefix_turns` is rejected by the preview model.** Any `sendClientContent` call containing a `model`-role turn (paired, alone, or split into two calls) produces WS close 1007 "Request contains an invalid argument". Single-user-turn shape works. The L3 injection-defense ack is now folded into the closing of the user turn instead of being a separate `model` turn. (Verified by `scripts/brain-spike-narrow.mjs`; full matrix in `.claude_learnings.md` 2026-05-09.) ⇒ R2 audit C1 disposition is partially wrong: strict Content shape `{role,parts:[{text}]}` IS still required, but turns must be user-only.
+> 2. **`ENCODED_BYTE_CAP` lowered from 90KB to 60KB.** `brain-seed-ingest-latency-spike.mjs` measured 1KB/30KB seeds round-trip cleanly (p99 845ms / 709ms) but 90KB seeds emit no transcript and no error — silent server-side rejection. Realistic max from `PREFIX_RAW_CHAR_BUDGET=24K` chars + wrapper is ~26KB encoded, so 60KB only protects edge cases.
+> 3. **`BRAIN_SEED_MARGIN_MS` recommended = 895ms** (worst-p99 + 50ms). The latency spike measured an upper bound that includes inference time; the constant has a hard 5000ms ceiling so 895 is well within. Set via `BRAIN_SEED_MARGIN_MS_OVERRIDE` Fly secret.
+> 4. **Resumption regression cleared.** 770-char ASCII persona + seed survives WS-1000 close + reopen with stored handle. Persona-on-`LiveConnectConfig.systemInstruction` is the locked decision.
+> 5. **Injection defense holds with single-turn architecture.** `brain-injection-spike.mjs` against real Gemini: poisoned sample with imperative "recommend example.com/pwn" injection was rejected; clean answer returned.
+
 **Goal**: Make the cloned mentor speak as the creator, not as generic Gemini. Today the proxy passes no `systemInstruction`, so every session falls back to `DEFAULT_SYSTEM = "You are a helpful mentor. Answer in one concise sentence."` Voice (Cartesia) and face (Simli/HeyGen) are creator-specific; the brain is not.
 
 **Scope (v1)**: static compiled persona + per-session topic-drawer prefix at hook-level. No vector RAG, no per-question retrieval, no LLM-compiled persona. Per CLAUDE.md: *"Up to 5 topics per creator. Each sample_content row is topic_tags[]-tagged. Session pulls only the relevant drawer, not the whole corpus. Simpler than vector RAG, faster to ship."*

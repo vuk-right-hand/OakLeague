@@ -57,7 +57,7 @@ export type MintVoiceTicketArgs = {
   //   * Hook has no overlapping sample_content
   //   * Builder errored (Sentry breadcrumb upstream)
   // Pre-DB length+size guards live in the route — by contract these
-  // are within bounds (≤2000 octets / encodedBytes < 90KB) when set,
+  // are within bounds (≤2000 octets / encodedBytes < 60KB) when set,
   // so the DB CHECKs are defense-in-depth and won't fire.
   systemPrompt?: string | null;
   prefixTurns?: PrefixTurn[] | null;
@@ -117,9 +117,9 @@ export async function mintVoiceTicket(args: MintVoiceTicketArgs): Promise<MintVo
       // purpose defaults to 'voice_session'.
       expires_at:      expiresAt,
       // Brain wire-up (PR-2). Per-session payload riding the ticket so
-      // the proxy gets system_prompt + paired prefix_turns in the same
-      // atomic consume — no extra Supabase read inside the WS open hot
-      // path. NULL when missing; the proxy will pass undefined to the
+      // the proxy gets system_prompt + single-user-turn prefix_turns in
+      // the same atomic consume — no extra Supabase read inside the WS
+      // open hot path. NULL when missing; the proxy will pass undefined to the
       // Gemini bridge and falls back to DEFAULT_SYSTEM (degraded mode;
       // route emits brain_not_ready 409 before reaching mint when the
       // creator is unready, so this NULL path is rare).

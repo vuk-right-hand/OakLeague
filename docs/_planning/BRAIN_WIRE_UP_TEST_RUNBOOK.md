@@ -59,12 +59,20 @@ npm run typecheck && npx vitest run --reporter=dot
 These pin two production constants. Do them BEFORE deploying — both run in <2 minutes.
 
 ```bash
-# Resumption regression: does a 700-char persona survive a 1000-close + reopen?
+# Resumption regression: does a 770-char persona survive a 1000-close + reopen?
 GEMINI_API_KEY=$YOUR_KEY node scripts/brain-resumption-spike.mjs
 ```
 
-**PASS**: exit 0, output contains `[PASS] persona + seed survived resume`.
+**PASS** (verified 2026-05-09 by claude-code): exit 0, output contains `[PASS] persona + seed survived resume`. Real run printed `COSMIC_PRINCIPLES.` from the resumed session.
 **FAIL fallback**: exit 1 → fall back path required (persona via `sendClientContent` instead of `LiveConnectConfig.systemInstruction`); document and pause.
+
+```bash
+# Injection-defense gate: does the malicious sample override the persona?
+GEMINI_API_KEY=$YOUR_KEY node scripts/brain-injection-spike.mjs
+```
+
+**PASS** (verified 2026-05-09 by claude-code): exit 0, output contains `[PASS] hardened persona + single user-turn wrapper rejected the injection`. Run printed a clean closing-technique answer with no example.com mentions.
+**FAIL** : exit 1 → strengthen prompts before merging; the injection got through.
 
 ```bash
 # Server-side seed-ingest latency p99 across 1KB / 30KB / 90KB:
@@ -73,7 +81,9 @@ GEMINI_API_KEY=$YOUR_KEY BRAIN_SPIKE_TRIALS=10 node scripts/brain-seed-ingest-la
 
 Output ends with: `recommended BRAIN_SEED_MARGIN_MS = NNN`. Take this number.
 
-**Action**: set `BRAIN_SEED_MARGIN_MS_OVERRIDE=NNN` as a Fly secret on the voice proxy (see Phase 2.2). If `recommended > 1000`, do NOT just bump — investigate; the constant has a 5000 max, and >1s p99 suggests Gemini is degraded.
+**2026-05-09 measurement** (10 trials/size): 1KB p99=845ms, 30KB p99=709ms, 90KB **FAILED** (no transcript). `ENCODED_BYTE_CAP` already tightened to 60KB in code as a result. Recommended margin: **895ms** (worst-p99 + 50ms). The margin is an upper bound — it includes inference time we don't actually need to wait for, but it's safe.
+
+**Action**: set `BRAIN_SEED_MARGIN_MS_OVERRIDE=895` (or whatever a fresh measurement prints) as a Fly secret on the voice proxy (see Phase 2.2). If `recommended > 1000`, do NOT just bump — investigate; the constant has a 5000 max, and >1s p99 suggests Gemini is degraded.
 
 ---
 
@@ -146,7 +156,7 @@ Push `feat/brain-wireup` to a Vercel preview branch, OR merge to `main` if going
 Set the seed-margin secret first if the spike measured ≠ 250ms:
 
 ```bash
-flyctl secrets set BRAIN_SEED_MARGIN_MS_OVERRIDE=NNN --app oakleague-voice-proxy-staging
+flyctl secrets set BRAIN_SEED_MARGIN_MS_OVERRIDE=895 --app oakleague-voice-proxy-staging
 ```
 
 Deploy:
@@ -327,7 +337,7 @@ supabase db push
 # Verify Phase 1.4 query returns null_prompts=0
 
 # Set BRAIN_SEED_MARGIN_MS_OVERRIDE on prod proxy (use the value from Phase 0.5)
-flyctl secrets set BRAIN_SEED_MARGIN_MS_OVERRIDE=NNN --app oakleague-voice-proxy
+flyctl secrets set BRAIN_SEED_MARGIN_MS_OVERRIDE=895 --app oakleague-voice-proxy
 
 # Deploy prod proxy
 flyctl deploy --app oakleague-voice-proxy

@@ -29,18 +29,22 @@ function client(apiKey) {
 const DEFAULT_SYSTEM = 'You are a helpful mentor. Answer in one concise sentence.';
 
 // Brain wire-up (PR-2 / R3 audit M7). Margin between sendClientContent
-// (paired prefix_turns seed) and the bridge resolving open(). The proxy
+// (single user-turn prefix_turns seed) and the bridge resolving open(). The proxy
 // sends `ready` to the client right after open() resolves; the user's
 // first mic-audio frame must NOT race the server-side ingest of the
 // seed — auto-VAD would treat mid-prefix audio as a turn boundary and
 // the model would respond to a fragment.
 //
 // Pre-merge spike (scripts/brain-seed-ingest-latency-spike.mjs) measures
-// p99 across 1KB / 30KB / 90KB payloads on desktop + cellular and pins
-// this constant to (p99 + 50ms). 250 is the placeholder; set the
-// measured value via env BRAIN_SEED_MARGIN_MS_OVERRIDE if you've run
-// the spike. If p99 measures > 1s, switch to a server-observable
-// signal (e.g. wait for first usageMetadata after seed) instead.
+// END-TO-END (sendClientContent → first transcript chunk) p99 across
+// 1KB/30KB/90KB and recommends margin = worst-p99 + 50ms. 2026-05-09
+// run pinned 895ms (1KB p99=845ms + 50ms; 90KB rejected silently —
+// hence ENCODED_BYTE_CAP=60KB now). 250 is the in-code placeholder;
+// real margin gets set via env BRAIN_SEED_MARGIN_MS_OVERRIDE on Fly.
+// CAVEAT: end-to-end includes inference time we don't strictly need to
+// wait for — server-side ingest alone is faster. If TTFB tax matters
+// more than safety, re-spike measuring "next sessionResumptionUpdate
+// after seed" instead and re-pin tighter. Hard ceiling 5000ms.
 const BRAIN_SEED_MARGIN_MS = (() => {
   const override = parseInt(process.env.BRAIN_SEED_MARGIN_MS_OVERRIDE || '', 10);
   // PR-2 audit S1: floor at 50ms — 0 guarantees the audio-vs-seed race.
@@ -190,13 +194,18 @@ export class GeminiBridge extends EventEmitter {
       this.on('event', h);
     });
 
-    // Brain wire-up (PR-2). Seed paired user/model history via
-    // sendClientContent BEFORE returning from open(). turnComplete:false
-    // so the server holds inference until the user's first audio frame
-    // triggers auto-VAD turn-end (R2 C2). 250ms margin to give the
-    // server time to ingest before the proxy signals 'ready' to the
-    // client (R3 M7 — pre-merge spike measures p99 across payload sizes
-    // and pins this constant; 250ms is the placeholder).
+    // Brain wire-up (PR-2 + 2026-05-09 spike fix). Seed reference
+    // material as a SINGLE user-role Content turn via sendClientContent
+    // BEFORE returning from open(). turnComplete:false so the server
+    // holds inference until the user's first audio frame triggers
+    // auto-VAD turn-end (R2 C2). Pre-spike attempt used paired
+    // user/model turns; preview model rejects any model-role turn in
+    // sendClientContent (WS 1007 invalid argument). The folded model-
+    // ack inside the user turn now carries L3 injection defense. 250ms
+    // margin to give the server time to ingest before the proxy signals
+    // 'ready' to the client (R3 M7 — pre-merge spike measures p99
+    // across payload sizes and pins this constant; 250ms is the
+    // placeholder).
     if (Array.isArray(brainPrefix) && brainPrefix.length > 0) {
       try {
         this._session.sendClientContent({

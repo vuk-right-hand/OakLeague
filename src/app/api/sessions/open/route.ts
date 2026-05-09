@@ -617,10 +617,13 @@ export async function POST(req: NextRequest) {
 
   // ── Brain prefix build (PR-2) ───────────────────────────────────────
   // Pulls sample_content rows whose topic_tags overlap hook.topic_tags
-  // and packages them as paired user/model `prefixTurns`. Server-only
-  // (sample_content can carry PII; never reaches the client). On any
-  // error, degrade to persona-only (system_prompt without prefix) and
-  // breadcrumb so we can find detachment in production.
+  // and packages them as a single user-role `prefixTurns` Content entry
+  // with the L3 model-ack folded into its closing text (post-2026-05-09
+  // spike: gemini-3.1-flash-live-preview rejects model-role turns in
+  // sendClientContent w/ WS-1007). Server-only (sample_content can
+  // carry PII; never reaches the client). On any error, degrade to
+  // persona-only (system_prompt without prefix) and breadcrumb so we
+  // can find detachment in production.
   let brainPrefix: Awaited<ReturnType<typeof buildBrainPrefix>> = null;
   try {
     brainPrefix = await buildBrainPrefix({
@@ -688,7 +691,7 @@ export async function POST(req: NextRequest) {
       // Brain wire-up (PR-2). Both already pre-validated:
       //   * system_prompt: octet_length ≤ 2000 enforced by creators
       //     CHECK at compile time
-      //   * prefixTurns: encodedBytes < 90KB enforced by buildBrainPrefix
+      //   * prefixTurns: encodedBytes < 60KB enforced by buildBrainPrefix
       //     before return
       // The DB CHECKs on voice_tickets are defense-in-depth.
       systemPrompt: creatorRow.system_prompt,
