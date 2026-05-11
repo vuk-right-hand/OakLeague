@@ -163,7 +163,7 @@ async function consumeTicket(ticketId, uaHash) {
     .is('consumed_at', null)
     .gt('expires_at', new Date().toISOString())
     .eq('bound_ua_hash', uaHash)
-    .select('user_id, creator_id, session_id, expected_tier, purpose, avatar_provider, system_prompt, prefix_turns')
+    .select('user_id, creator_id, session_id, expected_tier, purpose, avatar_provider, system_prompt, prefix_turns, tts_speed')
     .maybeSingle();
   if (error || !data) return null;
   // creator_id is NOT NULL by CHECK on new rows (migration 0041). A null here
@@ -191,6 +191,16 @@ async function consumeTicket(ticketId, uaHash) {
       // silently coerce to null otherwise.
       console.warn(`[ws] prefix_turns shape unexpected (type=${typeof data.prefix_turns}); dropping`);
       return null;
+    })(),
+    // Creator voice-speed (migration 20260511000006). supabase-js
+    // returns `numeric` columns as JS string; coerce at the boundary
+    // (R2 audit C3). Bridge's CartesiaTTSBridge constructor also
+    // defensively coerces, but doing it here keeps the shape clean for
+    // any other downstream consumer.
+    ttsSpeed:       (() => {
+      if (data.tts_speed == null) return null;
+      const n = typeof data.tts_speed === 'number' ? data.tts_speed : Number(data.tts_speed);
+      return Number.isFinite(n) ? n : null;
     })(),
   };
 }
@@ -758,6 +768,11 @@ wss.on('connection', async (ws, req) => {
         apiKey: CARTESIA_API_KEY,
         voiceId: creatorVoiceId,
         sampleRate: cartesiaSampleRate,
+        // Creator voice-speed (migration 20260511000006). NULL when the
+        // ticket pre-dates this column OR the creator hasn't dialed in
+        // a value; bridge treats NULL/1.0 as "omit generation_config.speed"
+        // (Cartesia default) via shouldSendSpeed().
+        ttsSpeed: consumed.ttsSpeed,
       });
       const t0 = Date.now();
       await cartesia.open();

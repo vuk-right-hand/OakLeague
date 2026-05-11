@@ -151,7 +151,7 @@ export async function POST(req: NextRequest) {
   // 409 brain_not_ready (R3 audit M1).
   const { data: creatorRow, error: creatorErr } = await admin
     .from('creators')
-    .select('id, simli_face_id, heygen_avatar_id, voice_id, voice_id_preview, voice_id_dev, published_at, system_prompt, brain_status')
+    .select('id, simli_face_id, heygen_avatar_id, voice_id, voice_id_preview, voice_id_dev, published_at, system_prompt, brain_status, tts_speed')
     .eq('id', creatorId)
     .maybeSingle<{
       id: string;
@@ -163,6 +163,10 @@ export async function POST(req: NextRequest) {
       published_at: string | null;
       system_prompt: string | null;
       brain_status: 'pending' | 'queued' | 'training' | 'ready' | 'errored';
+      // numeric arrives as string from supabase-js — coerce at boundary
+      // (R2 audit C3). DB CHECK is [0.6, 1.5]; mint helper drops to NULL
+      // on non-finite values as defense in depth.
+      tts_speed: number | string | null;
     }>();
   if (creatorErr) return json(500, { error: 'creator_lookup_failed' });
   if (!creatorRow) return json(404, { error: 'creator_not_found' });
@@ -696,6 +700,16 @@ export async function POST(req: NextRequest) {
       // The DB CHECKs on voice_tickets are defense-in-depth.
       systemPrompt: creatorRow.system_prompt,
       prefixTurns:  brainPrefix?.prefixTurns ?? null,
+      // Creator voice-speed (migration 20260511000006). supabase-js
+      // returns `numeric` as JS string; coerce at the boundary (R2 audit
+      // C3). DB DEFAULT 1.0 guarantees a value, but defensive on
+      // non-finite to avoid sending bad data through to Cartesia.
+      ttsSpeed: (() => {
+        const raw = creatorRow.tts_speed;
+        if (raw == null) return null;
+        const n = typeof raw === 'number' ? raw : Number(raw);
+        return Number.isFinite(n) ? n : null;
+      })(),
     });
   } catch (e) {
     Sentry.captureException(e, { extra: { op: 'sessions_open_voice_ticket', session_id: sessionId } });

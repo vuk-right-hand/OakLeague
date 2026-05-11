@@ -61,6 +61,17 @@ const RECONNECT_BACKOFFS_MS = [200, 500, 1000];
 
 const KNOWN_INBOUND_TYPES = new Set(['chunk', 'done', 'timestamps', 'error', 'flush_done']);
 
+// Decide whether to emit `generation_config.speed` on the Cartesia message.
+// We omit the field for NULL and explicit 1.0 (Cartesia default) — sending
+// speed:1.0 is functionally equivalent to omitting but writes a redundant
+// control block and couples our wire payload to the Cartesia param shape.
+// Keep this function in sync with the equivalent helper in
+// src/app/api/creator/voice-preview/route.ts (cross-package import not
+// feasible because server/voice-proxy has its own node_modules).
+function shouldSendSpeed(v) {
+  return typeof v === 'number' && Number.isFinite(v) && v !== 1.0 && v >= 0.6 && v <= 1.5;
+}
+
 // Bridge error code taxonomy. Provider-specific codes map onto these
 // const-union strings at the bridge boundary so consumers never see raw
 // Cartesia strings.
@@ -78,8 +89,14 @@ export class CartesiaTTSBridge extends EventEmitter {
    * @param {string} opts.voiceId           IVC voice id (creator clone).
    * @param {number} [opts.sampleRate=24000]
    * @param {number} [opts.openTimeoutMs=5000]
+   * @param {number|null} [opts.ttsSpeed=null]  Cartesia generation_config.speed,
+   *   range [0.6, 1.5]. NULL or 1.0 → omit the field (Cartesia default).
+   *   Carrying explicit 1.0 = sending speed:1.0 in JSON, which is functionally
+   *   equivalent to omitting but bloats wire payload AND couples us to
+   *   Cartesia param naming. Omit policy is enforced by shouldSendSpeed().
+   *   See migration 20260511000006 column COMMENT for full rationale.
    */
-  constructor({ apiKey, voiceId, sampleRate = DEFAULT_SAMPLE_RATE, openTimeoutMs = DEFAULT_OPEN_TIMEOUT_MS } = {}) {
+  constructor({ apiKey, voiceId, sampleRate = DEFAULT_SAMPLE_RATE, openTimeoutMs = DEFAULT_OPEN_TIMEOUT_MS, ttsSpeed = null } = {}) {
     super();
     if (!apiKey) throw new Error('CARTESIA_API_KEY missing');
     if (!voiceId) throw new Error('voiceId missing');
@@ -87,6 +104,16 @@ export class CartesiaTTSBridge extends EventEmitter {
     this._voiceId = voiceId;
     this._sampleRate = sampleRate;
     this._openTimeoutMs = openTimeoutMs;
+    // ttsSpeed: number ∈ [0.6, 1.5] OR null. Coerce strings (defense in
+    // depth — proxy already does Number() at ticket boundary). Out-of-range
+    // values fall back to null (omit) rather than fail the bridge open;
+    // creator-side UI clamps and DB CHECK catches before we get here.
+    const speedNum = typeof ttsSpeed === 'number'
+      ? ttsSpeed
+      : (ttsSpeed != null ? Number(ttsSpeed) : NaN);
+    this._ttsSpeed = (Number.isFinite(speedNum) && speedNum >= 0.6 && speedNum <= 1.5)
+      ? speedNum
+      : null;
     this._ws = null;
     this._closed = false;
     this._currentContextId = null;
@@ -194,6 +221,14 @@ export class CartesiaTTSBridge extends EventEmitter {
       },
       continue: true,
     };
+    // Creator playback-speed knob (migration 20260511000006).
+    // generation_config.speed must ride every Cartesia message per the
+    // pipecat reference pattern (Cartesia rejects continuation messages
+    // that drop the full voice/model_id/output_format block). Same logic
+    // applied to turnEnd() below — kept identical via shouldSendSpeed().
+    if (shouldSendSpeed(this._ttsSpeed)) {
+      msg.generation_config = { speed: this._ttsSpeed };
+    }
     this._charsThisTurn += text.length;
     this._sentFirstChunkOfTurn = true;
     if (this._currentTurnTextSample.length < 500) {
@@ -245,7 +280,7 @@ export class CartesiaTTSBridge extends EventEmitter {
     if (this._sentFirstChunkOfTurn) {
       // Match pipecat reference: full block on every message including the
       // empty-transcript terminator.
-      this._wsSend({
+      const terminator = {
         context_id: this._currentContextId,
         model_id: SONIC_MODEL,
         transcript: '',
@@ -256,7 +291,13 @@ export class CartesiaTTSBridge extends EventEmitter {
           sample_rate: this._sampleRate,
         },
         continue: false,
-      });
+      };
+      // Carry speed on the terminator too (matches sendText pattern;
+      // Cartesia treats the per-message block as authoritative).
+      if (shouldSendSpeed(this._ttsSpeed)) {
+        terminator.generation_config = { speed: this._ttsSpeed };
+      }
+      this._wsSend(terminator);
     } else {
       // No text was sent this turn (e.g., model produced empty transcript).
       // Skip the synth and resolve immediately as non-partial zero.

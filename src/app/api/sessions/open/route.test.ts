@@ -127,6 +127,10 @@ let creatorLookupResult: { data: unknown; error: unknown } = {
     // so the new brain_not_ready 409 gate doesn't fire on these tests.
     system_prompt: 'You are Test Creator. Topics: x. Answer briefly.',
     brain_status: 'ready',
+    // Creator voice-speed knob (migration 20260511000006). Mock as
+    // string to mirror supabase-js's `numeric → string` coercion;
+    // the route's boundary coercion (Number()) MUST handle this shape.
+    tts_speed: '1.0',
   },
   error: null,
 };
@@ -481,6 +485,7 @@ describe('/api/sessions/open — brain wire-up gates (R3 audit C1 + M1)', () => 
         published_at: '2026-01-01T00:00:00Z',
         system_prompt: 'You are Test Creator. Topics: x. Answer briefly.',
         brain_status: 'ready',
+        tts_speed: '1.0',
       },
       error: null,
     };
@@ -572,5 +577,39 @@ describe('/api/sessions/open — brain wire-up gates (R3 audit C1 + M1)', () => 
     expect(callArgs.systemPrompt).toBe('You are Test Creator. Topics: x. Answer briefly.');
     // No sample_content rows in mock → prefixTurns null.
     expect(callArgs.prefixTurns).toBeNull();
+    // Creator voice-speed (migration 20260511000006). Mock returned
+    // '1.0' (string, mirroring supabase-js numeric coercion); route
+    // MUST coerce to 1.0 (number) before passing to mintVoiceTicket.
+    expect(callArgs.ttsSpeed).toBe(1.0);
+    expect(typeof callArgs.ttsSpeed).toBe('number');
+  });
+
+  it('coerces tts_speed=0.85 (string from supabase-js) to number through to mintVoiceTicket', async () => {
+    creatorLookupResult = {
+      data: {
+        ...((creatorLookupResult.data ?? {}) as Record<string, unknown>),
+        tts_speed: '0.85', // string, mirrors supabase-js numeric shape
+      },
+      error: null,
+    };
+    const res = await POST(makeReq());
+    expect(res.status).toBe(200);
+    const callArgs = mockMintVoiceTicket.mock.calls[0][0] as Record<string, unknown>;
+    expect(callArgs.ttsSpeed).toBe(0.85);
+    expect(typeof callArgs.ttsSpeed).toBe('number');
+  });
+
+  it('passes tts_speed=null when creator row has null (legacy / forward-compat)', async () => {
+    creatorLookupResult = {
+      data: {
+        ...((creatorLookupResult.data ?? {}) as Record<string, unknown>),
+        tts_speed: null,
+      },
+      error: null,
+    };
+    const res = await POST(makeReq());
+    expect(res.status).toBe(200);
+    const callArgs = mockMintVoiceTicket.mock.calls[0][0] as Record<string, unknown>;
+    expect(callArgs.ttsSpeed).toBeNull();
   });
 });

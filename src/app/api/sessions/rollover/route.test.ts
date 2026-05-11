@@ -105,6 +105,10 @@ function makeAdmin() {
                   // route doesn't 409 these test cases.
                   system_prompt: 'You are Test Creator. Topics: x. Answer briefly.',
                   brain_status: 'ready',
+                  // Creator voice-speed (migration 20260511000006). Mock
+                  // as string to mirror supabase-js's numeric → string
+                  // coercion.
+                  tts_speed: '1.0',
                 },
                 error: null,
               }),

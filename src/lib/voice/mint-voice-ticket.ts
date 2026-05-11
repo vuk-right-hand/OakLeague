@@ -61,6 +61,14 @@ export type MintVoiceTicketArgs = {
   // so the DB CHECKs are defense-in-depth and won't fire.
   systemPrompt?: string | null;
   prefixTurns?: PrefixTurn[] | null;
+  // Creator voice-speed knob (migration 20260511000006). Cartesia
+  // Sonic 3 generation_config.speed multiplier in [0.6, 1.5]. NULL
+  // means "use Cartesia default" — passes through to the proxy and
+  // ultimately the CartesiaTTSBridge, which omits the field when
+  // NULL or 1.0. DB CHECK gate on voice_tickets ensures we never
+  // insert out-of-range values; this typing is the route-side
+  // contract.
+  ttsSpeed?: number | null;
 };
 
 export type MintVoiceTicketResult = {
@@ -125,6 +133,14 @@ export async function mintVoiceTicket(args: MintVoiceTicketArgs): Promise<MintVo
       // creator is unready, so this NULL path is rare).
       system_prompt:   args.systemPrompt ?? null,
       prefix_turns:    args.prefixTurns  ?? null,
+      // Creator voice-speed (migration 20260511000006). DB CHECK is
+      // [0.6, 1.5]; route already pulls from creators.tts_speed which
+      // is bounded by the same range. Defensive boundary: drop to NULL
+      // if a non-finite value somehow slipped through (proxy treats
+      // NULL as "use Cartesia default" via shouldSendSpeed()).
+      tts_speed:       typeof args.ttsSpeed === 'number' && Number.isFinite(args.ttsSpeed)
+                          ? args.ttsSpeed
+                          : null,
     })
     .select('ticket_id, expires_at')
     .single<{ ticket_id: string; expires_at: string }>();

@@ -104,7 +104,7 @@ export async function POST(req: NextRequest) {
 
   const { data: creatorRow, error: creatorErr } = await admin
     .from('creators')
-    .select('id, simli_face_id, heygen_avatar_id, voice_id, voice_id_preview, voice_id_dev, system_prompt, brain_status')
+    .select('id, simli_face_id, heygen_avatar_id, voice_id, voice_id_preview, voice_id_dev, system_prompt, brain_status, tts_speed')
     .eq('id', creatorId)
     .maybeSingle<{
       id: string;
@@ -115,6 +115,9 @@ export async function POST(req: NextRequest) {
       voice_id_dev: string | null;
       system_prompt: string | null;
       brain_status: 'pending' | 'queued' | 'training' | 'ready' | 'errored';
+      // numeric → string coercion (R2 audit C3). See open route.ts:165
+      // for full rationale; same shape here.
+      tts_speed: number | string | null;
     }>();
   if (creatorErr) return json(500, { error: 'creator_lookup_failed' });
   if (!creatorRow) return json(404, { error: 'creator_not_found' });
@@ -393,6 +396,14 @@ export async function POST(req: NextRequest) {
       ua:             req.headers.get('user-agent') ?? '',
       systemPrompt:   creatorRow.system_prompt,
       prefixTurns:    brainPrefix?.prefixTurns ?? null,
+      // Creator voice-speed (migration 20260511000006). See open route
+      // for full rationale on the numeric→string coercion.
+      ttsSpeed: (() => {
+        const raw = creatorRow.tts_speed;
+        if (raw == null) return null;
+        const n = typeof raw === 'number' ? raw : Number(raw);
+        return Number.isFinite(n) ? n : null;
+      })(),
     });
   } catch (e) {
     Sentry.captureException(e, { extra: { op: 'sessions_rollover_voice_ticket', session_id: newSessionId } });

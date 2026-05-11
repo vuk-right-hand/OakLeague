@@ -220,3 +220,91 @@ test('cancel + late chunks: counters frozen at cancel time', () => {
   bridge._onMessage(JSON.stringify({ type: 'chunk', data: 'AAAAAAAA', context_id: 'sess-1:1' }), false);
   assert.equal(bridge._audioBytesThisTurn, beforeBytes, 'late chunks must not change counters');
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// Creator voice-speed knob (migration 20260511000006)
+// ─────────────────────────────────────────────────────────────────────
+
+function makeStubBridgeWithSpeed(ttsSpeed) {
+  const sent = [];
+  const ws = {
+    readyState: 1,
+    send: (s) => { sent.push(JSON.parse(s)); },
+    close: () => {},
+    terminate: () => {},
+  };
+  const bridge = new CartesiaTTSBridge({
+    apiKey: 'k',
+    voiceId: 'voice-uuid-abc',
+    ttsSpeed,
+  });
+  bridge._ws = ws;
+  bridge._closed = false;
+  return { bridge, sent };
+}
+
+test('tts_speed=0.85: every sendText carries generation_config.speed=0.85', () => {
+  const { bridge, sent } = makeStubBridgeWithSpeed(0.85);
+  bridge.turnStart('sess-1:1');
+  bridge.sendText('Hello,');
+  bridge.sendText(' world.');
+  assert.equal(sent.length, 2);
+  for (const m of sent) {
+    assert.deepEqual(m.generation_config, { speed: 0.85 });
+  }
+});
+
+test('tts_speed=1.15: terminator in turnEnd also carries generation_config.speed=1.15', async () => {
+  const { bridge, sent } = makeStubBridgeWithSpeed(1.15);
+  bridge.turnStart('sess-1:1');
+  bridge.sendText('Hi.');
+  // Kick a `done` event before timeout so turnEnd resolves cleanly.
+  setTimeout(() => {
+    bridge._onMessage(JSON.stringify({ type: 'done', context_id: 'sess-1:1' }), false);
+  }, 10);
+  await bridge.turnEnd({ timeoutMs: 500 });
+  // sent[0] = sendText, sent[1] = terminator
+  assert.equal(sent.length, 2);
+  assert.deepEqual(sent[0].generation_config, { speed: 1.15 });
+  assert.deepEqual(sent[1].generation_config, { speed: 1.15 });
+  assert.equal(sent[1].continue, false);
+  assert.equal(sent[1].transcript, '');
+});
+
+test('tts_speed=null: generation_config field is OMITTED entirely (Cartesia default playback)', () => {
+  const { bridge, sent } = makeStubBridgeWithSpeed(null);
+  bridge.turnStart('sess-1:1');
+  bridge.sendText('Hi.');
+  assert.equal(sent.length, 1);
+  assert.ok(!('generation_config' in sent[0]), 'generation_config must not be present on null speed');
+});
+
+test('tts_speed=1.0: treated as no-op, generation_config OMITTED (forward-compat with Cartesia param renames)', () => {
+  const { bridge, sent } = makeStubBridgeWithSpeed(1.0);
+  bridge.turnStart('sess-1:1');
+  bridge.sendText('Hi.');
+  assert.equal(sent.length, 1);
+  assert.ok(!('generation_config' in sent[0]), 'generation_config must not be present on explicit 1.0');
+});
+
+test('tts_speed="1.15" (string from supabase-js numeric): coerced via Number(), emitted as number', () => {
+  // Defense-in-depth: even though proxy coerces at the ticket boundary,
+  // the bridge constructor coerces strings too so a future caller that
+  // forgets the boundary cast doesn't silently send a string wire value.
+  const { bridge, sent } = makeStubBridgeWithSpeed('1.15');
+  bridge.turnStart('sess-1:1');
+  bridge.sendText('Hi.');
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].generation_config, { speed: 1.15 });
+  assert.equal(typeof sent[0].generation_config.speed, 'number');
+});
+
+test('tts_speed=0.4 (below 0.6 floor): coerced to null fallback, generation_config OMITTED', () => {
+  // Defense-in-depth: DB CHECK should catch this upstream; bridge defaults
+  // to null/omit rather than fail the open if a corrupt ticket sneaks past.
+  const { bridge, sent } = makeStubBridgeWithSpeed(0.4);
+  bridge.turnStart('sess-1:1');
+  bridge.sendText('Hi.');
+  assert.equal(sent.length, 1);
+  assert.ok(!('generation_config' in sent[0]));
+});
