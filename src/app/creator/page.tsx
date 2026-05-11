@@ -57,6 +57,16 @@ export default async function CreatorDashboardPage() {
       </section>
 
       <section style={card}>
+        <h2 style={sectionTitle}>Voice playback</h2>
+        <p style={{ marginTop: 8, opacity: 0.7, fontSize: 14, lineHeight: 1.5 }}>
+          Dial how fast your cloned voice plays back to people who tap to ask you a question.
+        </p>
+        <a href="/creator/voice" style={{ display: 'inline-block', marginTop: 12, fontSize: 14 }}>
+          Adjust voice speed →
+        </a>
+      </section>
+
+      <section style={card}>
         <h2 style={sectionTitle}>Profile</h2>
         {bio ? (
           <p style={{ marginTop: 8, lineHeight: 1.5 }}>{bioTruncated}</p>

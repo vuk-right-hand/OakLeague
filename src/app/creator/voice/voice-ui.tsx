@@ -11,6 +11,17 @@ type PreviewError =
   | 'unauthorized'
   | 'cartesia_timeout'
   | 'cartesia_error'
+  | 'cartesia_unreachable'
+  | 'cartesia_auth_failed'
+  | 'cartesia_voice_not_found'
+  | 'cartesia_empty_body'
+  | 'cartesia_api_key_unset'
+  | 'cartesia_pricing_unset'
+  | 'rate_limit_failed'
+  | 'creator_lookup_failed'
+  | 'invalid_speed'
+  | 'speed_out_of_range'
+  | 'invalid_json'
   | 'unknown';
 
 type Props = {
@@ -35,7 +46,7 @@ function speedLabel(v: number): string {
   return `× ${v.toFixed(2)} (${delta > 0 ? '+' : ''}${delta}%)`;
 }
 
-function errorMessage(code: PreviewError): string {
+function errorMessage(code: PreviewError, detail?: string): string {
   switch (code) {
     case 'rate_limited':
       return 'Slow down — give the audio a moment to finish before trying another speed.';
@@ -50,7 +61,25 @@ function errorMessage(code: PreviewError): string {
     case 'cartesia_timeout':
       return 'The voice service is taking too long. Try again in a moment.';
     case 'cartesia_error':
+    case 'cartesia_empty_body':
       return 'The voice service had a hiccup. Try again in a moment.';
+    case 'cartesia_unreachable':
+      return 'Could not reach the voice service. Try again in a moment.';
+    case 'cartesia_auth_failed':
+      return 'Voice service authentication failed. Check CARTESIA_API_KEY is set.';
+    case 'cartesia_voice_not_found':
+      return 'Your cloned voice was not found upstream. Retrain or contact support.';
+    case 'cartesia_api_key_unset':
+      return 'Server missing CARTESIA_API_KEY env var. Set it in .env.local (dev) or Vercel project (prod).';
+    case 'cartesia_pricing_unset':
+      return 'Server missing CARTESIA_USD_PER_CHAR env var. Set it (e.g. 0.00005) and restart.';
+    case 'rate_limit_failed':
+    case 'creator_lookup_failed':
+      return 'Internal error. Check server logs.';
+    case 'invalid_speed':
+    case 'speed_out_of_range':
+    case 'invalid_json':
+      return detail ?? 'Invalid request. Refresh the page.';
     default:
       return 'Something went wrong. Try again in a moment.';
   }
@@ -62,6 +91,7 @@ export function VoiceSpeedUI({ initialSpeed, voiceTrained }: Props) {
   const [previewing, setPreviewing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [previewError, setPreviewError] = useState<PreviewError | null>(null);
+  const [previewErrorDetail, setPreviewErrorDetail] = useState<string | null>(null);
   const [savedToast, setSavedToast] = useState<'saved' | 'error' | null>(null);
 
   // R2 audit S5 — audio cleanup.
@@ -105,6 +135,7 @@ export function VoiceSpeedUI({ initialSpeed, voiceTrained }: Props) {
 
     setPreviewing(true);
     setPreviewError(null);
+    setPreviewErrorDetail(null);
 
     // Pre-commit audit M1 fix: every error branch MUST set previewing=false
     // BEFORE returning. The prior microtask-based reset relied on a stale
@@ -125,11 +156,17 @@ export function VoiceSpeedUI({ initialSpeed, voiceTrained }: Props) {
       const ct = res.headers.get('Content-Type') || '';
       if (!res.ok) {
         let code: PreviewError = 'unknown';
+        let detail: string | undefined;
         try {
-          const body = (await res.json()) as { code?: string };
+          const body = (await res.json()) as { code?: string; detail?: string };
           if (body.code) code = body.code as PreviewError;
+          if (body.detail) detail = body.detail;
         } catch { /* ignore */ }
+        // Log the actual server code to console so dev gets it even if
+        // the type whitelist falls through to 'unknown'.
+        console.warn('[voice-preview] server returned', res.status, code, detail);
         setPreviewError(code);
+        setPreviewErrorDetail(detail ?? null);
         setPreviewing(false);
         return;
       }
@@ -290,7 +327,7 @@ export function VoiceSpeedUI({ initialSpeed, voiceTrained }: Props) {
             role="alert"
             style={{ fontSize: 13, color: previewError === 'daily_cap_reached' ? '#ddb55a' : '#ff7a7a', marginTop: 8 }}
           >
-            {errorMessage(previewError)}
+            {errorMessage(previewError, previewErrorDetail ?? undefined)}
           </p>
         )}
         <p style={{ fontSize: 11, color: '#666', marginTop: 6, lineHeight: 1.5 }}>
