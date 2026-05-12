@@ -976,8 +976,22 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
 
   // ── Mic ────────────────────────────────────────────────────────────────────
   const startMic = useCallback((): void => {
-    if (state.phase !== 'ready' && state.phase !== 'speaking') return;
-    if (micActiveRef.current) return; // Already started this press cycle.
+    // 2026-05-12 diagnostic: Vuk's 2nd dogfood saw audio stop reaching the
+    // proxy after a few turns despite the hold button visually working. Log
+    // the gate decisions so we can see WHICH guard returned early when the
+    // next "stuck" press happens. Cheap (one log per press), kept in prod
+    // until root-cause is fixed (then drop the log).
+    const micTracks = micStreamRef.current?.getTracks() ?? [];
+    const trackStates = micTracks.map((t) => `${t.kind}/${t.readyState}/enabled=${t.enabled}`).join(',');
+    console.log(`[startMic] phase=${state.phase} micActive=${micActiveRef.current} ctx=${audioCtxRef.current?.state || 'null'} tracks=[${trackStates}]`);
+    if (state.phase !== 'ready' && state.phase !== 'speaking') {
+      console.warn(`[startMic] REJECTED phase=${state.phase}`);
+      return;
+    }
+    if (micActiveRef.current) {
+      console.warn('[startMic] REJECTED micActive=true (previous press did not clean up)');
+      return;
+    }
     micActiveRef.current = true;
     dispatchRef({ kind: 'mic_started' });
     // Proxy turn boundary + barge-in. mic-tap during 'speaking' is a
@@ -1032,7 +1046,15 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     // + onPointerCancel — all three call stopMic. Without micActiveRef,
     // the WS got duplicate turn_end messages → Cartesia state poisoned
     // → "Invalid transcript" by turn 4 → session died.
-    if (!micActiveRef.current) return;
+    // 2026-05-12 diagnostic — pair with startMic log.
+    const micTracks2 = micStreamRef.current?.getTracks() ?? [];
+    const trackStates2 = micTracks2.map((t) => `${t.kind}/${t.readyState}/enabled=${t.enabled}`).join(',');
+    console.log(`[stopMic] micActive=${micActiveRef.current} ctx=${audioCtxRef.current?.state || 'null'} tracks=[${trackStates2}]`);
+    if (!micActiveRef.current) {
+      // Common case: pointerup/cancel firing redundantly. Stay quiet here
+      // (already logged the press); only warn if we expected to be active.
+      return;
+    }
     micActiveRef.current = false;
     dispatchRef({ kind: 'mic_stopped' });
     // R3-M7 — user_perceived_response_ms t0 = mic-tap-release. Cleared

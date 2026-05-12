@@ -432,13 +432,20 @@ function MicButton({
   return (
     <button
       type="button"
-      disabled={!enabled}
-      // 2026-05-12 fix: PC mouse hold was shaky because onPointerLeave fired
-      // the moment the cursor drifted even 1px off the 84px circular target.
-      // setPointerCapture keeps pointer events bound to this element until
-      // pointerup/cancel, regardless of cursor position. Works on touch too
-      // (finger drift off the button no longer releases mid-hold).
+      // 2026-05-12 fix v2: DO NOT use the `disabled` HTML attribute. When phase
+      // transitions mid-press to a non-enabled state, the browser disables the
+      // button, RELEASES pointer capture, and the pointerup/cancel event never
+      // fires. Result: mic state stuck (UI still shows "Listening" or "Hold"
+      // depending on phase but no audio flows). Instead, keep the button alive
+      // and gate purely inside the handlers — they're already no-ops if phase
+      // is wrong (startMic returns early; stopMic uses micActiveRef latch).
+      aria-disabled={!enabled}
+      // 2026-05-12 fix v1: setPointerCapture keeps pointer events bound to
+      // this element until pointerup/cancel regardless of cursor position.
+      // Fixes PC mouse hold drifting off the 84px circular target + mobile
+      // finger drift.
       onPointerDown={(e) => {
+        if (!enabled) return;
         e.preventDefault();
         try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
         onPressStart();
