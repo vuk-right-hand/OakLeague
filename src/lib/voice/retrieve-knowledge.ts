@@ -22,7 +22,7 @@ export type RetrieveTopKArgs = {
   creatorId: string;
   queryText: string;
   k?: number;             // default 3; RPC caps at 5
-  minSimilarity?: number; // default 0.65 (raised from 0.55 post-first-dogfood); RPC floors at 0.30
+  minSimilarity?: number; // default 0.60 (0.55→0.65→0.60 across 2 dogfood iterations); RPC floors at 0.30
   sessionId?: string | null;
 };
 
@@ -60,7 +60,7 @@ export async function retrieveTopK(args: RetrieveTopKArgs): Promise<RetrieveTopK
     throw new RetrieveError('empty_query');
   }
   const k = Math.min(Math.max(args.k ?? 3, 1), 5);
-  const minSim = Math.max(args.minSimilarity ?? 0.65, 0.30);
+  const minSim = Math.max(args.minSimilarity ?? 0.60, 0.30);
   const admin = args.supabaseAdmin;
 
   // 1. Per-user-per-day budget. Returns false when over cap; we return an

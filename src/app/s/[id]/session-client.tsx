@@ -430,61 +430,66 @@ function MicButton({
   const enabled = phase === 'ready' || phase === 'listening' || phase === 'speaking';
   const active = phase === 'listening';
 
-  // 2026-05-12 fix v3: setPointerCapture was unreliable on PC — Vuk's
-  // diagnostic logs showed startMic + stopMic firing back-to-back even though
-  // he was holding. Likely cause: startMic dispatches `mic_started` which
-  // re-renders the button (style changes for active state), and the browser
-  // dropped pointer capture during the React reconciliation.
+  // 2026-05-12 fix v4: switched from hold-to-talk → tap-to-toggle.
   //
-  // New approach: document-level pointerup/cancel listener that lives outside
-  // React's render cycle. onPointerDown installs the listener; the listener
-  // removes itself on first fire. Press tracking is now fully decoupled from
-  // the button's DOM lifecycle / React re-renders.
-  const pressActiveRef = useRef(false);
+  // Hold-to-talk was fundamentally fragile across browsers/OS combos —
+  // setPointerCapture, document-level listeners, and React reconciliation
+  // all had edge cases that collapsed long presses into clicks. Discord,
+  // Telegram, voice memos, etc. all use tap-to-toggle. No timing dependency,
+  // no OS pointer-quirk hell.
+  //
+  // First tap: start listening. Second tap (or 30s auto-timeout): stop.
+  const activeRef = useRef(false);
+  const autoStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onPressStartRef = useRef(onPressStart);
   const onPressEndRef = useRef(onPressEnd);
+  onPressStartRef.current = onPressStart;
   onPressEndRef.current = onPressEnd;
+  // Keep activeRef in sync with the actual phase, so an externally-driven
+  // phase transition (e.g., model started speaking, fatal error) flips us
+  // back to "not active" without a tap.
+  activeRef.current = active;
 
-  // Defensive cleanup if the component unmounts mid-press.
+  // Defensive cleanup if the component unmounts while listening.
   useEffect(() => {
     return () => {
-      if (pressActiveRef.current) {
-        pressActiveRef.current = false;
+      if (autoStopTimerRef.current) clearTimeout(autoStopTimerRef.current);
+      if (activeRef.current) {
         try { onPressEndRef.current(); } catch {}
       }
     };
   }, []);
 
-  const handlePointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
+  const handleTap = (e: React.PointerEvent<HTMLButtonElement>) => {
     if (!enabled) return;
-    if (pressActiveRef.current) return; // double-fire guard
     e.preventDefault();
-    pressActiveRef.current = true;
-    onPressStart();
-
-    const release = () => {
-      if (!pressActiveRef.current) return;
-      pressActiveRef.current = false;
-      document.removeEventListener('pointerup', release);
-      document.removeEventListener('pointercancel', release);
-      // window.blur fires when user alt-tabs / switches windows. Releasing on
-      // blur prevents the mic from being stuck open if the user leaves the tab
-      // while pressing (e.g., to type something else, get a notification).
-      window.removeEventListener('blur', release);
+    if (activeRef.current) {
+      // Currently listening → stop.
+      if (autoStopTimerRef.current) {
+        clearTimeout(autoStopTimerRef.current);
+        autoStopTimerRef.current = null;
+      }
       try { onPressEndRef.current(); } catch {}
-    };
-
-    document.addEventListener('pointerup', release);
-    document.addEventListener('pointercancel', release);
-    window.addEventListener('blur', release);
+    } else {
+      // Currently not listening → start. Auto-stop after 30s as a safety so
+      // the mic doesn't stay open forever if user forgets to tap stop.
+      try { onPressStartRef.current(); } catch {}
+      autoStopTimerRef.current = setTimeout(() => {
+        autoStopTimerRef.current = null;
+        if (activeRef.current) {
+          try { onPressEndRef.current(); } catch {}
+        }
+      }, 30000);
+    }
   };
 
   return (
     <button
       type="button"
       aria-disabled={!enabled}
-      onPointerDown={handlePointerDown}
+      onPointerDown={handleTap}
       onContextMenu={(e) => e.preventDefault()}
-      aria-label="Hold to speak"
+      aria-label={active ? 'Tap to stop' : 'Tap to talk'}
       style={{
         width: 84, height: 84, borderRadius: 42,
         background: active ? '#ef4444' : enabled ? '#fff' : 'rgba(255,255,255,0.2)',
@@ -500,7 +505,7 @@ function MicButton({
         WebkitTapHighlightColor: 'transparent',
       }}
     >
-      {active ? 'Listening' : 'Hold'}
+      {active ? 'Stop' : 'Tap'}
     </button>
   );
 }

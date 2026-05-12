@@ -33,13 +33,13 @@ export async function retrieveTopK({
   creatorId,
   queryText,
   k = 3,
-  // Raised from 0.55 → 0.65 on 2026-05-12 after first dogfood: real-corpus
-  // top-3 was landing at 0.56-0.62 (Spike #4a calibrated baseline = 0.79 for
-  // a well-aligned chunk). Marginal-similarity chunks injected as noise and
-  // the model honestly disqualified ("that story doesn't register, friend").
-  // RPC floors at 0.30 anyway; 0.65 is a Goldilocks middle. Persona's
-  // honest-disqualifier clause handles the no-match case gracefully.
-  minSimilarity = 0.65,
+  // 2026-05-12 tuning iter 2: 0.65 → 0.60. 0.65 was too strict — borderline
+  // matches like "What is superstructure?" hit 0.62 and got injected nothing,
+  // triggering "outside my experience" on questions clearly in the corpus.
+  // 0.60 catches those while still killing the 0.55-0.58 noise. gemini-embedding-
+  // 001 has narrow spread on related content, so the right operating point
+  // is empirical not theoretical. May tune further once we re-rank / hybrid.
+  minSimilarity = 0.60,
   sessionId = null,
 }) {
   if (!queryText || queryText.trim().length === 0) {
