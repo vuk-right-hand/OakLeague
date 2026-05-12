@@ -51,6 +51,20 @@ const BRAIN_SEED_MARGIN_MS = (() => {
   return Number.isFinite(override) && override >= 50 && override <= 5000 ? override : 250;
 })();
 
+// pgvector RAG plan (vector mode). Margin between each sendRealtimeInput({text})
+// injection replay on reopen — mirrors BRAIN_SEED_MARGIN_MS pattern, scaled
+// down because injection payloads (≤4KB) are much smaller than prefix seeds
+// (up to 60KB) and ingest faster. 150ms is the conservative placeholder;
+// Spike #6 (brain-injection-replay-margin-spike.mjs) pins via the override.
+export const BRAIN_REOPEN_INJECTION_MARGIN_MS = (() => {
+  const override = parseInt(process.env.BRAIN_REOPEN_INJECTION_MARGIN_MS_OVERRIDE || '', 10);
+  return Number.isFinite(override) && override >= 50 && override <= 2000 ? override : 150;
+})();
+
+// Ring buffer cap for replay-on-reopen state.
+export const INJECTION_HISTORY_K = 5;
+export const INJECTION_MAX_BYTES = 4096;
+
 // R3-C4 — per-turn transcript cap. Chosen so the worst-case Cartesia bill
 // per turn (4000 chars × CARTESIA_USD_PER_CHAR ceiling) stays bounded AND
 // the per-turn second sum (input + cartesia_audio_seconds) stays under the
@@ -60,12 +74,23 @@ const BRAIN_SEED_MARGIN_MS = (() => {
 export const OUTPUT_TRANSCRIPT_MAX_CHARS = 4000;
 
 export class GeminiBridge extends EventEmitter {
-  constructor({ apiKey, enableOutputTranscription = false, discardAudioOut = false } = {}) {
+  constructor({
+    apiKey,
+    enableOutputTranscription = false,
+    discardAudioOut = false,
+    // pgvector RAG plan (vector mode). When true, adds inputAudioTranscription:{}
+    // to live.connect.config so we receive serverContent.inputTranscription.text
+    // at end-of-utterance. Emits `input_transcription` events with the
+    // per-turn audio duration so the proxy heuristic can detect Gemini's
+    // ~100-chunk truncation (R3 M2 fix).
+    enableInputTranscription = false,
+  } = {}) {
     super();
     if (!apiKey) throw new Error('GEMINI_API_KEY missing');
     this._apiKey = apiKey;
     this._enableOutputTranscription = !!enableOutputTranscription;
     this._discardAudioOut = !!discardAudioOut;
+    this._enableInputTranscription = !!enableInputTranscription;
     this._session = null;
     this._inputBytes = 0;
     this._outputBytes = 0;
@@ -113,6 +138,25 @@ export class GeminiBridge extends EventEmitter {
     // cost operator-visible.
     this._seedReplayCount = 0;
     this._lastSeedByteSize = 0;
+    // pgvector RAG plan (vector mode). Ring buffer of last K injection
+    // envelopes for replay-on-reopen (R1 C3 fix). Each entry is the literal
+    // text string passed to sendRealtimeInput({ text }). Bounded at K=5
+    // entries × 4KB max = 20KB replay traffic per reopen — well under the
+    // 60KB seed ceiling.
+    this._injectionHistory = [];
+    this._injectionReplayCount = 0;
+    // Per-turn input duration tracking (R3 M2). Bridge already tracks
+    // _currentTurnInputBytes via sendAudio; we surface it in the
+    // input_transcription event payload so truncationSuspected has a real
+    // denominator (audioSeconds = bytes / (16000 * 2) at 16kHz s16le).
+    this._currentTurnInputBytes = 0;
+    // R3 M1 — same-envelope ordering safety. Stash the latest
+    // inputTranscription text seen inside the current turn; if turn_complete
+    // arrives in the same envelope, we ensure input_transcription emits
+    // before turn_complete (already true given the iteration order in
+    // _onMessage, but tracking explicitly so a future refactor can't
+    // silently reorder).
+    this._pendingInputTranscriptionThisTurn = null;
   }
 
   // Brain wire-up (PR-2). Surface seed-replay metrics to the proxy at
@@ -154,6 +198,14 @@ export class GeminiBridge extends EventEmitter {
       // this. discardAudioOut governs whether we still pay the per-chunk
       // base64 decode cost downstream.
       config.outputAudioTranscription = {};
+    }
+    if (this._enableInputTranscription) {
+      // pgvector RAG plan (vector mode). Per forum 136977, 3.1 Live delivers
+      // inputTranscription as a single chunk at end-of-utterance (regression
+      // from 2.5 incremental). Per forum 107385, the path truncates after
+      // ~100 chunks for >15s audio — the proxy detects this via
+      // truncationSuspected() using the audioSeconds we emit in the event.
+      config.inputAudioTranscription = {};
     }
     // Auto-VAD: omit realtimeInputConfig (default = auto-VAD on,
     // endOfSpeechSensitivity = END_SENSITIVITY_HIGH). turnStart is a
@@ -225,6 +277,111 @@ export class GeminiBridge extends EventEmitter {
         console.warn(`[gemini-bridge] sendBrainPrefix failed: ${seedErr?.message || seedErr}`);
       }
     }
+
+    // pgvector RAG plan (vector mode) — replay injection history on reopen.
+    //
+    // R1 C3 + R2 M2 fix: when js-genai#707 fires a 1000-close mid-session
+    // and reopen() restarts the bridge, we lose every prior
+    // send_realtime_input({text}) injection — even if Gemini accepted our
+    // resumption-handle, the docs don't guarantee realtime-input is
+    // durable across reopens. Two-step strategy:
+    //
+    //   1. After setupComplete, wait up to 1500ms for the FIRST
+    //      sessionResumptionUpdate post-reopen. If it arrives with
+    //      resumable:true, Gemini has the prior context (including any
+    //      injections that landed before the close). Skip replay to avoid
+    //      polluting the model with duplicate references.
+    //   2. If the wait times out OR the update reports not-resumable, replay
+    //      the K=5 most recent injections via sendRealtimeInput({text}),
+    //      separated by BRAIN_REOPEN_INJECTION_MARGIN_MS.
+    //
+    // The first open() never has history (initial connect); only reopens do.
+    if (this._injectionHistory.length > 0) {
+      const resumableDecision = await this._awaitResumptionDecisionForReplay();
+      if (resumableDecision !== 'accepted') {
+        for (const injectText of this._injectionHistory) {
+          try {
+            this._session.sendRealtimeInput({ text: injectText });
+            this._injectionReplayCount += 1;
+            await new Promise((r) => setTimeout(r, BRAIN_REOPEN_INJECTION_MARGIN_MS));
+          } catch (e) {
+            console.warn(`[gemini-bridge] injection replay failed: ${e?.message || e}`);
+            break; // bridge likely closed; abandon replay
+          }
+        }
+      }
+    }
+  }
+
+  // Resumption-replay decision helper. Returns 'accepted' if a
+  // sessionResumptionUpdate with resumable:true arrives within timeout;
+  // 'rejected' if resumable:false arrives; 'timeout' otherwise. The proxy
+  // logs the outcome via the existing 'closed' / sessionResumptionUpdate
+  // pathway, so we don't double-emit here.
+  async _awaitResumptionDecisionForReplay(timeoutMs = 1500) {
+    return new Promise((resolve) => {
+      const start = Date.now();
+      // If we never had a stored handle, the open was a cold connect — no
+      // server-side history to inherit. Replay outright.
+      // (this._sessionResumeHandle is cleared inside reopen() error path;
+      // truthy means we passed it in the connect config.)
+      if (!this._sessionResumeHandle) {
+        resolve('rejected');
+        return;
+      }
+      const to = setTimeout(() => {
+        this.off('event', listener);
+        resolve('timeout');
+      }, timeoutMs);
+      const listener = (e) => {
+        if (e.kind === '__resumption_update__') {
+          if (Date.now() - start > timeoutMs) return;
+          clearTimeout(to);
+          this.off('event', listener);
+          resolve(e.resumable ? 'accepted' : 'rejected');
+        }
+      };
+      this.on('event', listener);
+    });
+  }
+
+  // pgvector RAG plan (vector mode). Inject a text payload into the live
+  // session via sendRealtimeInput({text}). Per Google docs, send_realtime_input
+  // is the only mid-session text channel on 3.1 Live (send_client_content is
+  // rejected after the first model turn). The proxy calls this between
+  // turn_complete and the next user audio frame; the proxy's audio gate
+  // guarantees ordering at the boundary.
+  injectText(text) {
+    if (!this._session || this._closed) {
+      const e = new Error('bridge_not_open');
+      e.code = 'ERR_BRIDGE_CLOSED';
+      throw e;
+    }
+    if (typeof text !== 'string' || text.length === 0) {
+      const e = new Error('invalid_injection_text');
+      e.code = 'ERR_BAD_INJECTION';
+      throw e;
+    }
+    const bytes = Buffer.byteLength(text, 'utf8');
+    if (bytes > INJECTION_MAX_BYTES) {
+      const e = new Error(`injection_too_large bytes=${bytes} cap=${INJECTION_MAX_BYTES}`);
+      e.code = 'ERR_INJECTION_TOO_LARGE';
+      throw e;
+    }
+    this._session.sendRealtimeInput({ text });
+    // Push to ring buffer — drop oldest if at cap.
+    this._injectionHistory.push(text);
+    while (this._injectionHistory.length > INJECTION_HISTORY_K) {
+      this._injectionHistory.shift();
+    }
+    return { bytes };
+  }
+
+  getInjectionMetrics() {
+    return {
+      historySize: this._injectionHistory.length,
+      replayCount: this._injectionReplayCount,
+    };
   }
 
   _onMessage(m) {
@@ -257,6 +414,33 @@ export class GeminiBridge extends EventEmitter {
         }
       }
     }
+    // pgvector RAG plan (vector mode) — inputTranscription event.
+    //
+    // 3.1 Live emits this once per user-turn at end-of-utterance (regression
+    // from 2.5 incremental delivery — forum 136977). Single chunk; for
+    // utterances >15s the path silently truncates after ~100 chunks
+    // (forum 107385). We surface the per-turn input bytes alongside so the
+    // proxy heuristic truncationSuspected() has a real denominator.
+    //
+    // R3 M1 — emitted BEFORE the turn_complete dispatch below. The iteration
+    // here runs strictly before the `if (m?.serverContent?.turnComplete)`
+    // block at the end of _onMessage, so within the same envelope the
+    // proxy receives input_transcription first then turn_complete. The
+    // proxy's turn_complete handler also defers via microtask for belt-
+    // and-suspenders against future refactors.
+    const itText = m?.serverContent?.inputTranscription?.text;
+    if (typeof itText === 'string' && itText.length > 0 && this._enableInputTranscription) {
+      // 16kHz s16le mono: 1 second = 32000 bytes.
+      const durationSec = this._currentTurnInputBytes / 32000;
+      this._pendingInputTranscriptionThisTurn = itText;
+      this.emit('event', {
+        kind: 'input_transcription',
+        at: Date.now(),
+        text: itText,
+        durationSec,
+      });
+    }
+
     // R3-C4 — outputTranscription chunks (Pipeline α'). Cap at
     // OUTPUT_TRANSCRIPT_MAX_CHARS per turn; emit transcript_runaway once
     // and stop forwarding for the rest of the turn.
@@ -308,12 +492,20 @@ export class GeminiBridge extends EventEmitter {
       // false. Store regardless — Google's worst case is they reject the
       // handle on reopen, in which case we just start fresh (same as today).
       this._sessionResumeHandle = sru.newHandle;
+      // Internal event for _awaitResumptionDecisionForReplay (vector mode).
+      // Listener is single-fire; if no one is listening it's a no-op.
+      this.emit('event', {
+        kind: '__resumption_update__',
+        at: Date.now(),
+        resumable: sru.resumable !== false, // default true unless explicit false
+      });
     }
     if (m?.serverContent?.interrupted) {
       this.emit('event', { kind: 'interrupted', at: Date.now() });
     }
     if (m?.serverContent?.turnComplete) {
       this._currentTurnReceivedContent = false;
+      this._pendingInputTranscriptionThisTurn = null;
       this.emit('event', { kind: 'turn_complete', at: Date.now() });
     }
   }

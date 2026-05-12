@@ -104,7 +104,7 @@ export async function POST(req: NextRequest) {
 
   const { data: creatorRow, error: creatorErr } = await admin
     .from('creators')
-    .select('id, simli_face_id, heygen_avatar_id, voice_id, voice_id_preview, voice_id_dev, system_prompt, brain_status, tts_speed')
+    .select('id, simli_face_id, heygen_avatar_id, voice_id, voice_id_preview, voice_id_dev, system_prompt, brain_status, tts_speed, brain_mode')
     .eq('id', creatorId)
     .maybeSingle<{
       id: string;
@@ -118,6 +118,8 @@ export async function POST(req: NextRequest) {
       // numeric → string coercion (R2 audit C3). See open route.ts:165
       // for full rationale; same shape here.
       tts_speed: number | string | null;
+      // pgvector RAG plan (M2). 'drawer' | 'vector'.
+      brain_mode: 'drawer' | 'vector';
     }>();
   if (creatorErr) return json(500, { error: 'creator_lookup_failed' });
   if (!creatorRow) return json(404, { error: 'creator_not_found' });
@@ -348,40 +350,82 @@ export async function POST(req: NextRequest) {
   // (migration 20260502000002 line 301) makes a second-rollover always
   // fail with P0006. So a retry can never succeed after voice-ticket
   // mint fails. Close the orphan new row + return mapped error code.
-  // Brain prefix build for the new session (PR-2). Mirror sessions/open.
+  // Brain prefix build for the new session (PR-2 + pgvector RAG).
+  // Drawer mode: build prefix as today. Vector mode: skip — per-turn
+  // retrieval runs proxy-side; injection history starts fresh on the new
+  // bridge (documented rollover regression — honest-disqualifier persona
+  // clause carries any in-flight-at-rollover question).
   let brainPrefix: Awaited<ReturnType<typeof buildBrainPrefix>> = null;
-  try {
-    brainPrefix = await buildBrainPrefix({
-      supabaseAdmin: admin,
-      creatorId,
-      hookId,
-    });
-    if (brainPrefix) {
-      captureServerSafe(callerUserId, 'brain_prefix_built', {
-        creator_id: creatorId,
-        hook_id: hookId,
-        source_count: brainPrefix.sourceCount,
-        total_raw_chars: brainPrefix.totalRawChars,
-        encoded_bytes: brainPrefix.encodedBytes,
-        selected_topic_count: brainPrefix.selectedTopicSlugs.length,
+  if (creatorRow.brain_mode === 'drawer') {
+    try {
+      brainPrefix = await buildBrainPrefix({
+        supabaseAdmin: admin,
+        creatorId,
+        hookId,
       });
-    } else {
+      if (brainPrefix) {
+        captureServerSafe(callerUserId, 'brain_prefix_built', {
+          creator_id: creatorId,
+          hook_id: hookId,
+          source_count: brainPrefix.sourceCount,
+          total_raw_chars: brainPrefix.totalRawChars,
+          encoded_bytes: brainPrefix.encodedBytes,
+          selected_topic_count: brainPrefix.selectedTopicSlugs.length,
+        });
+      } else {
+        captureServerSafe(callerUserId, 'brain_prefix_skipped', {
+          creator_id: creatorId,
+          hook_id: hookId,
+          reason: 'no_overlap',
+        });
+      }
+    } catch (prefixErr) {
+      Sentry.captureException(prefixErr, {
+        extra: { op: 'sessions_rollover_brain_prefix', creator_id: creatorId, hook_id: hookId },
+      });
       captureServerSafe(callerUserId, 'brain_prefix_skipped', {
         creator_id: creatorId,
         hook_id: hookId,
-        reason: 'no_overlap',
+        reason: 'builder_error',
+      });
+      brainPrefix = null;
+    }
+  } else {
+    // Audit M2: vector mode chunk-count guard (mirror sessions/open).
+    try {
+      const { count: chunkCount } = await admin
+        .from('sample_content_chunks')
+        .select('id', { count: 'exact', head: true })
+        .eq('creator_id', creatorId)
+        .not('embedding', 'is', null);
+      if ((chunkCount ?? 0) === 0) {
+        Sentry.captureMessage('vector.no_chunks', {
+          level: 'warning',
+          extra: { creator_id: creatorId, hook_id: hookId, surface: 'rollover' },
+        });
+        captureServerSafe(callerUserId, 'vector_mode_no_chunks', {
+          creator_id: creatorId,
+          hook_id: hookId,
+        });
+      }
+    } catch (chunkCountErr) {
+      Sentry.captureException(chunkCountErr, {
+        extra: { op: 'sessions_rollover_chunk_count', creator_id: creatorId },
       });
     }
-  } catch (prefixErr) {
-    Sentry.captureException(prefixErr, {
-      extra: { op: 'sessions_rollover_brain_prefix', creator_id: creatorId, hook_id: hookId },
-    });
-    captureServerSafe(callerUserId, 'brain_prefix_skipped', {
-      creator_id: creatorId,
-      hook_id: hookId,
-      reason: 'builder_error',
-    });
-    brainPrefix = null;
+  }
+
+  // {{user_name}} substitution (mirror sessions/open). Persona compile emits
+  // the literal placeholder; resolve from profiles.display_name here.
+  let resolvedSystemPrompt: string | null = creatorRow.system_prompt;
+  if (resolvedSystemPrompt && resolvedSystemPrompt.includes('{{user_name}}')) {
+    const { data: profileRow } = await admin
+      .from('profiles')
+      .select('display_name')
+      .eq('id', callerUserId)
+      .maybeSingle<{ display_name: string | null }>();
+    const userName = (profileRow?.display_name ?? '').trim() || 'friend';
+    resolvedSystemPrompt = resolvedSystemPrompt.replaceAll('{{user_name}}', userName);
   }
 
   let voiceTicket: { ticket: string; expiresAt: string };
@@ -394,8 +438,9 @@ export async function POST(req: NextRequest) {
       expectedTier:   tier,
       avatarProvider: avatarProvider ?? 'simli',
       ua:             req.headers.get('user-agent') ?? '',
-      systemPrompt:   creatorRow.system_prompt,
+      systemPrompt:   resolvedSystemPrompt,
       prefixTurns:    brainPrefix?.prefixTurns ?? null,
+      brainMode:      creatorRow.brain_mode,
       // Creator voice-speed (migration 20260511000006). See open route
       // for full rationale on the numeric→string coercion.
       ttsSpeed: (() => {

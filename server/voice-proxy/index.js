@@ -41,6 +41,13 @@ import { makeLogTurnCogs, installReaper, VOICE_CARTESIA_ENABLED, getCartesiaPric
 import { makeVoiceDeleteWorker } from './voice-delete-worker.js';
 import { makeSimliFaceDeleteWorker } from './simli-face-delete-worker.js';
 import { makeFaceUploadReaper } from './face-upload-reaper.js';
+import { makeEmbedWorker } from './embed-worker.js';
+// pgvector RAG — vector-mode retrieval (audit C1 fix). Mirrors of the TS libs
+// in src/lib/voice/. The TS originals stay for vitest + future Next-side
+// consumers; these JS files are the proxy's runtime source of truth (proxy is
+// pure ESM Node — cannot import .ts files at runtime).
+import { retrieveTopK } from './retrieve-knowledge.js';
+import { buildInjectionEnvelope } from './build-injection-envelope.js';
 
 const PORT = Number(process.env.PORT || 8080);
 const BUILD = process.env.FLY_MACHINE_ID || 'local';
@@ -163,7 +170,7 @@ async function consumeTicket(ticketId, uaHash) {
     .is('consumed_at', null)
     .gt('expires_at', new Date().toISOString())
     .eq('bound_ua_hash', uaHash)
-    .select('user_id, creator_id, session_id, expected_tier, purpose, avatar_provider, system_prompt, prefix_turns, tts_speed')
+    .select('user_id, creator_id, session_id, expected_tier, purpose, avatar_provider, system_prompt, prefix_turns, tts_speed, brain_mode')
     .maybeSingle();
   if (error || !data) return null;
   // creator_id is NOT NULL by CHECK on new rows (migration 0041). A null here
@@ -202,6 +209,10 @@ async function consumeTicket(ticketId, uaHash) {
       const n = typeof data.tts_speed === 'number' ? data.tts_speed : Number(data.tts_speed);
       return Number.isFinite(n) ? n : null;
     })(),
+    // pgvector RAG plan — brain_mode snapshot from voice_tickets (M6).
+    // 'drawer' = legacy topic-tag overlap; 'vector' = per-turn pgvector
+    // retrieval injected mid-session via the audio gate below.
+    brainMode:      (data.brain_mode === 'vector' ? 'vector' : 'drawer'),
   };
 }
 
@@ -565,6 +576,56 @@ wss.on('connection', async (ws, req) => {
   let heartbeatInterval = null;
   let turnNumber = 0;
   let cartesiaTurnDead = false; // R3-M1 / R4-S1 — relay-loop gate for barge-in
+
+  // ── pgvector RAG plan — vector-mode state ──────────────────────────────
+  //
+  // Closure-captured `creatorId` + `userId` from the consumed voice_ticket
+  // (R3 M4 fix — application-layer trust chain). NEVER re-read from any
+  // per-message field. `brainMode` selects which retrieval path runs.
+  const brainMode = consumed.brainMode;          // 'drawer' | 'vector'
+  const ticketCreatorId = consumed.creatorId;    // used for creator_knowledge_topk
+  const ticketUserId = consumed.userId;          // used for voice_retrieval_budget
+  //
+  // Audio gate (R2 C1 / R3 M1). Between bridge `turn_complete` and resolution
+  // of pendingInjection, we hold inbound audio frames in `audioHold` so the
+  // injection text lands BEFORE the next user-turn audio reaches Gemini.
+  // 200ms ring buffer (cap = 200ms × 16kHz × 2 bytes = 6400 bytes; we use
+  // a generous 32KB cap to also tolerate 24kHz). Overflow flushes the gate
+  // without injection (telemetry event); we always prefer answering over
+  // freezing the user mid-speech.
+  let forwardAudio = true;
+  let audioHold = [];
+  let audioHoldBytes = 0;
+  const AUDIO_HOLD_MAX_BYTES = 32 * 1024;
+  let pendingInjection = null; // { promise, turnNumber, skip }
+  let retrievalSkippedTruncationCount = 0;
+  let retrievalSkippedShortUtteranceCount = 0; // audit M3
+  let retrievalEmptyCount = 0;
+  let retrievalTimeoutCount = 0;
+  let injectionLandedCount = 0;
+  let injectionOverflowCount = 0;
+
+  // Audit M3: short-utterance skip. "yeah" / "ok" / "mm-hm" don't need a
+  // pgvector query — they're conversational fillers between substantive
+  // turns. 20 chars OR 1.5s is the lower bound for "could plausibly be a
+  // substantive question." Tightens daily budget headroom 3-5×.
+  const SHORT_UTTERANCE_MIN_CHARS   = 20;
+  const SHORT_UTTERANCE_MIN_SECONDS = 1.5;
+  function shortUtterance(text, audioSeconds) {
+    if (typeof text !== 'string') return true;
+    if (text.length < SHORT_UTTERANCE_MIN_CHARS) return true;
+    if (Number.isFinite(audioSeconds) && audioSeconds < SHORT_UTTERANCE_MIN_SECONDS) return true;
+    return false;
+  }
+
+  // R3 M1 truncation heuristic: ~150 wpm × 6 chars/word ÷ 60s = 15 chars/sec.
+  // Trigger when transcript.length < 0.6 × expectedChars AND audioSeconds > 12.
+  // Below 12s a fast speaker can legitimately ratio under 0.6 without truncation.
+  function truncationSuspected(text, audioSeconds) {
+    if (!Number.isFinite(audioSeconds) || audioSeconds <= 12) return false;
+    const expected = audioSeconds * 15;
+    return text.length < 0.6 * expected;
+  }
   // Phase C B4.5: wall-clock turn-start anchor for voice_usage_record's
   // day-bucketing. A turn that begins at 23:58 → 00:05 books to the day
   // it began (matches user intuition; admin "usage per day" reports use
@@ -638,6 +699,21 @@ wss.on('connection', async (ws, req) => {
       } catch (metricsErr) {
         captureException(metricsErr, { op: 'brain_seed_metrics', connId, sessionId });
       }
+    }
+    // pgvector RAG (vector mode) — per-session retrieval metrics. Logged
+    // alongside the brain-prefix metrics so operators can grep one stream
+    // for session-end signals. Skips emit entirely on drawer mode (no
+    // retrieval ran).
+    if (brainMode === 'vector') {
+      console.log(
+        `[ws ${connId}] vector.metrics injected=${injectionLandedCount} ` +
+        `skipped_short=${retrievalSkippedShortUtteranceCount} ` +
+        `skipped_truncation=${retrievalSkippedTruncationCount} ` +
+        `empty=${retrievalEmptyCount} ` +
+        `timeout=${retrievalTimeoutCount} ` +
+        `overflow=${injectionOverflowCount} ` +
+        `session=${sessionId.slice(0, 8)}`,
+      );
     }
     // R4-M1 — null-check INSTANCES, not booleans. Either bridge may be
     // null if the open path bailed early.
@@ -718,21 +794,29 @@ wss.on('connection', async (ws, req) => {
       apiKey: GEMINI_API_KEY,
       enableOutputTranscription: useCartesia,
       discardAudioOut: useCartesia,
+      // pgvector RAG plan (vector mode). When the ticket's brain_mode is
+      // 'vector', enable inputAudioTranscription so we receive
+      // serverContent.inputTranscription.text per user-turn to drive
+      // retrieval (R3 M1). Drawer mode keeps current behavior — flagged
+      // for staged rollout (BRAIN_ENABLE_INPUT_TRANSCRIPTION_DRAWER).
+      enableInputTranscription:
+        consumed.brainMode === 'vector'
+        || process.env.BRAIN_ENABLE_INPUT_TRANSCRIPTION_DRAWER === '1',
     });
-    console.log(`[ws ${connId}] gemini.open start (cartesia=${useCartesia})`);
+    console.log(`[ws ${connId}] gemini.open start (cartesia=${useCartesia} brain=${consumed.brainMode})`);
     const t0 = Date.now();
-    // Brain wire-up (PR-2). systemInstruction + brainPrefix ride the
-    // ticket; bridge.open() seeds prefix_turns post-setupComplete with
-    // turnComplete:false (R2 audit C2). Replays on every reopen via
-    // _lastOpenArgs (R2 C3 / R3 M5). NULL when route couldn't compile
-    // — bridge falls through to DEFAULT_SYSTEM in that case.
+    // Brain wire-up (PR-2 + pgvector RAG). systemInstruction + brainPrefix
+    // ride the ticket; bridge.open() seeds prefix_turns post-setupComplete
+    // with turnComplete:false (R2 audit C2). Replays on every reopen via
+    // _lastOpenArgs (R2 C3 / R3 M5). In vector mode, prefix_turns is null
+    // by DB invariant (M6) and per-turn retrieval injects via the audio gate.
     await bridge.open({
       model: modelWire,
       sessionId,
       systemInstruction: consumed.systemPrompt || undefined,
       brainPrefix: consumed.prefixTurns || null,
     });
-    console.log(`[ws ${connId}] gemini.open ok in ${Date.now() - t0}ms (sysprompt=${consumed.systemPrompt ? consumed.systemPrompt.length : 0}c prefix=${consumed.prefixTurns ? 'y' : 'n'})`);
+    console.log(`[ws ${connId}] gemini.open ok in ${Date.now() - t0}ms (sysprompt=${consumed.systemPrompt ? consumed.systemPrompt.length : 0}c prefix=${consumed.prefixTurns ? 'y' : 'n'} brain=${consumed.brainMode})`);
   } catch (e) {
     console.error(`[ws ${connId}] gemini-open FAIL:`, e?.message || e);
     captureException(e, { op: 'bridge-open', connId, modelWire, sessionId });
@@ -867,6 +951,100 @@ wss.on('connection', async (ws, req) => {
     ws.send(bytes, { binary: true });
   }
 
+  // ── Vector-mode retrieval helpers (audit C1 fix) ──────────────────────
+  //
+  // retrieveTopK + buildInjectionEnvelope are static-imported from the
+  // proxy-side JS mirrors at the top of this file. The previous attempt
+  // dynamic-imported the .ts originals from src/lib/voice; Node's ESM
+  // loader rejects .ts extensions and the catch installed silent sentinels,
+  // so vector mode appeared to work but never actually retrieved anything.
+  //
+  // Run retrieval for a user turn; the race against the 800ms ceiling
+  // happens in the turn_complete handler.
+  function kickoffRetrieval(transcript, turnNum) {
+    pendingInjection = {
+      turnNumber: turnNum,
+      skip: false,
+      promise: retrieveTopK({
+        supabase,
+        geminiApiKey: GEMINI_API_KEY,
+        userId: ticketUserId,
+        creatorId: ticketCreatorId,
+        queryText: transcript,
+        sessionId,
+      }).catch((err) => {
+        captureException(err, { op: 'vector.retrieve', sessionId, turnNumber: turnNum });
+        return { passages: [], budgetExceeded: false };
+      }),
+    };
+  }
+
+  // Audio-gate flush. Drains audioHold to the bridge in order; clears state.
+  function flushAudioHold() {
+    if (audioHold.length === 0) {
+      forwardAudio = true;
+      audioHoldBytes = 0;
+      return;
+    }
+    for (const buf of audioHold) {
+      try {
+        bridge.sendAudio({ bytes: buf, mimeType: 'audio/pcm;rate=16000' });
+      } catch (e) {
+        // bridge_not_open mid-flush — break and let next turn rebuild.
+        console.warn(`[ws ${connId}] audioHold flush abort: ${e?.message || e}`);
+        break;
+      }
+    }
+    audioHold = [];
+    audioHoldBytes = 0;
+    forwardAudio = true;
+  }
+
+  // Race pendingInjection against an 800ms ceiling. On result with passages,
+  // call bridge.injectText. Always flush the audio gate at the end.
+  async function resolveInjectionAtTurnComplete() {
+    if (!pendingInjection || pendingInjection.skip) {
+      flushAudioHold();
+      pendingInjection = null;
+      return;
+    }
+    const promise = pendingInjection.promise;
+    pendingInjection = null;
+    let result = null;
+    try {
+      result = await Promise.race([
+        promise,
+        new Promise((resolve) => setTimeout(() => resolve('__timeout__'), 800)),
+      ]);
+    } catch (e) {
+      // Caught above; swallow defensively.
+      result = null;
+    }
+    if (result === '__timeout__') {
+      retrievalTimeoutCount += 1;
+      flushAudioHold();
+      return;
+    }
+    if (!result || !Array.isArray(result.passages) || result.passages.length === 0) {
+      retrievalEmptyCount += 1;
+      flushAudioHold();
+      return;
+    }
+    try {
+      const envelope = buildInjectionEnvelope({
+        passages: result.passages.map((p) => ({ text: p.text, sourceType: p.sourceType })),
+      });
+      if (envelope && envelope.passageCount > 0) {
+        bridge.injectText(envelope.text);
+        injectionLandedCount += 1;
+      }
+    } catch (e) {
+      captureException(e, { op: 'vector.inject', sessionId, turnNumber });
+    } finally {
+      flushAudioHold();
+    }
+  }
+
   // ── Gemini events ─────────────────────────────────────────────────────
   bridge.on((e) => {
     if (closed) return;
@@ -897,8 +1075,44 @@ wss.on('connection', async (ws, req) => {
         sessionId,
         characterCount: e.characterCount,
       });
+    } else if (e.kind === 'input_transcription') {
+      // pgvector RAG plan (vector mode). Single chunk per user-turn for 3.1
+      // Live. Kick off retrieval BEFORE turn_complete (which the model emits
+      // immediately after when its clarifier finishes generating). The race
+      // resolves in resolveInjectionAtTurnComplete().
+      if (brainMode !== 'vector') return;
+      // Audit M3: skip retrieval for conversational fillers. The clarifier
+      // pattern means turn N+1 ("maintaining habits") is often <20 chars
+      // and doesn't carry substantive intent — the retrieval was already
+      // primed on turn N. Skip burns one budget call per filler turn for
+      // no gain.
+      if (shortUtterance(e.text, e.durationSec)) {
+        retrievalSkippedShortUtteranceCount += 1;
+        pendingInjection = { skip: true, turnNumber };
+        return;
+      }
+      if (truncationSuspected(e.text, e.durationSec)) {
+        retrievalSkippedTruncationCount += 1;
+        pendingInjection = { skip: true, turnNumber };
+        console.warn(`[ws ${connId}] input_transcription truncated — skipping retrieval (chars=${e.text.length} sec=${e.durationSec.toFixed(2)})`);
+        return;
+      }
+      kickoffRetrieval(e.text, turnNumber);
     } else if (e.kind === 'turn_complete') {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'turn_complete', at: e.at }));
+      // pgvector RAG plan — audio gate. Microtask-defer the race so any
+      // same-envelope input_transcription set pendingInjection FIRST (R3 M1
+      // belt-and-suspenders; bridge's _onMessage already iterates input
+      // before turn_complete, but we don't trust that to never refactor).
+      if (brainMode === 'vector') {
+        forwardAudio = false;
+        setImmediate(() => {
+          resolveInjectionAtTurnComplete().catch((err) => {
+            captureException(err, { op: 'vector.resolve_injection', sessionId });
+            flushAudioHold();
+          });
+        });
+      }
     } else if (e.kind === 'interrupted') {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'interrupted', at: e.at }));
     } else if (e.kind === 'error') {
@@ -1010,6 +1224,24 @@ wss.on('connection', async (ws, req) => {
   ws.on('message', async (data, isBinary) => {
     if (closed) return;
     if (isBinary) {
+      // pgvector RAG plan — audio gate (R2 C1). When forwardAudio=false
+      // (between bridge turn_complete and resolveInjectionAtTurnComplete),
+      // accumulate frames in audioHold to preserve text-before-audio ordering
+      // at the turn boundary. Overflow flushes the gate without injection;
+      // we prefer answering over freezing the user.
+      if (!forwardAudio) {
+        const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+        if (audioHoldBytes + buf.length > AUDIO_HOLD_MAX_BYTES) {
+          injectionOverflowCount += 1;
+          console.warn(`[ws ${connId}] audio-gate overflow at ${audioHoldBytes + buf.length} bytes — flushing without injection`);
+          flushAudioHold();
+          // Fall through to forward the current frame.
+        } else {
+          audioHold.push(buf);
+          audioHoldBytes += buf.length;
+          return;
+        }
+      }
       try { bridge.sendAudio({ bytes: data, mimeType: 'audio/pcm;rate=16000' }); }
       catch (e) {
         // Send-audio failures are usually a closed-mid-frame race (1000-close
@@ -1037,6 +1269,16 @@ wss.on('connection', async (ws, req) => {
         // turnStart so any race with a stale chunk in the WS receive
         // buffer drops cleanly. (Was post-turnStart; moved per audit C3.)
         cartesiaTurnDead = false;
+        // pgvector RAG plan — barge-in / new-turn reset of the audio gate.
+        // If the client signals turn_start while we're still mid-injection
+        // (forwardAudio=false), the user has barge-in'd the clarifier. Drop
+        // the pending injection and flush any held audio so the new turn
+        // streams cleanly. The user's pending question is the new substantive
+        // turn; retrieval will re-fire on the next input_transcription.
+        if (!forwardAudio || pendingInjection) {
+          pendingInjection = null;
+          flushAudioHold();
+        }
         // Phase 0.5 fix (2026-05-07). Google's 3.1 Live preview sometimes
         // closes the WS with code=1000 after a turn instead of holding it
         // open (js-genai#707). The [google-live-workaround] in
@@ -1275,6 +1517,7 @@ let reaperHandle = null;
 let voiceDeleteHandle = null;
 let simliFaceDeleteHandle = null;
 let faceUploadReaperHandle = null;
+let embedWorkerHandle = null;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`voice-proxy listening on :${PORT} (build=${BUILD})`);
   // Reaper: 20s cadence + 60s threshold (RPC default). Fires once at boot for
@@ -1299,6 +1542,18 @@ server.listen(PORT, '0.0.0.0', () => {
   // Auditor R3-NC2 — stale-pending face-upload reaper. No vendor key
   // needed; just calls the SECURITY DEFINER RPC. Always on.
   faceUploadReaperHandle = makeFaceUploadReaper({ supabase }).install().handle;
+  // pgvector RAG plan — embed-worker (in-process, R3 M5). Spawns alongside
+  // the other workers; same Fly app, same env. Polls
+  // sample_content_embedding_jobs every 5s and chunks + embeds via
+  // gemini-embedding-001. No-op without GEMINI_API_KEY (validated at boot
+  // already; this is defensive).
+  if (GEMINI_API_KEY) {
+    embedWorkerHandle = makeEmbedWorker({
+      supabase,
+      geminiApiKey: GEMINI_API_KEY,
+      flyMachineId: BUILD,
+    }).install().handle;
+  }
 });
 
 // Graceful shutdown — stop the reaper interval so node exits cleanly when the
@@ -1309,6 +1564,7 @@ function shutdown(signal) {
   if (voiceDeleteHandle) clearInterval(voiceDeleteHandle);
   if (simliFaceDeleteHandle) clearInterval(simliFaceDeleteHandle);
   if (faceUploadReaperHandle) clearInterval(faceUploadReaperHandle);
+  if (embedWorkerHandle) clearInterval(embedWorkerHandle);
   server.close(() => process.exit(0));
   // Hard-exit after 5s if connections won't drain.
   setTimeout(() => process.exit(0), 5000).unref();

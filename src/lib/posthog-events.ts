@@ -83,6 +83,17 @@ export const ServerEvents = {
   // Brain wire-up (PR-2). Fired by proxy at session-end so the
   // always-replay token cost (R3 audit M5/R6) is operator-visible.
   brain_prefix_reseeded:  'brain_prefix_reseeded',
+  // pgvector RAG plan — vector-mode telemetry.
+  brain_mode_vector_session: 'brain_mode_vector_session',
+  // pgvector RAG audit M2 — fired at session-open when a creator is flipped
+  // to vector mode but has zero embedded chunks (backfill skipped). Without
+  // this signal, the symptom is "vector mode looks like persona-only" and
+  // takes a transcript-read to diagnose.
+  vector_mode_no_chunks: 'vector_mode_no_chunks',
+  // pgvector RAG audit M3 — fired when proxy skips retrieval on a short
+  // utterance ("yeah", "ok"). Lets us measure how often retrieval would
+  // have run vs how often it skipped.
+  retrieval_skipped_short_utterance: 'retrieval_skipped_short_utterance',
 } as const;
 
 // ── Type unions ─────────────────────────────────────────────────────────────

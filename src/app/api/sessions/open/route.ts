@@ -151,7 +151,7 @@ export async function POST(req: NextRequest) {
   // 409 brain_not_ready (R3 audit M1).
   const { data: creatorRow, error: creatorErr } = await admin
     .from('creators')
-    .select('id, simli_face_id, heygen_avatar_id, voice_id, voice_id_preview, voice_id_dev, published_at, system_prompt, brain_status, tts_speed')
+    .select('id, simli_face_id, heygen_avatar_id, voice_id, voice_id_preview, voice_id_dev, published_at, system_prompt, brain_status, tts_speed, brain_mode')
     .eq('id', creatorId)
     .maybeSingle<{
       id: string;
@@ -167,6 +167,8 @@ export async function POST(req: NextRequest) {
       // (R2 audit C3). DB CHECK is [0.6, 1.5]; mint helper drops to NULL
       // on non-finite values as defense in depth.
       tts_speed: number | string | null;
+      // pgvector RAG plan (M2). 'drawer' | 'vector'. Default 'drawer'.
+      brain_mode: 'drawer' | 'vector';
     }>();
   if (creatorErr) return json(500, { error: 'creator_lookup_failed' });
   if (!creatorRow) return json(404, { error: 'creator_not_found' });
@@ -619,54 +621,103 @@ export async function POST(req: NextRequest) {
     return json(502, { error: 'gemini_mint_failed' });
   }
 
-  // ── Brain prefix build (PR-2) ───────────────────────────────────────
-  // Pulls sample_content rows whose topic_tags overlap hook.topic_tags
-  // and packages them as a single user-role `prefixTurns` Content entry
-  // with the L3 model-ack folded into its closing text (post-2026-05-09
-  // spike: gemini-3.1-flash-live-preview rejects model-role turns in
-  // sendClientContent w/ WS-1007). Server-only (sample_content can
-  // carry PII; never reaches the client). On any error, degrade to
-  // persona-only (system_prompt without prefix) and breadcrumb so we
-  // can find detachment in production.
+  // ── Brain prefix build (PR-2 + pgvector RAG) ────────────────────────
+  // Drawer mode: pulls sample_content rows whose topic_tags overlap
+  // hook.topic_tags and packages them as a single user-role `prefixTurns`
+  // Content entry (existing behavior).
+  // Vector mode: skips the prefix build entirely — per-turn retrieval
+  // injection runs proxy-side via the audio gate. DB invariant
+  // voice_tickets_brain_mode_prefix_chk enforces prefix_turns IS NULL when
+  // brain_mode='vector' (defense-in-depth — this is the pre-DB gate).
   let brainPrefix: Awaited<ReturnType<typeof buildBrainPrefix>> = null;
-  try {
-    brainPrefix = await buildBrainPrefix({
-      supabaseAdmin: admin,
-      creatorId,
-      hookId,
-    });
-    if (brainPrefix) {
-      captureServerSafe(callerUserId, 'brain_prefix_built', {
-        creator_id: creatorId,
-        hook_id: hookId,
-        source_count: brainPrefix.sourceCount,
-        total_raw_chars: brainPrefix.totalRawChars,
-        encoded_bytes: brainPrefix.encodedBytes,
-        selected_topic_count: brainPrefix.selectedTopicSlugs.length,
+  if (creatorRow.brain_mode === 'drawer') {
+    try {
+      brainPrefix = await buildBrainPrefix({
+        supabaseAdmin: admin,
+        creatorId,
+        hookId,
       });
-    } else {
+      if (brainPrefix) {
+        captureServerSafe(callerUserId, 'brain_prefix_built', {
+          creator_id: creatorId,
+          hook_id: hookId,
+          source_count: brainPrefix.sourceCount,
+          total_raw_chars: brainPrefix.totalRawChars,
+          encoded_bytes: brainPrefix.encodedBytes,
+          selected_topic_count: brainPrefix.selectedTopicSlugs.length,
+        });
+      } else {
+        captureServerSafe(callerUserId, 'brain_prefix_skipped', {
+          creator_id: creatorId,
+          hook_id: hookId,
+          reason: 'no_overlap',
+        });
+        Sentry.addBreadcrumb({
+          category: 'brain',
+          level: 'info',
+          message: 'partial_prefix',
+          data: { creator_id: creatorId, hook_id: hookId },
+        });
+      }
+    } catch (prefixErr) {
+      Sentry.captureException(prefixErr, {
+        extra: { op: 'sessions_open_brain_prefix', creator_id: creatorId, hook_id: hookId },
+      });
       captureServerSafe(callerUserId, 'brain_prefix_skipped', {
         creator_id: creatorId,
         hook_id: hookId,
-        reason: 'no_overlap',
+        reason: 'builder_error',
       });
-      Sentry.addBreadcrumb({
-        category: 'brain',
-        level: 'info',
-        message: 'partial_prefix',
-        data: { creator_id: creatorId, hook_id: hookId },
-      });
+      brainPrefix = null;
     }
-  } catch (prefixErr) {
-    Sentry.captureException(prefixErr, {
-      extra: { op: 'sessions_open_brain_prefix', creator_id: creatorId, hook_id: hookId },
-    });
-    captureServerSafe(callerUserId, 'brain_prefix_skipped', {
+  } else {
+    // Vector mode — no prefix build. Per-turn retrieval runs proxy-side.
+    captureServerSafe(callerUserId, 'brain_mode_vector_session', {
       creator_id: creatorId,
       hook_id: hookId,
-      reason: 'builder_error',
     });
-    brainPrefix = null;
+    // Audit M2: chunk-count guard. A vector-mode creator with zero embedded
+    // chunks looks UX-identical to a healthy session (persona-only fallback),
+    // so the operator never learns the backfill was skipped. One Sentry
+    // warning + one PostHog event makes the misconfiguration visible.
+    try {
+      const { count: chunkCount } = await admin
+        .from('sample_content_chunks')
+        .select('id', { count: 'exact', head: true })
+        .eq('creator_id', creatorId)
+        .not('embedding', 'is', null);
+      if ((chunkCount ?? 0) === 0) {
+        Sentry.captureMessage('vector.no_chunks', {
+          level: 'warning',
+          extra: { creator_id: creatorId, hook_id: hookId },
+        });
+        captureServerSafe(callerUserId, 'vector_mode_no_chunks', {
+          creator_id: creatorId,
+          hook_id: hookId,
+        });
+      }
+    } catch (chunkCountErr) {
+      // Non-fatal — count is observability, not correctness. Log only.
+      Sentry.captureException(chunkCountErr, {
+        extra: { op: 'sessions_open_chunk_count', creator_id: creatorId },
+      });
+    }
+  }
+
+  // ── {{user_name}} substitution (pgvector plan inline user-name fix) ──
+  // Persona compile (M10) emits a literal {{user_name}} placeholder.
+  // Resolve here using profiles.display_name (collected at signup). Falls
+  // back to 'friend' if null/empty. The substituted string is what lands
+  // on voice_tickets.system_prompt; proxy passes it to Gemini Live verbatim.
+  let resolvedSystemPrompt: string | null = creatorRow.system_prompt;
+  if (resolvedSystemPrompt && resolvedSystemPrompt.includes('{{user_name}}')) {
+    const { data: profileRow } = await admin
+      .from('profiles')
+      .select('display_name')
+      .eq('id', callerUserId)
+      .maybeSingle<{ display_name: string | null }>();
+    const userName = (profileRow?.display_name ?? '').trim() || 'friend';
+    resolvedSystemPrompt = resolvedSystemPrompt.replaceAll('{{user_name}}', userName);
   }
 
   // ── Mint voice ticket (proxy WS auth — fatal on failure) ─────────────
@@ -698,8 +749,9 @@ export async function POST(req: NextRequest) {
       //   * prefixTurns: encodedBytes < 60KB enforced by buildBrainPrefix
       //     before return
       // The DB CHECKs on voice_tickets are defense-in-depth.
-      systemPrompt: creatorRow.system_prompt,
+      systemPrompt: resolvedSystemPrompt,
       prefixTurns:  brainPrefix?.prefixTurns ?? null,
+      brainMode:    creatorRow.brain_mode,
       // Creator voice-speed (migration 20260511000006). supabase-js
       // returns `numeric` as JS string; coerce at the boundary (R2 audit
       // C3). DB DEFAULT 1.0 guarantees a value, but defensive on

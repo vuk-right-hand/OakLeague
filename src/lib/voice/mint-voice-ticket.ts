@@ -69,6 +69,12 @@ export type MintVoiceTicketArgs = {
   // insert out-of-range values; this typing is the route-side
   // contract.
   ttsSpeed?: number | null;
+  // pgvector RAG plan (M6). Snapshot of creators.brain_mode at session-open.
+  // 'drawer' = legacy. 'vector' = per-turn pgvector retrieval injection.
+  // DB invariant voice_tickets_brain_mode_prefix_chk requires
+  //   (brain_mode='vector' → prefix_turns IS NULL) ∧ (brain_mode='drawer' → any)
+  // Caller responsibility: route gates buildBrainPrefix on 'drawer'.
+  brainMode?: 'drawer' | 'vector' | null;
 };
 
 export type MintVoiceTicketResult = {
@@ -141,6 +147,10 @@ export async function mintVoiceTicket(args: MintVoiceTicketArgs): Promise<MintVo
       tts_speed:       typeof args.ttsSpeed === 'number' && Number.isFinite(args.ttsSpeed)
                           ? args.ttsSpeed
                           : null,
+      // pgvector RAG plan (M6). 'vector' mode triggers proxy-side per-turn
+      // retrieval injection. Default 'drawer' = legacy path. DB invariant
+      // ensures prefix_turns is null when brain_mode='vector'.
+      brain_mode:      args.brainMode ?? 'drawer',
     })
     .select('ticket_id, expires_at')
     .single<{ ticket_id: string; expires_at: string }>();
