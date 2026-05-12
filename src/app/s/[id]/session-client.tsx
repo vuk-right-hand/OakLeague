@@ -429,36 +429,60 @@ function MicButton({
 }) {
   const enabled = phase === 'ready' || phase === 'listening' || phase === 'speaking';
   const active = phase === 'listening';
+
+  // 2026-05-12 fix v3: setPointerCapture was unreliable on PC — Vuk's
+  // diagnostic logs showed startMic + stopMic firing back-to-back even though
+  // he was holding. Likely cause: startMic dispatches `mic_started` which
+  // re-renders the button (style changes for active state), and the browser
+  // dropped pointer capture during the React reconciliation.
+  //
+  // New approach: document-level pointerup/cancel listener that lives outside
+  // React's render cycle. onPointerDown installs the listener; the listener
+  // removes itself on first fire. Press tracking is now fully decoupled from
+  // the button's DOM lifecycle / React re-renders.
+  const pressActiveRef = useRef(false);
+  const onPressEndRef = useRef(onPressEnd);
+  onPressEndRef.current = onPressEnd;
+
+  // Defensive cleanup if the component unmounts mid-press.
+  useEffect(() => {
+    return () => {
+      if (pressActiveRef.current) {
+        pressActiveRef.current = false;
+        try { onPressEndRef.current(); } catch {}
+      }
+    };
+  }, []);
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
+    if (!enabled) return;
+    if (pressActiveRef.current) return; // double-fire guard
+    e.preventDefault();
+    pressActiveRef.current = true;
+    onPressStart();
+
+    const release = () => {
+      if (!pressActiveRef.current) return;
+      pressActiveRef.current = false;
+      document.removeEventListener('pointerup', release);
+      document.removeEventListener('pointercancel', release);
+      // window.blur fires when user alt-tabs / switches windows. Releasing on
+      // blur prevents the mic from being stuck open if the user leaves the tab
+      // while pressing (e.g., to type something else, get a notification).
+      window.removeEventListener('blur', release);
+      try { onPressEndRef.current(); } catch {}
+    };
+
+    document.addEventListener('pointerup', release);
+    document.addEventListener('pointercancel', release);
+    window.addEventListener('blur', release);
+  };
+
   return (
     <button
       type="button"
-      // 2026-05-12 fix v2: DO NOT use the `disabled` HTML attribute. When phase
-      // transitions mid-press to a non-enabled state, the browser disables the
-      // button, RELEASES pointer capture, and the pointerup/cancel event never
-      // fires. Result: mic state stuck (UI still shows "Listening" or "Hold"
-      // depending on phase but no audio flows). Instead, keep the button alive
-      // and gate purely inside the handlers — they're already no-ops if phase
-      // is wrong (startMic returns early; stopMic uses micActiveRef latch).
       aria-disabled={!enabled}
-      // 2026-05-12 fix v1: setPointerCapture keeps pointer events bound to
-      // this element until pointerup/cancel regardless of cursor position.
-      // Fixes PC mouse hold drifting off the 84px circular target + mobile
-      // finger drift.
-      onPointerDown={(e) => {
-        if (!enabled) return;
-        e.preventDefault();
-        try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
-        onPressStart();
-      }}
-      onPointerUp={(e) => {
-        e.preventDefault();
-        try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
-        onPressEnd();
-      }}
-      onPointerCancel={(e) => {
-        try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
-        onPressEnd();
-      }}
+      onPointerDown={handlePointerDown}
       onContextMenu={(e) => e.preventDefault()}
       aria-label="Hold to speak"
       style={{
