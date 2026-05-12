@@ -33,7 +33,13 @@ export async function retrieveTopK({
   creatorId,
   queryText,
   k = 3,
-  minSimilarity = 0.55,
+  // Raised from 0.55 → 0.65 on 2026-05-12 after first dogfood: real-corpus
+  // top-3 was landing at 0.56-0.62 (Spike #4a calibrated baseline = 0.79 for
+  // a well-aligned chunk). Marginal-similarity chunks injected as noise and
+  // the model honestly disqualified ("that story doesn't register, friend").
+  // RPC floors at 0.30 anyway; 0.65 is a Goldilocks middle. Persona's
+  // honest-disqualifier clause handles the no-match case gracefully.
+  minSimilarity = 0.65,
   sessionId = null,
 }) {
   if (!queryText || queryText.trim().length === 0) {

@@ -42,8 +42,10 @@ const CHARS_PER_TOKEN = 4;
 
 // Mirrors src/lib/voice/chunk-sample.ts. Pure function so we duplicate
 // rather than dynamic-import a TS file at runtime (worker is plain ESM).
-const TARGET_TOKENS = 500;
-const OVERLAP_TOKENS = 80;
+// Lowered from 500/80 on 2026-05-12 — see src/lib/voice/chunk-sample.ts comment.
+// MUST stay in sync with chunk-sample.ts since this is the runtime path.
+const TARGET_TOKENS = 300;
+const OVERLAP_TOKENS = 100;
 const HARD_MAX_TOKENS = 2048;
 const HARD_MAX_CHARS = 8000;
 
@@ -194,8 +196,14 @@ export function makeEmbedWorker({ supabase, geminiApiKey, flyMachineId } = {}) {
     }
 
     // Atomic claim — single row per tick to keep blast radius bounded.
-    // ORDER BY claimed_at NULLS FIRST guarantees we pick truly-pending rows
-    // before any post-reap requeue.
+    //
+    // NOTE: PostgREST in Supabase rejects ORDER BY combined with UPDATE+LIMIT
+    // ("column does not exist" even for columns that exist). Surfaced 2026-05-12
+    // during the first prod deploy of vector mode — Spikes never exercised the
+    // worker (Spike #4 path 2 stub-INSERTed chunks). Followup: move to a
+    // SECURITY DEFINER claim_pending_embedding_job RPC for server-side ordering.
+    // For now we rely on PG natural row order, which is fine at this scale
+    // (one job per 5s tick, reaper handles fairness for stuck rows).
     const nowIso = new Date().toISOString();
     const { data: claim, error: claimErr } = await supabase
       .from('sample_content_embedding_jobs')
@@ -206,7 +214,6 @@ export function makeEmbedWorker({ supabase, geminiApiKey, flyMachineId } = {}) {
       })
       .eq('status', 'pending')
       .lt('attempts', 5)
-      .order('claimed_at', { ascending: true, nullsFirst: true })
       .limit(1)
       .select('id, sample_id, enqueue_version')
       .maybeSingle();

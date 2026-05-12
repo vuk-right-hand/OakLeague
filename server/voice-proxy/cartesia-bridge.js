@@ -201,6 +201,19 @@ export class CartesiaTTSBridge extends EventEmitter {
   /** Streams a transcript chunk. Maintains continue:true. */
   sendText(text) {
     if (!text) return;
+    // 2026-05-12 dogfood fix — Cartesia returned "Invalid transcript" on
+    // ~3 chunks during the first vector-mode session. Gemini's
+    // outputTranscription emits smart-quotes (' ' " "), em-dashes (—),
+    // ellipses (…), and other Unicode punctuation that Cartesia's text
+    // tokenizer rejects. Normalize to ASCII equivalents so audio synthesis
+    // doesn't drop chunks.
+    text = text
+      .replace(/[‘’‚‛]/g, "'")  // curly single quotes / low-9
+      .replace(/[“”„‟]/g, '"')  // curly double quotes / low-9
+      .replace(/[–—]/g, '-')              // en-dash, em-dash
+      .replace(/…/g, '...')                    // horizontal ellipsis
+      .replace(/[ ]/g, ' ');                   // non-breaking space
+    if (!text) return;  // post-normalize re-check (defensive)
     if (this._closed || this._turnDead) return;
     if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
     if (!this._currentContextId) throw new Error('sendText before turnStart');

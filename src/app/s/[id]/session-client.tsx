@@ -433,10 +433,25 @@ function MicButton({
     <button
       type="button"
       disabled={!enabled}
-      onPointerDown={(e) => { e.preventDefault(); onPressStart(); }}
-      onPointerUp={(e) => { e.preventDefault(); onPressEnd(); }}
-      onPointerLeave={() => onPressEnd()}
-      onPointerCancel={() => onPressEnd()}
+      // 2026-05-12 fix: PC mouse hold was shaky because onPointerLeave fired
+      // the moment the cursor drifted even 1px off the 84px circular target.
+      // setPointerCapture keeps pointer events bound to this element until
+      // pointerup/cancel, regardless of cursor position. Works on touch too
+      // (finger drift off the button no longer releases mid-hold).
+      onPointerDown={(e) => {
+        e.preventDefault();
+        try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
+        onPressStart();
+      }}
+      onPointerUp={(e) => {
+        e.preventDefault();
+        try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+        onPressEnd();
+      }}
+      onPointerCancel={(e) => {
+        try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+        onPressEnd();
+      }}
       onContextMenu={(e) => e.preventDefault()}
       aria-label="Hold to speak"
       style={{

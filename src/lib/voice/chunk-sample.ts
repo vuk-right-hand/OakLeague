@@ -19,10 +19,16 @@ export type SampleChunk = {
   topicTags: string[];
 };
 
-// Tunables. 500-token target with 80-token overlap balances retrieval recall
-// (smaller chunks → better topical precision) against context efficiency.
-const TARGET_TOKENS = 500;
-const OVERLAP_TOKENS = 80;
+// Tunables. 300-token target with 100-token overlap.
+// Lowered from 500/80 on 2026-05-12 after first dogfood — Vuk's transcript-
+// style corpus (numbered paragraphs, narrative passages) had top-3 retrieval
+// landing at 0.56-0.62 cosine. Smaller windows + larger overlap pin the
+// narrative unit (e.g. the twins story opening) inside fewer chunks, so a
+// query about the topic surfaces the right chunk at higher similarity.
+// Trade-off: ~1.5× more chunks per sample → ~1.5× more embedding spend at
+// index time, but per-turn retrieval cost is unchanged (still top-K).
+const TARGET_TOKENS = 300;
+const OVERLAP_TOKENS = 100;
 // Hard cap aligned with gemini-embedding-001 input ceiling AND the
 // sample_content_chunks.token_count CHECK constraint (≤ 2048).
 const HARD_MAX_TOKENS = 2048;
