@@ -182,8 +182,9 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   const micActiveRef = useRef<boolean>(false);
   // 2026-05-13 — state mirror of micActiveRef. Refs don't trigger re-renders;
   // the button needs a re-rendered value to flip its UI. Updated in lockstep
-  // with micActiveRef inside startMic / stopMic / forceMicSilent. Reading
-  // this is the SINGLE source of truth for "should the button show STOP".
+  // with micActiveRef inside startMic / stopMic / endSession / visibility-
+  // hidden — the only four places that mutate mic state. Reading this is
+  // the SINGLE source of truth for "should the button show STOP".
   const [micActive, setMicActive] = useState<boolean>(false);
   // 2026-05-13 — silence-detection auto-stop. Replaces the dumb 30s hard cap
   // on the MicButton.
@@ -199,6 +200,14 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   const lastVoiceActivityRef = useRef<number>(0);
   const micStartedAtRef = useRef<number>(0);
   const silenceTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // 2026-05-13 (v2) — gate for `tts_audio_chunk` dispatch. True between
+  // `stopMic` (we sent turn_end, expecting model response) and `turn_complete`
+  // (server signals response is done). Only audio_out frames inside this
+  // window count as "the model is currently speaking" — anything after is
+  // Cartesia tail and must not re-flip phase ready→speaking (the ping-pong
+  // that left phase stuck at speaking after every turn). Reset on startMic /
+  // endSession / visibility-hidden so a stuck flag never blocks the next turn.
+  const expectingTtsRef = useRef<boolean>(false);
   // Forward-ref for stopMic so the silence-timer callback (set up inside
   // startMic) can call stopMic without a temporal-dead-zone issue. The
   // useCallback below assigns into this ref after defining stopMic.
@@ -666,14 +675,17 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
         onAudioOut: (bytes) => {
           if (cancelled) return;
           recordAudioOut(bytes.byteLength, performance.now());
-          // 2026-05-13 — server-VAD ended the user turn early. If the user
-          // never tapped stop, micActive is still true while the model is
-          // starting to speak. Force-silence the mic NOW so the button stops
-          // lying. Runs BEFORE the bridge.sendAudio + reducer dispatch so the
-          // UI flip lands as close to the actual server transition as possible.
-          if (micActiveRef.current) {
-            forceMicSilentRef.current?.('first_audio_out_mid_listening');
-          }
+          // 2026-05-13 (v2) — mic-state firewall. With manual VAD the server
+          // never starts speaking while micActive=true; ANY audio_out that
+          // arrives during user listening is leftover Cartesia tail from the
+          // previous turn (already in the WS buffer when our cancel hit the
+          // proxy). Drop it: don't pipe to avatar (avoids "avatar talks over
+          // user"), don't dispatch tts_audio_chunk (avoids phase ping-pong
+          // ready ↔ speaking that used to leave phase stuck at speaking).
+          // Critically: do NOT force-silence the mic — earlier code did, and
+          // that race killed turn 2 every time the user tapped fast enough to
+          // catch the tail.
+          if (micActiveRef.current) return;
           // R3-M7 — first audio_out after mic_stopped is t1 of the
           // user_perceived_response_ms metric.
           if (userPerceivedT0Ref.current !== null) {
@@ -682,7 +694,13 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
             captureSafe('user_perceived_response_ms', { ms, session_id: sessionIdRef.current });
           }
           try { bridgeRef.current?.sendAudio(bytes); } catch { /* bridge closed */ }
-          dispatchRef({ kind: 'tts_audio_chunk' });
+          // Phase-transition gate (R5-C3 audit). Only dispatch while we're
+          // still waiting for the model's response — drop tail chunks that
+          // arrive after the server fired turn_complete so phase doesn't
+          // flip ready→speaking on stale audio and get stuck there.
+          if (expectingTtsRef.current) {
+            dispatchRef({ kind: 'tts_audio_chunk' });
+          }
         },
         // HeyGen requires explicit speak_end at turn boundary; Simli/Tavus
         // bridges leave commitUtterance undefined (no-op via optional chain).
@@ -697,13 +715,13 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
         // gluing silent worklet frames + a phantom barge-in onto Gemini's
         // ongoing turn until auto-VAD couldn't recover.
         onTurnComplete: () => {
-          // Defense in depth — turn_complete arriving while we still think
-          // we're listening means server-VAD ended the turn AND model
-          // generation completed before any audio_out flowed (rare but
-          // possible: empty response, error path). Force-sync local state.
-          if (micActiveRef.current) {
-            forceMicSilentRef.current?.('turn_complete_mid_listening');
-          }
+          // Manual VAD: turn_complete from the server cannot fire while the
+          // user is actively listening (server waits for our activityEnd).
+          // No mic state touched here — phase-only signal.
+          // Close the tts-expecting window so any Cartesia tail chunks that
+          // arrive after this point are treated as stale and don't re-flip
+          // phase ready→speaking.
+          expectingTtsRef.current = false;
           try { bridgeRef.current?.commitUtterance?.(); } catch { /* */ }
           dispatchRef({ kind: 'turn_complete' });
         },
@@ -834,10 +852,28 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   useEffect(() => {
     function onVisibility() {
       if (document.hidden) {
-        // 2026-05-13 — visibility hidden while mic active: force-silence
-        // so the button doesn't return showing "Stop" when user comes back.
+        // 2026-05-13 (v3) — visibility hidden while mic active. Send turn_end
+        // FIRST so the proxy accrues this turn's mic-seconds (R5-C1 audit:
+        // a bare `cancel` skips the turn_end branch where voice_usage_record
+        // runs — Vuk's iPhone testing would leak un-accrued mic-time on every
+        // lock-screen). Follow with `cancel` so Cartesia stops synthesizing
+        // a response no one will hear (still paid for Gemini tokens, but
+        // saves Cartesia char cost). Order: turn_end → cancel within the
+        // same event loop tick — both queue onto the WS in order.
         if (micActiveRef.current) {
-          forceMicSilentRef.current?.('visibility_hidden');
+          micActiveRef.current = false;
+          setMicActive(false);
+          expectingTtsRef.current = false;
+          if (silenceTimerRef.current) {
+            clearInterval(silenceTimerRef.current);
+            silenceTimerRef.current = null;
+          }
+          try { proxyRef.current?.sendControl({ type: 'turn_end' }); } catch (e) {
+            Sentry.captureException(e, { level: 'warning', extra: { op: 'sendControl_turn_end_visibility', session_id: sessionIdRef.current } });
+          }
+          try { proxyRef.current?.sendControl({ type: 'cancel' }); } catch (e) {
+            Sentry.captureException(e, { level: 'warning', extra: { op: 'sendControl_cancel_visibility', session_id: sessionIdRef.current } });
+          }
         }
         dispatchRef({ kind: 'visibility_hidden' });
         // Stop mic frame delivery but keep AudioContext + worklet alive to
@@ -1053,6 +1089,9 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     }
     micActiveRef.current = true;
     setMicActive(true);
+    // Reset the tts-expecting gate — any leftover tail audio from a prior
+    // turn must not be treated as the current turn's response window.
+    expectingTtsRef.current = false;
     // Silence-detection seed: count tap-moment as "voice activity" so the
     // 7s silence window starts from tap, not from -∞. A user who taps and
     // immediately goes silent still gets a 7s mic-open window. The
@@ -1143,6 +1182,11 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     }
     micActiveRef.current = false;
     setMicActive(false);
+    // Open the tts-expecting window — audio_out frames arriving from here
+    // until turn_complete are the model's response to this turn and should
+    // drive phase ready→speaking. Tail chunks after turn_complete won't,
+    // because onTurnComplete closes this gate.
+    expectingTtsRef.current = true;
     // Tear down silence-detection timer. Idempotent — guarded by the null check.
     if (silenceTimerRef.current) {
       clearInterval(silenceTimerRef.current);
@@ -1152,40 +1196,46 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     // R3-M7 — user_perceived_response_ms t0 = mic-tap-release. Cleared
     // when first proxy audio_out frame arrives.
     userPerceivedT0Ref.current = performance.now();
-    try { proxyRef.current?.sendControl({ type: 'turn_end' }); } catch {}
+    try { proxyRef.current?.sendControl({ type: 'turn_end' }); } catch (e) {
+      Sentry.captureException(e, { level: 'warning', extra: { op: 'sendControl_turn_end', session_id: sessionIdRef.current } });
+    }
     try { micStreamRef.current?.getTracks().forEach((t) => (t.enabled = false)); } catch {}
   }, []);
   // Wire the forward-ref so startMic's silence timer can call stopMic.
   stopMicRef.current = stopMic;
 
-  // 2026-05-13 — server-driven force-silence. When Gemini's auto-VAD ends
-  // the user's turn early (first tts_audio_chunk arrives mid-listening, OR
-  // turn_complete fires while we still think we're listening), the client
-  // state machine has diverged from the server. Local mic state must catch
-  // up immediately so the button stops lying. This DOES NOT send `turn_end`
-  // to the proxy because the server already advanced — that signal would
-  // be ignored, but skipping it avoids any chance of confusing the proxy.
-  const forceMicSilent = useCallback((reason: string): void => {
-    if (!micActiveRef.current) return;
-    console.log(`[force-mic-silent] reason=${reason} (server-driven turn end)`);
-    micActiveRef.current = false;
-    setMicActive(false);
-    if (silenceTimerRef.current) {
-      clearInterval(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
-    try { micStreamRef.current?.getTracks().forEach((t) => (t.enabled = false)); } catch {}
-    // R3-M7 — still the start of "user is waiting for answer", even though
-    // server-VAD ended the turn instead of an explicit tap.
-    userPerceivedT0Ref.current = performance.now();
-  }, []);
-  const forceMicSilentRef = useRef<typeof forceMicSilent>(forceMicSilent);
-  forceMicSilentRef.current = forceMicSilent;
+  // 2026-05-13 (v2) — `forceMicSilent` removed. With manual VAD, the server
+  // never ends a user turn unilaterally; the only legitimate callers were
+  // races on Cartesia tail audio that actively broke turn 2 (the leftover
+  // chunk would force-silence the mic the user had just turned on for the
+  // next turn). Mic state mutates only in startMic / stopMic / endSession /
+  // visibility-hidden — one place each, no defensive divergence.
 
   // ── End session ────────────────────────────────────────────────────────────
   const endSession = useCallback(async (reason: 'user_ended' | 'client_error') => {
     if (closedRef.current) return;
     closedRef.current = true;
+    // R5-M1 audit: if the user hits End while still holding the mic, the
+    // proxy never sees a turn_end for the final turn and voice_usage_record
+    // never runs for it. Send turn_end FIRST so the in-flight turn closes
+    // cleanly and mic-seconds accrue, then `cancel` to abandon the response
+    // (we're tearing down anyway). Best-effort: WS may close before the
+    // proxy fully processes it, but mostly it's fast enough.
+    if (micActiveRef.current) {
+      micActiveRef.current = false;
+      setMicActive(false);
+      expectingTtsRef.current = false;
+      if (silenceTimerRef.current) {
+        clearInterval(silenceTimerRef.current);
+        silenceTimerRef.current = null;
+      }
+      try { proxyRef.current?.sendControl({ type: 'turn_end' }); } catch (e) {
+        Sentry.captureException(e, { level: 'warning', extra: { op: 'sendControl_turn_end_endSession', session_id: sessionIdRef.current } });
+      }
+      try { proxyRef.current?.sendControl({ type: 'cancel' }); } catch (e) {
+        Sentry.captureException(e, { level: 'warning', extra: { op: 'sendControl_cancel_endSession', session_id: sessionIdRef.current } });
+      }
+    }
     dispatch({ kind: 'user_close' });
     try { workletNodeRef.current?.port.postMessage({ type: 'stop' }); } catch {}
     try { workletNodeRef.current?.disconnect(); } catch {}
