@@ -4,6 +4,8 @@ import { supabaseAdmin } from '@/lib/supabase/admin';
 import { VoiceCloneUpload } from './voice-clone-upload';
 import { FaceUpload } from './face-upload';
 import { BrainRecompileButton } from './brain-recompile-button';
+import { CorpusReprocessPanel } from './corpus-reprocess-panel';
+import { CorpusComparePanel } from './corpus-compare-panel';
 
 export const dynamic = 'force-dynamic';
 
@@ -29,6 +31,9 @@ type Creator = {
   // Brain wire-up PR-3.
   system_prompt: string | null;
   brain_compiled_at: string | null;
+  // RAG SOTA Day-6: retrieval_version (1=legacy, 2=v2 hybrid). Defaults to 1
+  // for every creator until admin flips it post-corpus-reprocess.
+  retrieval_version: number;
 };
 
 type Topic = {
@@ -77,7 +82,7 @@ export default async function AdminCreatorDetail({
 
   const [{ data: creator }, { data: topics }, { data: samples }] = await Promise.all([
     sb.from('creators')
-      .select('id, handle, display_name, creator_type, brain_status, voice_id, simli_face_id, published_at, created_at, updated_at, application_id, bio, system_prompt, brain_compiled_at')
+      .select('id, handle, display_name, creator_type, brain_status, voice_id, simli_face_id, published_at, created_at, updated_at, application_id, bio, system_prompt, brain_compiled_at, retrieval_version')
       .eq('id', id)
       .maybeSingle<Creator>(),
     sb.from('creator_topics')
@@ -168,6 +173,7 @@ export default async function AdminCreatorDetail({
         <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>Brain status</h2>
         <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 13 }}>
           <StatusCell label="brain_status" value={creator.brain_status} />
+          <StatusCell label="retrieval_version" value={`v${creator.retrieval_version}`} />
           <StatusCell label="published_at" value={creator.published_at ? new Date(creator.published_at).toLocaleString() : '—'} />
           <StatusCell label="updated_at" value={new Date(creator.updated_at).toLocaleString()} />
           <StatusCell
@@ -188,6 +194,26 @@ export default async function AdminCreatorDetail({
             ? Buffer.byteLength(creator.system_prompt, 'utf8')
             : null}
         />
+      </section>
+
+      <section style={{ marginBottom: 32 }}>
+        <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>
+          Corpus re-process (v2)
+          <span style={{ opacity: 0.5, fontSize: 13, fontWeight: 400 }}>
+            {' '}— enqueue full v2 pipeline for every ready sample
+          </span>
+        </h2>
+        <CorpusReprocessPanel creatorId={creator.id} />
+      </section>
+
+      <section style={{ marginBottom: 32 }}>
+        <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>
+          Corpus compare v1 ↔ v2
+          <span style={{ opacity: 0.5, fontSize: 13, fontWeight: 400 }}>
+            {' '}— ask a question, see top-5 chunks from each pipeline side-by-side
+          </span>
+        </h2>
+        <CorpusComparePanel creatorId={creator.id} retrievalVersion={creator.retrieval_version} />
       </section>
 
       <section style={{ marginBottom: 32 }}>

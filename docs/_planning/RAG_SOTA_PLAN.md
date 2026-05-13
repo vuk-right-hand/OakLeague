@@ -840,6 +840,29 @@ After v2 ships and stabilizes for ~1 week of production traffic, run an offline 
 
 ---
 
+## 11c. Phase 1 ship status (Days 1-7 complete, audit-3 unit-audited)
+
+**Built & audited:**
+- Days 1-2: schema migrations 1-7 + pgTAP
+- Day 3: preprocess.ts + narrative-chunk.ts + 6-pass sanitizer
+- Day 4: contextual-gen.ts + Anthropic Haiku client + 1h cache + internal route
+- Day 5: embed-worker.makeCorpusReprocessWorker + shutdown drain + finally-flush cogs_log
+- Day 6: admin re-process panel + CLI + brain-injection-spike-v2 (4×10 trials)
+- Day 7: admin compare panel + Promote v2 + Flip retrieval_version button + route
+
+**Deferred to Phase 2 (documented from audit-3 unit audit):**
+- **Worker-side advisory lock** — `claim_corpus_reprocess_job`'s comment promises pairing with `pg_advisory_xact_lock(hashtext('reprocess:' || creator_id))` but the worker code doesn't take a session-spanning lock. Phase-1 mitigation: promote RPC has a state-guard that refuses if `status='processing'` rows exist for the creator's samples (migration 20260519000001 line 222-232). True fix needs worker session-level lock work — Phase 2.
+- **Stale-v2-zombie detection on legacy worker** — if admin re-processes a v1 creator into v2 chunks but never promotes, then the creator later edits sample_content, the trigger routes to legacy queue (creator still v1) → legacy worker regenerates v1 chunks pointing at fresh raw_text, but the v2 narrative_units + v2 chunks from the earlier reprocess stay pointing at stale text. Mitigation: admin-only flow; warned in ops handoff. Phase 2 fix: legacy worker refuses + writes Sentry warning when it sees a sample with any chunker_version=2 rows for the creator.
+- **Spike persona drift guard** — script-side `PERSONA` is hand-mirrored from `_creator_brain_compile_unsafe` (now includes M14 vector clarifier). Production-faithful version would read the compiled persona from a test-fixture creator row via supabase-js. Phase 2 fix when adding more spike automation.
+- **Production retrieval RPC for retrieval_version=2** — Phase 1 lands v2 CHUNKS but the read path (`creator_knowledge_topk`) still filters chunker_version=1. So a creator at retrieval_version=2 with v2 chunks gets zero passages until Phase 2 hybrid retrieval lands. The compare panel's banner + the new Flip button collaborate to prevent silent zero-retrieval state — admin must explicitly choose. Production session-open guard ("if retrieval_version=1 but chunker_version=1 count = 0, fail open with diagnostic") is a Phase-2 add.
+
+**Operational gates required before Phase 1 hits prod beyond dogfood:**
+1. `npm run spike:injection-v2` passes 10/10 per class (manually, before each merge touching sanitizer/prefix/persona).
+2. Vuk runs the dogfood end-to-end on staging (Day 7 buffer) — re-process his corpus, compare, promote, flip — verify v2 results subjectively beat v1.
+3. `docs/_planning/RAG_SOTA_PLAN.md` operational runbook section drafted for "I promoted and now the creator is broken" recovery path.
+
+---
+
 ## 12. What we are NOT doing in this plan (explicit non-goals)
 
 - **Phase 3** — variable-depth response (drop "1-3 sentences" persona constraint). Out of scope per handoff. Founder + main team owns.

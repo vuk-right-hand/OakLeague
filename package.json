@@ -11,7 +11,8 @@
     "db:reset": "supabase db reset",
     "db:test": "supabase test db",
     "db:diff": "supabase db diff",
-    "seed:dev": "psql postgresql://postgres:postgres@127.0.0.1:54322/postgres -f supabase/seed_dev.sql"
+    "seed:dev": "psql postgresql://postgres:postgres@127.0.0.1:54322/postgres -f supabase/seed_dev.sql",
+    "spike:injection-v2": "node scripts/brain-injection-spike-v2.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.95.2",
