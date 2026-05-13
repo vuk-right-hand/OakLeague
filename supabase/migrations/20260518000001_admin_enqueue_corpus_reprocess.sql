@@ -181,9 +181,19 @@ BEGIN
     -- UI can show "5 already queued, 5 newly enqueued" instead of
     -- "5 of 10" with no explanation for the missing 5.
     --
-    -- The `WHERE` after `DO UPDATE` filters which conflicting rows actually
-    -- update; PG returns nothing in RETURNING for the filtered-out rows.
-    -- To count those, run a separate count query against the queue.
+    -- Audit-3 follow-up: capture the pre-INSERT pending/processing count
+    -- BEFORE the UPSERT runs. Counting after the INSERT overcounts because
+    -- newly-inserted rows arrive with status='pending' and look identical
+    -- to "already-queued" pending rows. The pre-snapshot is the only
+    -- correct source of truth.
+    SELECT count(*)::int INTO v_skipped_already_queued
+      FROM public.sample_content s
+      JOIN public.corpus_reprocess_jobs j
+        ON j.sample_id = s.id AND j.target_version = 2
+     WHERE s.creator_id = p_creator_id
+       AND s.raw_text IS NOT NULL
+       AND j.status IN ('pending', 'processing');
+
     WITH ins AS (
       INSERT INTO public.corpus_reprocess_jobs
         (sample_id, target_version, status, attempts, enqueue_version)
@@ -204,16 +214,6 @@ BEGIN
       RETURNING 1 AS r
     )
     SELECT count(*)::int INTO v_enqueued FROM ins;
-
-    -- skipped_already_queued = ready samples that have a queue row in
-    -- pending/processing state (i.e. they were filtered out by the WHERE).
-    SELECT count(*)::int INTO v_skipped_already_queued
-      FROM public.sample_content s
-      JOIN public.corpus_reprocess_jobs j
-        ON j.sample_id = s.id AND j.target_version = 2
-     WHERE s.creator_id = p_creator_id
-       AND s.raw_text IS NOT NULL
-       AND j.status IN ('pending', 'processing');
 
     v_skipped_inflight := 0;
   END IF;

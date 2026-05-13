@@ -50,11 +50,19 @@ BEGIN
   -- row count and chunker_version split.
   SELECT array_fill(0::real, ARRAY[768])::halfvec(768) INTO v_vec;
 
+  -- sample_content_chunks + narrative_units are RLS deny-all. Setup runs as
+  -- postgres (BYPASSRLS), so the initial INSERTs are fine. Any mutation to
+  -- these tables *after* set_authenticated must be wrapped in reset_role /
+  -- re-set_authenticated, same pattern Day-6 uses for corpus_reprocess_jobs.
+  -- (row_security = off would make RLS errors LOUDER, not bypass them — only
+  -- BYPASSRLS / superuser / table-owner can read through deny-all policies.)
+
   INSERT INTO public.admin_roles (user_id, email, role)
     VALUES (v_admin, 'acpv-admin@test', 'superadmin');
 
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user, 'approved', 'ACPV Creator', 'acpvc1')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user, 'approved', 'ACPV Creator', 'acpvc1',
+            '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app;
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status)
     VALUES (gen_random_uuid(), v_user, v_app, 'ACPV Creator', 'acpvc1', 'ready')
@@ -107,7 +115,9 @@ BEGIN
   );
 
   -- 3: only v1 (delete the v2 chunks temporarily; restore after).
+  PERFORM tests.reset_role();
   DELETE FROM public.sample_content_chunks WHERE creator_id = v_creator AND chunker_version = 2;
+  PERFORM tests.set_authenticated(v_admin);
   SELECT count(*) FILTER (WHERE chunker_version = 1),
          count(*) FILTER (WHERE chunker_version = 2)
     INTO v_v1_count, v_v2_count
@@ -117,15 +127,19 @@ BEGIN
     '3: only v1 → returns v1 rows only'
   );
   -- Restore v2 chunks for later tests.
+  PERFORM tests.reset_role();
   INSERT INTO public.sample_content_chunks
     (id, sample_id, creator_id, chunk_index, text, topic_tags, embedding, chunker_version, parent_unit_id, chunk_context)
   VALUES
     (gen_random_uuid(), v_sample, v_creator, 2, 'v2 chunk one',   ARRAY['topic-a'], v_vec, 2, v_parent, 'ctx one'),
     (gen_random_uuid(), v_sample, v_creator, 3, 'v2 chunk two',   ARRAY['topic-a'], v_vec, 2, v_parent, 'ctx two'),
     (gen_random_uuid(), v_sample, v_creator, 4, 'v2 chunk three', ARRAY['topic-a'], v_vec, 2, v_parent, 'ctx three');
+  PERFORM tests.set_authenticated(v_admin);
 
   -- 4: only v2.
+  PERFORM tests.reset_role();
   DELETE FROM public.sample_content_chunks WHERE creator_id = v_creator AND chunker_version = 1;
+  PERFORM tests.set_authenticated(v_admin);
   SELECT count(*) FILTER (WHERE chunker_version = 1),
          count(*) FILTER (WHERE chunker_version = 2)
     INTO v_v1_count, v_v2_count
@@ -135,11 +149,13 @@ BEGIN
     '4: only v2 → returns v2 rows only'
   );
   -- Restore v1 for later tests.
+  PERFORM tests.reset_role();
   INSERT INTO public.sample_content_chunks
     (id, sample_id, creator_id, chunk_index, text, topic_tags, embedding, chunker_version)
   VALUES
     (gen_random_uuid(), v_sample, v_creator, 0, 'v1 chunk one body text', ARRAY['topic-a'], v_vec, 1),
     (gen_random_uuid(), v_sample, v_creator, 1, 'v1 chunk two body text', ARRAY['topic-a'], v_vec, 1);
+  PERFORM tests.set_authenticated(v_admin);
 
   -- 5: NULL creator_id → 22023.
   BEGIN
@@ -163,13 +179,15 @@ BEGIN
       RETURN NEXT fail(format('6: NULL query_vec → unexpected sqlstate %s', SQLSTATE));
   END;
 
-  -- 7: k=9999 clamps to 20. We only have 2+3=5 chunks so total rows = 5
-  -- and v1 rows ≤ 20, v2 rows ≤ 20. Implicit assertion: no error.
+  -- 7: k=9999 does not error (clamp is in the function body; we only have
+  -- 5 chunks total so a clamp-vs-no-clamp behavior split isn't observable
+  -- here — would need >20 chunks per bucket to test the clamp empirically.
+  -- Honest assertion: the call succeeds and returns all available rows.
   SELECT count(*) INTO v_row_count
     FROM public.admin_compare_v1_v2_retrieval(v_creator, v_vec, 9999);
   RETURN NEXT ok(
     v_row_count = 5,
-    format('7: k=9999 clamps without erroring, all rows returned (%s)', v_row_count)
+    format('7: k=9999 does not error, all rows returned (%s)', v_row_count)
   );
   PERFORM tests.reset_role();
 
@@ -206,8 +224,9 @@ BEGIN
   PERFORM tests.reset_role();
 
   -- 11: promote with NO v2 chunks → 22023 (refuse).
-  PERFORM tests.set_authenticated(v_admin);
+  PERFORM tests.reset_role();
   DELETE FROM public.sample_content_chunks WHERE creator_id = v_creator AND chunker_version = 2;
+  PERFORM tests.set_authenticated(v_admin);
   BEGIN
     PERFORM public.admin_promote_v2_chunks(v_creator);
     RETURN NEXT fail('11: promote with no v2 chunks should refuse');
@@ -219,16 +238,20 @@ BEGIN
   END;
 
   -- 12: promote with v2 chunks → DELETEs v1, audit row written.
-  -- Restore v2 chunks.
+  -- Restore v2 chunks (postgres role for BYPASSRLS).
+  PERFORM tests.reset_role();
   INSERT INTO public.sample_content_chunks
-    (id, sample_id, creator_id, chunk_index, text, embedding, chunker_version, parent_unit_id, chunk_context)
+    (id, sample_id, creator_id, chunk_index, text, topic_tags, embedding, chunker_version, parent_unit_id, chunk_context)
   VALUES
-    (gen_random_uuid(), v_sample, v_creator, 2, 'v2 chunk one',   v_vec, 2, v_parent, 'ctx one'),
-    (gen_random_uuid(), v_sample, v_creator, 3, 'v2 chunk two',   v_vec, 2, v_parent, 'ctx two'),
-    (gen_random_uuid(), v_sample, v_creator, 4, 'v2 chunk three', v_vec, 2, v_parent, 'ctx three');
+    (gen_random_uuid(), v_sample, v_creator, 2, 'v2 chunk one',   ARRAY['topic-a'], v_vec, 2, v_parent, 'ctx one'),
+    (gen_random_uuid(), v_sample, v_creator, 3, 'v2 chunk two',   ARRAY['topic-a'], v_vec, 2, v_parent, 'ctx two'),
+    (gen_random_uuid(), v_sample, v_creator, 4, 'v2 chunk three', ARRAY['topic-a'], v_vec, 2, v_parent, 'ctx three');
+  PERFORM tests.set_authenticated(v_admin);
 
   SELECT deleted_v1_count, remaining_v2_count INTO v_deleted, v_remaining
     FROM public.admin_promote_v2_chunks(v_creator);
+  -- Verification reads also need BYPASSRLS (chunks + admin_audit_log are deny-all).
+  PERFORM tests.reset_role();
   SELECT count(*) INTO v_v1_count
     FROM public.sample_content_chunks
    WHERE creator_id = v_creator AND chunker_version = 1;
@@ -238,13 +261,16 @@ BEGIN
   SELECT count(*) INTO v_audit_n
     FROM public.admin_audit_log
    WHERE action = 'creator_promote_v2_chunks' AND target_id = v_creator;
+  PERFORM tests.set_authenticated(v_admin);
   RETURN NEXT ok(
     v_deleted = 2 AND v_remaining = 3 AND v_v1_count = 0 AND v_v2_count = 3 AND v_audit_n = 1,
     format('12: promote → deleted_v1=%s remaining_v2=%s actual_v1=%s actual_v2=%s audits=%s',
            v_deleted, v_remaining, v_v1_count, v_v2_count, v_audit_n)
   );
 
-  -- 13: non-existent creator → 42704.
+  -- 13: non-existent creator → 42704. Explicit set_authenticated for hermetic
+  -- isolation — don't rely on prior test's trailing role.
+  PERFORM tests.set_authenticated(v_admin);
   BEGIN
     PERFORM public.admin_promote_v2_chunks(gen_random_uuid());
     RETURN NEXT fail('13: non-existent creator should raise');
@@ -303,13 +329,15 @@ BEGIN
   -- 17: Audit-3 C1 — state guard. Simulate an active reprocess by
   -- inserting a corpus_reprocess_jobs row in 'processing' state with a
   -- fresh claimed_at. Promote MUST refuse with 55P03 reprocess_in_progress.
-  PERFORM tests.set_authenticated(v_admin);
+  -- corpus_reprocess_jobs is RLS deny-all — write as postgres (BYPASSRLS).
+  PERFORM tests.reset_role();
   INSERT INTO public.corpus_reprocess_jobs
     (sample_id, target_version, status, attempts, enqueue_version, claimed_by, claimed_at)
   VALUES
     (v_sample, 2, 'processing', 1, 1, 'test-worker-c1', now())
   ON CONFLICT (sample_id, target_version) DO UPDATE
     SET status = 'processing', claimed_at = now(), claimed_by = 'test-worker-c1';
+  PERFORM tests.set_authenticated(v_admin);
   BEGIN
     PERFORM public.admin_promote_v2_chunks(v_creator);
     RETURN NEXT fail('17: promote should refuse with active processing row');
@@ -320,10 +348,10 @@ BEGIN
       RETURN NEXT fail(format('17: promote with active processing → %s', SQLSTATE));
   END;
   -- Clean up to leave the test deterministic if a future test follows.
+  PERFORM tests.reset_role();
   UPDATE public.corpus_reprocess_jobs
      SET status = 'pending', claimed_at = NULL, claimed_by = NULL
    WHERE sample_id = v_sample AND target_version = 2;
-  PERFORM tests.reset_role();
 END;
 $fn$;
 
