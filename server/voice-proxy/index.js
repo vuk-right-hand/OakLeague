@@ -41,7 +41,7 @@ import { makeLogTurnCogs, installReaper, VOICE_CARTESIA_ENABLED, getCartesiaPric
 import { makeVoiceDeleteWorker } from './voice-delete-worker.js';
 import { makeSimliFaceDeleteWorker } from './simli-face-delete-worker.js';
 import { makeFaceUploadReaper } from './face-upload-reaper.js';
-import { makeEmbedWorker } from './embed-worker.js';
+import { makeEmbedWorker, makeCorpusReprocessWorker } from './embed-worker.js';
 // pgvector RAG — vector-mode retrieval (audit C1 fix). Mirrors of the TS libs
 // in src/lib/voice/. The TS originals stay for vitest + future Next-side
 // consumers; these JS files are the proxy's runtime source of truth (proxy is
@@ -61,6 +61,14 @@ const CARTESIA_API_KEY      = process.env.CARTESIA_API_KEY || '';
 // Optional — worker no-ops if absent. Set in Fly secrets when /s/[id]
 // cutover ships.
 const SIMLI_API_KEY         = process.env.SIMLI_API_KEY || '';
+
+// Day-5 RAG SOTA — corpus reprocess worker POSTs to three Next 15 internal
+// routes (/api/internal/preprocess, /narrative-chunk, /contextual-gen).
+// Bearer auth via INTERNAL_API_SECRET. Base URL is the Vercel deployment.
+// Both optional at boot — reprocess worker no-ops if either is missing
+// (legacy embed-worker keeps running for v1 creators).
+const INTERNAL_API_BASE_URL = process.env.INTERNAL_API_BASE_URL || '';
+const INTERNAL_API_SECRET   = process.env.INTERNAL_API_SECRET || '';
 if (VOICE_CARTESIA_ENABLED) {
   if (!CARTESIA_API_KEY) {
     console.error('FATAL: CARTESIA_API_KEY missing while VOICE_CARTESIA_ENABLED=1');
@@ -1518,6 +1526,10 @@ let voiceDeleteHandle = null;
 let simliFaceDeleteHandle = null;
 let faceUploadReaperHandle = null;
 let embedWorkerHandle = null;
+let corpusReprocessWorkerHandle = null;
+// Day-5-unit-audit C1: hold the worker OBJECT (not just .handle) so the
+// SIGTERM handler can call signalShutdown() before killing the interval.
+let corpusReprocessWorker = null;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`voice-proxy listening on :${PORT} (build=${BUILD})`);
   // Reaper: 20s cadence + 60s threshold (RPC default). Fires once at boot for
@@ -1554,20 +1566,57 @@ server.listen(PORT, '0.0.0.0', () => {
       flyMachineId: BUILD,
     }).install().handle;
   }
+
+  // Day-5 RAG SOTA — corpus reprocess worker. Runs alongside the legacy
+  // embed worker; polls a different queue (corpus_reprocess_jobs) and runs
+  // the full v2 pipeline (sanitize → narrative-chunk → contextual-gen →
+  // embed → _insert_chunk_v2_unsafe). No-op if either INTERNAL_API_* env
+  // is missing — legacy worker still handles v1 creators.
+  if (GEMINI_API_KEY && INTERNAL_API_BASE_URL && INTERNAL_API_SECRET) {
+    if (INTERNAL_API_SECRET.length < 32) {
+      // eslint-disable-next-line no-console
+      console.error('[boot] INTERNAL_API_SECRET < 32 chars — corpus reprocess worker DISABLED');
+    } else {
+      corpusReprocessWorker = makeCorpusReprocessWorker({
+        supabase,
+        geminiApiKey: GEMINI_API_KEY,
+        internalApiBaseUrl: INTERNAL_API_BASE_URL,
+        internalApiSecret: INTERNAL_API_SECRET,
+        flyMachineId: BUILD,
+      });
+      corpusReprocessWorkerHandle = corpusReprocessWorker.install().handle;
+    }
+  } else {
+    // eslint-disable-next-line no-console
+    console.log('[boot] INTERNAL_API_BASE_URL or INTERNAL_API_SECRET missing — corpus reprocess worker disabled (legacy embed-worker still active)');
+  }
 });
 
 // Graceful shutdown — stop the reaper interval so node exits cleanly when the
 // http server's connections drain. SIGTERM is what Fly sends on deploy.
 function shutdown(signal) {
   console.log(`[shutdown] ${signal} — clearing reaper + delete workers`);
+  // Day-5-unit-audit C1: signal the reprocess worker BEFORE clearing
+  // intervals so an in-flight 9-min tick can drain at the next checkpoint
+  // (Flash done, unit boundary). The tick's finally block flushes cogs_log
+  // for whatever was paid so far — no silent spend loss on deploys.
+  if (corpusReprocessWorker) {
+    try { corpusReprocessWorker.signalShutdown(); }
+    catch (e) { console.error('[shutdown] signalShutdown failed', e); }
+  }
   if (reaperHandle) clearInterval(reaperHandle);
   if (voiceDeleteHandle) clearInterval(voiceDeleteHandle);
   if (simliFaceDeleteHandle) clearInterval(simliFaceDeleteHandle);
   if (faceUploadReaperHandle) clearInterval(faceUploadReaperHandle);
   if (embedWorkerHandle) clearInterval(embedWorkerHandle);
+  if (corpusReprocessWorkerHandle) clearInterval(corpusReprocessWorkerHandle);
   server.close(() => process.exit(0));
-  // Hard-exit after 5s if connections won't drain.
-  setTimeout(() => process.exit(0), 5000).unref();
+  // Day-5-unit-audit C1: hard-exit backstop bumped 5s → 30s. The reprocess
+  // worker's drain checkpoint + bumpFailure + cogs_log flush is ~1-3s on a
+  // healthy network; the extended budget gives slow networks headroom
+  // without unduly delaying clean deploys (typical deploy: server.close
+  // exits within seconds, this timeout never fires).
+  setTimeout(() => process.exit(0), 30_000).unref();
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));

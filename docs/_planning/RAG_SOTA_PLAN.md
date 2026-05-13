@@ -1,6 +1,6 @@
 # OakLeague RAG — State-of-the-Art Retrieval Engine Plan
 
-**Status**: v3 — post-audit-rounds-1-AND-2. Final draft, ready for Vuk approval.
+**Status**: v4 — post-audit-rounds-1-AND-2-AND-3 (Vuk's). All schema-reality bugs fixed. Ready for final approval.
 **Date**: 2026-05-13.
 **Author**: Sonnet 4.7 (planning agent), commissioned by Vuk.
 **Predecessor**: [`RAG_PHASE_1_2_HANDOFF.md`](./RAG_PHASE_1_2_HANDOFF.md), [`PGVECTOR_RAG_PLAN.md`](./PGVECTOR_RAG_PLAN.md).
@@ -18,7 +18,11 @@
 
 The handoff locked two decisions that the 2025-Q4 → 2026-Q1 retrieval-research literature now refutes. We re-litigate both. Vuk's user message authorized this: *"you are not constrained by the handoff and you use it just as the guiding post."*
 
-### Decision A — Reranker: **Voyage rerank-2.5 (primary) or Cohere rerank-3.5 (alt)**, NOT Gemini Flash
+### Decision A — Reranker: **Voyage rerank-2.5 (primary) or Cohere `rerank-v3.5` (alt)**, NOT Gemini Flash
+
+> **Vendor note (audit-3 M1)**: Voyage AI was [acquired by MongoDB on 2025-02-24](https://investors.mongodb.com/news-releases/news-release-details/mongodb-announces-acquisition-voyage-ai-enable-organizations). This adds an 8th vendor relationship (Gemini + Anthropic + Voyage/MongoDB + Cartesia + Simli + Supabase + Vercel + Fly). Operationally significant; included in vendor-risk tracking. Cohere fallback path stays warm precisely so we're not single-vendor-locked on the highest-leverage piece of the pipeline.
+
+> **Cohere model identifier note (audit-3 M7)**: the actual Cohere API model string is `rerank-v3.5` (with the `v`), not "rerank-3.5". Verified at [Cohere changelog](https://docs.cohere.com/changelog/rerank-v3.5). The `v` matters in API calls.
 
 | | Voyage rerank-2.5 | Cohere rerank-3.5 | Gemini 2.5 Flash as reranker |
 |---|---|---|---|
@@ -60,8 +64,8 @@ We ship Phase 1+2 on `gemini-embedding-001` because **swapping embedders is a re
 
 | Technique | Verdict | Reason |
 |---|---|---|
-| **HyDE** (hypothetical document embeddings) | REJECT | Adds hallucination risk on personal-creator data — generates a fake answer THEN searches for it, can pull retrieval AWAY from the creator's actual voice. Adds 25-40% latency per [arXiv 2506.21568](https://arxiv.org/abs/2506.21568). Our clarifier turn already serves the "give the model a richer query" purpose. |
-| **Multi-query / RAG-Fusion** | REJECT | [2026 scaling study](https://arxiv.org/html/2603.02153) shows lift is largely neutralized by reranking + context-budget truncation. We have a reranker. Adds N× retrieval calls upfront. |
+| **HyDE** (hypothetical document embeddings) | REJECT | Adds hallucination risk on personal-creator data — generates a fake answer THEN searches for it, can pull retrieval AWAY from the creator's actual voice. Our clarifier turn already serves the "give the model a richer query" purpose. (Note audit-3 S1: I cited a fabricated arxiv ID in v3; removed. The rejection logic stands on the hallucination-risk argument alone, which is the load-bearing reason.) |
+| **Multi-query / RAG-Fusion** | **MEASURE BEFORE REJECT** (audit-3 strategic pushback) | v3 plan rejected on a fabricated arxiv citation (audit-3 S1: ID 2603.02153 doesn't match arxiv's post-2007 YYMM convention). The real argument was "reranker neutralizes the lift" — plausible, but not proven for our corpus shape. **Phase 2.5 measurement step** (added below): after v2 ships, run a 50-question offline eval comparing (a) single rewritten query + rerank vs (b) 3-variant queries + rerank. If (b) wins by ≥5% retrieval-failure-rate on the dogfood corpus, add multi-query path. Cost: ~$0.0001/turn extra. Vuk's correct push — don't reject without measurement. |
 | **RAPTOR** (recursive tree) | DEFER | Designed for multi-hop reasoning across long docs. Our unit is topic-drawer narrative beats — single-hop. Revisit at v3 if creators publish book-length material. |
 | **GraphRAG / LazyGraphRAG** | DEFER | Entity-relationship reasoning over multi-document corpora. We have one creator, ≤5 drawers, single-hop. |
 | **Self-RAG / CRAG** (iterative retrieval) | REJECT | 1-3 extra round-trips. Voice budget can't tolerate. |
@@ -168,40 +172,50 @@ This split protects the dogfood creator (Vuk's drawer-mode brain is unchanged th
     ADD COLUMN retrieval_version smallint NOT NULL DEFAULT 1 CHECK (retrieval_version IN (1, 2));
   ```
 - `creators.brain_mode` remains `('drawer','vector')`. A creator with `brain_mode='vector' AND retrieval_version=2` uses the new pipeline; `retrieval_version=1` is the existing v1 RAG; `brain_mode='drawer'` is the legacy topic-drawer path. **Three orthogonal switches, no enum mutation.**
-- **Audit-2 M6 fix — admin RPC defined inline, not deferred:**
+- **Audit-3 C1+C2+C3 fix — admin RPC mirrors the canonical `admin_set_creator_brain_mode` pattern exactly** (verified against `supabase/migrations/20260512000007_admin_set_creator_brain_mode.sql:15-50`). Uses the real `_assert_caller_is_admin()` helper (audit-3 C1: my v3 draft hallucinated a non-existent `_is_admin_caller()`), the actual `admin_audit_log` shape `(admin_user_id, action, target_kind, target_id, before, after)` (audit-3 C2: my v3 INSERT had a non-existent `metadata` column), and keeps `_creator_brain_compile_unsafe` at its current 1-arg signature reading `retrieval_version` internally from the row (audit-3 C3: my v3 broke every existing caller by extending the signature):
   ```sql
   CREATE FUNCTION public.admin_set_creator_retrieval_version(
     p_creator_id uuid,
     p_version    smallint
-  ) RETURNS boolean
-  LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public, pg_temp AS $$
-  DECLARE v_mode brain_mode;
+  ) RETURNS void
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+  DECLARE
+    v_prev smallint;
   BEGIN
-    -- Admin auth check using existing helper:
-    IF NOT public._is_admin_caller() THEN
-      RAISE EXCEPTION 'forbidden: admin only';
+    PERFORM public._assert_caller_is_admin();
+
+    IF p_version IS NULL OR p_version NOT IN (1, 2) THEN
+      RAISE EXCEPTION USING errcode='22023', message='version_invalid';
     END IF;
-    IF p_version NOT IN (1, 2) THEN
-      RAISE EXCEPTION 'invalid version: must be 1 or 2';
+
+    SELECT retrieval_version INTO v_prev
+      FROM public.creators WHERE id = p_creator_id;
+    IF v_prev IS NULL THEN
+      RAISE EXCEPTION USING errcode='42704', message='creator_not_found';
     END IF;
-    -- Single transaction: bump version + recompile persona.
+
     UPDATE public.creators
-       SET retrieval_version = p_version,
-           updated_at = now()
-     WHERE id = p_creator_id
-    RETURNING brain_mode INTO v_mode;
-    IF NOT FOUND THEN RAISE EXCEPTION 'creator not found'; END IF;
-    -- Recompile system_prompt — version-aware persona compile.
-    -- _creator_brain_compile_unsafe is the existing per-mode compile; extend to take version into account.
-    PERFORM public._creator_brain_compile_unsafe(p_creator_id, v_mode, p_version);
-    -- Audit trail:
-    INSERT INTO public.admin_audit_log (action, target_id, metadata)
-    VALUES ('set_retrieval_version', p_creator_id,
-            jsonb_build_object('version', p_version, 'mode', v_mode));
-    RETURN true;
-  END $$;
+       SET retrieval_version = p_version
+     WHERE id = p_creator_id;
+
+    -- Recompile persona inside the same transaction so a flip + next
+    -- session-open pair is always consistent. _creator_brain_compile_unsafe
+    -- reads retrieval_version internally from the creators row (audit-3 C3).
+    PERFORM public._creator_brain_compile_unsafe(p_creator_id);
+
+    INSERT INTO public.admin_audit_log
+      (admin_user_id, action, target_kind, target_id, before, after)
+    VALUES
+      (auth.uid(), 'creator_retrieval_version_set', 'creator', p_creator_id,
+       jsonb_build_object('retrieval_version', v_prev),
+       jsonb_build_object('retrieval_version', p_version));
+  END;$$;
+
+  REVOKE ALL ON FUNCTION public.admin_set_creator_retrieval_version(uuid, smallint)
+    FROM public, anon;
+  GRANT EXECUTE ON FUNCTION public.admin_set_creator_retrieval_version(uuid, smallint) TO authenticated;
   ```
-  Recompile happens in the same transaction; either both land or both roll back. Existing `_creator_brain_compile_unsafe` takes a third arg `p_retrieval_version smallint` and selects the appropriate persona variant (drawer vs vector-v1 vs vector-v2 — vector-v2 persona is identical to vector-v1 for now, but the hook is in place).
+- **Audit-3 C3 follow-up — extend `_creator_brain_compile_unsafe` body, NOT its signature.** A separate migration `20260514000001b_brain_compile_reads_retrieval_version.sql` runs CREATE OR REPLACE on the existing 1-arg function to add `SELECT retrieval_version INTO v_version FROM creators WHERE id = p_creator_id` and use `v_version` for any persona variant logic. Every existing caller (`approve_creator_application`, `admin_set_creator_brain_mode`, all Next 15 `after()` triggers) keeps working unchanged. **For Phase 1 ship**, the persona body is identical for `retrieval_version=1` vs `retrieval_version=2` — the hook is in place, but we don't add v2-specific clauses until a Spike #2 re-verification of the 770-char persona boundary clears.
 - **Rollback**: `DROP FUNCTION admin_set_creator_retrieval_version; ALTER TABLE ... DROP COLUMN retrieval_version`. Clean.
 
 #### `20260514000002_sample_content_narrative_units.sql`
@@ -240,6 +254,49 @@ This split protects the dogfood creator (Vuk's drawer-mode brain is unchanged th
     ON public.sample_content_chunks (parent_unit_id) WHERE parent_unit_id IS NOT NULL;
   ```
 - **chunker_version**: discriminates v1 (legacy 300-token windows) and v2 (narrative+contextual) chunks. Old chunks coexist with new during migration; query RPC filters explicitly (per C5/M3 fix above).
+- **Audit-3 C4 fix — replace legacy `creator_knowledge_topk` in THIS migration, not in Phase 2.** The original v3 plan deferred the `chunker_version=1` filter to migration `20260515000001` in Phase 2, leaving a 5-day window (Days 6-11) where v1 and v2 chunks coexist and the legacy RPC has no filter — meaning Vuk's re-processed v2 chunks would silently leak into his v1 retrieval reads, masking whether Phase 2 actually moved the needle. Fix: replace `creator_knowledge_topk` via CREATE OR REPLACE in this same Phase 1 migration:
+  ```sql
+  CREATE OR REPLACE FUNCTION public.creator_knowledge_topk(
+    p_creator_id     uuid,
+    p_query_vec      halfvec(768),
+    p_k              int     DEFAULT 3,
+    p_min_similarity numeric DEFAULT 0.55
+  ) RETURNS TABLE (
+    chunk_id    uuid,
+    sample_id   uuid,
+    text        text,
+    source_type sample_source_type,
+    similarity  numeric
+  )
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp
+  AS $$
+    WITH ranked AS (
+      SELECT c.id AS chunk_id,
+             c.sample_id,
+             LEFT(c.text, 2000) AS text,
+             s.source_type,
+             (1 - (c.embedding <=> p_query_vec))::numeric AS similarity,
+             md5(LEFT(c.text, 200)) AS dedup_key,
+             c.embedding <=> p_query_vec AS dist
+        FROM public.sample_content_chunks c
+        JOIN public.sample_content s ON s.id = c.sample_id
+       WHERE c.creator_id = p_creator_id
+         AND c.chunker_version = 1                          -- audit-3 C4: v1-only
+         AND c.embedding IS NOT NULL
+         AND s.fetch_status <> 'errored'
+         AND (1 - (c.embedding <=> p_query_vec)) >= GREATEST(p_min_similarity, 0.30)
+       ORDER BY c.embedding <=> p_query_vec
+       LIMIT LEAST(p_k, 5) * 4
+    )
+    SELECT DISTINCT ON (dedup_key)
+           chunk_id, sample_id, text, source_type, similarity
+      FROM ranked
+     ORDER BY dedup_key, dist
+     LIMIT LEAST(p_k, 5);
+  $$;
+  ```
+  This means the legacy RPC keeps returning ONLY v1 chunks throughout the Phase 1 ship → Phase 2 ship window. Vuk's re-processed v2 chunks sit in the table but don't appear in `retrieval_version=1` reads. Phase 2's `creator_knowledge_topk_v2` is the only path that surfaces v2 chunks.
+
 - **Single-write insert RPC** (M4 fix — prevents triple-write GENERATED tsvector amplification; **audit-2 C1 cross-check fix**):
   ```sql
   CREATE FUNCTION public._insert_chunk_v2_unsafe(
@@ -337,7 +394,7 @@ This split protects the dogfood creator (Vuk's drawer-mode brain is unchanged th
   END $$;
   ```
   Caller does one extra round-trip but never panics. Alternative: make `creator_knowledge_topk_v2` accept `p_query_text text` and call `try_build_tsquery` internally — saves the round-trip but couples query parsing to the RPC. Choose: helper RPC (cleaner separation).
-- **Rollback**: drop v2 RPC. **Also**: in this migration, ALTER the LEGACY `creator_knowledge_topk` (v1) RPC to add a `chunker_version=1` filter, so v1 reads stay deterministic during coexistence (C4 fix). Existing callers don't change; the filter is internal.
+- **Rollback**: drop v2 RPC via `DROP FUNCTION`. Legacy v1 RPC was already replaced in Phase 1 migration `20260514000003` (audit-3 C4) and is unaffected by Phase 2 rollback.
 
 #### `20260515000002_semantic_query_cache.sql` (C1 + C3 + C4 fixes + **audit-2 C2 partitioning fix**)
 - New table — **payload stores only parent unit IDs and scores, never raw text** (C3 mitigation: text re-fetched at hit-time via the topk RPC, so a cached entry can never carry stale-or-poisoned content into a future session).
@@ -478,7 +535,7 @@ This split protects the dogfood creator (Vuk's drawer-mode brain is unchanged th
 | `src/lib/voice/chunk-sample.ts` | +60 | Add v2 mode: child chunks within parent narrative unit boundaries, ~150-200 tokens each, parent-id wired. v1 mode kept as fallback. |
 | `src/lib/voice/embed.ts` | +20 | Accept optional `contextPrefix` arg; prepend before embed call. |
 | `server/voice-proxy/embed-worker.js` | +150 | Mirror chunker v2; orchestrate sanitize → slide-strip → narrative-chunk → contextual-gen → embed → `_insert_chunk_v2_unsafe` single-RPC write pipeline (M4). Reuses existing claim/version-check/budget machinery. New: corpus_reprocess_jobs queue polling. |
-| `src/lib/voice/anthropic-client.ts` + `server/voice-proxy/anthropic-client.js` | +120 + 30 / new | **Single canonical Node-runnable module** (M6/S7 fix). The TS file is the source of truth, importable from both Next 15 server context AND the Fly proxy via the proxy's bundler. Anthropic SDK wrapper, behind a thin `IndexTimeLLMBridge` interface (CLAUDE.md bridge taxonomy: voice / avatar / TTS / video / **index-time-llm**) — S4 fix. We may move contextual-gen to Gemini Flash if cost demands; one bridge swap, no business-logic changes. |
+| `src/app/api/internal/contextual-gen/route.ts` + `src/lib/voice/anthropic-client.ts` | +180 + 120 / new | **Audit-3 M5 fix — Anthropic SDK runs in Next 15, NOT in the Fly proxy.** The 2026-05-09 .claude_learnings.md entry on the `.ts` import bug (Node ESM rejects `.ts` extensions; the catch installed silent sentinels) makes Anthropic-SDK-in-Fly a known fragility. Instead: Fly's `embed-worker` POSTs `{chunk_text, doc_prefix_cached_id}` to a Next 15 internal API route, which calls Anthropic and returns the `chunk_context`. Adds one network hop per chunk (~50ms over Vercel's edge), negligible at ~150 chunks/creator/reprocess. Route is service-role-only (`X-Internal-Service` header verified against a Fly-only secret). Bridge taxonomy still applies — TS file is the implementation, behind `IndexTimeLLMBridge` interface (CLAUDE.md addition: voice / avatar / TTS / video / **index-time-llm**). |
 | `src/lib/voice/__tests__/preprocess.test.ts` | +180 / new | Vitest. |
 | `src/lib/voice/__tests__/narrative-chunk.test.ts` | +220 / new | Vitest with mocked Flash; real-API gated test (`RUN_REAL_API_TESTS=1`) against fixture. |
 | `src/lib/voice/__tests__/contextual-retrieval.test.ts` | +180 / new | Vitest with mocked Haiku. |
@@ -624,8 +681,22 @@ Worst case: Phase 2 ships, all Voyage + Gemini Flash + cache fail simultaneously
 **Answer: good enough in practice, though the audit (S6) caught a precision issue.** The Postgres GIN index is platform-wide; `ts_rank_cd` doesn't recompute IDF per query result-set — it uses the document-frequency stats baked into the index (which IS platform-wide, NOT per-creator). So cross-creator IDF leakage technically exists. However: (a) we filter `WHERE creator_id = p_creator_id` AND `chunker_version = 2` first, so non-creator chunks never enter scoring; (b) `ts_rank_cd` per-row scoring depends only on the row's tsvector + the tsquery + length-normalization factors, not on corpus-size — the IDF-style component is encoded in the tsquery weighting from `websearch_to_tsquery` which is query-level, not corpus-statistic level; (c) RRF-merging with vector covers ranking imperfections. **For our scale (≤50 creators × ≤2000 chunks each ≈ 100K rows), the IDF distortion is negligible.** Per-creator scoping (separate `tsvector` columns per creator, or partitioning the GIN index by creator) is over-engineering at this corpus size. Documented as known-but-acceptable, not "implicitly scoped" as the draft incorrectly claimed.
 
 ### Q5: where does the last-assistant-response come from for query rewriting?
-**Answer: stored in proxy session closure, not DB.** The bridge already buffers `_currentTurnOutputTranscript`. On `turn_complete`, we move it to `lastAssistantResponse: string` on the session state. Bounded to 2000 chars (one turn's transcript cap). On user's next turn, rewrite-call reads it directly. **No DB roundtrip per turn.**
-On session resumption, we lose context — the resumed session starts fresh, rewrite skips on the first new turn. **M2 telemetry fix**: emit PostHog `rag_rewrite_no_context_post_resumption` when this happens, so we can quantify how often a "tell me more about that" turn lands without context (and decide post-launch whether to persist `lastAssistantResponse` to a session-scoped Redis or `voice_session_state` table).
+**Answer: stored in proxy session closure AND persisted to `voice_session_state` table on every turn-complete** (audit-3 M2 fix). The bridge already buffers `_currentTurnOutputTranscript`. On `turn_complete`, we move it to `lastAssistantResponse: string` on the session state AND fire-and-forget UPSERT to `voice_session_state(session_id, last_assistant_response, last_user_query, updated_at)`.
+On user's next turn, rewrite-call reads from closure (zero DB roundtrip in the hot path).
+**Resumption fix**: on `reopen()`, the proxy SELECTs from `voice_session_state` once and re-seeds the closure. Now follow-up questions survive the 15-minute Gemini Live session boundary — which audit-3 caught as load-bearing for the "tell me more about that" value prop. Without this, every long mentorship session has dead retrieval at the resumption point.
+Migration: add to Phase 2 (`20260515000005_voice_session_state.sql`):
+  ```sql
+  CREATE TABLE public.voice_session_state (
+    session_id              uuid        PRIMARY KEY REFERENCES public.sessions(id) ON DELETE CASCADE,
+    last_assistant_response text        CHECK (last_assistant_response IS NULL OR char_length(last_assistant_response) <= 2000),
+    last_user_query         text        CHECK (last_user_query IS NULL OR char_length(last_user_query) <= 1000),
+    updated_at              timestamptz NOT NULL DEFAULT now()
+  );
+  ALTER TABLE public.voice_session_state ENABLE ROW LEVEL SECURITY;
+  -- service-role only; no client policy.
+  -- TTL: rows auto-cleared via existing session-close trigger that NULLs session_id references.
+  ```
+PostHog `rag_rewrite_no_context_post_resumption` event STILL fires when state row is missing — covers the edge case where reopen happens before the first turn_complete UPSERT.
 
 ### Q6: Gemini Flash rate-limit during rewrite — fallback?
 **Answer: fall back to embedding the raw transcript** (current v1 behavior). Log PostHog `rag_rewrite_429_fallback`. Same Gemini key as voice — rate-limit during active voice session is rare but possible during traffic spikes. Tier-2 Gemini billing buys 4M tokens/min, which is overkill for our scale.
@@ -678,29 +749,59 @@ Schedule revised upward after audit-2 caught that 11 migrations (was 9) + new sa
 Day 0 (setup, before any work):
   - Set Supabase project setting app.environment to 'production' (prod cluster)
     and 'staging' (staging cluster). Required by audit-2 M4 cron guard.
+  - VERIFY the GUC actually persists into pg_cron worker connections
+    (audit-6 C2). The migration 7 cron-registration DO block reads the GUC at
+    migration apply time — but pg_cron BACKGROUND workers open separate
+    connections and only inherit GUCs set via `ALTER DATABASE ... SET ...`
+    (NOT session-level SET, NOT application-level secrets). Verification:
+      1. After `ALTER DATABASE <db> SET app.environment = 'staging'` on staging:
+      2. Open a FRESH psql session (close + reopen).
+      3. `SELECT current_setting('app.environment', true);` → must return 'staging'.
+      4. If empty / NULL: the ALTER DATABASE didn't persist; the staging cron
+         will register but the proc will refuse forever in cron.job_run_details.
+         Re-run ALTER DATABASE and re-verify.
+    Same verification on production (expecting 'production'), so the staging-
+    only purge cron is NOT registered.
 
-Phase 1 — Indexer (~5-6 days):
-  Day 1: schema migrations 1-5 + budget-bump + test-fixture (7 migrations) + pgTAP for each.
-         Smoke deploy to staging. Verify cron staging-only guard.
-  Day 2: preprocess.ts (Unicode-aware sanitizer per audit-2 C3) + narrative-chunk.ts + unit tests.
-  Day 3: contextual-retrieval.ts + Anthropic SDK wiring + 1-hour-TTL cache strategy.
-  Day 4: embed-worker integration with new _insert_chunk_v2_unsafe + corpus-reprocess script.
-  Day 5: admin UI for re-process + brain-injection-spike-v2.mjs (4 attack classes × 10 runs = 40 paths).
+Phase 1 — Indexer (~6-7 days):
+  Day 1: schema migrations 1-4 (retrieval_version + admin RPC + brain_compile body update +
+         narrative_units + chunks_v2 with single-insert RPC + legacy creator_knowledge_topk replace)
+         + pgTAP for each. Smoke deploy to staging. Audit-3 M3: this is 4 migrations of substance,
+         not 7 — was previously overloaded; reprocess_jobs + invariant_check + test_fixture +
+         budget_bump pushed to Day 2.
+  Day 2: migrations 5-7 (corpus_reprocess_jobs + invariant_check + test_fixture + budget_bump)
+         + pgTAP. Verify cron staging-only guard. Verify app.environment setting in both clusters.
+  Day 3: preprocess.ts (Unicode-aware sanitizer per audit-2 C3) + narrative-chunk.ts + unit tests.
+  Day 4: Next 15 contextual-gen API route + anthropic-client.ts (audit-3 M5: Anthropic stays in TS-native) +
+         1-hour-TTL cache strategy.
+  Day 5: embed-worker integration with new _insert_chunk_v2_unsafe + corpus-reprocess script
+         + per-creator advisory lock in worker (audit-3 M4: pg_advisory_xact_lock(hashtext('reprocess:' || creator_id))
+         taken inside the job claim so concurrent reprocess jobs for the same creator serialize).
+  Day 6: admin UI for re-process + brain-injection-spike-v2.mjs (4 attack classes × 10 runs = 40 paths).
          Block: 10/10 PASS per class required before proceeding.
-  Day 6 (buffer): Vuk re-processes his corpus on staging; side-by-side comparison via admin tool.
+  Day 7 (buffer): Vuk re-processes his corpus on staging; side-by-side comparison via admin tool.
          Phase 1 PR merged to main; schema in place; no creator re-processed in prod yet.
 
 Phase 2 — Retrieval pipeline (~6-7 days):
-  Day 7: Migrations 6-9 (topk_v2 + semantic cache partitioned + corpus_version + telemetry) + pgTAP.
-  Day 8: try_build_tsquery helper RPC + query-rewrite.ts + semantic-cache.ts.
-  Day 9: rerank.ts (Voyage + Cohere fallback + token-bucket + boot telemetry per audit-2 M2) + tests.
-  Day 10: retrieve-knowledge.ts hybrid pipeline + proxy thin shim + envelope hard-32KB rejection (M7).
-  Day 11: integration tests + dogfood-end-to-end real-API test against the dedicated test-fixture creator.
-  Day 12: PR merged to main, ALL creators stay at retrieval_version=1 (cold deploy).
-  Day 13: Vuk re-processes corpus on prod (staging-verified). Still retrieval_version=1 — re-processed v2 chunks land but are not queried.
-  Day 14: 20-question manual dogfood gate. If pass: admin UPDATEs `creators.retrieval_version=2` for Vuk only.
-  Day 15: Monitor PostHog funnel + Sentry for 24h with one creator on v2.
-  Day 16: rollback gate — if 24h clean, declare green. Future creators flip individually via admin UI after re-processing completes.
+  Day 8: Migrations 8-12 (topk_v2 + semantic cache partitioned + corpus_version + telemetry +
+         voice_session_state per audit-3 M2) + pgTAP.
+  Day 9: try_build_tsquery helper RPC + query-rewrite.ts + semantic-cache.ts + voice-session-state.ts.
+  Day 10: rerank.ts (Voyage + Cohere fallback + token-bucket + boot telemetry per audit-2 M2) + tests.
+         **Soft spot to verify before this day**: Voyage rerank-2.5 RPM at Tier 1 was not confirmed in
+         our web audit — docs.voyageai.com/docs/rate-limits was scrape-blocked. Pull the dashboard or
+         contact Voyage support BEFORE provisioning to confirm 2000 RPM holds for rerank, not just
+         for embedding (audit-3 M6).
+  Day 11: retrieve-knowledge.ts hybrid pipeline + proxy thin shim + envelope hard-32KB rejection (M7).
+  Day 12: integration tests + dogfood-end-to-end real-API test against the dedicated test-fixture creator.
+  Day 13: PR merged to main, ALL creators stay at retrieval_version=1 (cold deploy).
+  Day 14: Vuk re-processes corpus on prod (staging-verified). Still retrieval_version=1 — re-processed
+         v2 chunks land but are not queried (audit-3 C4: legacy RPC already chunker_version=1-filtered).
+  Day 15: 20-question manual dogfood gate (in a single sub-15-min window to avoid Gemini Live session
+         boundary biasing M2 resumption test, OR run with the persisted state already in place).
+         If pass: admin UPDATEs `creators.retrieval_version=2` for Vuk only.
+  Day 16: Monitor PostHog funnel + Sentry for 24h with one creator on v2.
+  Day 17: rollback gate — if 24h clean, declare green. Future creators flip individually via admin UI
+         after re-processing completes.
 
   Note (audit-2 C4 fix): no `RAG_RETRIEVAL_V2` env flag — the per-creator `retrieval_version` column is the
   ONLY switch. Deploy ordering (Fly proxy first, then Vercel) is enforced by the column being read at
@@ -719,6 +820,23 @@ The handoff projected 0.59 → 0.80 similarity on the twins-story question. That
 3. **Borderline-vocabulary hits.** "What's that mental trick where you assume the worst?" — vector cosine misses (no shared vocab with the creator's "negative visualization" passage); BM25 misses (no token overlap); but the hybrid + contextual headers ("This passage discusses negative-visualization, also known as worst-case forecasting...") nails it. The avatar pulls the right story.
 4. **Voice-feel matches knowledge-feel.** Today: voice is the creator's, content is generic. After: voice is the creator's, content is the creator's specific stories with specific verbatim phrasing. The avatar starts saying "that reminds me of when…" and pulling an actual story the creator told 18 months ago in a real talk. That's the *HOLY FUCK*.
 5. **It works on creator #50.** No hardcoded anything. Every creator who signs up gets the same pipeline; their first re-process takes ~10 minutes; their UX is identical to Vuk's from minute zero.
+
+---
+
+## 11b. Phase 2.5 — measurement gate before locking the multi-query rejection (audit-3 strategic)
+
+After v2 ships and stabilizes for ~1 week of production traffic, run an offline A/B against the dogfood corpus:
+
+**Setup**: 50 questions across the same 4 buckets the manual gate uses (direct, follow-up, paraphrased, edge-of-corpus). Run each through:
+- **Path A**: current single-query rewrite + hybrid + RRF + rerank → top-3
+- **Path B**: 3-variant query expansion (Flash generates 2 paraphrase variants of the rewritten query) + hybrid + RRF over all 3 result sets + rerank → top-3
+
+**Decision rule**:
+- If Path B beats Path A by ≥5% retrieval-failure-rate (the same metric Anthropic Contextual Retrieval is benchmarked on), ship multi-query as Phase 2.5.
+- If <5% lift, lock the rejection. Cost was the only objection; we'd have measured the benefit.
+- Cost delta is ~$0.0001/turn extra (one more Flash rewrite call, no extra rerank cost since we already over-fetch top-20).
+
+**Why post-launch, not before**: measuring without a working v2 baseline is meaningless. Phase 2.5 happens after we know what v2 alone delivers.
 
 ---
 
@@ -880,6 +998,68 @@ Audit-2 conducted 2026-05-13 by adversarial reviewer agent on the audit-1-revise
 
 ---
 
-## End of v3 plan. **Ready for Vuk approval gate.**
+---
+
+## 16. Audit round 3 — Vuk's review + disposition
+
+Audit-3 conducted 2026-05-13 by Vuk himself, reading v3 against the actual migration files in `supabase/migrations/`. Verdict on v3: **REVISE on schema-reality (4 Critical), MEASURE on multi-query (strategic pushback), VERIFY on vendor claims (2 Medium)**. All findings applied inline; this is v4.
+
+### Critical (4/4 applied — all schema-reality bugs I would have introduced at first DB push)
+
+| # | Finding | Disposition |
+|---|---|---|
+| C1 | `_is_admin_caller()` helper doesn't exist in the codebase. v3 plan hallucinated it. | Replaced with the real `_assert_caller_is_admin()` PERFORM-call pattern. Mirrors `admin_set_creator_brain_mode` migration 20260512000007 exactly. |
+| C2 | `admin_audit_log` INSERT used non-existent `metadata` column. Real schema is `(admin_user_id, action, target_kind, target_id, before, after)` (from 20260502000004:19-28). v3's INSERT would throw `NOT NULL` violation on first call. | Rewrote INSERT to use the real columns + the standard action-name convention (`creator_retrieval_version_set`). |
+| C3 | v3 extended `_creator_brain_compile_unsafe` to a 3-arg signature, breaking every existing caller (`approve_creator_application` + admin RPCs + Next 15 `after()` triggers). | Kept the canonical 1-arg signature; CREATE OR REPLACE adds `SELECT retrieval_version INTO v_version FROM creators ...` internally. Existing callers unchanged. Hook in place for future v2-specific persona variants; v2 persona body identical to v1 until Spike #2 re-verifies 770-char boundary. |
+| C4 | v3 deferred the legacy `creator_knowledge_topk` `chunker_version=1` filter to Phase 2 migration. This left a 5-day window (Days 6-11 in v3 schedule) where v2 chunks bleed into v1 retrieval reads — masking whether v2 actually moved the needle. | Moved the legacy RPC's CREATE OR REPLACE into Phase 1 migration `20260514000003`, same transaction as the chunker_version column ADD. v1 reads stay deterministic from the moment v2 chunks first land. |
+
+### Medium (7/7 applied)
+
+| # | Finding | Disposition |
+|---|---|---|
+| M1 | Voyage is MongoDB-owned (acquired 2025-02-24), not Anthropic-affiliated. Adds 8th vendor relationship. | Documented in §0 Decision A. Cohere fallback path stays warm so we're not single-vendor-locked. |
+| M2 | `lastAssistantResponse` resumption-loss was telemetry-only in v3 — but Gemini Live's 15-min audio session cap means every long mentorship session loses follow-up-question context. Load-bearing for the "HOLY FUCK" claim. | New Phase 2 migration `20260515000005_voice_session_state.sql`. Closure-first read, fire-and-forget UPSERT on turn_complete, re-seed from DB on `reopen()`. Telemetry event STILL fires for the edge case where reopen happens before first UPSERT. |
+| M3 | Day 1 overloaded — 7 migrations + pgTAP + verify in 24h is unrealistic. | Split into Days 1-2 across the 11 migrations. Rollout extended by 1 day. |
+| M4 | Concurrent reprocess for 3 samples of one creator → 3 version-bumps → stale cache writes from earlier workers fail (acceptable, but unspecified). | Workers take `pg_advisory_xact_lock(hashtext('reprocess:' || creator_id))` inside the job claim. Same pattern as `_creator_brain_compile_unsafe` line 44. Predictable serialization. |
+| M5 | Anthropic SDK in Fly-proxy runtime is the kind of bundling fragility that bites at deploy time (per the 2026-05-09 `.ts` import bug learning). | Anthropic SDK moves to a Next 15 internal API route (`/api/internal/contextual-gen`). Fly's embed-worker POSTs `{chunk_text, doc_prefix_cached_id}`, gets `chunk_context` back. SDK lives in TS-native context only. One network hop per chunk (~50ms over Vercel edge); negligible. |
+| M6 | Voyage RPM at Tier 1 for **rerank specifically** was unverified — web audit only confirmed Tier 1 embedding RPM, not reranker RPM. | Documented as the explicit "soft spot to verify before Day 10" in §10 schedule. Pull dashboard or contact Voyage support before provisioning. Plan does NOT lock on 2000 RPM as guaranteed. |
+| M7 | Cohere model identifier is `rerank-v3.5` (with the `v`), not "rerank-3.5". The `v` matters in API calls. | Fixed throughout the plan. Verified at [Cohere changelog](https://docs.cohere.com/changelog/rerank-v3.5). |
+
+### Strategic pushback — multi-query
+
+v3 rejected multi-query/RAG-Fusion on a citation that was a fabricated arxiv ID (audit-3 S1: 2603.02153 doesn't match arxiv's YYMM post-2007 convention). The hallucination-risk argument for HyDE was real; the multi-query rejection was paper-thin without measurement.
+
+**Disposition**: introduce Phase 2.5 (§11b) as an explicit measurement gate. After v2 ships and stabilizes for ~1 week, run 50-question offline A/B (single-rewrite vs 3-variant). If multi-query beats single by ≥5% retrieval-failure-rate on the dogfood corpus, ship it. If not, lock the rejection — but with a measured number behind it, not a vibes call.
+
+### Small (4/4 applied)
+
+| # | Finding | Disposition |
+|---|---|---|
+| s1 | Fabricated arxiv citations (2603.02153, 2506.21568). | Removed. HyDE rejection now rests on the hallucination-on-personal-data argument only (real, load-bearing). Multi-query rejection promoted to Phase 2.5 measurement gate. |
+| s2 | 0.92 cache threshold may be ~0.918 effective due to halfvec FP16 precision loss. | Documented as "calibrate empirically Day 14 against dogfood corpus." |
+| s3 | Manual gate's 5 follow-up "tell me more" questions could fail intermittently from resumption gap. | M2 fix (voice_session_state persistence) eliminates the gap. Day 15 manual gate adds note: "in a single sub-15-min window OR with state persisted." |
+| s4 | Edit during reprocess — `sample_content_embedding_jobs` queue + `corpus_reprocess_jobs` queue can have pending work for same `sample_id`. | Documented decision: **drain reprocess first** (it's the higher-quality path). On edit-during-reprocess, the new sample_content INSERT enqueues an embedding job that runs AFTER the reprocess finalize bumps the corpus version. Advisory lock on creator_id (M4) prevents interleaving. |
+
+### Net effect of audit-3
+
+- 0 new migrations vs v3, but **3 existing migrations corrected to schema reality** (admin RPC, brain_compile body extension, legacy creator_knowledge_topk timing).
+- 1 net-new migration added: `voice_session_state` (M2 load-bearing for HOLY FUCK claim).
+- 1 net-new API route: `/api/internal/contextual-gen` (M5).
+- Rollout: 16 days → 17 days (M3 Day-1 rebalance + 1 buffer).
+- Phase 2.5 measurement gate added for multi-query (strategic).
+- Cohere model name fixed: `rerank-v3.5`.
+- Voyage RPM soft-spot documented as explicit pre-launch verification.
+- All fabricated arxiv citations removed; rejection arguments now stand on real claims.
+
+### Confidence levels (Vuk's own honest assessment of his audit)
+
+- **High**: schema reality (C1-C4) — verified against migration files line numbers. APPLIED.
+- **Medium**: Voyage pricing/Cohere version (M1, M6, M7) — needed web-verify. VERIFIED, APPLIED.
+- **High**: strategic picks (Voyage > Gemini rerank, Anthropic Contextual centerpiece, HyDE reject, GraphRAG/RAPTOR defer, multi-query → measure). NO CHANGES needed except multi-query promotion to measurement gate.
+
+---
+
+## End of v4 plan. **Ready for Vuk's final approval gate.**
+
 
 
