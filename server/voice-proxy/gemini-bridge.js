@@ -207,10 +207,26 @@ export class GeminiBridge extends EventEmitter {
       // truncationSuspected() using the audioSeconds we emit in the event.
       config.inputAudioTranscription = {};
     }
-    // Auto-VAD: omit realtimeInputConfig (default = auto-VAD on,
-    // endOfSpeechSensitivity = END_SENSITIVITY_HIGH). turnStart is a
-    // no-op; turnEnd sends `audioStreamEnd: true`. Switched from manual
-    // VAD on 2026-05-02 to bypass the upstream multi-turn regression.
+    // 2026-05-13 — MANUAL VAD. Reversing the 2026-05-02 switch to auto-VAD.
+    //
+    // The "multi-turn-2 close-mid-turn regression" cited in the prior comment
+    // turned out to be a protocol mismatch: sending `activityStart` WHILE
+    // auto-VAD was enabled is a protocol error per Gemini Live docs. With
+    // auto-VAD properly disabled here, manual signals (`activityStart` /
+    // `activityEnd`) are the supported path. No protocol mismatch, no
+    // regression.
+    //
+    // Why manual VAD: tap-to-toggle UX requires the user's tap to be the
+    // ONLY source of turn boundaries. With auto-VAD on, Gemini's server-side
+    // VAD ends user turns based on silence detection (~1s pause = turn over).
+    // That cuts users off mid-thought ("button flipped on its own") AND
+    // diverges the local state machine from the server's. Client-owned
+    // boundaries fix both at the architectural level.
+    //
+    // ROLLBACK: delete the realtimeInputConfig block + revert turnStart()
+    // to no-op + revert turnEnd() to `audioStreamEnd: true`. One-line env
+    // flag could gate this if multi-turn ever genuinely regresses.
+    config.realtimeInputConfig = { automaticActivityDetection: { disabled: true } };
     this._session = await ai.live.connect({
       model,
       config,
@@ -518,10 +534,10 @@ export class GeminiBridge extends EventEmitter {
     this._currentTurnOutputTranscript = '';
     this._currentTurnRunawayFired = false;
     this._currentTurnReceivedContent = false;
-    // Auto-VAD: no activityStart signal — Gemini infers turn boundaries
-    // from audio content. Sending activityStart with auto-VAD on is a
-    // protocol error and trips the upstream multi-turn-2 close-mid-turn
-    // regression (forum: discuss.ai.google.dev/t/142838).
+    // Manual VAD (2026-05-13): explicit activityStart paired with the
+    // automaticActivityDetection.disabled=true config above. Tells Gemini
+    // "the user is talking now, do not infer end-of-turn from silence."
+    this._session.sendRealtimeInput({ activityStart: {} });
   }
 
   sendAudio({ bytes, mimeType }) {
@@ -534,16 +550,14 @@ export class GeminiBridge extends EventEmitter {
     });
   }
 
-  /** Signals end of client audio stream, resolves on next turn_complete with
-   *  per-turn metrics. In auto-VAD mode the explicit signal is `audioStreamEnd`
-   *  (the auto-VAD equivalent of manual-VAD's `activityEnd`). Per Live API
-   *  reference: "Indicates that the audio stream has ended … should only be
-   *  sent when automatic activity detection is enabled (which is the default)
-   *  … client can reopen the stream by sending subsequent audio messages."
+  /** Signals end of client audio stream (manual VAD = client owns boundaries),
+   *  resolves on next turn_complete with per-turn metrics. With
+   *  realtimeInputConfig.automaticActivityDetection.disabled=true, the
+   *  protocol-correct signal is `activityEnd: {}` (Gemini Live docs).
    *  https://ai.google.dev/api/live#RealtimeInputConfig */
   async turnEnd({ timeoutMs = 30_000 } = {}) {
     if (!this._session || this._closed) throw new Error('bridge_not_open');
-    this._session.sendRealtimeInput({ audioStreamEnd: true });
+    this._session.sendRealtimeInput({ activityEnd: {} });
 
     await new Promise((resolve, reject) => {
       const to = setTimeout(() => { this.off('event', h); reject(new Error('turn_complete_timeout')); }, timeoutMs);

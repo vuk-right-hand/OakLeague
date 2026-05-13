@@ -25,7 +25,7 @@
 
 'use client';
 
-import { useCallback, useEffect, useReducer, useRef } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import * as Sentry from '@sentry/nextjs';
 import { createSimliBridge } from '@/lib/avatar/simli-bridge';
 import { createHeygenBridge } from '@/lib/avatar/heygen-bridge';
@@ -97,6 +97,13 @@ export type PipeHandle = {
   state: SessionState;
   videoRef: React.RefObject<HTMLVideoElement | null>;
   audioRef: React.RefObject<HTMLAudioElement | null>;
+  // 2026-05-13 — single source of truth for "is the mic physically capturing
+  // and forwarding audio to the proxy right now". The button MUST read this,
+  // not `phase === 'listening'`, because the reducer's phase is server-driven
+  // (it transitions out of 'listening' on tts_audio_chunk when Gemini's auto-
+  // VAD ends the user's turn) while micActive reflects actual track state.
+  // These can diverge; micActive is what the button needs.
+  micActive: boolean;
   startMic: () => void;
   stopMic: () => void;
   endSession: (reason: 'user_ended' | 'client_error') => Promise<void>;
@@ -173,6 +180,11 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   // by turn 4. Tracks "is the mic currently engaged this turn" so
   // start/stop fire exactly once per press-and-hold cycle.
   const micActiveRef = useRef<boolean>(false);
+  // 2026-05-13 — state mirror of micActiveRef. Refs don't trigger re-renders;
+  // the button needs a re-rendered value to flip its UI. Updated in lockstep
+  // with micActiveRef inside startMic / stopMic / forceMicSilent. Reading
+  // this is the SINGLE source of truth for "should the button show STOP".
+  const [micActive, setMicActive] = useState<boolean>(false);
   // 2026-05-13 — silence-detection auto-stop. Replaces the dumb 30s hard cap
   // on the MicButton.
   //   * lastVoiceActivityRef: performance.now() of the most recent worklet
@@ -654,6 +666,14 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
         onAudioOut: (bytes) => {
           if (cancelled) return;
           recordAudioOut(bytes.byteLength, performance.now());
+          // 2026-05-13 — server-VAD ended the user turn early. If the user
+          // never tapped stop, micActive is still true while the model is
+          // starting to speak. Force-silence the mic NOW so the button stops
+          // lying. Runs BEFORE the bridge.sendAudio + reducer dispatch so the
+          // UI flip lands as close to the actual server transition as possible.
+          if (micActiveRef.current) {
+            forceMicSilentRef.current?.('first_audio_out_mid_listening');
+          }
           // R3-M7 — first audio_out after mic_stopped is t1 of the
           // user_perceived_response_ms metric.
           if (userPerceivedT0Ref.current !== null) {
@@ -677,6 +697,13 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
         // gluing silent worklet frames + a phantom barge-in onto Gemini's
         // ongoing turn until auto-VAD couldn't recover.
         onTurnComplete: () => {
+          // Defense in depth — turn_complete arriving while we still think
+          // we're listening means server-VAD ended the turn AND model
+          // generation completed before any audio_out flowed (rare but
+          // possible: empty response, error path). Force-sync local state.
+          if (micActiveRef.current) {
+            forceMicSilentRef.current?.('turn_complete_mid_listening');
+          }
           try { bridgeRef.current?.commitUtterance?.(); } catch { /* */ }
           dispatchRef({ kind: 'turn_complete' });
         },
@@ -807,6 +834,11 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   useEffect(() => {
     function onVisibility() {
       if (document.hidden) {
+        // 2026-05-13 — visibility hidden while mic active: force-silence
+        // so the button doesn't return showing "Stop" when user comes back.
+        if (micActiveRef.current) {
+          forceMicSilentRef.current?.('visibility_hidden');
+        }
         dispatchRef({ kind: 'visibility_hidden' });
         // Stop mic frame delivery but keep AudioContext + worklet alive to
         // avoid full re-initialization on resume.
@@ -1020,6 +1052,7 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       return;
     }
     micActiveRef.current = true;
+    setMicActive(true);
     // Silence-detection seed: count tap-moment as "voice activity" so the
     // 7s silence window starts from tap, not from -∞. A user who taps and
     // immediately goes silent still gets a 7s mic-open window. The
@@ -1109,6 +1142,7 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       return;
     }
     micActiveRef.current = false;
+    setMicActive(false);
     // Tear down silence-detection timer. Idempotent — guarded by the null check.
     if (silenceTimerRef.current) {
       clearInterval(silenceTimerRef.current);
@@ -1123,6 +1157,30 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   }, []);
   // Wire the forward-ref so startMic's silence timer can call stopMic.
   stopMicRef.current = stopMic;
+
+  // 2026-05-13 — server-driven force-silence. When Gemini's auto-VAD ends
+  // the user's turn early (first tts_audio_chunk arrives mid-listening, OR
+  // turn_complete fires while we still think we're listening), the client
+  // state machine has diverged from the server. Local mic state must catch
+  // up immediately so the button stops lying. This DOES NOT send `turn_end`
+  // to the proxy because the server already advanced — that signal would
+  // be ignored, but skipping it avoids any chance of confusing the proxy.
+  const forceMicSilent = useCallback((reason: string): void => {
+    if (!micActiveRef.current) return;
+    console.log(`[force-mic-silent] reason=${reason} (server-driven turn end)`);
+    micActiveRef.current = false;
+    setMicActive(false);
+    if (silenceTimerRef.current) {
+      clearInterval(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    try { micStreamRef.current?.getTracks().forEach((t) => (t.enabled = false)); } catch {}
+    // R3-M7 — still the start of "user is waiting for answer", even though
+    // server-VAD ended the turn instead of an explicit tap.
+    userPerceivedT0Ref.current = performance.now();
+  }, []);
+  const forceMicSilentRef = useRef<typeof forceMicSilent>(forceMicSilent);
+  forceMicSilentRef.current = forceMicSilent;
 
   // ── End session ────────────────────────────────────────────────────────────
   const endSession = useCallback(async (reason: 'user_ended' | 'client_error') => {
@@ -1262,6 +1320,7 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     state,
     videoRef,
     audioRef,
+    micActive,
     startMic,
     stopMic,
     endSession,

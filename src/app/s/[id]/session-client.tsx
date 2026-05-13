@@ -410,6 +410,7 @@ function LiveSession(props: LiveProps) {
       <div style={{ padding: 24, display: 'flex', justifyContent: 'center', background: '#000' }}>
         <MicButton
           phase={phase}
+          micActive={pipe.micActive}
           onPressStart={() => pipe.startMic()}
           onPressEnd={() => pipe.stopMic()}
         />
@@ -420,15 +421,26 @@ function LiveSession(props: LiveProps) {
 
 function MicButton({
   phase,
+  micActive,
   onPressStart,
   onPressEnd,
 }: {
   phase: string;
+  micActive: boolean;
   onPressStart: () => void;
   onPressEnd: () => void;
 }) {
   const enabled = phase === 'ready' || phase === 'listening' || phase === 'speaking';
-  const active = phase === 'listening';
+  // 2026-05-13 — `active` derives from the physical mic state (pipe.micActive),
+  // NOT phase === 'listening'. The reducer's phase is server-driven (it
+  // transitions out of 'listening' when Gemini's auto-VAD ends the user's
+  // turn — `tts_audio_chunk` flips phase: listening → speaking). The mic
+  // can be physically off while phase still says 'speaking'. We always want
+  // the button label to match what the mic is doing, not what the model is
+  // doing. The hook's forceMicSilent path syncs micActive to false the
+  // instant the server takes over, so the button flips at the same time as
+  // the avatar starts speaking — no more "Tap" while audio is flowing.
+  const active = micActive;
 
   // 2026-05-12 fix v4: tap-to-toggle (was hold-to-talk; the hold pattern was
   // fragile across browsers — setPointerCapture + React reconciliation hell).
