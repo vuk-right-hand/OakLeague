@@ -40,10 +40,22 @@ function decimate3to1(input, state) {
   return out;
 }
 
+// Voice activity detection — RMS over each output frame. Threshold and
+// per-frame logic lives here so the main thread doesn't have to redecimate.
+// -50 dBFS converted to linear amplitude: 10^(-50/20) ≈ 0.00316.
+// Frames with RMS above this are reported as voice activity. Main thread
+// uses the message timestamp to drive silence-based auto-stop. False positives
+// from background hum slightly above -50 dBFS are acceptable: they delay
+// auto-stop, never trigger spurious stops.
+const VOICE_RMS_THRESHOLD = 0.00316;
+
 class MicProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this._buf16k = new Int16Array(640); // 40ms @ 16k
+    // Parallel float32 buffer for RMS calculation. Match the int16 fill cursor
+    // — when _fill wraps, both are flushed.
+    this._bufF32 = new Float32Array(640);
     this._fill = 0;
     this._stopped = false;
     // Owned by decimate3to1 — phase 0..2; caller passes the same object back.
@@ -70,9 +82,24 @@ class MicProcessor extends AudioWorkletProcessor {
       let s = decimated[i];
       if (s > 1) s = 1;
       else if (s < -1) s = -1;
-      this._buf16k[this._fill++] = (s < 0 ? s * 0x8000 : s * 0x7fff) | 0;
+      this._buf16k[this._fill] = (s < 0 ? s * 0x8000 : s * 0x7fff) | 0;
+      this._bufF32[this._fill] = s;
+      this._fill += 1;
 
       if (this._fill === this._buf16k.length) {
+        // RMS over the just-completed 40ms frame. Cheap: one sqrt + one
+        // compare per frame (~25 frames/sec).
+        let sumSq = 0;
+        for (let k = 0; k < this._bufF32.length; k++) {
+          const v = this._bufF32[k];
+          sumSq += v * v;
+        }
+        const rms = Math.sqrt(sumSq / this._bufF32.length);
+        if (rms >= VOICE_RMS_THRESHOLD) {
+          // Tiny payload — main thread treats any arrival as "voice activity
+          // observed at this timestamp." No need to send the RMS value itself.
+          this.port.postMessage({ type: 'voice_activity' });
+        }
         const out = new Int16Array(this._buf16k);
         this.port.postMessage({ type: 'frame', pcm: out.buffer }, [out.buffer]);
         this._fill = 0;

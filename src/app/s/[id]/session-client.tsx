@@ -430,30 +430,27 @@ function MicButton({
   const enabled = phase === 'ready' || phase === 'listening' || phase === 'speaking';
   const active = phase === 'listening';
 
-  // 2026-05-12 fix v4: switched from hold-to-talk → tap-to-toggle.
+  // 2026-05-12 fix v4: tap-to-toggle (was hold-to-talk; the hold pattern was
+  // fragile across browsers — setPointerCapture + React reconciliation hell).
   //
-  // Hold-to-talk was fundamentally fragile across browsers/OS combos —
-  // setPointerCapture, document-level listeners, and React reconciliation
-  // all had edge cases that collapsed long presses into clicks. Discord,
-  // Telegram, voice memos, etc. all use tap-to-toggle. No timing dependency,
-  // no OS pointer-quirk hell.
-  //
-  // First tap: start listening. Second tap (or 30s auto-timeout): stop.
+  // 2026-05-13: auto-stop is silence-detection-driven from use-session-pipe
+  // (RMS in the AudioWorklet → 7s silence threshold → stop). The fixed 30s
+  // cap that used to live here was awful UX (cuts mid-sentence at 30s, leaves
+  // mic open 26s after a 4s utterance). Button just handles user tap intent;
+  // pipe owns the auto-stop policy.
   const activeRef = useRef(false);
-  const autoStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onPressStartRef = useRef(onPressStart);
   const onPressEndRef = useRef(onPressEnd);
   onPressStartRef.current = onPressStart;
   onPressEndRef.current = onPressEnd;
   // Keep activeRef in sync with the actual phase, so an externally-driven
-  // phase transition (e.g., model started speaking, fatal error) flips us
-  // back to "not active" without a tap.
+  // phase transition (e.g., model started speaking, fatal error, silence
+  // auto-stop) flips us back to "not active" without a user tap.
   activeRef.current = active;
 
   // Defensive cleanup if the component unmounts while listening.
   useEffect(() => {
     return () => {
-      if (autoStopTimerRef.current) clearTimeout(autoStopTimerRef.current);
       if (activeRef.current) {
         try { onPressEndRef.current(); } catch {}
       }
@@ -464,22 +461,9 @@ function MicButton({
     if (!enabled) return;
     e.preventDefault();
     if (activeRef.current) {
-      // Currently listening → stop.
-      if (autoStopTimerRef.current) {
-        clearTimeout(autoStopTimerRef.current);
-        autoStopTimerRef.current = null;
-      }
       try { onPressEndRef.current(); } catch {}
     } else {
-      // Currently not listening → start. Auto-stop after 30s as a safety so
-      // the mic doesn't stay open forever if user forgets to tap stop.
       try { onPressStartRef.current(); } catch {}
-      autoStopTimerRef.current = setTimeout(() => {
-        autoStopTimerRef.current = null;
-        if (activeRef.current) {
-          try { onPressEndRef.current(); } catch {}
-        }
-      }, 30000);
     }
   };
 

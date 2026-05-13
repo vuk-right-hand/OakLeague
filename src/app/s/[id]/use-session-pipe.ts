@@ -173,6 +173,24 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   // by turn 4. Tracks "is the mic currently engaged this turn" so
   // start/stop fire exactly once per press-and-hold cycle.
   const micActiveRef = useRef<boolean>(false);
+  // 2026-05-13 — silence-detection auto-stop. Replaces the dumb 30s hard cap
+  // on the MicButton.
+  //   * lastVoiceActivityRef: performance.now() of the most recent worklet
+  //     `voice_activity` message (RMS ≥ -50 dBFS over a 40ms frame).
+  //   * On startMic we seed it with NOW so a user who taps and immediately
+  //     goes silent still gets a 7s mic-open window (the silence counter
+  //     starts at tap, not at -∞).
+  //   * Interval polls every 500ms while micActive=true. Auto-stop fires
+  //     when (now - lastVoiceActivity) > VAD_SILENCE_TIMEOUT_MS or
+  //     (now - micStartedAt) > VAD_HARD_CEILING_MS (runaway guard for
+  //     wedged streams).
+  const lastVoiceActivityRef = useRef<number>(0);
+  const micStartedAtRef = useRef<number>(0);
+  const silenceTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Forward-ref for stopMic so the silence-timer callback (set up inside
+  // startMic) can call stopMic without a temporal-dead-zone issue. The
+  // useCallback below assigns into this ref after defining stopMic.
+  const stopMicRef = useRef<(() => void) | null>(null);
   // Phase 0.5 (2026-05-07). In-flight getUserMedia promise — used by
   // BOTH the room-mount pre-warm and the lazy startMic path so a fast
   // first-press can't fire a second concurrent permission prompt.
@@ -360,6 +378,15 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     const src = ctx.createMediaStreamSource(stream);
     const node = new AudioWorkletNode(ctx, 'mic-processor');
     node.port.onmessage = (ev) => {
+      const kind = ev.data?.type as string | undefined;
+      if (kind === 'voice_activity') {
+        // Worklet emits this whenever an outbound frame has RMS ≥ -50 dBFS.
+        // Used by the silence-detection auto-stop in stopMic's companion
+        // timer. Drop the marker outside an active mic press.
+        if (!micActiveRef.current) return;
+        lastVoiceActivityRef.current = performance.now();
+        return;
+      }
       const pcm = ev.data?.pcm as ArrayBuffer | undefined;
       if (!pcm) return;
       // Drop frames whenever the mic isn't logically engaged (between
@@ -993,6 +1020,32 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       return;
     }
     micActiveRef.current = true;
+    // Silence-detection seed: count tap-moment as "voice activity" so the
+    // 7s silence window starts from tap, not from -∞. A user who taps and
+    // immediately goes silent still gets a 7s mic-open window. The
+    // auto-stop ceiling at 120s prevents wedged streams from staying open
+    // forever.
+    const nowMs = performance.now();
+    lastVoiceActivityRef.current = nowMs;
+    micStartedAtRef.current = nowMs;
+    if (silenceTimerRef.current) clearInterval(silenceTimerRef.current);
+    silenceTimerRef.current = setInterval(() => {
+      if (!micActiveRef.current) {
+        if (silenceTimerRef.current) {
+          clearInterval(silenceTimerRef.current);
+          silenceTimerRef.current = null;
+        }
+        return;
+      }
+      const t = performance.now();
+      const silenceMs = t - lastVoiceActivityRef.current;
+      const elapsedMs = t - micStartedAtRef.current;
+      if (silenceMs > 7000 || elapsedMs > 120000) {
+        const reason = silenceMs > 7000 ? 'silence' : 'ceiling';
+        console.log(`[mic auto-stop] reason=${reason} silence=${silenceMs.toFixed(0)}ms elapsed=${elapsedMs.toFixed(0)}ms`);
+        stopMicRef.current?.();
+      }
+    }, 500);
     dispatchRef({ kind: 'mic_started' });
     // Proxy turn boundary + barge-in. mic-tap during 'speaking' is a
     // barge-in: cancel the in-flight TTS playback locally (avatar buffer)
@@ -1056,6 +1109,11 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       return;
     }
     micActiveRef.current = false;
+    // Tear down silence-detection timer. Idempotent — guarded by the null check.
+    if (silenceTimerRef.current) {
+      clearInterval(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
     dispatchRef({ kind: 'mic_stopped' });
     // R3-M7 — user_perceived_response_ms t0 = mic-tap-release. Cleared
     // when first proxy audio_out frame arrives.
@@ -1063,6 +1121,8 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     try { proxyRef.current?.sendControl({ type: 'turn_end' }); } catch {}
     try { micStreamRef.current?.getTracks().forEach((t) => (t.enabled = false)); } catch {}
   }, []);
+  // Wire the forward-ref so startMic's silence timer can call stopMic.
+  stopMicRef.current = stopMic;
 
   // ── End session ────────────────────────────────────────────────────────────
   const endSession = useCallback(async (reason: 'user_ended' | 'client_error') => {
