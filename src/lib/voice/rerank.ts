@@ -230,10 +230,26 @@ export type RerankCandidate = {
 };
 
 export type RerankedResult = {
+  /**
+   * The caller-supplied `id` from the input `RerankCandidate.id`.
+   * USE THIS for round-trip mapping back to caller's data structures.
+   *
+   * Day-8/9/10/11-cross C3: do NOT rely on `originalIndex` for caller-
+   * side mapping. The rerank module filters candidates with empty/null
+   * `text` before reaching the provider, which shifts the index. The
+   * `id` field is preserved 1-1 with caller input across all code paths
+   * (success and fallback/passthrough). Callers should build a
+   * `Map<id, originalRow>` and index by `r.id`, not by position.
+   */
   id: string;
   /** Score from the reranker. Voyage's relevance_score is in [0,1]; higher = more relevant. */
   score: number;
-  /** Original index in the input candidate array. Useful for diagnostics. */
+  /**
+   * Original index in the POST-FILTER candidate array. DIAGNOSTIC USE ONLY.
+   * After Day-11-cross C3 the orchestrator uses `id` for the round-trip;
+   * this field stays for log inspection and parity with provider response
+   * shapes. Do not use as a caller-side array index.
+   */
   originalIndex: number;
 };
 
@@ -313,6 +329,14 @@ export class RerankConfigError extends Error {
 //
 // Single instance — Voyage rate-limits per API key, and there's only
 // one Voyage key per process. Multi-key tenancy is not a near-term need.
+//
+// SERVERLESS COLD-START (Day-11-cross Small): in environments where each
+// invocation gets a fresh process (Vercel Edge Functions, Lambda cold
+// start), the bucket resets to capacity on every cold start → 25-token
+// burst per cold start with no cross-invocation enforcement. This module
+// is intended for long-lived processes (the Fly voice proxy, Next.js
+// node runtime). Using it from a fresh-process serverless invocation is
+// not recommended; provision Voyage's server-side rate-limiting instead.
 
 let _bucketTokens = TOKEN_BUCKET_CAPACITY;
 let _bucketLastRefillAt = performance.now();
@@ -368,6 +392,24 @@ async function _acquireBucketToken(waitMs: number): Promise<boolean> {
     return true;
   }
   return false;
+}
+
+/**
+ * Penalize the bucket after a Voyage 429 (Day-11-cross M7). Drains tokens
+ * to 0 and pushes the refill clock forward by retry-after (clamped to a
+ * sane 60s ceiling so a misconfigured server can't lock us out forever).
+ *
+ * Default penalty when retry-after is missing or invalid: 5 seconds —
+ * matches Voyage's typical short-window 429 behavior.
+ */
+function _penalizeBucket(retryAfterHeader: string): void {
+  const seconds = Number.parseInt(retryAfterHeader, 10);
+  const penaltyMs =
+    Number.isFinite(seconds) && seconds > 0
+      ? Math.min(seconds * 1000, 60_000) // hard ceiling 60s
+      : 5_000;
+  _bucketTokens = 0;
+  _bucketLastRefillAt = performance.now() + penaltyMs;
 }
 
 /** Test-only: reset bucket between tests. Gated on NODE_ENV. */
@@ -579,7 +621,13 @@ async function voyageRerank(input: RerankInput): Promise<RerankResult> {
     // Provider-side rate-limit (our token bucket gave us a token but
     // Voyage still 429'd — clock skew or concurrent processes sharing
     // the key). Degrade same as bucket overflow.
+    //
+    // Day-11-cross M7: penalize the local bucket so subsequent calls
+    // fall back at our gate instead of round-tripping to a known-429
+    // endpoint. Without this, a Voyage 60-second rate-limit window
+    // produces 60s × 25 RPS = 1500 doomed POSTs.
     const retryAfter = resp.headers.get('retry-after') ?? '<none>';
+    _penalizeBucket(retryAfter);
     // eslint-disable-next-line no-console
     console.warn(
       `[rerank] rate_limited provider=voyage status=429 retry_after=${retryAfter}`,

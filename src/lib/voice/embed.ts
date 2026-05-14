@@ -29,6 +29,11 @@ export const EMBEDDING_USD_PER_TOKEN = Number(
   process.env.EMBEDDING_USD_PER_TOKEN || '0.00000015',
 );
 
+// Day-11 audit M3: pin the embed quoted_at at module load so cogs_log
+// rows can't show mixed values across a single deploy. Override via env
+// for rate-change deploys; falls back to a stable default date.
+export const EMBEDDING_QUOTED_AT = process.env.EMBEDDING_QUOTED_AT || '2026-05-14';
+
 export class EmbedError extends Error {
   readonly code:
     | 'api_key_missing'
