@@ -5,9 +5,58 @@ adds the RAG retrieval orchestrator behind a per-creator
 `retrieval_version` gate; flipping creators to v2 is a manual admin
 action gated on Day-13 work landing.
 
-## Unreleased — `rag-sota-phase-2-days-8-12` (Days 8–12)
+## Unreleased — `rag-sota-phase-2-days-8-12` (Days 8–13)
 
-### Added
+### Added (Day 13 — proxy → Vercel shim wiring)
+- `/api/internal/retrieve-knowledge` HTTP shim wrapping
+  `retrieveKnowledgeV2`. Vercel Node runtime; HMAC-signed envelope
+  (Authorization Bearer + X-Internal-Timestamp + X-Internal-Body-Sha256)
+  with ±60s skew; body's `user_id`/`creator_id`/`corpus_version_at_session`
+  re-derived from `sessions.id` (Day-13 audit C3/M5). Body's
+  `budget_ms` is RELATIVE duration; shim computes deadline locally to
+  defuse Fly↔Vercel clock skew (audit C4).
+- `src/lib/voice/internal-request-signature.ts` + proxy JS mirror —
+  HMAC sign/verify with timing-safe equality, 64-hex length pinning.
+- `server/voice-proxy/retrieve-knowledge-v2-client.js` — fire-once
+  shim caller. NO retry on any status (audit M3 — orchestrator
+  increments budget before throw). Per-turn AbortController wired
+  into bridge `interrupted` so barge-in cancels the in-flight fetch
+  (audit-build C1). External signal listener auto-detached on happy
+  path (audit-build C2).
+- `server/voice-proxy/voice-session-state-writer.js` — durable-
+  fallback UPSERT, length-gated ≥20 chars (audit M4).
+- `server/voice-proxy/posthog-client.js` — fire-and-forget batch
+  emitter, queueMicrotask dispatch, 1500ms AbortController, queue cap
+  16. Boot-logs once when POSTHOG_API_KEY unset. Drained on SIGTERM
+  with 1500ms grace (audit-build M2).
+- `server/voice-proxy/build-injection-envelope.js` — ported v2
+  features (title rendering, score-aware drop, 32KB hard input
+  ceiling, `oversize` + `droppedPassages` fields). Vitest drift test
+  in `src/lib/voice/build-injection-envelope-drift.test.ts` asserts
+  byte-identical TS↔JS output across 10 fixtures.
+- `sessions.retrieval_version_at_session smallint NOT NULL DEFAULT 1`
+  + CHECK(1,2). Snapshot column written by patched `session_open` +
+  `session_rollover` RPCs under the same FOR SHARE row lock that
+  already snapshots `corpus_version_at_session`. Migration
+  `20260522000001_sessions_retrieval_version_snapshot.sql`.
+- Proxy in-memory closure `lastAssistantResponseClosure` is the
+  source-of-truth for the next turn's rewriter (audit C5 / audit-
+  build M3). DB UPSERT is durable fallback only; written BEFORE
+  `ws.send(turn_end_ack)` to avoid race with synchronous
+  `input_transcription` events.
+- Boot-fatal config check on Fly when `RAG_V2_PROXY_ENABLED=1` —
+  proxy `process.exit(1)` if `RAG_V2_SHIM_URL` or
+  `INTERNAL_API_SECRET` is missing or invalid (audit-build C4).
+  v2 sessions reaching a v2-disabled proxy SKIP retrieval entirely
+  (not fall through to v1) with a loud Sentry signal.
+- Spike-a admin path probes `creators.retrieval_version` and emits a
+  warning when the creator is on v2 but the path hard-pins v1 (audit-
+  build M4).
+- M5 audit response collapse — all five session-validation failures
+  return opaque `403 forbidden`; reason is logged server-side only,
+  closing the existence/ownership oracle.
+
+### Added (Days 8-12 — original Phase 2 ship)
 - Hybrid retrieval pipeline: query rewrite (Gemini Flash) → embed
   (Gemini embedding-001) → semantic cache lookup (16-way HASH partitioned,
   per-partition HNSW) → hybrid RPC (`creator_knowledge_topk_v2`, vector

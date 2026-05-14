@@ -48,6 +48,27 @@ import { makeEmbedWorker, makeCorpusReprocessWorker } from './embed-worker.js';
 // pure ESM Node — cannot import .ts files at runtime).
 import { retrieveTopK } from './retrieve-knowledge.js';
 import { buildInjectionEnvelope } from './build-injection-envelope.js';
+// Day-13 — v2 retrieval HTTP shim client. Calls Next.js
+// /api/internal/retrieve-knowledge instead of running the orchestrator
+// in-proc (handoff §2a Option A). Fire-once, no retry (audit M3).
+import {
+  callRetrieveKnowledgeV2,
+  RetrieveV2ClientError,
+} from './retrieve-knowledge-v2-client.js';
+// Day-13 — proxy-side voice_session_state writer for the durable-fallback
+// path (audit C5). Closure const is the source of truth for next-turn
+// rewrite; this UPSERT survives WS replacement on Gemini Live 15-min reopen.
+import {
+  persistLastAssistantResponse,
+  VOICE_SESSION_STATE_MAX_CHARS,
+  MIN_PERSIST_CHARS,
+} from './voice-session-state-writer.js';
+// Day-13 — fire-and-forget PostHog batch emitter for v2 telemetry
+// (audit M2). Pre-mapped events arrive from the shim response.
+import {
+  captureBatch as posthogCaptureBatch,
+  drainInFlight as posthogDrainInFlight,
+} from './posthog-client.js';
 
 const PORT = Number(process.env.PORT || 8080);
 const BUILD = process.env.FLY_MACHINE_ID || 'local';
@@ -126,6 +147,32 @@ function requireEnv(name) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
 });
+
+// Day-13 audit-build C4 — fail-loud at boot if v2 wiring is misconfigured.
+// `callRetrieveKnowledgeV2`'s lazy `getConfig()` would otherwise let the
+// proxy start cleanly, then silently degrade every v2 turn to persona-only
+// when the first call fires. Hard-exit here keeps the dogfood path honest.
+// Skip when v2 is intentionally not wired (default for prod until Day-15).
+const RAG_V2_PROXY_ENABLED = process.env.RAG_V2_PROXY_ENABLED === '1';
+if (RAG_V2_PROXY_ENABLED) {
+  if (!process.env.RAG_V2_SHIM_URL) {
+    console.error('FATAL: RAG_V2_PROXY_ENABLED=1 but RAG_V2_SHIM_URL not set');
+    process.exit(1);
+  }
+  if (!process.env.INTERNAL_API_SECRET || process.env.INTERNAL_API_SECRET.length < 32) {
+    console.error('FATAL: RAG_V2_PROXY_ENABLED=1 but INTERNAL_API_SECRET missing or < 32 chars');
+    process.exit(1);
+  }
+  try {
+    new URL(process.env.RAG_V2_SHIM_URL);
+  } catch {
+    console.error(`FATAL: RAG_V2_SHIM_URL is not a valid URL: ${process.env.RAG_V2_SHIM_URL}`);
+    process.exit(1);
+  }
+  console.log(`[boot] RAG v2 wiring enabled — shim=${process.env.RAG_V2_SHIM_URL}`);
+} else {
+  console.log('[boot] RAG v2 wiring disabled (set RAG_V2_PROXY_ENABLED=1 to enable)');
+}
 
 function sha256Hex(s) { return createHash('sha256').update(s).digest('hex'); }
 
@@ -248,8 +295,13 @@ async function attachToSession({ sessionId, userId, creatorId, expectedTier }) {
   if (expectedTier) q = q.eq('tier_at_session', expectedTier);
   // Read the public-safe columns. Privileged HeyGen tokens live on
   // sessions_private (RLS service-role-only) — separate query below.
+  // Day-13: corpus_version_at_session + retrieval_version_at_session
+  // become closure consts for the WS lifetime. Snapshot-at-session-open
+  // contract; never re-read live (CLAUDE.md tier-routing-at-session-open).
   const { data, error } = await q
-    .select('id, tier_at_session, avatar_provider')
+    .select(
+      'id, tier_at_session, avatar_provider, corpus_version_at_session, retrieval_version_at_session',
+    )
     .maybeSingle();
   if (error) {
     console.error('[session-attach]', error);
@@ -282,6 +334,9 @@ async function attachToSession({ sessionId, userId, creatorId, expectedTier }) {
     sessionId: data.id,
     tier: data.tier_at_session,
     avatarProvider: data.avatar_provider ?? null,
+    // Day-13 snapshot consts. Both NOT NULL DEFAULT 1 by schema.
+    corpusVersionAtSession: Number(data.corpus_version_at_session ?? 1),
+    retrievalVersionAtSession: Number(data.retrieval_version_at_session ?? 1),
     heygenSessionId,
     heygenSessionToken,
   };
@@ -289,14 +344,38 @@ async function attachToSession({ sessionId, userId, creatorId, expectedTier }) {
 
 async function openSession({ userId, creatorId, modelWire }) {
   const modelEnum = MODEL_TO_ENUM[modelWire];
+  // Day-13 audit-build M4 — admin spike-a path hard-pins
+  // retrieval_version_at_session=1, but the creator may already be at
+  // v2 (Day-15+). v1 retrieveTopK queries chunker_version=1 chunks
+  // which may not exist for v2-reprocessed creators → admin sees
+  // silent zero retrieval. Probe + warn so the surface is visible
+  // (admin-only path; one extra read is cheap).
+  try {
+    const { data: cd } = await supabase
+      .from('creators')
+      .select('retrieval_version')
+      .eq('id', creatorId)
+      .maybeSingle();
+    if (cd && Number(cd.retrieval_version) === 2) {
+      console.warn(
+        `[session-open spike-a] creator=${creatorId.slice(0, 8)} is at retrieval_version=2 but spike-a path hard-pins v1; expect ZERO retrieval`,
+      );
+    }
+  } catch (e) {
+    console.warn(`[session-open spike-a] retrieval_version probe failed: ${e?.message || e}`);
+  }
   const { data, error } = await supabase
     .from('sessions')
     .insert({
       user_id: userId,
       creator_id: creatorId,
       model_used: modelEnum,
-      tier_at_session: 'free', // overwritten by sessions_enforce_tier_and_kill_switch trigger
+      tier_at_session: 'free',
       status: 'starting',
+      // Day-13: spike-a path doesn't go through session_open RPC's FOR
+      // SHARE snapshot. Explicit 1/1 is safer than DB default.
+      corpus_version_at_session: 1,
+      retrieval_version_at_session: 1,
     })
     .select('id, tier_at_session')
     .single();
@@ -308,7 +387,13 @@ async function openSession({ userId, creatorId, modelWire }) {
     captureException(error, { op: 'session-insert', userId, modelWire });
     return { err: 'upstream_error' };
   }
-  return { sessionId: data.id, tier: data.tier_at_session };
+  // Day-13: mirror attachToSession's return shape.
+  return {
+    sessionId: data.id,
+    tier: data.tier_at_session,
+    corpusVersionAtSession: 1,
+    retrievalVersionAtSession: 1,
+  };
 }
 
 async function endSession(sessionId, reason) {
@@ -593,6 +678,16 @@ wss.on('connection', async (ws, req) => {
   const brainMode = consumed.brainMode;          // 'drawer' | 'vector'
   const ticketCreatorId = consumed.creatorId;    // used for creator_knowledge_topk
   const ticketUserId = consumed.userId;          // used for voice_retrieval_budget
+  // Day-13 — snapshot consts from sessions. retrievalVersionAtSession
+  // routes per-turn retrieval: 1 → legacy retrieveTopK (in-proc), 2 →
+  // HTTP shim to /api/internal/retrieve-knowledge (orchestrator runs on
+  // Vercel). corpusVersionAtSession rides every v2 call as the cache key.
+  const retrievalVersionAtSession = Number(sess.retrievalVersionAtSession ?? 1);
+  const corpusVersionAtSession = Number(sess.corpusVersionAtSession ?? 1);
+  // Day-13 audit C5 — last assistant response lives in-memory as the
+  // source-of-truth for the NEXT turn's rewrite call. The DB UPSERT to
+  // voice_session_state is durable-fallback only.
+  let lastAssistantResponseClosure = null;
   //
   // Audio gate (R2 C1 / R3 M1). Between bridge `turn_complete` and resolution
   // of pendingInjection, we hold inbound audio frames in `audioHold` so the
@@ -959,19 +1054,61 @@ wss.on('connection', async (ws, req) => {
     ws.send(bytes, { binary: true });
   }
 
-  // ── Vector-mode retrieval helpers (audit C1 fix) ──────────────────────
+  // ── Vector-mode retrieval helpers (audit C1 fix + Day-13 v2 branch) ───
   //
-  // retrieveTopK + buildInjectionEnvelope are static-imported from the
-  // proxy-side JS mirrors at the top of this file. The previous attempt
-  // dynamic-imported the .ts originals from src/lib/voice; Node's ESM
-  // loader rejects .ts extensions and the catch installed silent sentinels,
-  // so vector mode appeared to work but never actually retrieved anything.
-  //
-  // Run retrieval for a user turn; the race against the 800ms ceiling
-  // happens in the turn_complete handler.
+  // Day-13: retrievalVersionAtSession routes between two paths.
+  //   * v1 (legacy): retrieveTopK(in-proc) → passages
+  //   * v2 (Day-11 orchestrator): callRetrieveKnowledgeV2 → parents
   function kickoffRetrieval(transcript, turnNum) {
+    if (retrievalVersionAtSession === 2 && !RAG_V2_PROXY_ENABLED) {
+      // Safety net: v2 session but proxy not deployed with v2 enabled.
+      // v1 path would query chunker_version=1 chunks that may not exist.
+      console.error(
+        `[ws ${connId}] v2 session detected but RAG_V2_PROXY_ENABLED=0 — skipping retrieval (sessionId=${sessionId.slice(0, 8)})`,
+      );
+      captureException(new Error('v2_session_proxy_disabled'), {
+        op: 'vector.retrieve.proxy_disabled',
+        sessionId,
+        turnNumber: turnNum,
+      });
+      pendingInjection = { skip: true, turnNumber: turnNum };
+      return;
+    }
+    if (retrievalVersionAtSession === 2) {
+      // Day-13 audit-build C1: per-turn AbortController so barge-in
+      // (bridge `interrupted`) cancels the in-flight HTTP fetch.
+      const ac = new AbortController();
+      pendingInjection = {
+        turnNumber: turnNum,
+        version: 2,
+        skip: false,
+        abort: () => { try { ac.abort(); } catch {} },
+        promise: callRetrieveKnowledgeV2({
+          userId: ticketUserId,
+          creatorId: ticketCreatorId,
+          sessionId,
+          rawUtterance: transcript,
+          lastAssistantResponse: lastAssistantResponseClosure,
+          corpusVersionAtSession,
+          budgetMs: 4000,
+          signal: ac.signal,
+        }).catch((err) => {
+          // Audit M3: NEVER retry. Single-shot. Failures degrade to
+          // persona-only.
+          captureException(err, {
+            op: 'vector.retrieve.v2',
+            sessionId,
+            turnNumber: turnNum,
+            code: err instanceof RetrieveV2ClientError ? err.code : 'unknown',
+          });
+          return { parents: [], budgetExceeded: false, rewriteFallback: false, posthogEvents: [] };
+        }),
+      };
+      return;
+    }
     pendingInjection = {
       turnNumber: turnNum,
+      version: 1,
       skip: false,
       promise: retrieveTopK({
         supabase,
@@ -1008,14 +1145,15 @@ wss.on('connection', async (ws, req) => {
     forwardAudio = true;
   }
 
-  // Race pendingInjection against an 800ms ceiling. On result with passages,
-  // call bridge.injectText. Always flush the audio gate at the end.
+  // Race pendingInjection against an 800ms ceiling. Day-13: v1 returns
+  // `{passages:[]}`; v2 returns `{parents:[], posthogEvents, ...}`.
   async function resolveInjectionAtTurnComplete() {
     if (!pendingInjection || pendingInjection.skip) {
       flushAudioHold();
       pendingInjection = null;
       return;
     }
+    const version = pendingInjection.version || 1;
     const promise = pendingInjection.promise;
     pendingInjection = null;
     let result = null;
@@ -1025,7 +1163,6 @@ wss.on('connection', async (ws, req) => {
         new Promise((resolve) => setTimeout(() => resolve('__timeout__'), 800)),
       ]);
     } catch (e) {
-      // Caught above; swallow defensively.
       result = null;
     }
     if (result === '__timeout__') {
@@ -1033,15 +1170,52 @@ wss.on('connection', async (ws, req) => {
       flushAudioHold();
       return;
     }
-    if (!result || !Array.isArray(result.passages) || result.passages.length === 0) {
+    const envelopePassages =
+      version === 2 && Array.isArray(result?.parents)
+        ? result.parents.map((p) => ({
+            text: p.text,
+            sourceType: p.sourceType,
+            title: p.title ?? undefined,
+            score: typeof p.score === 'number' ? p.score : undefined,
+          }))
+        : Array.isArray(result?.passages)
+          ? result.passages.map((p) => ({ text: p.text, sourceType: p.sourceType }))
+          : [];
+
+    if (version === 2 && Array.isArray(result?.posthogEvents) && result.posthogEvents.length > 0) {
+      posthogCaptureBatch({
+        events: result.posthogEvents,
+        distinctId: ticketUserId,
+        sessionId,
+      });
+    }
+
+    if (envelopePassages.length === 0) {
       retrievalEmptyCount += 1;
       flushAudioHold();
       return;
     }
     try {
-      const envelope = buildInjectionEnvelope({
-        passages: result.passages.map((p) => ({ text: p.text, sourceType: p.sourceType })),
-      });
+      const envelope = buildInjectionEnvelope({ passages: envelopePassages });
+      // Day-13 audit M6: emit `rag_envelope_oversize` when input exceeded
+      // INJECTION_HARD_INPUT_BYTES even after lowest-score drops.
+      if (envelope?.oversize === true && version === 2) {
+        posthogCaptureBatch({
+          events: [
+            {
+              name: 'rag_envelope_oversize',
+              properties: {
+                user_id: ticketUserId,
+                creator_id: ticketCreatorId,
+                session_id: sessionId,
+                dropped_passages: envelope.droppedPassages,
+              },
+            },
+          ],
+          distinctId: ticketUserId,
+          sessionId,
+        });
+      }
       if (envelope && envelope.passageCount > 0) {
         bridge.injectText(envelope.text);
         injectionLandedCount += 1;
@@ -1123,6 +1297,10 @@ wss.on('connection', async (ws, req) => {
       }
     } else if (e.kind === 'interrupted') {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'interrupted', at: e.at }));
+      // Day-13 audit-build C1 — cancel in-flight v2 retrieval on barge-in.
+      if (pendingInjection && typeof pendingInjection.abort === 'function') {
+        try { pendingInjection.abort(); } catch {}
+      }
     } else if (e.kind === 'error') {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'error', at: e.at, message: e.message }));
     } else if (e.kind === 'closed') {
@@ -1396,6 +1574,27 @@ wss.on('connection', async (ws, req) => {
             }));
           } catch {}
         }
+        // Day-13 audit C5 / audit-build M3 — persist last_assistant_response
+        // BEFORE turn_end_ack. Source-of-truth is in-memory closure; the
+        // DB UPSERT is durable-fallback for WS replacement on Gemini Live
+        // 15-min reopen. Length-gated so failed/partial turns don't poison
+        // turn N+1's rewriter.
+        if (retrievalVersionAtSession === 2) {
+          const transcript = typeof metrics?.outputTranscript === 'string'
+            ? metrics.outputTranscript
+            : '';
+          if (transcript.length >= MIN_PERSIST_CHARS) {
+            lastAssistantResponseClosure = transcript.slice(0, VOICE_SESSION_STATE_MAX_CHARS);
+            persistLastAssistantResponse(
+              supabase,
+              sessionId,
+              lastAssistantResponseClosure,
+              (err, ctx) =>
+                captureException(err, { op: ctx?.stage || 'voice_session_state', sessionId }),
+            );
+          }
+        }
+
         ws.send(JSON.stringify({ type: 'turn_end_ack', metrics, cartesia: cartesiaMetrics }));
         logTurnCogs({
           userId, sessionId, turnNumber,
@@ -1610,6 +1809,15 @@ function shutdown(signal) {
   if (faceUploadReaperHandle) clearInterval(faceUploadReaperHandle);
   if (embedWorkerHandle) clearInterval(embedWorkerHandle);
   if (corpusReprocessWorkerHandle) clearInterval(corpusReprocessWorkerHandle);
+  // Day-13 audit-build M2 — drain in-flight PostHog batches before exit.
+  posthogDrainInFlight({ timeoutMs: 1500 })
+    .then((r) => {
+      if (!r.drained) {
+        console.warn(`[shutdown] posthog drain incomplete (remaining=${r.remaining})`);
+      }
+    })
+    .catch(() => {});
+
   server.close(() => process.exit(0));
   // Day-5-unit-audit C1: hard-exit backstop bumped 5s → 30s. The reprocess
   // worker's drain checkpoint + bumpFailure + cogs_log flush is ~1-3s on a
