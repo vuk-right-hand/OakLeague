@@ -44,6 +44,15 @@ export type RewriteLeg = {
   usdPerOutputToken: number;
   quotedAt: string;
   latencyMs: number;
+  /**
+   * True when the rewriter detected a follow-up utterance ("tell me more",
+   * "what about that") AND had no `lastAssistantResponse` to expand from
+   * — typically because Gemini Live just reopened mid-conversation and
+   * the session's voice_session_state row is empty. Final-cross audit C2:
+   * propagated to PostHog `rag_rewrite_no_context_post_resumption` for
+   * Day-15 dogfood-gate bucket-2 (follow-up) diagnostics.
+   */
+  noContextAfterResumption: boolean;
 };
 
 export type EmbedLeg = {
@@ -294,13 +303,27 @@ export async function flushCogsLogRows(
   rows: readonly CogsLogRow[],
 ): Promise<void> {
   if (rows.length === 0) return;
-  // Batch insert — one round-trip for all rows. supabase-js handles the
-  // array shape natively.
-  const { error } = await admin.from('cogs_log').insert(rows as CogsLogRow[]);
-  if (error) {
+  // Day-12 audit M4: this function is invoked `void`-fired from the
+  // orchestrator's try/finally. If we let a network rejection propagate,
+  // Node 22+ default --unhandled-rejections=warn/throw can either flood
+  // Sentry or crash the process. Wrap the entire body so failures land
+  // as console.warn (orchestrator never sees them).
+  try {
+    // Batch insert — one round-trip for all rows. supabase-js handles
+    // the array shape natively.
+    const { error } = await admin.from('cogs_log').insert(rows as CogsLogRow[]);
+    if (error) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[rag-telemetry] cogs_log batch insert returned error (${rows.length} rows): ${error.message}`,
+      );
+    }
+  } catch (e) {
     // eslint-disable-next-line no-console
     console.warn(
-      `[rag-telemetry] cogs_log batch insert failed (${rows.length} rows): ${error.message}`,
+      `[rag-telemetry] cogs_log batch insert threw (${rows.length} rows): ${
+        (e as Error)?.message ?? 'unknown'
+      }`,
     );
   }
 }
@@ -340,6 +363,18 @@ export function toPostHogEventBatch(t: RagTurnTelemetry): PostHogEvent[] {
     events.push({ name: 'rag_cache_miss', properties: { ...base } });
   }
   if (t.cacheStaleCorpus) {
+    // Final-cross audit M4 disambiguation. The `cacheStaleCorpus=true`
+    // flag fires in two distinct conditions:
+    //   1. Upsert was rejected by the FOR SHARE check on
+    //      creators.current_corpus_version (the original semantic)
+    //   2. Cache lookup hit a row but fetchParentNarrativesByIds
+    //      returned 0 parents (Day-11-cross C2 fall-through)
+    // Both are "the cache lied" but the second one ALSO causes
+    // `cacheHit=false`. PostHog dashboards computing
+    // `count(rag_cache_hit) / (count(rag_cache_hit) + count(rag_cache_miss))`
+    // would double-deduct on case-2 if we emitted both `rag_cache_miss`
+    // and `rag_session_corpus_drift`. To keep the metrics clean we
+    // emit ONE event per cause:
     events.push({
       name: 'rag_session_corpus_drift',
       properties: { ...base, corpus_version_at_session: t.corpusVersionAtSession },
@@ -371,8 +406,20 @@ export function toPostHogEventBatch(t: RagTurnTelemetry): PostHogEvent[] {
         },
       });
     }
-    // M2 plan event: emitted by the orchestrator when noContextAfterResumption
-    // is true; the telemetry aggregator surfaces it from the rewrite leg.
+    // Final-cross audit C2: noContextAfterResumption signal. Fires when
+    // the user asked a follow-up ("tell me more about that") AFTER Gemini
+    // Live's 15-min reopen — voice_session_state was empty or new, so
+    // there's no prior assistant turn for the rewriter to expand from.
+    // Day-15 dogfood gate bucket-2 needs this to triage follow-up failures.
+    if (t.rewrite.noContextAfterResumption) {
+      events.push({
+        name: 'rag_rewrite_no_context_post_resumption',
+        properties: {
+          ...base,
+          model: t.rewrite.modelId,
+        },
+      });
+    }
   }
 
   // Rerank events

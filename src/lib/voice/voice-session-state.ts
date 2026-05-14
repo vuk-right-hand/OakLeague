@@ -22,7 +22,12 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
-export const VOICE_SESSION_STATE_MAX_CHARS = 2000;
+// Final-cross audit M2: bumped from 2000 → 4000 to match Gemini Live's
+// outputTranscript per-turn cap (CLAUDE.md OUTPUT_TRANSCRIPT_MAX_CHARS).
+// At 2000 we silently truncated 30%+ of a long assistant reply, breaking
+// pronoun resolution on the next "tell me more" turn. Migration
+// 20260521000010 widens the DB CHECK constraints to match.
+export const VOICE_SESSION_STATE_MAX_CHARS = 4000;
 
 export type VoiceSessionStateRow = {
   lastAssistantResponse: string | null;

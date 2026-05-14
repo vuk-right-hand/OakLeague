@@ -51,6 +51,7 @@ describe('toCogsLogRows', () => {
       usdPerOutputToken: 0.0000025,
       quotedAt: '2026-05-14',
       latencyMs: 250,
+      noContextAfterResumption: false,
     };
     t.embed = {
       modelId: 'gemini-embedding-001',
@@ -97,6 +98,7 @@ describe('toCogsLogRows', () => {
       usdPerOutputToken: 0.0000025,
       quotedAt: '2026-05-14',
       latencyMs: 5,
+      noContextAfterResumption: false,
     };
     expect(toCogsLogRows(t)).toEqual([]);
   });
@@ -113,6 +115,7 @@ describe('toCogsLogRows', () => {
       usdPerOutputToken: 0.0000025,
       quotedAt: '2026-05-14',
       latencyMs: 250,
+      noContextAfterResumption: false,
     };
     const rows = toCogsLogRows(t);
     expect(rows).toHaveLength(1);
@@ -225,6 +228,7 @@ describe('toPostHogEventBatch', () => {
       usdPerOutputToken: 0,
       quotedAt: '2026-05-14',
       latencyMs: 3000,
+      noContextAfterResumption: false,
     };
     const evs = toPostHogEventBatch(t);
     expect(evs.some((e) => e.name === 'rag_rewrite_transport_failed')).toBe(true);
@@ -331,6 +335,42 @@ describe('toPostHogEventBatch', () => {
     const t = newTurnTelemetry(BASE_ARGS);
     const evs = toPostHogEventBatch(t);
     expect(evs.some((e) => e.name === 'rag_budget_exceeded')).toBe(false);
+  });
+
+  it('Final-cross C2: emits rag_rewrite_no_context_post_resumption when flagged', () => {
+    const t = newTurnTelemetry(BASE_ARGS);
+    t.rewrite = {
+      modelId: 'gemini-2.5-flash',
+      fallback: false,
+      inputTokens: 50,
+      outputTokens: 10,
+      usdPerInputToken: 0.0000003,
+      usdPerOutputToken: 0.0000025,
+      quotedAt: '2026-05-14',
+      latencyMs: 200,
+      noContextAfterResumption: true,
+    };
+    const evs = toPostHogEventBatch(t);
+    const ev = evs.find((e) => e.name === 'rag_rewrite_no_context_post_resumption');
+    expect(ev).toBeDefined();
+    expect(ev?.properties.model).toBe('gemini-2.5-flash');
+  });
+
+  it('Final-cross C2: does NOT emit when noContextAfterResumption is false', () => {
+    const t = newTurnTelemetry(BASE_ARGS);
+    t.rewrite = {
+      modelId: 'gemini-2.5-flash',
+      fallback: false,
+      inputTokens: 50,
+      outputTokens: 10,
+      usdPerInputToken: 0.0000003,
+      usdPerOutputToken: 0.0000025,
+      quotedAt: '2026-05-14',
+      latencyMs: 200,
+      noContextAfterResumption: false,
+    };
+    const evs = toPostHogEventBatch(t);
+    expect(evs.some((e) => e.name === 'rag_rewrite_no_context_post_resumption')).toBe(false);
   });
 });
 

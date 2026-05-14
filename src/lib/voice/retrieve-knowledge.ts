@@ -280,6 +280,28 @@ export type RetrievedParent = {
   scoreSource: 'rerank' | 'rrf' | 'cache';
 };
 
+/**
+ * Final-cross audit M1: explicit helper to map orchestrator output to
+ * envelope input. The shapes differ — RetrievedParent has parentUnitId +
+ * scoreSource (Day-12 audit didn't drop them; they're needed for
+ * downstream telemetry), but buildInjectionEnvelope only needs text +
+ * sourceType + title + score. Day-13 proxy author calls this once per
+ * turn between `retrieveKnowledgeV2` and `buildInjectionEnvelope`.
+ *
+ * NOT a method on the result so callers can drop into v1's RetrievedChunk
+ * → envelope path through the same shape if needed.
+ */
+export function parentsToPassages(
+  parents: readonly RetrievedParent[],
+): Array<{ text: string; sourceType: string; title?: string; score?: number }> {
+  return parents.map((p) => ({
+    text: p.text,
+    sourceType: p.sourceType,
+    title: p.title ?? undefined,
+    score: p.score ?? undefined,
+  }));
+}
+
 export type RetrieveKnowledgeV2Result = {
   parents: RetrievedParent[];
   telemetry: RagTurnTelemetry;
@@ -481,6 +503,10 @@ async function runOrchestrator(
     usdPerOutputToken: rewriteResult.usdPerOutputToken,
     quotedAt: QUERY_REWRITE_QUOTED_AT,
     latencyMs: rewriteResult.latencyMs,
+    // Final-cross audit C2: propagate the follow-up-without-context flag
+    // so the Day-13 proxy's PostHog emitter fires
+    // `rag_rewrite_no_context_post_resumption` on Day-15 bucket-2 misses.
+    noContextAfterResumption: rewriteResult.noContextAfterResumption,
   };
   const rewrittenText =
     rewriteResult.rewritten && rewriteResult.rewritten.length > 0

@@ -184,6 +184,7 @@ describe('module is vanilla-Node-importable (no server-only)', () => {
   it('exports the expected surface and was loaded in a Node-only test runtime', () => {
     expect(typeof readSessionState).toBe('function');
     expect(typeof upsertSessionState).toBe('function');
-    expect(VOICE_SESSION_STATE_MAX_CHARS).toBe(2000);
+    // Final-cross M2: bumped 2000 → 4000 to match Gemini Live transcript cap.
+    expect(VOICE_SESSION_STATE_MAX_CHARS).toBe(4000);
   });
 });

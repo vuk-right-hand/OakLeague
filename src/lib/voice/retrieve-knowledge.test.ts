@@ -29,7 +29,11 @@ vi.mock('@google/genai', () => ({
   })),
 }));
 
-import { retrieveKnowledgeV2, RetrieveKnowledgeV2Error } from './retrieve-knowledge';
+import {
+  retrieveKnowledgeV2,
+  RetrieveKnowledgeV2Error,
+  parentsToPassages,
+} from './retrieve-knowledge';
 import { _resetTokenBucketForTests } from './rerank';
 import { _resetClientForTests as _resetRewriteClientForTests } from './query-rewrite';
 import { HALFVEC_DIM } from './halfvec';
@@ -403,6 +407,43 @@ describe('retrieveKnowledgeV2 — stale corpus signaling', () => {
     expect(r.telemetry.cacheStaleCorpus).toBe(true);
     // Parents still returned (upsert failure non-fatal).
     expect(r.parents.length).toBe(1);
+  });
+});
+
+describe('parentsToPassages — Final-cross M1 helper', () => {
+  it('maps RetrievedParent → RetrievedPassage shape (drops parentUnitId + scoreSource)', () => {
+    const passages = parentsToPassages([
+      {
+        parentUnitId: 'pu-1',
+        text: 'body text',
+        title: 'A Story',
+        sourceType: 'transcript',
+        score: 0.91,
+        scoreSource: 'rerank',
+      },
+    ]);
+    expect(passages).toEqual([
+      { text: 'body text', sourceType: 'transcript', title: 'A Story', score: 0.91 },
+    ]);
+  });
+
+  it('coerces null title and null score to undefined', () => {
+    const passages = parentsToPassages([
+      {
+        parentUnitId: 'pu-1',
+        text: 't',
+        title: null,
+        sourceType: 's',
+        score: null,
+        scoreSource: 'cache',
+      },
+    ]);
+    expect(passages[0].title).toBeUndefined();
+    expect(passages[0].score).toBeUndefined();
+  });
+
+  it('handles empty input', () => {
+    expect(parentsToPassages([])).toEqual([]);
   });
 });
 
