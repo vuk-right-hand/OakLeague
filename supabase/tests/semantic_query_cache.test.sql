@@ -36,7 +36,7 @@
 --    20.  Purge deletes expired, leaves live rows.
 
 BEGIN;
-SELECT plan(20);
+SELECT plan(22);
 
 CREATE FUNCTION pg_temp.unit_vec(p_position int) RETURNS halfvec(768)
 LANGUAGE plpgsql IMMUTABLE AS $$
@@ -188,6 +188,65 @@ BEGIN
     v_rls_enabled AND v_n_policies = 0,
     format('7: RLS enabled (%s) + zero policies (%s) = deny-all', v_rls_enabled, v_n_policies)
   );
+
+  -- ── 7b (Day-9-cross M5): real-deny test — authenticated SELECT denied ──
+  -- Seed one row as postgres (BYPASSRLS) so the SELECT, were it permitted,
+  -- would return a row. REVOKE ALL on authenticated means even SELECT
+  -- raises insufficient_privilege at the GRANT layer before RLS evaluates.
+  INSERT INTO public.semantic_query_cache
+    (creator_id, corpus_version, query_embedding, query_text_hash, payload_json, expires_at)
+  VALUES
+    (v_creator, 1, pg_temp.unit_vec(1), v_short_hash,
+     jsonb_build_object('parent_unit_ids', jsonb_build_array(v_parent_id1),
+                        'scores', jsonb_build_array(0.9)),
+     now() + interval '1 hour');
+  PERFORM tests.set_authenticated(v_user);
+  BEGIN
+    SELECT count(*) INTO v_row_count FROM public.semantic_query_cache;
+    PERFORM tests.reset_role();
+    -- If we got here, either (a) GRANT slipped in or (b) RLS filter passed
+    -- it. Assert zero rows visible regardless.
+    RETURN NEXT ok(
+      v_row_count = 0,
+      format('7b: authenticated SELECT visible rows=%s (want 0 — RLS or GRANT denies)', v_row_count)
+    );
+  EXCEPTION
+    WHEN insufficient_privilege THEN
+      PERFORM tests.reset_role();
+      RETURN NEXT pass('7b: authenticated SELECT raised insufficient_privilege (REVOKE ALL holds)');
+    WHEN OTHERS THEN
+      PERFORM tests.reset_role();
+      RETURN NEXT fail(format('7b: authenticated SELECT unexpected sqlstate %s', SQLSTATE));
+  END;
+  -- Clean up seed for downstream tests.
+  DELETE FROM public.semantic_query_cache WHERE creator_id = v_creator;
+
+  -- ── 7c: authenticated INSERT also denied ──────────────────────────────
+  PERFORM tests.set_authenticated(v_user);
+  BEGIN
+    INSERT INTO public.semantic_query_cache
+      (creator_id, corpus_version, query_embedding, query_text_hash, payload_json, expires_at)
+    VALUES
+      (v_creator, 1, pg_temp.unit_vec(1), v_short_hash,
+       jsonb_build_object('parent_unit_ids', jsonb_build_array(v_parent_id1),
+                          'scores', jsonb_build_array(0.9)),
+       now() + interval '1 hour');
+    -- INSERT under RLS deny-all returns 0 rows-inserted without raising.
+    -- Verify the row didn't land.
+    PERFORM tests.reset_role();
+    SELECT count(*) INTO v_row_count FROM public.semantic_query_cache WHERE creator_id = v_creator;
+    RETURN NEXT ok(
+      v_row_count = 0,
+      format('7c: authenticated INSERT blocked (row count=%s, want 0)', v_row_count)
+    );
+  EXCEPTION
+    WHEN insufficient_privilege THEN
+      PERFORM tests.reset_role();
+      RETURN NEXT pass('7c: authenticated INSERT denied with insufficient_privilege');
+    WHEN OTHERS THEN
+      PERFORM tests.reset_role();
+      RETURN NEXT pass(format('7c: authenticated INSERT denied with sqlstate %s', SQLSTATE));
+  END;
 
   -- ═════════════════════════════════════════════════════════════════════
   -- Lookup RPC

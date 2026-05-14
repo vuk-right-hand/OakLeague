@@ -64,6 +64,14 @@ DECLARE
   v_creator_id  uuid;
   v_new_version int;
 BEGIN
+  -- Day-9-cross C1: cap the lock wait so a long-running admin promote
+  -- (Day-7 admin_promote_v2_chunks holds the same advisory key for
+  -- the duration of its DELETE FROM sample_content_chunks) can't stall
+  -- worker finalizes indefinitely. 5s matches Day-7 promote's own
+  -- lock_timeout. On wait-out, plpgsql raises lock_not_available (55P03)
+  -- and the worker's outer try/catch maps it to a transient retry.
+  SET LOCAL lock_timeout = '5s';
+
   -- Server-derive sample_id + creator_id from the job + sample join.
   -- FOR UPDATE OF j locks the jobs row only (not sample_content readers).
   -- enqueue_version match enforces silent-abandon on mid-flight re-enqueue.

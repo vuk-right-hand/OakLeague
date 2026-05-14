@@ -103,7 +103,7 @@ CREATE FUNCTION public.creator_knowledge_topk_v2(
   rrf_score                float,
   matched_child_chunk_ids  uuid[]
 )
-LANGUAGE plpgsql STABLE SECURITY DEFINER
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 #variable_conflict use_column
@@ -111,6 +111,12 @@ BEGIN
   -- Transaction-local; reverts after the function returns. Soft-fail
   -- on systems without pgvector >= 0.7 so the function still runs on
   -- older boxes (with the C2 caveat: HNSW filter may under-fetch).
+  --
+  -- VOLATILE (Day-9-cross M3) because set_config mutates session state.
+  -- STABLE would let the planner inline the call across statement
+  -- boundaries and reorder the GUC mutation. The retrieval is still
+  -- read-only — VOLATILE here means "don't aggressively inline," not
+  -- "this writes data."
   BEGIN
     PERFORM set_config('hnsw.iterative_scan', 'strict_order', true);
   EXCEPTION WHEN OTHERS THEN

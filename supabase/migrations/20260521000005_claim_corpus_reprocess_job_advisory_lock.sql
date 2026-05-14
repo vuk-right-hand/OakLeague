@@ -60,6 +60,13 @@ BEGIN
     v_claimed_by := substring(v_claimed_by FROM 1 FOR 128);
   END IF;
 
+  -- Day-9-cross C1: cap the advisory lock wait so a long-running admin
+  -- promote (Day-7 admin_promote_v2_chunks holds the same key) can't
+  -- stall the worker's claim loop. 5s matches the lock_timeout on
+  -- finalize and promote. On wait-out the function raises 55P03, the
+  -- worker treats it as "no claimable work this tick" and retries.
+  SET LOCAL lock_timeout = '5s';
+
   -- Atomic claim — FOR UPDATE SKIP LOCKED with deterministic ordering
   -- (created_at then id for tie-break). Table alias `j` is required:
   -- plpgsql.variable_conflict=error treats the unqualified column names

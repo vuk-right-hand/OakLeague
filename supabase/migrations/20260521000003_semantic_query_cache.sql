@@ -129,7 +129,18 @@ ALTER TABLE public.semantic_query_cache ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON TABLE public.semantic_query_cache FROM public, anon, authenticated;
 GRANT ALL ON TABLE public.semantic_query_cache TO service_role;
 
--- ── Lookup RPC (C2: LIMIT 1 first, threshold filter outer) ──────────────
+-- ── Lookup RPC (Day-9-cross C3: plpgsql wrapper to set hnsw.iterative_scan) ──
+--
+-- The function-clause `SET hnsw.iterative_scan = 'strict_order'` fails
+-- on Supabase with "permission denied to set parameter" because the
+-- migration role lacks privilege to set custom-extension GUCs at
+-- function-create time. Confirmed locally:
+--   `CREATE FUNCTION ... SET hnsw.iterative_scan = '...' AS $$ ... $$;`
+--   → ERROR: permission denied to set parameter "hnsw.iterative_scan"
+-- Same pattern as MIG-2's creator_knowledge_topk_v2 fix: use a plpgsql
+-- wrapper that calls set_config(..., true) transaction-locally inside
+-- the body. Caller behavior is identical; planner still pushes the
+-- filter through HNSW when iterative_scan is active.
 CREATE FUNCTION public.semantic_query_cache_lookup(
   p_creator_id     uuid,
   p_corpus_version int,
@@ -141,13 +152,27 @@ CREATE FUNCTION public.semantic_query_cache_lookup(
   age_seconds      int,
   cached_row_id    uuid
 )
-LANGUAGE sql STABLE SECURITY DEFINER
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = public, pg_temp
-SET hnsw.iterative_scan = 'strict_order'
 AS $$
-  -- Pull the single closest row first. If we later add per-partition HNSW,
-  -- this ORDER BY + LIMIT 1 plan picks up the index; threshold filter on
-  -- the outer query does NOT block index use (C2 fix).
+#variable_conflict use_column
+BEGIN
+  -- Transaction-local. Reverts after the function returns. Soft-fail
+  -- on systems without pgvector >= 0.7 so the function still runs.
+  --
+  -- VOLATILE (Day-9-cross M3) because set_config mutates session state.
+  -- STABLE would invite the planner to inline and re-order the GUC
+  -- mutation. Lookup itself is read-only.
+  BEGIN
+    PERFORM set_config('hnsw.iterative_scan', 'strict_order', true);
+  EXCEPTION WHEN OTHERS THEN
+    NULL;
+  END;
+
+  -- Pull the single closest row first. With per-partition HNSW (added
+  -- in this migration), this ORDER BY + LIMIT 1 plan + iterative_scan
+  -- pushes the corpus_version + expires_at filter through the index.
+  RETURN QUERY
   WITH closest AS (
     SELECT cqc.id,
            cqc.payload_json,
@@ -167,6 +192,7 @@ AS $$
     c.id
     FROM closest c
    WHERE c.sim >= GREATEST(0::float, LEAST(p_threshold, 1.0::float));
+END;
 $$;
 
 COMMENT ON FUNCTION public.semantic_query_cache_lookup(uuid, int, halfvec, float) IS

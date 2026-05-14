@@ -17,7 +17,7 @@
 --  11. REVOKE ALL FROM authenticated, anon (defense-in-depth)
 
 BEGIN;
-SELECT plan(11);
+SELECT plan(13);
 
 CREATE FUNCTION pg_temp.run() RETURNS SETOF text LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -208,6 +208,51 @@ BEGIN
     v_priv_count = 0,
     format('11: zero authenticated/anon privileges on voice_session_state (defense-in-depth) — got %s', v_priv_count)
   );
+
+  -- ── 12 (Day-9-cross M5): authenticated SELECT denied ─────────────────
+  -- v_session1 has a state row (test 8 re-INSERT) but REVOKE ALL means
+  -- the GRANT layer denies before RLS gets a chance.
+  PERFORM tests.set_authenticated(v_user);
+  BEGIN
+    SELECT count(*) INTO v_row_count
+      FROM public.voice_session_state WHERE session_id = v_session1;
+    PERFORM tests.reset_role();
+    RETURN NEXT ok(
+      v_row_count = 0,
+      format('12: authenticated SELECT visible rows=%s (want 0)', v_row_count)
+    );
+  EXCEPTION
+    WHEN insufficient_privilege THEN
+      PERFORM tests.reset_role();
+      RETURN NEXT pass('12: authenticated SELECT raised insufficient_privilege (REVOKE ALL holds)');
+    WHEN OTHERS THEN
+      PERFORM tests.reset_role();
+      RETURN NEXT fail(format('12: authenticated SELECT unexpected sqlstate %s', SQLSTATE));
+  END;
+
+  -- ── 13: authenticated INSERT also denied ─────────────────────────────
+  PERFORM tests.set_authenticated(v_user);
+  BEGIN
+    INSERT INTO public.voice_session_state (session_id, last_assistant_response)
+    VALUES (v_session1, 'authenticated wrote this');
+    -- INSERT under RLS deny-all + REVOKE either raises insufficient_privilege
+    -- (table-level GRANT missing) or returns silently with the row not landing.
+    PERFORM tests.reset_role();
+    SELECT count(*) INTO v_row_count
+      FROM public.voice_session_state
+     WHERE session_id = v_session1 AND last_assistant_response = 'authenticated wrote this';
+    RETURN NEXT ok(
+      v_row_count = 0,
+      format('13: authenticated INSERT blocked (row count=%s, want 0)', v_row_count)
+    );
+  EXCEPTION
+    WHEN insufficient_privilege THEN
+      PERFORM tests.reset_role();
+      RETURN NEXT pass('13: authenticated INSERT denied with insufficient_privilege');
+    WHEN OTHERS THEN
+      PERFORM tests.reset_role();
+      RETURN NEXT pass(format('13: authenticated INSERT denied with sqlstate %s', SQLSTATE));
+  END;
 
 END;
 $fn$;
