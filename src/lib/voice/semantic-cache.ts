@@ -15,14 +15,68 @@
 //   unrelated sessions and serve cross-context retrieval. Reviewing this
 //   contract before any change.
 //
+// ═════════════════════════════════════════════════════════════════════
+// LOAD-BEARING ORCHESTRATOR RULE — REWRITE-FALLBACK CACHE BYPASS
+// (Day-8/9/10 cross-cutting audit C2)
+// ═════════════════════════════════════════════════════════════════════
+//   When `rewriteQuery()` from `./query-rewrite.ts` returns
+//   `fallback: true`, its `rewritten` field equals the RAW utterance
+//   (passthrough). If the Day-11 orchestrator then calls
+//   `hashQueryText(rewritten)` and uses it as a cache key, every user's
+//   "tell me more" under degraded rewrite hashes to the same key per
+//   (creator_id, corpus_version) — the UNIQUE constraint serves the
+//   FIRST session's parent_unit_ids to every subsequent matching session
+//   until the next successful rewrite. Cross-session retrieval leak.
+//
+//   The orchestrator MUST:
+//     - SKIP `lookupCache` when `rewriteResult.fallback === true`
+//     - SKIP `upsertCache` when `rewriteResult.fallback === true`
+//     - Fall back to fresh retrieval (no cache touch) for that turn
+//
+//   This rule lives here because semantic-cache.ts cannot enforce it
+//   internally — it doesn't see the rewrite result. The Day-11
+//   orchestrator owns the gate. Cross-linked in `query-rewrite.ts`
+//   header so any future contributor sees the rule from either entry
+//   point.
+// ═════════════════════════════════════════════════════════════════════
+//
+// STALE-CORPUS DRIFT TELEMETRY (Day-8/9/10 cross-cutting audit C1):
+//   `upsertCache` returns `reason: 'stale_corpus'` when the RPC's FOR
+//   SHARE check against `creators.current_corpus_version` rejects the
+//   write (TOCTOU window between session-open snapshot and finalize
+//   bump). Today both "session was always stale" and "finalize just
+//   raced us" map to the same reason — operationally invisible.
+//
+//   The Day-11 orchestrator SHOULD, on receiving `stale_corpus`:
+//     1. SELECT current_corpus_version FROM creators WHERE id = ...
+//        (one extra query; rare path).
+//     2. Compare to the session-captured value.
+//     3. Emit PostHog `rag_session_corpus_drift` with both values so
+//        ops can distinguish "session was opened pre-finalize" (one-off,
+//        fine) from "finalize is racing us per-turn" (alert-worthy).
+//
 // All RPC calls require a service-role Supabase client — RLS is deny-all.
 // Errors don't throw; cache writes/reads return typed Result so the
 // caller decides whether to fire-and-forget or surface (CLAUDE.md
 // "don't silently catch" — the *caller* decides what to swallow).
+//
+// COGS_LOG CONTRACT (cross-cutting unit audit S3):
+//   This module makes NO paid-API calls — both lookup and upsert are
+//   pure Postgres operations behind RPCs. CLAUDE.md's "every paid API
+//   call writes cogs_log" does NOT apply here. Cogs_log entries for the
+//   surrounding turn (embed, rewrite, rerank) are the responsibility of
+//   their respective modules' callers.
+//
+// BUDGET ALLOCATION (cross-cutting unit audit M7):
+//   This module is sub-50ms when healthy (single HNSW lookup or single
+//   INSERT/UPDATE). It does NOT accept a `deadlineMs` parameter — DB
+//   queries either complete within their statement_timeout or surface
+//   as `db_error`. The orchestrator's per-turn budget is consumed by
+//   the rewrite + rerank + embed steps, not by cache hits.
 
 import { createHash } from 'node:crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { vectorToPgText, HALFVEC_DIM } from './halfvec';
+import { vectorToPgText, HALFVEC_DIM, VectorEncodingError } from './halfvec';
 
 export const CACHE_DEFAULT_THRESHOLD = 0.92;
 export const CACHE_DEFAULT_TTL_SECONDS = 604800; // 7 days; DB clamps to [60, 30d]
@@ -46,6 +100,7 @@ export type CacheUpsertResult =
         | 'empty_arrays'
         | 'invalid_creator_id'
         | 'stale_corpus' // RPC returned NULL after our pre-flight passed
+        | 'vector_encoding_failed' // halfvec.ts threw; non-finite element in queryVec
         | 'db_error';
       detail?: string;
     };
@@ -113,10 +168,26 @@ export async function lookupCache(input: LookupCacheInput): Promise<CacheLookupH
 
   const threshold = clamp01(input.threshold ?? CACHE_DEFAULT_THRESHOLD);
 
+  // Day-8/9/10 cross-cutting audit C3: vectorToPgText throws on
+  // non-finite values. semantic-cache promises "never throw" — catch
+  // and fail-open as cache miss so the orchestrator falls through to
+  // fresh retrieval instead of crashing the turn.
+  let pgVec: string;
+  try {
+    pgVec = vectorToPgText(input.queryVec);
+  } catch (e) {
+    if (e instanceof VectorEncodingError) {
+      // eslint-disable-next-line no-console
+      console.warn(`[semantic-cache] lookupCache vector_encoding_failed: ${e.message}`);
+      return null;
+    }
+    throw e;
+  }
+
   const { data, error } = await input.client.rpc('semantic_query_cache_lookup', {
     p_creator_id: input.creatorId,
     p_corpus_version: input.corpusVersion,
-    p_query_vec: vectorToPgText(input.queryVec),
+    p_query_vec: pgVec,
     p_threshold: threshold,
   });
 
@@ -192,10 +263,22 @@ export async function upsertCache(input: UpsertCacheInput): Promise<CacheUpsertR
   const hash = hashQueryText(input.rewrittenText);
   const ttl = input.ttlSeconds ?? CACHE_DEFAULT_TTL_SECONDS;
 
+  // Day-8/9/10 cross-cutting audit C3: catch VectorEncodingError so the
+  // promised "never throw" contract holds. Map to typed reason.
+  let pgVec: string;
+  try {
+    pgVec = vectorToPgText(input.queryVec);
+  } catch (e) {
+    if (e instanceof VectorEncodingError) {
+      return { ok: false, reason: 'vector_encoding_failed', detail: e.message };
+    }
+    throw e;
+  }
+
   const { data, error } = await input.client.rpc('semantic_query_cache_upsert', {
     p_creator_id: input.creatorId,
     p_corpus_version: input.corpusVersion,
-    p_query_vec: vectorToPgText(input.queryVec),
+    p_query_vec: pgVec,
     p_query_text_hash: hash,
     p_parent_unit_ids: [...parentIds],
     p_scores: [...scores],

@@ -24,6 +24,10 @@
 //    16. RPC returns null (stale corpus) → ok:false reason:stale_corpus
 //    17. RPC returns uuid → ok:true rowId
 //    18. RPC error → ok:false reason:db_error
+//
+//   VectorEncodingError catch (Day-8/9/10 unit-audit C3):
+//    19. lookupCache with NaN-poisoned queryVec → null + console.warn (no throw)
+//    20. upsertCache with NaN-poisoned queryVec → ok:false reason:vector_encoding_failed
 
 import { describe, it, expect, vi } from 'vitest';
 import {
@@ -251,5 +255,54 @@ describe('upsertCache — RPC interaction', () => {
     if (r.ok) throw new Error('expected ok:false');
     expect(r.reason).toBe('db_error');
     expect(r.detail).toContain('check_violation');
+  });
+});
+
+describe('VectorEncodingError catch — fail-open contract (Day-8/9/10 unit-audit C3)', () => {
+  // Build a 768-dim vector with one non-finite element so vectorToPgText
+  // throws before the RPC is even called.
+  function poisonedVec(): number[] {
+    const v = new Array<number>(HALFVEC_DIM).fill(0);
+    v[42] = Number.NaN;
+    return v;
+  }
+
+  it('lookupCache returns null on NaN queryVec (no throw, console.warn fires)', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // RPC mock that fails the test if called — we must short-circuit before any DB call.
+    const client = mockClient(async () => {
+      throw new Error('RPC should not be called when queryVec is poisoned');
+    });
+    const r = await lookupCache({
+      client,
+      creatorId: 'creator-uuid',
+      corpusVersion: 3,
+      queryVec: poisonedVec(),
+    });
+    expect(r).toBeNull();
+    expect(warnSpy).toHaveBeenCalled();
+    const msg = warnSpy.mock.calls[0][0] as string;
+    expect(msg).toContain('vector_encoding_failed');
+    warnSpy.mockRestore();
+  });
+
+  it('upsertCache returns ok:false reason:vector_encoding_failed on NaN queryVec', async () => {
+    // RPC mock that fails the test if called.
+    const client = mockClient(async () => {
+      throw new Error('RPC should not be called when queryVec is poisoned');
+    });
+    const r = await upsertCache({
+      client,
+      creatorId: 'creator-uuid',
+      corpusVersion: 3,
+      queryVec: poisonedVec(),
+      rewrittenText: 'how do I deal with my boss',
+      parentUnitIds: ['pa', 'pb'],
+      scores: [0.9, 0.7],
+    });
+    if (r.ok) throw new Error('expected ok:false');
+    expect(r.reason).toBe('vector_encoding_failed');
+    expect(r.detail).toBeDefined();
+    expect(r.detail).toContain('non_finite_value_at_42');
   });
 });

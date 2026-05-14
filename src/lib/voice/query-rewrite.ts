@@ -11,6 +11,42 @@
 // keys on the REWRITTEN query (Day-9 audit C1 — hashing the raw utterance
 // causes cross-session collisions on common phrases like "tell me more").
 //
+// ═════════════════════════════════════════════════════════════════════
+// LOAD-BEARING ORCHESTRATOR RULE — REWRITE-FALLBACK CACHE BYPASS
+// (Day-8/9/10 cross-cutting audit C2; cross-linked from semantic-cache.ts)
+// ═════════════════════════════════════════════════════════════════════
+//   When this function returns `fallback: true`, the `rewritten` field
+//   equals the RAW utterance (passthrough). Hashing it as a cache key
+//   would serve cross-session collisions ("tell me more" → same hash for
+//   every degraded turn against the same creator). The Day-11 orchestrator
+//   MUST skip BOTH `lookupCache` AND `upsertCache` when `result.fallback
+//   === true` and proceed with fresh retrieval (no cache touch). See
+//   `semantic-cache.ts` header for full discussion.
+// ═════════════════════════════════════════════════════════════════════
+//
+// POSTHOG EVENT CONTRACT (cross-cutting unit audit S2):
+//   This module emits only `console.warn` on fallback paths. The Day-11
+//   orchestrator MUST emit PostHog events keyed on `fallbackReason`:
+//     - 'timeout' / 'transport_error'  → rag_rewrite_transport_failed
+//     - 'empty_response' / 'parse_error' → rag_rewrite_model_malformed
+//     - 'budget_exhausted'             → rag_rewrite_budget_exhausted
+//     - 'empty_utterance'              → (no event; benign)
+//   Plus the existing `rag_rewrite_no_context_post_resumption` when
+//   `noContextAfterResumption=true`.
+//
+// COGS_LOG CONTRACT: caller writes cogs_log using returned `modelId +
+// usdPerInputToken + usdPerOutputToken + inputTokens + outputTokens +
+// quotedAt`. CLAUDE.md "every paid API call writes cogs_log" applies —
+// orchestrator owns the write.
+//
+// BUDGET ALLOCATION (cross-cutting unit audit M7):
+//   `deadlineMs` is the caller's overall budget. This module's hard cap
+//   is REWRITE_TIMEOUT_MS_HARD_CAP=3000; fast-fails when <500ms remains.
+//   The Day-11 orchestrator typically allocates ~30% of the turn budget
+//   to rewrite, ~10% to embed, ~30% to rerank, leaving ~30% headroom.
+//   Pin per-step ceilings in `RAG_TURN_BUDGET_*` env constants when
+//   they're added.
+//
 // Budget contract: caller passes `deadlineMs` (absolute epoch ms). This
 // module computes its own timeout = min(3000, deadlineMs - now()). If less
 // than MIN_REMAINING_MS remains, fast-fail to fallback (return user
