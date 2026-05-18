@@ -1,6 +1,13 @@
 // rag-telemetry.test.ts — vitest for RagTurnTelemetry aggregator.
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+vi.mock('@sentry/nextjs', () => ({
+  captureException: vi.fn(),
+  captureMessage: vi.fn(),
+}));
+import * as Sentry from '@sentry/nextjs';
+
 import {
   newTurnTelemetry,
   toCogsLogRows,
@@ -375,6 +382,10 @@ describe('toPostHogEventBatch', () => {
 });
 
 describe('flushCogsLogRows', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it('does nothing when rows is empty (no DB call)', async () => {
     const insertSpy = vi.fn();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -383,58 +394,165 @@ describe('flushCogsLogRows', () => {
     expect(insertSpy).not.toHaveBeenCalled();
   });
 
-  it('batches all rows into a single insert', async () => {
+  const ROW_REWRITE = {
+    user_id: 'u1',
+    session_id: 's1',
+    service: 'gemini' as const,
+    operation: 'rewrite' as const,
+    units: 100,
+    unit_label: 'tokens' as const,
+    cost_usd: 0.0001,
+    metadata: {},
+  };
+  const ROW_EMBED = {
+    user_id: 'u1',
+    session_id: 's1',
+    service: 'gemini' as const,
+    operation: 'embedding' as const,
+    units: 50,
+    unit_label: 'tokens' as const,
+    cost_usd: 0.00001,
+    metadata: {},
+  };
+  const ROW_RERANK_VOYAGE = {
+    user_id: 'u1',
+    session_id: 's1',
+    service: 'voyage' as const,
+    operation: 'rerank' as const,
+    units: 30,
+    unit_label: 'tokens' as const,
+    cost_usd: 0.0002,
+    metadata: {},
+  };
+
+  it('happy path: single batch insert, no per-row, no Sentry', async () => {
     const insertSpy = vi.fn().mockResolvedValue({ error: null });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const admin = { from: vi.fn(() => ({ insert: insertSpy })) } as any;
-    const rows = [
-      {
-        user_id: 'u1',
-        session_id: 's1',
-        service: 'gemini' as const,
-        operation: 'rewrite' as const,
-        units: 100,
-        unit_label: 'tokens' as const,
-        cost_usd: 0.0001,
-        metadata: {},
-      },
-      {
-        user_id: 'u1',
-        session_id: 's1',
-        service: 'gemini' as const,
-        operation: 'embedding' as const,
-        units: 50,
-        unit_label: 'tokens' as const,
-        cost_usd: 0.00001,
-        metadata: {},
-      },
-    ];
+    const rows = [ROW_REWRITE, ROW_EMBED];
     await flushCogsLogRows(admin, rows);
     expect(insertSpy).toHaveBeenCalledTimes(1);
     expect(insertSpy).toHaveBeenCalledWith(rows);
+    expect(Sentry.captureException).not.toHaveBeenCalled();
   });
 
-  it('warns on DB error but does not throw (fire-and-forget contract)', async () => {
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const insertSpy = vi.fn().mockResolvedValue({ error: { message: 'db_exploded' } });
+  // Audit-2 C1 regression: this is the exact scenario that silently
+  // dropped ALL RAG v2 COGS. A 'voyage' rerank row fails the enum; the
+  // atomic batch insert takes the valid gemini rows down with it. The
+  // fix must insert the valid legs per-row and only escalate the bad one.
+  it('audit-2 C1: a bad enum row does NOT drop valid rows; per-row fallback saves the good legs, only the bad row hits Sentry', async () => {
+    const goodInserted: Array<{ operation: string }> = [];
+    const insertSpy = vi.fn().mockImplementation((arg: unknown) => {
+      const ENUM_ERR = {
+        error: { message: 'invalid input value for enum cogs_service: "voyage"', code: '22P02' },
+      };
+      if (Array.isArray(arg)) return Promise.resolve(ENUM_ERR); // batch fails on the voyage row
+      const row = arg as { service: string; operation: string };
+      if (row.service === 'voyage') return Promise.resolve(ENUM_ERR); // per-row: still fails
+      goodInserted.push({ operation: row.operation });
+      return Promise.resolve({ error: null }); // per-row: valid legs land
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const admin = { from: vi.fn(() => ({ insert: insertSpy })) } as any;
+
+    await expect(
+      flushCogsLogRows(admin, [ROW_REWRITE, ROW_EMBED, ROW_RERANK_VOYAGE]),
+    ).resolves.toBeUndefined();
+
+    // 1 batch attempt + 3 per-row retries
+    expect(insertSpy).toHaveBeenCalledTimes(4);
+    // audit-2 C1-M4 duplicate-safety: the FIRST call is the atomic batch
+    // (array arg) and it failed → it landed ZERO rows; every preserved
+    // row came ONLY from a subsequent per-row (object arg) call. If a
+    // future refactor makes the batch path partially-persist, this fails.
+    expect(Array.isArray(insertSpy.mock.calls[0][0])).toBe(true);
+    const perRowCalls = insertSpy.mock.calls
+      .slice(1)
+      .map((c) => c[0] as { operation?: string });
+    expect(perRowCalls.every((a) => !Array.isArray(a))).toBe(true);
+    expect(goodInserted.length).toBe(2); // came only from per-row, not the batch
+    // the two valid gemini legs were preserved (the original bug lost them)
+    expect(goodInserted.map((r) => r.operation).sort()).toEqual([
+      'embedding',
+      'rewrite',
+    ]);
+    // only the bad voyage row escalated — exactly once, to Sentry
+    expect(Sentry.captureException).toHaveBeenCalledTimes(1);
+  });
+
+  // audit-2 C1-S6: the real-world voyage row on response-shape drift is
+  // the zero-cost `token_count_unavailable` marker (units:0, cost_usd:0).
+  // Same enum, same fallback path — prove it's covered too.
+  it('audit-2 C1: zero-cost voyage marker row also survives the per-row fallback path', async () => {
+    const ROW_RERANK_MARKER = {
+      user_id: 'u1',
+      session_id: 's1',
+      service: 'voyage' as const,
+      operation: 'rerank' as const,
+      units: 0,
+      unit_label: 'tokens' as const,
+      cost_usd: 0,
+      metadata: { token_count_unavailable: true },
+    };
+    const insertSpy = vi.fn().mockImplementation((arg: unknown) => {
+      const ENUM_ERR = {
+        error: { message: 'invalid input value for enum cogs_service: "voyage"', code: '22P02' },
+      };
+      if (Array.isArray(arg)) return Promise.resolve(ENUM_ERR);
+      const row = arg as { service: string };
+      if (row.service === 'voyage') return Promise.resolve(ENUM_ERR);
+      return Promise.resolve({ error: null });
+    });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const admin = { from: vi.fn(() => ({ insert: insertSpy })) } as any;
     await expect(
-      flushCogsLogRows(admin, [
-        {
-          user_id: 'u1',
-          session_id: 's1',
-          service: 'gemini' as const,
-          operation: 'rewrite' as const,
-          units: 100,
-          unit_label: 'tokens' as const,
-          cost_usd: 0.0001,
-          metadata: {},
-        },
-      ]),
+      flushCogsLogRows(admin, [ROW_REWRITE, ROW_RERANK_MARKER]),
     ).resolves.toBeUndefined();
-    expect(warnSpy).toHaveBeenCalled();
-    expect((warnSpy.mock.calls[0][0] as string)).toContain('db_exploded');
-    warnSpy.mockRestore();
+    expect(Sentry.captureException).toHaveBeenCalledTimes(1); // only the marker voyage row
+  });
+
+  it('escalates a persistently-failing row to Sentry (not console.warn) and never throws', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const insertSpy = vi.fn().mockResolvedValue({ error: { message: 'db_exploded' } });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const admin = { from: vi.fn(() => ({ insert: insertSpy })) } as any;
+    await expect(flushCogsLogRows(admin, [ROW_REWRITE])).resolves.toBeUndefined();
+    expect(Sentry.captureException).toHaveBeenCalledTimes(1);
+    expect(errSpy).toHaveBeenCalled();
+    expect((errSpy.mock.calls.flat() as string[]).join(' ')).toContain('COGS DATA LOSS');
+    errSpy.mockRestore();
+  });
+
+  it('batch insert that THROWS still falls back per-row and never throws out (fire-and-forget)', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const insertSpy = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error('network boom');
+      })
+      .mockResolvedValue({ error: null });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const admin = { from: vi.fn(() => ({ insert: insertSpy })) } as any;
+    await expect(flushCogsLogRows(admin, [ROW_REWRITE])).resolves.toBeUndefined();
+    expect(insertSpy).toHaveBeenCalledTimes(2); // batch threw → 1 per-row retry
+    // audit-2 C1-S2: the fallback sends the per-row OBJECT shape, not the array again
+    expect(insertSpy).toHaveBeenLastCalledWith(ROW_REWRITE);
+    expect(Sentry.captureException).not.toHaveBeenCalled(); // per-row succeeded
+    errSpy.mockRestore();
+  });
+
+  // audit-2 C1-S3: telemetry-of-telemetry must never throw. If Sentry
+  // itself blows up inside reportCogsRowLoss, flushCogsLogRows still
+  // resolves (the void-fired contract holds on the worst path).
+  it('never throws even when Sentry.captureException itself throws', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(Sentry.captureException).mockImplementationOnce(() => {
+      throw new Error('sentry transport down');
+    });
+    const insertSpy = vi.fn().mockResolvedValue({ error: { message: 'db_exploded' } });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const admin = { from: vi.fn(() => ({ insert: insertSpy })) } as any;
+    await expect(flushCogsLogRows(admin, [ROW_REWRITE])).resolves.toBeUndefined();
+    errSpy.mockRestore();
   });
 });

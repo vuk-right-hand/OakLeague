@@ -60,6 +60,15 @@ do not deploy. (Also manually confirm transitive imports like
 - **b985303 mic-fix divergence** must be resolved at the `main` merge.
 - **Hume migrations:** already applied to prod (`rbuuwwupxuanalvtipch`),
   including `20260522000001`. ✅ done.
+- **RAG migrations NOT yet applied to prod:** `20260522000100`
+  (retrieval_version snapshot) and **`20260522000101`
+  (cogs_service ADD VALUE 'voyage')**. ⚠️ `20260522000101` MUST be
+  applied to prod **before** any Vercel deploy that ships the patched
+  `rag-telemetry.ts` AND before any creator is on `retrieval_version=2`
+  — otherwise every Voyage rerank row hits the still-missing enum, the
+  per-row fallback fires a Sentry event per turn, and Voyage spend stays
+  absent from `cogs_log` (kill-switch under-fed). Code+migration ship
+  together; nothing enforces apply-before-deploy except this line.
 
 ---
 

@@ -29,6 +29,12 @@
 
 import 'server-only';
 import type { SupabaseClient } from '@supabase/supabase-js';
+// Audit-2 C1: a swallowed cogs_log enum failure (the 'voyage' hole) is
+// exactly how RAG v2 COGS were silently lost. cogs_log is money — a
+// dropped row escalates to Sentry, not console.warn. This module is
+// `server-only` + runs only in the Node API route, so @sentry/nextjs is
+// the correct (and already-present) Sentry surface.
+import * as Sentry from '@sentry/nextjs';
 
 // ───────────────────────────────────────────────────────────────────────
 // Leg-level shapes — match the return shapes of each Day-9/10 module
@@ -159,6 +165,10 @@ export function newTurnTelemetry(args: {
 export type CogsLogRow = {
   user_id: string;
   session_id: string | null;
+  // INVARIANT: this union must stay a subset of the `cogs_service`
+  // Postgres enum (20260420000001 + ADD VALUE migrations: heygen,
+  // anthropic, hume, voyage@20260522000101). Adding a service here
+  // without the matching enum migration is exactly the audit-2 C1 bug.
   service: 'gemini' | 'voyage';
   operation: 'rewrite' | 'embedding' | 'rerank';
   units: number; // tokens
@@ -290,41 +300,96 @@ export function toCogsLogRows(t: RagTurnTelemetry): CogsLogRow[] {
   return rows;
 }
 
+// Per-lost-row escalation. cogs_log is money — a dropped row is a
+// data-integrity event, NOT a warning (a swallowed console.warn is
+// exactly how the 'voyage' enum hole stayed invisible). audit-2 C1-M5:
+// send only an allow-listed projection to Sentry, never the raw `row`
+// (its `metadata` is `Record<string, unknown>` — a future leg could put
+// a text snippet there; don't ship unredacted shapes into Sentry extra).
+function reportCogsRowLoss(row: CogsLogRow, err: unknown): void {
+  const message =
+    (err as { message?: string })?.message ?? String(err ?? 'unknown');
+  // eslint-disable-next-line no-console
+  console.error(
+    `[rag-telemetry] cogs_log ROW LOST — COGS DATA LOSS service=${row.service} ` +
+      `operation=${row.operation} cost_usd=${row.cost_usd}: ${message}`,
+  );
+  try {
+    Sentry.captureException(
+      err instanceof Error
+        ? err
+        : new Error(`cogs_log row insert failed: ${message}`),
+      {
+        tags: { area: 'rag-cogs', service: row.service, operation: row.operation },
+        extra: {
+          service: row.service,
+          operation: row.operation,
+          cost_usd: row.cost_usd,
+          units: row.units,
+          user_id: row.user_id,
+          session_id: row.session_id,
+        },
+      },
+    );
+  } catch {
+    /* never let telemetry-of-telemetry throw */
+  }
+}
+
 /**
  * Best-effort cogs_log writer. Fire-and-forget — failing one row should
- * not block the user turn. Each failed row is console.warn'd (same
- * pattern as retrieve-knowledge.ts:cogs_log insert).
+ * not block the user turn.
  *
  * Day-11 audit note: orchestrator typically calls this WITHOUT awaiting
  * so the user response isn't gated on the cogs_log insert latency.
+ *
+ * Audit-2 C1 (2026-05-22): a single multi-VALUES INSERT is ATOMIC — one
+ * bad row (e.g. the historical `service:'voyage'` enum hole) fails the
+ * whole batch, so the valid rewrite+embed rows were dropped WITH the bad
+ * rerank row, and the failure was swallowed as console.warn → all RAG v2
+ * COGS silently lost. Fix: batch-first for the normal one-round-trip
+ * path, but on ANY batch failure fall back to per-row inserts so valid
+ * legs survive, and escalate each lost row to Sentry. The failed batch
+ * inserts NOTHING (atomic) so the per-row retry cannot duplicate.
+ *
+ * audit-2 C1-M3: the per-row fallback is O(N) SEQUENTIAL round-trips
+ * (1 failed batch + up to N per-row). This is acceptable ONLY because
+ * the call is `void`-fired (never gates the user turn) and faults are
+ * expected to be transient (a real cogs_log outage) or a one-time
+ * migration window — NOT free. Do not promote this to the hot path.
  */
 export async function flushCogsLogRows(
   admin: SupabaseClient,
   rows: readonly CogsLogRow[],
 ): Promise<void> {
   if (rows.length === 0) return;
-  // Day-12 audit M4: this function is invoked `void`-fired from the
-  // orchestrator's try/finally. If we let a network rejection propagate,
-  // Node 22+ default --unhandled-rejections=warn/throw can either flood
-  // Sentry or crash the process. Wrap the entire body so failures land
-  // as console.warn (orchestrator never sees them).
-  try {
-    // Batch insert — one round-trip for all rows. supabase-js handles
-    // the array shape natively.
-    const { error } = await admin.from('cogs_log').insert(rows as CogsLogRow[]);
-    if (error) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        `[rag-telemetry] cogs_log batch insert returned error (${rows.length} rows): ${error.message}`,
-      );
-    }
-  } catch (e) {
+  // Day-12 audit M4: invoked `void`-fired from the orchestrator's
+  // try/finally — must never throw (Node 22 unhandled-rejection).
+  const perRowFallback = async (reason: string): Promise<void> => {
     // eslint-disable-next-line no-console
-    console.warn(
-      `[rag-telemetry] cogs_log batch insert threw (${rows.length} rows): ${
-        (e as Error)?.message ?? 'unknown'
-      }`,
+    console.error(
+      `[rag-telemetry] cogs_log batch insert failed (${rows.length} rows): ` +
+        `${reason} — falling back to per-row so valid legs are not lost`,
     );
+    for (const row of rows) {
+      try {
+        const { error: rowErr } = await admin.from('cogs_log').insert(row);
+        if (rowErr) reportCogsRowLoss(row, rowErr);
+      } catch (e) {
+        reportCogsRowLoss(row, e);
+      }
+    }
+  };
+  try {
+    // Normal path: one round-trip. supabase-js handles the array shape.
+    const { error } = await admin.from('cogs_log').insert(rows as CogsLogRow[]);
+    if (error) await perRowFallback(error.message);
+  } catch (e) {
+    try {
+      await perRowFallback((e as Error)?.message ?? 'unknown (threw)');
+    } catch {
+      /* per-row path itself must never throw out of a void-fired call */
+    }
   }
 }
 
