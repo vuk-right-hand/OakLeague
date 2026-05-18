@@ -20,11 +20,14 @@ import { createHash } from 'node:crypto';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import type { AvatarProvider } from '@/lib/avatar/avatar-bridge';
 import type { PrefixTurn } from '@/lib/voice/brain-prefix';
+import { currentVoiceIdEnv } from '@/lib/voice/env-scoped-voice-id';
 
 export class VoiceTicketMintError extends Error {
   readonly code:
     | 'bad_ua'
     | 'bad_avatar_provider'
+    | 'bad_tts_provider'
+    | 'hume_prosody_missing'
     | 'creator_not_found'
     | 'session_not_owned'
     | 'ticket_mint_failed'
@@ -69,6 +72,23 @@ export type MintVoiceTicketArgs = {
   // insert out-of-range values; this typing is the route-side
   // contract.
   ttsSpeed?: number | null;
+  // HUME_TTS_PLAN §6.3 — session's resolved TTS provider. Computed by the
+  // caller (route) as `creator.tts_provider ?? proxyCfg.ttsProvider`. Defaults
+  // to 'cartesia' for back-compat when the caller is a path that has not been
+  // updated yet (spike-a admin ticket). DB column is NOT NULL DEFAULT 'cartesia'
+  // (migration 0002) — explicit value here is the writer-discipline contract
+  // (CI grep enforced by scripts/check-tts-provider-writes.sh).
+  ttsProvider?: 'cartesia' | 'hume';
+  // HUME_TTS_PLAN §6.3 — Hume prosody dials snapshotted from creator at mint
+  // time, persisted on the ticket so the proxy's consumeTicket() is the only
+  // DB read per session. All four required when ttsProvider='hume' (route is
+  // responsible for the env-scoped resolution before calling here); ignored
+  // when ttsProvider='cartesia'. Mint hard-rejects ttsProvider='hume' with
+  // any of these NULL (HUME_TTS_PLAN unit-wide audit M-defensive).
+  humeTtsSpeed?: number | null;
+  humeTrailingSilence?: number | null;
+  humeVoiceDescription?: string | null;
+  humeModelVersion?: string | null;
   // pgvector RAG plan (M6). Snapshot of creators.brain_mode at session-open.
   // 'drawer' = legacy. 'vector' = per-turn pgvector retrieval injection.
   // DB invariant voice_tickets_brain_mode_prefix_chk requires
@@ -94,6 +114,32 @@ export async function mintVoiceTicket(args: MintVoiceTicketArgs): Promise<MintVo
   // surfacing 400 here is cleaner than a 500 from a deferred PG error.
   if (args.avatarProvider !== 'simli' && args.avatarProvider !== 'tavus' && args.avatarProvider !== 'heygen') {
     throw new VoiceTicketMintError('bad_avatar_provider', 400);
+  }
+  // HUME_TTS_PLAN §6.3 — validate TTS provider + paired hume prosody.
+  // Provider defaults to 'cartesia' (back-compat); 'hume' requires the four
+  // prosody fields to be non-null so the bridge constructor never sees a
+  // half-resolved ticket. The DB CHECK on voice_tickets is the last line of
+  // defense; this is the first.
+  const ttsProvider = args.ttsProvider ?? 'cartesia';
+  if (ttsProvider !== 'cartesia' && ttsProvider !== 'hume') {
+    throw new VoiceTicketMintError('bad_tts_provider', 400);
+  }
+  if (ttsProvider === 'hume') {
+    // Audit M3 (unit-wide, 2026-05-13) — only model_version is required;
+    // speed and trailing_silence are optional dials. NULL on either =
+    // "use Hume default" (1.0 / 0.3 respectively), same contract as
+    // Cartesia's tts_speed (null/1.0 → omit). Mint will pass NULL through;
+    // bridge's shouldSendSpeed / shouldSendTrailingSilence already gates
+    // emission on the wire. modelVersion DOES need a value because the
+    // bridge constructor validates the URL query param.
+    const modelOk = typeof args.humeModelVersion === 'string' && args.humeModelVersion.length > 0;
+    if (!modelOk) {
+      throw new VoiceTicketMintError(
+        'hume_prosody_missing',
+        500,
+        `hume requires model_version (got model=${args.humeModelVersion})`,
+      );
+    }
   }
   const uaHash = createHash('sha256').update(args.ua).digest('hex');
 
@@ -126,6 +172,23 @@ export async function mintVoiceTicket(args: MintVoiceTicketArgs): Promise<MintVo
       hook_id:         args.hookId,
       expected_tier:   args.expectedTier,
       avatar_provider: args.avatarProvider,
+      // HUME_TTS_PLAN §6.3 (2026-05-13): tts_provider resolved by the caller
+      // (route) as `creator.tts_provider ?? proxyCfg.ttsProvider`. CI grep
+      // (scripts/check-tts-provider-writes.sh) enforces every voice_tickets
+      // insert carries tts_provider literally — keep the key visible here.
+      tts_provider:    ttsProvider,
+      // HUME_TTS_PLAN §6.3 — paired Hume prosody. NULL on cartesia tickets
+      // (CHECK constraints on migration 0005 are permissive — NULL allowed
+      // — so cartesia stays clean).
+      hume_tts_speed:         ttsProvider === 'hume' ? args.humeTtsSpeed         ?? null : null,
+      hume_trailing_silence:  ttsProvider === 'hume' ? args.humeTrailingSilence  ?? null : null,
+      hume_voice_description: ttsProvider === 'hume' ? args.humeVoiceDescription ?? null : null,
+      hume_model_version:     ttsProvider === 'hume' ? args.humeModelVersion     ?? null : null,
+      // HUME_TTS_PLAN §6 audit M1 — pin VERCEL_ENV onto the ticket so the
+      // proxy reads which env-scoped voice column to use (cartesia voice_id*
+      // OR hume_voice_id*). Proxy no longer depends on a separate Fly
+      // VOICE_ID_ENV secret; ticket-as-contract pattern (Vuk-M5 precedent).
+      voice_id_env:    currentVoiceIdEnv(),
       // pipeline_kind defaults to 'native_audio' per migration 0045 — the
       // α' wire format is native_audio + Cartesia layered server-side.
       // purpose defaults to 'voice_session'.

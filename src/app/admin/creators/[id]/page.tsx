@@ -6,6 +6,7 @@ import { FaceUpload } from './face-upload';
 import { BrainRecompileButton } from './brain-recompile-button';
 import { CorpusReprocessPanel } from './corpus-reprocess-panel';
 import { CorpusComparePanel } from './corpus-compare-panel';
+import { TtsProviderPanel } from './tts-provider-panel';
 
 export const dynamic = 'force-dynamic';
 
@@ -34,6 +35,29 @@ type Creator = {
   // RAG SOTA Day-6: retrieval_version (1=legacy, 2=v2 hybrid). Defaults to 1
   // for every creator until admin flips it post-corpus-reprocess.
   retrieval_version: number;
+  // HUME_TTS_PLAN §6.11. NULL on tts_provider = inherit env.
+  // Audit S5 (unit-wide) — all three env-scoped Hume columns selected so
+  // the status cells can display the env that matches the admin's current
+  // deploy (preview admins see preview values, not stale prod values).
+  tts_provider: 'cartesia' | 'hume' | null;
+  hume_voice_id: string | null;
+  hume_voice_id_preview: string | null;
+  hume_voice_id_dev: string | null;
+  hume_voice_name: string | null;
+  hume_voice_name_preview: string | null;
+  hume_voice_name_dev: string | null;
+  hume_tts_speed: number | string | null;
+  hume_tts_speed_preview: number | string | null;
+  hume_tts_speed_dev: number | string | null;
+  hume_trailing_silence: number | string | null;
+  hume_trailing_silence_preview: number | string | null;
+  hume_trailing_silence_dev: number | string | null;
+  hume_voice_description: string | null;
+  hume_voice_description_preview: string | null;
+  hume_voice_description_dev: string | null;
+  hume_model_version: '1' | '2' | 'default' | null;
+  hume_model_version_preview: '1' | '2' | 'default' | null;
+  hume_model_version_dev: '1' | '2' | 'default' | null;
 };
 
 type Topic = {
@@ -82,7 +106,18 @@ export default async function AdminCreatorDetail({
 
   const [{ data: creator }, { data: topics }, { data: samples }] = await Promise.all([
     sb.from('creators')
-      .select('id, handle, display_name, creator_type, brain_status, voice_id, simli_face_id, published_at, created_at, updated_at, application_id, bio, system_prompt, brain_compiled_at, retrieval_version')
+      .select(`
+        id, handle, display_name, creator_type, brain_status, voice_id,
+        simli_face_id, published_at, created_at, updated_at, application_id,
+        bio, system_prompt, brain_compiled_at, retrieval_version,
+        tts_provider,
+        hume_voice_id, hume_voice_id_preview, hume_voice_id_dev,
+        hume_voice_name, hume_voice_name_preview, hume_voice_name_dev,
+        hume_tts_speed, hume_tts_speed_preview, hume_tts_speed_dev,
+        hume_trailing_silence, hume_trailing_silence_preview, hume_trailing_silence_dev,
+        hume_voice_description, hume_voice_description_preview, hume_voice_description_dev,
+        hume_model_version, hume_model_version_preview, hume_model_version_dev
+      `)
       .eq('id', id)
       .maybeSingle<Creator>(),
     sb.from('creator_topics')
@@ -96,6 +131,35 @@ export default async function AdminCreatorDetail({
   ]);
 
   if (!creator) notFound();
+
+  // Audit S5 (unit-wide) — env-aware Hume column selection. VERCEL_ENV is
+  // 'production' | 'preview' | undefined (dev/local). The status display +
+  // panel initial values render the matching env's columns so a preview
+  // deploy admin sees preview values, not stale prod values.
+  const vercelEnv = process.env.VERCEL_ENV;
+  const currentEnv: 'production' | 'preview' | 'development' =
+    vercelEnv === 'production' ? 'production'
+    : vercelEnv === 'preview'  ? 'preview'
+    :                            'development';
+  const envLabel = currentEnv === 'production' ? 'prod' : currentEnv === 'preview' ? 'preview' : 'dev';
+  const envHumeVoiceId   = currentEnv === 'production' ? creator.hume_voice_id
+                         : currentEnv === 'preview'    ? creator.hume_voice_id_preview
+                         :                               creator.hume_voice_id_dev;
+  const envHumeVoiceName = currentEnv === 'production' ? creator.hume_voice_name
+                         : currentEnv === 'preview'    ? creator.hume_voice_name_preview
+                         :                               creator.hume_voice_name_dev;
+  const envHumeSpeed     = currentEnv === 'production' ? creator.hume_tts_speed
+                         : currentEnv === 'preview'    ? creator.hume_tts_speed_preview
+                         :                               creator.hume_tts_speed_dev;
+  const envHumeSilence   = currentEnv === 'production' ? creator.hume_trailing_silence
+                         : currentEnv === 'preview'    ? creator.hume_trailing_silence_preview
+                         :                               creator.hume_trailing_silence_dev;
+  const envHumeDescription = currentEnv === 'production' ? creator.hume_voice_description
+                           : currentEnv === 'preview'    ? creator.hume_voice_description_preview
+                           :                               creator.hume_voice_description_dev;
+  const envHumeModel     = currentEnv === 'production' ? creator.hume_model_version
+                         : currentEnv === 'preview'    ? creator.hume_model_version_preview
+                         :                               creator.hume_model_version_dev;
 
   const topicRows = (topics ?? []) as Topic[];
   const sampleRows = (samples ?? []) as SampleRow[];
@@ -258,6 +322,56 @@ export default async function AdminCreatorDetail({
             createdAt: orphan.created_at,
             lastError: orphan.last_error,
           } : null}
+        />
+      </section>
+
+      {/* Audit S5 (unit-wide) — env-aware Hume status display. The panel
+          writes whichever env the deploy is in (NEXT_PUBLIC_VERCEL_ENV via
+          tts-provider-panel.tsx). Status cells render the matching env's
+          values so the admin doesn't see stale prod values on a preview
+          deploy. */}
+      <section style={{ marginBottom: 32 }}>
+        <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>
+          TTS routing
+          <span style={{ fontSize: 11, fontWeight: 400, marginLeft: 8, opacity: 0.7 }}>
+            (env: {currentEnv})
+          </span>
+        </h2>
+        <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 13, marginBottom: 8 }}>
+          <StatusCell label="tts_provider override" value={creator.tts_provider ?? '— (inherit env)'} />
+          <StatusCell label={`hume voice_id (${envLabel})`} value={envHumeVoiceId ?? '—'} mono />
+          <StatusCell label={`hume voice_name (${envLabel})`} value={envHumeVoiceName ?? '—'} />
+          <StatusCell
+            label={`hume speed (${envLabel})`}
+            value={envHumeSpeed != null ? String(envHumeSpeed) : '— (default 1.0)'}
+          />
+          <StatusCell
+            label={`hume trailing silence (${envLabel})`}
+            value={envHumeSilence != null ? String(envHumeSilence) : '— (default 0.3)'}
+          />
+          <StatusCell label={`hume model (${envLabel})`} value={envHumeModel ?? '2 (default)'} />
+        </div>
+        <TtsProviderPanel
+          creatorId={creator.id}
+          initialTtsProvider={creator.tts_provider}
+          initialHumeVoiceId={envHumeVoiceId}
+          initialHumeVoiceName={envHumeVoiceName}
+          initialHumeTtsSpeed={
+            envHumeSpeed == null
+              ? null
+              : (typeof envHumeSpeed === 'number'
+                  ? envHumeSpeed
+                  : Number(envHumeSpeed))
+          }
+          initialHumeTrailingSilence={
+            envHumeSilence == null
+              ? null
+              : (typeof envHumeSilence === 'number'
+                  ? envHumeSilence
+                  : Number(envHumeSilence))
+          }
+          initialHumeVoiceDescription={envHumeDescription}
+          initialHumeModelVersion={envHumeModel as '1' | '2' | 'default' | null}
         />
       </section>
 

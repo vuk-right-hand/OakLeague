@@ -35,27 +35,64 @@ if (DSN) {
       }
       if (event.request?.url) event.request.url = scrubUrl(event.request.url);
       if (event.transaction) event.transaction = scrubUrl(event.transaction);
+      // HUME_TTS_PLAN audit C4 fix (2026-05-13): Sentry's RequestData
+      // integration parses query strings into a separate field where the
+      // `?` prefix is stripped — `[?&#]` URL-regex never matches. Scrub it
+      // by treating it as a `&`-prefixed body so the regex fires.
+      if (typeof event.request?.query_string === 'string') {
+        event.request.query_string = scrubUrl('&' + event.request.query_string).slice(1);
+      }
       // R3-C4 + R4-M8: scrub transcript-shaped fields from every channel.
       // User conversation content (Gemini outputTranscription text, Cartesia
-      // transcripts) must NEVER reach Sentry. Single helper applied at every
-      // surface — extras, contexts, breadcrumbs[].data, message,
-      // exception.values[].value.
+      // transcripts, Hume SnippetAudioChunk.text) must NEVER reach Sentry.
+      // Single helper applied at every surface — extras, contexts,
+      // breadcrumbs[].data, message, exception.values[].value.
       scrubTranscriptKeys(event.extra);
       scrubTranscriptKeys(event.contexts);
       if (Array.isArray(event.breadcrumbs)) {
         for (const b of event.breadcrumbs) {
           if (b && typeof b === 'object') {
             scrubTranscriptKeys(b.data);
-            if (typeof b.message === 'string') b.message = stripLikelyTranscript(b.message);
+            if (typeof b.message === 'string') b.message = scrubUrl(stripLikelyTranscript(b.message));
+            // Vuk-C1 / R2-M1: breadcrumb data.url frequently embeds the WS URL
+            // on connect failures. Scrub query-string secrets explicitly.
+            // Audit C4 fix (2026-05-13): also scrub data.to (3xx redirect
+            // breadcrumbs land the target URL there, not in data.url).
+            if (b.data && typeof b.data === 'object') {
+              if (typeof b.data.url === 'string') b.data.url = scrubUrl(b.data.url);
+              if (typeof b.data.to  === 'string') b.data.to  = scrubUrl(b.data.to);
+              if (typeof b.data.from === 'string') b.data.from = scrubUrl(b.data.from);
+            }
           }
         }
       }
-      if (typeof event.message === 'string') event.message = stripLikelyTranscript(event.message);
+      if (typeof event.message === 'string') event.message = scrubUrl(stripLikelyTranscript(event.message));
+      // HUME_TTS_PLAN §2.0 step 2 / R2-M1: Hume forces api_key into the WS
+      // URL query string. The `ws` library stringifies that URL into
+      // exception.value AND into stacktrace context lines on ECONNREFUSED
+      // / ENOTFOUND. Scrub both before send. Cartesia path doesn't carry
+      // secrets in error messages (uses X-API-Key header) but this scrub
+      // is provider-agnostic — runs on every captured exception.
       if (event.exception?.values) {
         for (const v of event.exception.values) {
-          if (typeof v?.value === 'string') v.value = stripLikelyTranscript(v.value);
+          if (typeof v?.value === 'string') v.value = scrubUrl(stripLikelyTranscript(v.value));
+          if (v?.stacktrace?.frames) {
+            for (const f of v.stacktrace.frames) {
+              if (typeof f?.context_line === 'string') f.context_line = scrubUrl(f.context_line);
+              if (Array.isArray(f?.pre_context))  f.pre_context  = f.pre_context.map((s) => typeof s === 'string' ? scrubUrl(s) : s);
+              if (Array.isArray(f?.post_context)) f.post_context = f.post_context.map((s) => typeof s === 'string' ? scrubUrl(s) : s);
+            }
+          }
         }
       }
+      // HUME_TTS_PLAN audit C4 fix (2026-05-13): defense-in-depth — walk
+      // the whole event tree and scrub any string that LOOKS like it
+      // contains api_key=/access_token=/ticket= regardless of where it
+      // appears (custom request fields, integration-injected metadata,
+      // nested context object Sentry adds via getCurrentScope, etc.).
+      // The field-specific scrubs above catch the common channels; this
+      // is the belt-and-suspenders for everything else.
+      scrubSecretsDeep(event);
       return event;
     },
   });
@@ -64,8 +101,56 @@ if (DSN) {
   console.log('[sentry] SENTRY_DSN unset — capture is no-op');
 }
 
-function scrubUrl(s) {
-  return String(s).replace(/([?&#])ticket=[^&#]+/g, '$1ticket=[redacted]');
+// Vuk-C1 / HUME_TTS_PLAN §2.0 step 1: scrub query-string secrets in URLs.
+// Three patterns cover the secret-bearing query params we ever emit:
+//   ticket      — voice-proxy WS auth (single-use ticket id)
+//   api_key     — Hume WS auth (Hume forces auth into URL; no header path)
+//   access_token — Hume alternative auth (documented but unused; defensive)
+// Pattern matches each independently so a URL carrying multiple is fully
+// scrubbed. Exported for sentry.test.js direct coverage.
+export function scrubUrl(s) {
+  return String(s)
+    .replace(/([?&#])ticket=[^&#]+/g,        '$1ticket=[redacted]')
+    .replace(/([?&#])api_key=[^&#]+/g,       '$1api_key=[redacted]')
+    .replace(/([?&#])access_token=[^&#]+/g,  '$1access_token=[redacted]');
+}
+
+// HUME_TTS_PLAN audit C4 fix (2026-05-13): tree-walk secret scrub. Applied
+// AFTER all field-specific scrubs as defense-in-depth. Catches the case
+// where a Sentry integration we don't control (RequestData, Node context,
+// Express middleware, etc.) embeds the WS URL into a field we forgot to
+// list explicitly. Cycles are unlikely in Sentry event payloads (JSON-
+// serializable by contract) but we track visited objects to be safe.
+export function scrubSecretsDeep(root, seen = new WeakSet()) {
+  if (!root || typeof root !== 'object') return root;
+  if (seen.has(root)) return root;
+  seen.add(root);
+  if (Array.isArray(root)) {
+    for (let i = 0; i < root.length; i++) {
+      const v = root[i];
+      if (typeof v === 'string') {
+        // Only run the regex when the string contains a delimiter — cheap
+        // pre-check avoids regexing every stack frame line.
+        if (v.includes('api_key=') || v.includes('access_token=') || v.includes('ticket=')) {
+          root[i] = scrubUrl(v);
+        }
+      } else if (v && typeof v === 'object') {
+        scrubSecretsDeep(v, seen);
+      }
+    }
+    return root;
+  }
+  for (const k of Object.keys(root)) {
+    const v = root[k];
+    if (typeof v === 'string') {
+      if (v.includes('api_key=') || v.includes('access_token=') || v.includes('ticket=')) {
+        root[k] = scrubUrl(v);
+      }
+    } else if (v && typeof v === 'object') {
+      scrubSecretsDeep(v, seen);
+    }
+  }
+  return root;
 }
 
 // S-C5 — explicit denylist of keys whose VALUES are user-conversation
@@ -102,6 +187,37 @@ const TRANSCRIPT_KEYS = new Set([
   'requestbody',
   'request_body',
   'cartesia_transcript',
+  // HUME_TTS_PLAN §2.0.1 / Vuk-C2: Hume's SnippetAudioChunk envelope
+  // carries a `text` field on EVERY audio chunk = the avatar-spoken
+  // transcript fragment. Generic `text` is too broad to denylist; pin
+  // the Hume-specific aliases the bridge MUST use when logging chunk
+  // metadata. NO `JSON.stringify(msg)` allowed in hume-bridge.js
+  // (enforced by CI grep — see plan §2.0.1).
+  'hume_chunk_text',
+  'humechunktext',
+  'snippet_text',
+  'snippettext',
+  'snippetaudiochunk_text',
+  'snippetaudiochunktext',
+  'hume_text',
+  'humetext',
+  // HUME_TTS_PLAN §4 audit C5 (2026-05-13): cartesia-bridge.js + hume-bridge.js
+  // BOTH emit `textSample` on error events for ops diagnostics. The field
+  // value is user transcript content — the offending text we sent that
+  // Cartesia/Hume rejected. Pre-existing Cartesia leak (line 492); newly
+  // introduced in Hume. Lowercased full-key set membership covers both
+  // `textSample` and `text_sample`.
+  'textsample',
+  'text_sample',
+  // HUME_TTS_PLAN unit-wide audit M5 (2026-05-13): the bridge emits
+  // `humeMessage` on error events. For E0101/payload_parse the bridge
+  // sanitizes to literal 'hume_payload_parse'. For other codes mapped to
+  // 'other' the bridge passes Hume's verbatim message (bounded 200 chars).
+  // If Hume ever adds an error code that echoes client input in the
+  // message field, those 200 chars are user content. Defense-in-depth:
+  // redact at Sentry layer.
+  'humemessage',
+  'hume_message',
 ]);
 
 export function scrubTranscriptKeys(obj) {

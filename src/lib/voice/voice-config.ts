@@ -1,23 +1,49 @@
-// R3-C2 (sec) — single source of truth for VOICE_CARTESIA_ENABLED.
+// R3-C2 (sec) — single source of truth for VOICE_TTS_LAYER_ENABLED.
+// HUME_TTS_PLAN §6.2 — extended to also surface `ttsProvider` ('cartesia'|'hume').
 //
-// The Fly voice-proxy reads VOICE_CARTESIA_ENABLED from its own env and
-// routes traffic accordingly. The Next.js side needs to know whether to
-// pre-flight gate at /api/sessions/open (return 409
-// `creator_voice_not_trained` when α' is on but creator.voice_id IS NULL).
+// 2026-05-14 rename: env var + field was VOICE_CARTESIA_ENABLED / useCartesia,
+// renamed to VOICE_TTS_LAYER_ENABLED / useTtsLayer because the flag actually
+// gates the "α' TTS layer is on" bit (Cartesia OR Hume), not Cartesia
+// specifically. Probe accepts BOTH keys from the proxy response during the
+// migration window — old Fly deploys keep returning `useCartesia`.
 //
-// Two flags = two source of truth = drift bug. Round-3 audit R3-C2 caught
+// The Fly voice-proxy reads VOICE_TTS_LAYER_ENABLED + VOICE_TTS_PROVIDER from
+// its own env and routes traffic accordingly. The Next.js side needs to know
+// (a) whether to pre-flight gate at /api/sessions/open (return 409
+// `creator_voice_not_trained` when α' is on but the env-scoped voice column
+// is NULL), and (b) which TTS provider to inherit when `creators.tts_provider`
+// is NULL.
+//
+// Two flags = two sources of truth = drift bug. Round-3 audit R3-C2 caught
 // this. Resolution: the proxy is the authority. Vercel polls the proxy's
 // /voice-config endpoint and caches the answer for 60s. If the proxy is
-// unreachable, fail-open (don't pre-gate) — the proxy will still issue
-// the proper 4009 close on WS open if α' is on, so the user-facing
-// outcome is at most a slightly worse error path during a brief outage.
+// unreachable, fail-open (`useTtsLayer=false`, `ttsProvider='cartesia'`) —
+// the proxy's WS-open close codes are the actual gate.
 //
 // VOICE_PROXY_URL must be set on Vercel as the WSS URL of the Fly proxy
 // (e.g., wss://oakleague-voice-proxy.fly.dev). We swap the protocol +
 // path for the healthz fetch.
 
-let _cache: { useCartesia: boolean; fetchedAt: number } | null = null;
+export type ProxyVoiceConfig = {
+  useTtsLayer: boolean;
+  ttsProvider: 'cartesia' | 'hume';
+  // HUME_TTS_PLAN §6 audit M5 — true when this value is the fail-open
+  // fallback (proxy unreachable, env unset, malformed body). The caller
+  // can choose to 503 instead of silently using the fallback. Bridge
+  // routing decisions during failOpen=true risk a cartesia ticket for a
+  // hume-overridden creator → 4009 at WS open.
+  failOpen: boolean;
+};
+
+let _cache: { value: ProxyVoiceConfig; fetchedAt: number } | null = null;
 const CACHE_TTL_MS = 60_000;
+// Audit M5 (§6 unit-wide) — a fail-open cache entry is held for a SHORTER
+// window (5s) than a successful probe (60s). Prior behavior cached the
+// fail-open value for the full 60s window (with a backdated fetchedAt
+// that effectively gave it ~55s), which amplified a short proxy outage
+// into a deterministic-route bug for the whole window. With a 5s TTL,
+// the next request re-probes the proxy and surfaces live state quickly.
+const FAIL_OPEN_CACHE_TTL_MS = 5_000;
 
 function buildConfigUrl(): string | null {
   const wsUrl = process.env.NEXT_PUBLIC_VOICE_PROXY_URL || process.env.VOICE_PROXY_URL || '';
@@ -35,21 +61,28 @@ function buildConfigUrl(): string | null {
   }
 }
 
+function failOpen(): ProxyVoiceConfig {
+  return { useTtsLayer: false, ttsProvider: 'cartesia', failOpen: true };
+}
+
 /**
- * Returns whether Cartesia α' is currently enabled on the proxy.
- * Cached 60s. On any error (proxy unreachable, malformed body, env unset),
- * returns `false` — the pre-WS gate at /api/sessions/open is just an
- * optimization; the proxy's 4009 close at WS-open is the actual gate.
+ * Returns the proxy's live voice-config. Cached 60s. On any error (proxy
+ * unreachable, malformed body, env unset), returns the fail-open default
+ * (`useTtsLayer=false`, `ttsProvider='cartesia'`) — the pre-WS gate at
+ * /api/sessions/open is just an optimization; the proxy's 4009/4014 close
+ * at WS-open is the actual gate.
  */
-export async function getProxyVoiceConfig(): Promise<{ useCartesia: boolean }> {
+export async function getProxyVoiceConfig(): Promise<ProxyVoiceConfig> {
   const now = Date.now();
-  if (_cache && now - _cache.fetchedAt < CACHE_TTL_MS) {
-    return { useCartesia: _cache.useCartesia };
+  if (_cache) {
+    const ttl = _cache.value.failOpen ? FAIL_OPEN_CACHE_TTL_MS : CACHE_TTL_MS;
+    if (now - _cache.fetchedAt < ttl) return _cache.value;
   }
   const url = buildConfigUrl();
   if (!url) {
-    _cache = { useCartesia: false, fetchedAt: now };
-    return { useCartesia: false };
+    const value = failOpen();
+    _cache = { value, fetchedAt: now };
+    return value;
   }
   try {
     const ac = new AbortController();
@@ -61,15 +94,22 @@ export async function getProxyVoiceConfig(): Promise<{ useCartesia: boolean }> {
       clearTimeout(to);
     }
     if (!res.ok) throw new Error(`status=${res.status}`);
-    const body = (await res.json()) as { useCartesia?: unknown };
-    const useCartesia = body?.useCartesia === true;
-    _cache = { useCartesia, fetchedAt: now };
-    return { useCartesia };
+    const body = (await res.json()) as { useTtsLayer?: unknown; useCartesia?: unknown; ttsProvider?: unknown };
+    // Accept new key first, fall back to legacy `useCartesia` for old Fly deploys.
+    const useTtsLayer = body?.useTtsLayer === true || body?.useCartesia === true;
+    const rawProvider = typeof body?.ttsProvider === 'string' ? body.ttsProvider : '';
+    const ttsProvider: 'cartesia' | 'hume' =
+      rawProvider === 'hume' ? 'hume' : 'cartesia';
+    const value: ProxyVoiceConfig = { useTtsLayer, ttsProvider, failOpen: false };
+    _cache = { value, fetchedAt: now };
+    return value;
   } catch {
-    // Fail-open: proxy unreachable. Cache `false` for a short window so we
-    // don't hammer the proxy on every session-open during an outage.
-    _cache = { useCartesia: false, fetchedAt: now - (CACHE_TTL_MS - 5_000) };
-    return { useCartesia: false };
+    // Audit M5 — surface failOpen=true so callers can 503 instead of
+    // silently routing to a possibly-wrong provider. Short-cache the
+    // fallback (5s) so the next request re-probes the proxy.
+    const value = failOpen();
+    _cache = { value, fetchedAt: now };
+    return value;
   }
 }
 

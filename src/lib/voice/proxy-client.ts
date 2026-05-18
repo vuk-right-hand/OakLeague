@@ -23,7 +23,7 @@
 const OVERLAP_DRAIN_MS = 2000;
 
 export type ProxyClientHandlers = {
-  onReady?: (msg: { sessionId: string; useCartesia: boolean; build: string }) => void;
+  onReady?: (msg: { sessionId: string; useTtsLayer: boolean; build: string }) => void;
   onAudioOut?: (bytes: ArrayBuffer) => void;
   onError?: (code: string, detail?: string) => void;
   onWarning?: (code: string) => void;
@@ -94,7 +94,13 @@ export function createProxyClient(handlers: ProxyClientHandlers): ProxyClient {
         if (type === 'ready') {
           handlers.onReady?.({
             sessionId: String(msg.sessionId ?? ''),
-            useCartesia: Boolean(msg.useCartesia),
+            // Accept new key, fall back to legacy `useCartesia` during the
+            // Fly migration window — old proxy deploys still emit only the
+            // old key. Audit S5 — strict `=== true` (NOT Boolean()): the
+            // proxy emits a real JSON boolean; Boolean("false") === true
+            // would fail OPEN on a malformed payload. Parity with the safe
+            // form in voice-config.ts.
+            useTtsLayer: msg.useTtsLayer === true || msg.useCartesia === true,
             build: String(msg.build ?? ''),
           });
         } else if (type === 'error') {

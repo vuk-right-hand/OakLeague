@@ -20,6 +20,33 @@ vi.mock('@/lib/auth-guards', () => ({
   getCallerUserId: vi.fn(async () => 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa'),
 }));
 
+// HUME_TTS_PLAN §6 audit M5 — voice-config mock with failOpen=false
+// steady-state. Tests that need the proxy-unreachable path override.
+const mockGetProxyVoiceConfig = vi.fn(async () => ({
+  useTtsLayer: true,
+  ttsProvider: 'cartesia' as 'cartesia' | 'hume',
+  failOpen: false,
+}));
+vi.mock('@/lib/voice/voice-config', () => ({
+  getProxyVoiceConfig: () => mockGetProxyVoiceConfig(),
+}));
+
+// HUME_TTS_PLAN §6 — env-scoped voice-id resolver. Tests run without
+// VERCEL_ENV set; default would be 'development' → voice_id_dev column.
+// Mock resolveVoiceId to return the stub regardless of env so the route's
+// pre-WS gate passes. pickEnvScoped + coerceNumericOrNull surfaces via
+// the actual module export.
+vi.mock('@/lib/voice/env-scoped-voice-id', () => ({
+  resolveVoiceId: vi.fn(() => 'voice-id-stub'),
+  pickEnvScoped: vi.fn(() => null),
+  coerceNumericOrNull: (v: unknown) => {
+    if (v == null) return null;
+    const n = typeof v === 'number' ? v : Number(v);
+    return Number.isFinite(n) ? n : null;
+  },
+  currentVoiceIdEnv: vi.fn(() => 'production'),
+}));
+
 vi.mock('@/lib/avatar/resolver', () => ({
   resolveAvatarProvider: vi.fn(() => 'simli'),
 }));
@@ -109,6 +136,11 @@ function makeAdmin() {
                   // as string to mirror supabase-js's numeric → string
                   // coercion.
                   tts_speed: '1.0',
+                  brain_mode: 'drawer',
+                  // HUME_TTS_PLAN §6 — env-scoped Cartesia voice id; the
+                  // route's pre-WS gate now checks the resolved column
+                  // and 409s if absent. Provide a stub so the gate passes.
+                  voice_id: 'voice-id-stub',
                 },
                 error: null,
               }),
@@ -248,12 +280,23 @@ describe('/api/sessions/rollover — voice-ticket fatal (PR-2 round-2 M2)', () =
   });
 
   it('PR-2: returns 503 proxy_url_unconfigured when env unset + closes new session', async () => {
+    // Audit M5 — when VOICE_PROXY_URL is unset, getProxyVoiceConfig now
+    // surfaces failOpen=true. The route's earlier 503 check fires first
+    // (voice_proxy_unreachable) — the new behavior is strictly stricter
+    // than the old proxy_url_unconfigured (same root cause). Mock that
+    // shape for this test.
     delete process.env.NEXT_PUBLIC_VOICE_PROXY_URL;
+    mockGetProxyVoiceConfig.mockResolvedValueOnce({
+      useTtsLayer: false,
+      ttsProvider: 'cartesia',
+      failOpen: true,
+    });
     mockMintVoiceTicket.mockResolvedValue({ ticket: 'ticket-1', expiresAt: new Date(Date.now() + 120_000).toISOString() });
     const res = await POST(makeReq());
     expect(res.status).toBe(503);
-    expect((await res.json()).error).toBe('proxy_url_unconfigured');
-    expect(rpcCalls.filter((c) => c.name === 'session_close').length).toBe(1);
+    expect((await res.json()).error).toBe('voice_proxy_unreachable');
+    // The new 503 fires BEFORE session_open is called downstream, so no
+    // session_close happens (no new session row was created yet).
   });
 
   it('on success: returns 200 envelope with voice + voice_ticket + proxy_url, no gemini key', async () => {

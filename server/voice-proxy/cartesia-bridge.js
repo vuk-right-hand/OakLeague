@@ -401,6 +401,10 @@ export class CartesiaTTSBridge extends EventEmitter {
   }
 
   _onMessage(data, isBinary) {
+    // A/B harness audit C1 — capture wire-receive timestamp BEFORE JSON
+    // parse + base64 decode so TTFA measurements aren't skewed by per-
+    // envelope decoding cost differences between providers.
+    const wireRxAtMs = Date.now();
     if (this._closed) return;
     if (isBinary) {
       // R3-C4 strict: docs guarantee JSON envelopes on 2026-03-01.
@@ -446,6 +450,7 @@ export class CartesiaTTSBridge extends EventEmitter {
       this.emit('event', {
         kind: 'audio_out',
         at: Date.now(),
+        wireRxAtMs, // C1 audit fix — pre-parse receive timestamp
         chunk: { bytes, mimeType: `audio/pcm;rate=${this._sampleRate}` },
         contextId: msg.context_id,
       });

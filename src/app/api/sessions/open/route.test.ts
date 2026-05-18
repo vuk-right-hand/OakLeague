@@ -22,11 +22,25 @@ vi.mock('@/lib/auth-guards', () => ({
 }));
 
 vi.mock('@/lib/voice/voice-config', () => ({
-  getProxyVoiceConfig: vi.fn(async () => ({ useCartesia: true })),
+  // HUME_TTS_PLAN §6 audit M5 — mock includes ttsProvider + failOpen.
+  // failOpen:false is the steady-state success shape; tests that want
+  // the proxy-unreachable path override per-test.
+  getProxyVoiceConfig: vi.fn(async () => ({
+    useTtsLayer: true,
+    ttsProvider: 'cartesia',
+    failOpen: false,
+  })),
 }));
 
 vi.mock('@/lib/voice/env-scoped-voice-id', () => ({
   resolveVoiceId: vi.fn(() => 'voice-id-stub'),
+  pickEnvScoped: vi.fn(() => null),
+  coerceNumericOrNull: (v: unknown) => {
+    if (v == null) return null;
+    const n = typeof v === 'number' ? v : Number(v);
+    return Number.isFinite(n) ? n : null;
+  },
+  currentVoiceIdEnv: vi.fn(() => 'production'),
 }));
 
 vi.mock('@/lib/avatar/resolver', () => ({
@@ -216,13 +230,20 @@ function makeAdmin() {
       }
       if (table === 'sessions') {
         // Takeover-path lookup: chained .eq().is().maybeSingle().
+        // Audit C1 (unit-wide) — route now writes tts_provider_at_session
+        // post-session_open via `.update().eq()`. Test mock must return
+        // success for that UPDATE chain or the route returns 500.
         return {
           select: () => ({
             eq: () => ({
               is: () => ({
                 maybeSingle: async () => takeoverLookupResult,
               }),
+              maybeSingle: async () => takeoverLookupResult,
             }),
+          }),
+          update: () => ({
+            eq: async () => ({ data: null, error: null }),
           }),
         };
       }

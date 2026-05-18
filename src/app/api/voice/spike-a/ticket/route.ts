@@ -130,6 +130,10 @@ export async function POST(req: NextRequest) {
       bound_ua_hash: uaHash,
       creator_id: creatorId,
       avatar_provider: 'simli',
+      // HUME_TTS_PLAN §5.5 writer discipline (2026-05-13): pass tts_provider
+      // explicitly. Spike-A is admin-gated dev-only path; cartesia is the
+      // appropriate baseline.
+      tts_provider: 'cartesia',
     })
     .select('ticket_id, expires_at')
     .single<{ ticket_id: string; expires_at: string }>();

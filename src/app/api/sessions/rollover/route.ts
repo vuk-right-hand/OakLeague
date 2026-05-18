@@ -33,7 +33,7 @@ import type { AvatarEnvelope } from '@/lib/avatar/avatar-envelope';
 import { mintVoiceTicket, VoiceTicketMintError } from '@/lib/voice/mint-voice-ticket';
 import { buildBrainPrefix } from '@/lib/voice/brain-prefix';
 import { captureServerSafe } from '@/lib/posthog-server';
-import { resolveVoiceId } from '@/lib/voice/env-scoped-voice-id';
+import { resolveVoiceId, pickEnvScoped, coerceNumericOrNull } from '@/lib/voice/env-scoped-voice-id';
 import { getProxyVoiceConfig } from '@/lib/voice/voice-config';
 import { shouldEmitBrainNotReady } from '@/lib/voice/brain-not-ready-dedupe';
 
@@ -49,6 +49,9 @@ type Body = {
   hook_id?: unknown;
   model?: unknown;
 };
+
+// Audit S2 (unit-wide) — calls use coerceNumericOrNull directly; no
+// local alias needed.
 
 export async function POST(req: NextRequest) {
   if (!isSameOrigin(req)) return json(403, { error: 'bad_origin' });
@@ -102,9 +105,23 @@ export async function POST(req: NextRequest) {
     return json(400, { error: 'hook_creator_mismatch' });
   }
 
+  // HUME_TTS_PLAN §6.2 — SELECT both providers' env-scoped columns +
+  // Hume prosody dials. The actual provider for THIS rollover session is
+  // read from sessions.tts_provider_at_session below (snapshot from the
+  // original /api/sessions/open call), not /voice-config.
   const { data: creatorRow, error: creatorErr } = await admin
     .from('creators')
-    .select('id, simli_face_id, heygen_avatar_id, voice_id, voice_id_preview, voice_id_dev, system_prompt, brain_status, tts_speed, brain_mode')
+    .select(`
+      id, simli_face_id, heygen_avatar_id,
+      voice_id, voice_id_preview, voice_id_dev,
+      hume_voice_id, hume_voice_id_preview, hume_voice_id_dev,
+      hume_voice_name, hume_voice_name_preview, hume_voice_name_dev,
+      hume_tts_speed, hume_tts_speed_preview, hume_tts_speed_dev,
+      hume_trailing_silence, hume_trailing_silence_preview, hume_trailing_silence_dev,
+      hume_voice_description, hume_voice_description_preview, hume_voice_description_dev,
+      hume_model_version, hume_model_version_preview, hume_model_version_dev,
+      system_prompt, brain_status, tts_speed, brain_mode
+    `)
     .eq('id', creatorId)
     .maybeSingle<{
       id: string;
@@ -113,6 +130,24 @@ export async function POST(req: NextRequest) {
       voice_id: string | null;
       voice_id_preview: string | null;
       voice_id_dev: string | null;
+      hume_voice_id: string | null;
+      hume_voice_id_preview: string | null;
+      hume_voice_id_dev: string | null;
+      hume_voice_name: string | null;
+      hume_voice_name_preview: string | null;
+      hume_voice_name_dev: string | null;
+      hume_tts_speed: number | string | null;
+      hume_tts_speed_preview: number | string | null;
+      hume_tts_speed_dev: number | string | null;
+      hume_trailing_silence: number | string | null;
+      hume_trailing_silence_preview: number | string | null;
+      hume_trailing_silence_dev: number | string | null;
+      hume_voice_description: string | null;
+      hume_voice_description_preview: string | null;
+      hume_voice_description_dev: string | null;
+      hume_model_version: string | null;
+      hume_model_version_preview: string | null;
+      hume_model_version_dev: string | null;
       system_prompt: string | null;
       brain_status: 'pending' | 'queued' | 'training' | 'ready' | 'errored';
       // numeric → string coercion (R2 audit C3). See open route.ts:165
@@ -124,14 +159,41 @@ export async function POST(req: NextRequest) {
   if (creatorErr) return json(500, { error: 'creator_lookup_failed' });
   if (!creatorRow) return json(404, { error: 'creator_not_found' });
 
-  // PR-2 audit C3: pre-gate Cartesia voice_id on rollover, mirror open
-  // route. Without this, a creator whose voice clone was deleted between
-  // session-open and rollover dies at proxy-WS 4009 cartesia_no_voice
-  // mid-conversation. User hits the 15-min cap and gets a hard cut.
-  const envVoiceId = resolveVoiceId(creatorRow);
-  const { useCartesia } = await getProxyVoiceConfig();
-  if (useCartesia && !envVoiceId) {
-    return json(409, { error: 'creator_voice_not_trained' });
+  // HUME_TTS_PLAN §6.2 — rollover reads sessions.tts_provider_at_session
+  // from the OLD session row (snapshot at original /api/sessions/open).
+  // Pre-migration sessions have NULL → fall back to 'cartesia' (the only
+  // provider that existed). NEVER call getProxyVoiceConfig() for provider:
+  // the env may have flipped between open and rollover, but the session is
+  // locked to its open-time snapshot (CLAUDE.md "Tier routing at session-
+  // open only" — same rule applies).
+  const { data: oldProviderRow } = await admin
+    .from('sessions')
+    .select('tts_provider_at_session')
+    .eq('id', oldId)
+    .maybeSingle<{ tts_provider_at_session: 'cartesia' | 'hume' | null }>();
+  const sessionProvider: 'cartesia' | 'hume' =
+    oldProviderRow?.tts_provider_at_session ?? 'cartesia';
+
+  // PR-2 audit C3: pre-gate the env-scoped voice column on rollover, mirror
+  // open route. Without this, a creator whose voice clone was deleted between
+  // session-open and rollover dies at proxy-WS 4009/4014 mid-conversation.
+  // Audit M5: 503 instead of risking a wrong-provider ticket when the proxy
+  // is unreachable.
+  const envVoiceId = resolveVoiceId(creatorRow, undefined, sessionProvider);
+  const proxyCfgR = await getProxyVoiceConfig();
+  if (proxyCfgR.failOpen) {
+    return json(503, { error: 'voice_proxy_unreachable' });
+  }
+  const useTtsLayer = proxyCfgR.useTtsLayer;
+  // Audit C4 — same predicate as proxy `useTts = useTtsLayer ||
+  // ttsProvider === 'hume'`. A hume-override creator whose env-scoped
+  // voice id is NULL must 409 here too, not slip to WS-open.
+  const useTts = useTtsLayer || sessionProvider === 'hume';
+  if (useTts && !envVoiceId) {
+    return json(409, {
+      error: 'creator_voice_not_trained',
+      tts_provider: sessionProvider,
+    });
   }
 
   // Brain readiness gate — same shape + semantics as sessions/open
@@ -191,6 +253,21 @@ export async function POST(req: NextRequest) {
   const newSessionId = row.new_session_id as string;
   const tier = row.tier as 'free' | 'premium' | 'boardroom';
   const dailyLimitRemaining = (row.daily_limit_remaining_s as number) ?? 0;
+
+  // HUME_TTS_PLAN §6.2 — propagate the OLD session's provider snapshot onto
+  // the NEW session row. session_rollover RPC doesn't write this column;
+  // we write it here so cogs_insert_turn_voice_v2 cross-checks succeed on
+  // the new session's first turn.
+  try {
+    await admin
+      .from('sessions')
+      .update({ tts_provider_at_session: sessionProvider })
+      .eq('id', newSessionId);
+  } catch (e) {
+    Sentry.captureException(e, {
+      extra: { op: 'sessions_rollover_tts_provider_snapshot', session_id: newSessionId, tts_provider: sessionProvider },
+    });
+  }
 
   // Avatar provider: read the OLD session's snapshot column (post-build
   // audit M1). resolveAvatarProvider(tier) would re-evaluate via env,
@@ -441,14 +518,27 @@ export async function POST(req: NextRequest) {
       systemPrompt:   resolvedSystemPrompt,
       prefixTurns:    brainPrefix?.prefixTurns ?? null,
       brainMode:      creatorRow.brain_mode,
-      // Creator voice-speed (migration 20260511000006). See open route
-      // for full rationale on the numeric→string coercion.
-      ttsSpeed: (() => {
-        const raw = creatorRow.tts_speed;
-        if (raw == null) return null;
-        const n = typeof raw === 'number' ? raw : Number(raw);
-        return Number.isFinite(n) ? n : null;
-      })(),
+      // Creator voice-speed (migration 20260511000006). Shared coercion
+      // helper — see env-scoped-voice-id.ts.
+      ttsSpeed: coerceNumericOrNull(creatorRow.tts_speed),
+      // HUME_TTS_PLAN §6.3 — provider locked to the OLD session's snapshot.
+      // Hume prosody pulled from creators' env-scoped columns at rollover
+      // time (admin can dial speed/silence mid-creator-life; the rolled-over
+      // session picks up the new value).
+      ttsProvider: sessionProvider,
+      humeTtsSpeed: sessionProvider === 'hume'
+        ? coerceNumericOrNull(pickEnvScoped(creatorRow, 'hume_tts_speed'))
+        : null,
+      humeTrailingSilence: sessionProvider === 'hume'
+        ? coerceNumericOrNull(pickEnvScoped(creatorRow, 'hume_trailing_silence'))
+        : null,
+      humeVoiceDescription: sessionProvider === 'hume'
+        ? (pickEnvScoped(creatorRow, 'hume_voice_description') as string | null)
+        : null,
+      humeModelVersion: sessionProvider === 'hume'
+        // Audit M3 (unit-wide) — default to '2' (Octave 2) when null.
+        ? ((pickEnvScoped(creatorRow, 'hume_model_version') as string | null) || '2')
+        : null,
     });
   } catch (e) {
     Sentry.captureException(e, { extra: { op: 'sessions_rollover_voice_ticket', session_id: newSessionId } });
