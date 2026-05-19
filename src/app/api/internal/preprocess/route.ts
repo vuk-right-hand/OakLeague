@@ -33,7 +33,7 @@ import { NextResponse, type NextRequest } from 'next/server';
 import { randomUUID } from 'node:crypto';
 import * as Sentry from '@sentry/nextjs';
 import { z } from 'zod';
-import { preprocessRawText } from '@/lib/voice/preprocess';
+import { preprocessRawTextWithReport } from '@/lib/voice/preprocess';
 import { checkInternalAuth } from '@/lib/internal-api-auth';
 
 export const runtime = 'nodejs';
@@ -77,19 +77,46 @@ export async function POST(req: NextRequest) {
 
   try {
     const t0 = Date.now();
-    // preprocessRawText composes stripSlideMarkers + sanitizeForLLMPrompt.
-    // Pure CPU. Idempotent — calling it on already-sanitized text returns
-    // the same bytes (caller is allowed to defensively re-call).
-    const sanitized = preprocessRawText(parsed.data.raw_text);
+    // preprocessRawTextWithReport composes stripSlideMarkers →
+    // sanitizeForLLMPrompt → L0 (P0-5/P1-7 index-time injection
+    // neutralization). Pure CPU. Idempotent — calling it on
+    // already-sanitized text returns the same bytes (the route's
+    // defensive-re-call contract; L0's MIDDLE-DOT defang no longer
+    // matches its bare-letter pattern). `.text` is the CANONICAL byte
+    // representation the worker passes to narrative-chunk + contextual-gen.
+    const { text: sanitized, injectionNeutralized, injectionCategories } =
+      preprocessRawTextWithReport(parsed.data.raw_text);
     const ms = Date.now() - t0;
 
-    // Defensive: if sanitizer stripped everything to whitespace, surface
-    // an explicit 400 — caller can mark the sample as fetch_status='errored'.
+    // Defensive: if the STRUCTURAL sanitizer stripped everything to
+    // whitespace, surface an explicit 400 — caller can mark the sample
+    // fetch_status='errored'. (Combined-audit M4: L0 cannot reach this
+    // path — it only ever INSERTS a U+00B7, never deletes, so it cannot
+    // turn non-empty input empty. The empty case is purely structural.)
     if (!sanitized || sanitized.trim().length === 0) {
       return jsonError('empty_after_sanitize', 400, requestId, {
         retryable: false,
         message: 'raw_text was empty or pure structural noise after sanitization',
       });
+    }
+
+    // L0 scan signal — verified best practice is data-provenance +
+    // operator VISIBILITY, not silent sanitize. A poisoned sample is
+    // still processed (neutralized in place, never rejected — north-star
+    // voice fidelity), but a heavily-poisoned corpus is surfaced to
+    // Sentry so an admin can review the source before it ships.
+    if (injectionNeutralized > 0) {
+      // Tag rides any later Sentry event in this request; the durable
+      // provenance is the response field below (the embed-worker
+      // persists it for admin review). console.warn is the always-on
+      // operator trail. Deliberately NOT a per-sample Sentry event — an
+      // initial reprocess of adversarial-quoting content would be noisy;
+      // visibility is proportionate (tag + log + persisted count).
+      Sentry.setTag('l0_injection_neutralized', String(injectionNeutralized));
+      console.warn(
+        `[preprocess] ${requestId} L0 neutralized ${injectionNeutralized} injection span(s) ` +
+          `(creator=${parsed.data.creator_id} categories=${injectionCategories.join(',')})`,
+      );
     }
 
     return NextResponse.json(
@@ -98,6 +125,10 @@ export async function POST(req: NextRequest) {
         ms,
         request_id: requestId,
         retryable: false,
+        // P1-7 — scan signal echoed so the embed-worker can persist it
+        // alongside the sample (corpus provenance / admin review).
+        injection_neutralized: injectionNeutralized,
+        injection_categories: injectionCategories,
       },
       { status: 200, headers: { 'cache-control': 'no-store' } },
     );

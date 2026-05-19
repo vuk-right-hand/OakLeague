@@ -278,6 +278,15 @@ await provisionPricing();
 // proxy start cleanly, then silently degrade every v2 turn to persona-only
 // when the first call fires. Hard-exit here keeps the dogfood path honest.
 // Skip when v2 is intentionally not wired (default for prod until Day-15).
+// DECOUPLED_BRAIN_PLAN P1-6 (audit M6). The orchestrator abandons the
+// retrieval wait at this ceiling (persona-only degrade so the deep
+// answer starts immediately — no dead air after the hedge). The
+// retrieval HTTP budget MUST be locked to the SAME value: a larger
+// budget = the orchestrator gives up at 2500ms while the v2 shim keeps
+// running and BILLING to 4000ms producing a result nobody consumes.
+// P0 measured retrieve p95 ≈ 2022ms so the common case clears with
+// margin; the tail is bounded and billing-capped, not a silent leak.
+const DECOUPLED_RETRIEVE_CEILING_MS = 2500;
 const RAG_V2_PROXY_ENABLED = process.env.RAG_V2_PROXY_ENABLED === '1';
 if (RAG_V2_PROXY_ENABLED) {
   if (!process.env.RAG_V2_SHIM_URL) {
@@ -1182,6 +1191,12 @@ wss.on('connection', async (ws, req) => {
         // if the bind ever gains a staging override.
         || decoupled
         || process.env.BRAIN_ENABLE_INPUT_TRANSCRIPTION_DRAWER === '1',
+      // DECOUPLED_BRAIN_PLAN P1-6 (audit C1) — D-GoAway proactive
+      // resumption-handle reopen is ONLY safe on the STT-only decoupled
+      // path (no persona/prefix re-seed → regression-immune). Passing the
+      // once-bound `decoupled` const (L877) hard-gates it: legacy keeps
+      // its audited reactive-only reopen, byte-identical pre-P1-6.
+      decoupled,
     });
     console.log(`[ws ${connId}] gemini.open start (tts_layer=${useTtsLayer} useTts=${useTts} provider=${ttsProvider} brain=${consumed.brainMode} decoupled=${decoupled})`);
     const t0 = Date.now();
@@ -1584,6 +1599,7 @@ wss.on('connection', async (ws, req) => {
   // barge-in, never silence/error to the user.
   let decoupledOrch = null;
   let decoupledFatalFired = false; // audit C2 — onFatal idempotency latch
+  let goAwayReopenFailedFired = false; // audit NEW-M5 — fail teardown one-shot
   if (decoupled) {
     // Audit M5 — decoupled REQUIRES the α' TTS layer (the deep answer is
     // spoken in the creator's cloned voice; CLAUDE.md hard rule). The
@@ -1610,7 +1626,7 @@ wss.on('connection', async (ws, req) => {
           result = await callRetrieveKnowledgeV2({
             userId: ticketUserId, creatorId: ticketCreatorId, sessionId,
             rawUtterance: question, lastAssistantResponse: lastAssistantResponseClosure,
-            corpusVersionAtSession, budgetMs: 4000, signal,
+            corpusVersionAtSession, budgetMs: DECOUPLED_RETRIEVE_CEILING_MS, signal,
           });
         } else {
           result = await retrieveTopK({
@@ -1673,6 +1689,12 @@ wss.on('connection', async (ws, req) => {
         closeWs(ws, 1011, 'cogs_misconfig');
       },
       onPersonaNull: () => console.warn(`[ws ${connId}] brain_persona_null decoupled session=${sessionId.slice(0, 8)}`),
+      // Audit M6 — explicitly LOCK the orchestrator's retrieval ceiling
+      // to the same constant the retrieve HTTP budget uses (above), so
+      // the two can never drift: the orchestrator stops waiting at
+      // exactly the point the shim self-cancels + the retrieve abort
+      // fires (orchestrator side), killing the wasted billing tail.
+      retrieveCeilingMs: DECOUPLED_RETRIEVE_CEILING_MS,
       log: {
         warn: (m) => console.warn(`[ws ${connId}] ${m}`),
         error: (m) => console.error(`[ws ${connId}] ${m}`),
@@ -1797,6 +1819,41 @@ wss.on('connection', async (ws, req) => {
       }
     } else if (e.kind === 'error') {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'error', at: e.at, message: e.message }));
+    } else if (e.kind === 'go_away') {
+      // DECOUPLED_BRAIN_PLAN P1-6 — observability only. The bridge owns
+      // the proactive resumption-handle reopen at the next VAD-silence;
+      // nothing for the proxy to do but record the advance warning.
+      console.log(`[ws ${connId}] gemini go_away timeLeftMs=${e.timeLeftMs} reopen_in_ms=${e.deadlineInMs} session=${sessionId.slice(0, 8)}`);
+    } else if (e.kind === 'go_away_reopen') {
+      // The bridge's intentional close is suppressed (no 'closed'
+      // event); we only see start/ok/fail/aborted_user_closed. ok ⇒
+      // fresh session, next turn_start is seamless. fail ⇒ the session
+      // is genuinely past the cap and unrecoverable (the reactive
+      // 1000-close fallback cannot help) → tear down cleanly instead of
+      // a server ABORTED.
+      if (e.phase === 'fail') {
+        // Audit NEW-M5 — one-shot (mirrors decoupledFatalFired). The
+        // synchronous `closed` latch + the `if (closed) return` at the
+        // top of this handler already prevent a second teardown, but a
+        // dedicated latch keeps captureException / upstream_closed /
+        // closeWs provably single-fire and matches the decoupled-fatal
+        // pattern the codebase already uses for this exact hazard.
+        if (goAwayReopenFailedFired) return;
+        goAwayReopenFailedFired = true;
+        console.error(`[ws ${connId}] gemini go_away_reopen FAILED (${e.reason}): ${e.message} — tearing down`);
+        captureException(new Error('go_away_reopen_failed'), { op: 'gemini.go_away_reopen', sessionId, reason: e.reason });
+        if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'upstream_closed', at: e.at, code: 1011, reason: 'go_away_reopen_failed' }));
+        teardown('go_away_reopen_failed').catch(() => {});
+        closeWs(ws, 1011, 'go_away_reopen_failed');
+      } else if (e.phase === 'aborted_user_closed') {
+        // Audit M5 — the user closed mid-bounce. EXPECTED outcome, not a
+        // failure: the user-close path owns its own teardown. Do NOT
+        // captureException (phantom Sentry on every hangup-during-goAway)
+        // and do NOT send upstream_closed / fire a racing teardown.
+        console.log(`[ws ${connId}] gemini go_away_reopen aborted (user closed mid-bounce, ${e.reason}) session=${sessionId.slice(0, 8)}`);
+      } else {
+        console.log(`[ws ${connId}] gemini go_away_reopen ${e.phase} (${e.reason}) session=${sessionId.slice(0, 8)}`);
+      }
     } else if (e.kind === 'closed') {
       // Phase 0.5 fix (2026-05-07). Google's js-genai#707 closes the
       // Gemini WS with code=1000 after a turn instead of holding it
@@ -2085,7 +2142,13 @@ wss.on('connection', async (ws, req) => {
         // north star. Wait (bounded) for the orchestrator to finish
         // speaking the turn. Decoupled-only ⇒ legacy path byte-identical.
         if (decoupled && decoupledOrch) {
-          try { await decoupledOrch.awaitTurnSpoken(msg.timeoutMs || 30_000); }
+          // Audit Small — floor the wait at 5s. A buggy/malicious client
+          // sending a tiny timeoutMs would otherwise let continue:false
+          // race ahead of the deep answer = the exact C1 truncation this
+          // gate exists to prevent. Client cannot shrink it below 5s;
+          // can still extend it (e.g. 60s) for a long answer.
+          const spokenWaitMs = Math.max(msg.timeoutMs || 30_000, 5_000);
+          try { await decoupledOrch.awaitTurnSpoken(spokenWaitMs); }
           catch (e) { captureException(e, { op: 'decoupled.awaitTurnSpoken', sessionId }); }
         }
         let ttsMetrics = null;

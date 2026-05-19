@@ -73,6 +73,98 @@ export const INJECTION_MAX_BYTES = 4096;
 // it, re-derive the second-equivalent ceiling and tighten R4-C2 mapping.
 export const OUTPUT_TRANSCRIPT_MAX_CHARS = 4000;
 
+// ── D-GoAway (DECOUPLED_BRAIN_PLAN P1-6) ────────────────────────────────
+//
+// Gemini Live sends `serverContent`-sibling `goAway{timeLeft}` ~60s
+// BEFORE it terminates the SESSION (doc-verified ai.google.dev/api/live
+// + ai.google.dev/gemini-api/docs/live-session, 2026-05-19 — NOT a
+// 10-min connection-lifetime warning; it precedes session end by ~60s).
+// Ignoring it = the next close arrives as ABORTED mid-turn. Recovery:
+// retain the freshest `sessionResumptionUpdate.newHandle` and reconnect
+// with it; the resumption token is valid for 2h.
+//
+// HARD-GATED to `this._decoupled` (audit C1). On the legacy/coupled path
+// reopen() re-seeds the persona + up-to-60KB topic-drawer prefix and the
+// gemini-3.1-flash-live-preview ~200-token resumption regression is only
+// verified safe for the AUDITED reactive 1000-close path — NOT a
+// proactive mid-session bounce with a 60KB re-seed. Decoupled STT Live
+// carries NO systemInstruction/history → reopen() is the trivial,
+// regression-immune case, so the proactive bounce is sound there only.
+//
+// Strategy (plan §7/§12 D-GoAway): on `goAway`, do NOT reopen
+// immediately — defer to the next VAD-silence (`turn_complete`, the
+// manual-VAD turn boundary) so the reopen never lands mid-utterance and
+// never loses an in-flight input transcript (audit C2). A hard fallback
+// timer at `timeLeft − margin` forces the reopen if no turn_complete
+// arrives first (a controlled resumption-handle reopen beats a server
+// ABORTED) — but it DEFERS while an utterance is in flight (C2).
+const GOAWAY_SAFETY_MARGIN_MS = (() => {
+  const o = parseInt(process.env.GOAWAY_SAFETY_MARGIN_MS_OVERRIDE || '', 10);
+  return Number.isFinite(o) && o >= 250 && o <= 30000 ? o : 2000;
+})();
+// If timeLeft is absent/unparseable, do NOT trust a large window — assume
+// little time and let the next turn_complete (usually within seconds)
+// drive the reopen; this is only the fallback-timer seed.
+const GOAWAY_FALLBACK_DEFAULT_MS = 8000;
+
+// Audit M3 — sane upper bound on a parsed timeLeft. GoAway precedes
+// session end by ~60s; the audio-session cap is 15min. Anything beyond
+// 20min is implausible as a *seconds* Duration and almost certainly
+// means the SDK surfaced the value in a different unit (e.g. ms). When
+// the seconds-assumption yields a value past this, we DON'T trust it —
+// fall back to the conservative default so the deferred turn_complete
+// path (usually within seconds) drives the reopen, instead of arming an
+// effectively-never-firing fallback timer that lets the server ABORT.
+// P1-9 real-API gated test empirically pins the true wire form.
+const GOAWAY_MAX_PLAUSIBLE_MS = 20 * 60 * 1000;
+
+// timeLeft is a protobuf Duration. Sources diverge on the wire form
+// (proto3-JSON canonical = string "3.5s"; raw proto = {seconds,nanos};
+// some SDK builds surface a number). Parse ALL three defensively; never
+// throw — an unparseable / implausible value falls back to the
+// conservative default. A NEGATIVE duration is also treated as
+// unparseable (it must NOT collapse to 0 ⇒ immediate mid-utterance
+// reopen — audit Small).
+export function parseGoAwayTimeLeftMs(timeLeft) {
+  if (timeLeft == null) return GOAWAY_FALLBACK_DEFAULT_MS;
+  if (typeof timeLeft === 'number' && Number.isFinite(timeLeft)) {
+    if (timeLeft < 0) return GOAWAY_FALLBACK_DEFAULT_MS;
+    // Duration convention = seconds. If the seconds-assumption produces
+    // an implausibly large window the value is not seconds — don't trust.
+    const ms = Math.round(timeLeft * 1000);
+    return ms > GOAWAY_MAX_PLAUSIBLE_MS ? GOAWAY_FALLBACK_DEFAULT_MS : ms;
+  }
+  if (typeof timeLeft === 'string') {
+    const m = /^(-?\d+(?:\.\d+)?)s?$/.exec(timeLeft.trim());
+    if (m) {
+      const v = parseFloat(m[1]);
+      if (!Number.isFinite(v) || v < 0) return GOAWAY_FALLBACK_DEFAULT_MS;
+      const ms = Math.round(v * 1000);
+      return ms > GOAWAY_MAX_PLAUSIBLE_MS ? GOAWAY_FALLBACK_DEFAULT_MS : ms;
+    }
+    return GOAWAY_FALLBACK_DEFAULT_MS;
+  }
+  if (typeof timeLeft === 'object') {
+    // Audit NEW-S2 — a PRESENT but non-finite field is garbage, not a
+    // zero. Don't silently drop a bad `seconds` and trust `nanos` alone
+    // (that yields a tiny ms ⇒ near-immediate mid-utterance deadline).
+    // Unparseable → conservative fallback, per the function contract.
+    const secsRaw = timeLeft.seconds;
+    const nanosRaw = timeLeft.nanos;
+    const secs = Number(secsRaw ?? 0);
+    const nanos = Number(nanosRaw ?? 0);
+    const secsBad = secsRaw != null && !Number.isFinite(secs);
+    const nanosBad = nanosRaw != null && !Number.isFinite(nanos);
+    if (!secsBad && !nanosBad && (Number.isFinite(secs) || Number.isFinite(nanos))) {
+      const ms = Math.round((Number.isFinite(secs) ? secs : 0) * 1000
+        + (Number.isFinite(nanos) ? nanos : 0) / 1e6);
+      if (ms < 0) return GOAWAY_FALLBACK_DEFAULT_MS;
+      return ms > GOAWAY_MAX_PLAUSIBLE_MS ? GOAWAY_FALLBACK_DEFAULT_MS : ms;
+    }
+  }
+  return GOAWAY_FALLBACK_DEFAULT_MS;
+}
+
 export class GeminiBridge extends EventEmitter {
   constructor({
     apiKey,
@@ -84,6 +176,19 @@ export class GeminiBridge extends EventEmitter {
     // per-turn audio duration so the proxy heuristic can detect Gemini's
     // ~100-chunk truncation (R3 M2 fix).
     enableInputTranscription = false,
+    // D-GoAway (P1-6, audit C1). The proactive resumption-handle reopen
+    // is ONLY safe on the decoupled STT-only path: it carries NO
+    // systemInstruction / brainPrefix, so reopen() is the trivial,
+    // regression-immune case. On the legacy/coupled path open() re-seeds
+    // the creator persona + up-to-60KB topic-drawer prefix on every
+    // (re)connect, and the gemini-3.1-flash-live-preview ~200-token
+    // resumption regression is only verified safe for the AUDITED
+    // reactive js-genai#707 1000-close path — NOT a proactively-induced
+    // mid-session bounce with a 60KB re-seed. So D-GoAway is HARD-GATED
+    // off unless decoupled: legacy keeps its byte-identical pre-P1-6
+    // reactive-only reopen behavior. Default false ⇒ inert in prod
+    // (creators.decoupled default false, no route writer yet).
+    decoupled = false,
   } = {}) {
     super();
     if (!apiKey) throw new Error('GEMINI_API_KEY missing');
@@ -91,6 +196,7 @@ export class GeminiBridge extends EventEmitter {
     this._enableOutputTranscription = !!enableOutputTranscription;
     this._discardAudioOut = !!discardAudioOut;
     this._enableInputTranscription = !!enableInputTranscription;
+    this._decoupled = !!decoupled;
     this._session = null;
     this._inputBytes = 0;
     this._outputBytes = 0;
@@ -107,6 +213,11 @@ export class GeminiBridge extends EventEmitter {
     this._currentTurnReceivedContent = false;
     this._setupCompleteAt = null;
     this._closed = false;
+    // Audit NEW-S1 — explicit init for consistency with every other
+    // lifecycle flag (set true only by close()). Read by _proactiveReopen
+    // / _reopenImpl before close() ever runs; `undefined` was falsy-safe
+    // but the M5 contract should be self-documenting.
+    this._userClosed = false;
     // usageMetadata capture (M8). Gemini Live emits usageMetadata on server
     // messages where `promptTokenCount` is the CUMULATIVE count of the entire
     // conversation history up to that message (not a per-message delta).
@@ -157,6 +268,43 @@ export class GeminiBridge extends EventEmitter {
     // _onMessage, but tracking explicitly so a future refactor can't
     // silently reorder).
     this._pendingInputTranscriptionThisTurn = null;
+    // D-GoAway (P1-6). Set when the server sends `goAway`; the reopen is
+    // deferred to the next turn_complete (VAD-silence) or, failing that,
+    // the hard fallback timer at timeLeft−margin. `_goAwayReopenInFlight`
+    // makes the proactive bounce idempotent AND tells onclose to suppress
+    // the `closed` event for our OWN intentional close (so the proxy's
+    // reactive teardown/lazy-reopen path does not fight it). All inert
+    // unless `this._decoupled` (audit C1).
+    this._goAwayPending = false;
+    this._goAwayTimer = null;
+    this._goAwayReopenInFlight = false;
+    // Audit C2 — true between turnStart() and the matching turn_complete
+    // (manual-VAD utterance window). 3.1 Live emits inputTranscription
+    // ONCE at end-of-utterance; force-closing mid-utterance (deadline
+    // fallback) destroys the user's entire question on the decoupled
+    // path → dead air. The deadline fallback defers while this is true.
+    this._utteranceInFlight = false;
+    // Audit C2 — bounded re-arm count so a pathological >timeLeft
+    // monologue still force-reopens eventually (a controlled reopen that
+    // loses one in-flight question still beats an uncontrolled server
+    // ABORTED that loses it AND wedges the next turn).
+    this._goAwayDeadlineRetries = 0;
+    // Audit C3 — monotonically-increasing session generation. The
+    // onclose closure captures the gen it was created under; a stale
+    // OLD-session close that fires AFTER a newer session exists (the
+    // _proactiveReopen fire-and-forget-close → reopen race) is a complete
+    // no-op so it cannot clobber `_closed`, emit a phantom `closed`, or
+    // tear down a perfectly healthy NEW session. Inert on legacy: the
+    // reactive lazy-reopen path is sequential (old session fully closed
+    // before reopen is even called) so sessions never overlap → the gen
+    // guard never triggers and behavior is byte-identical pre-P1-6.
+    this._sessionGen = 0;
+    // Audit M1/M2 — reopen() reentrancy coalescing. Both the proactive
+    // D-GoAway bounce and the proxy's lazy turn_start reopen can call
+    // reopen() concurrently; without coalescing that is two ai.live.connect
+    // calls + resumption-handle replay + two live sessions. All callers
+    // share the one in-flight reopen promise.
+    this._reopenInFlight = null;
   }
 
   // Brain wire-up (PR-2). Surface seed-replay metrics to the proxy at
@@ -227,28 +375,23 @@ export class GeminiBridge extends EventEmitter {
     // to no-op + revert turnEnd() to `audioStreamEnd: true`. One-line env
     // flag could gate this if multi-turn ever genuinely regresses.
     config.realtimeInputConfig = { automaticActivityDetection: { disabled: true } };
+    // Audit C3 — the generation this session's callbacks belong to.
+    // Captured by the onclose/onerror closures so a stale OLD-session
+    // event that fires after a newer session exists is a no-op.
+    const myGen = ++this._sessionGen;
     this._session = await ai.live.connect({
       model,
       config,
       callbacks: {
         onopen: () => {},
         onmessage: (m) => this._onMessage(m),
-        onerror: (ev) => this.emit('event', {
-          kind: 'error', at: Date.now(), message: ev?.message || 'ws_error', fatal: true,
-        }),
-        onclose: (ev) => {
-          this._closed = true;
-          // js-genai#707 workaround: if Gemini sent us content this turn
-          // and is now closing normally without a turnComplete, synthesize
-          // one so turnEnd resolves. Strict gate: code=1000 + content seen.
-          // Any other close path (errors, mid-turn drops with no content)
-          // still rejects the awaiting promise as before.
-          if (ev?.code === 1000 && this._currentTurnReceivedContent) {
-            console.warn(`[google-live-workaround] synthesizing turn_complete on code=1000 close (sessionId=${this._sessionId})`);
-            this.emit('event', { kind: 'turn_complete', at: Date.now() });
-          }
-          this.emit('event', { kind: 'closed', at: Date.now(), code: ev?.code, reason: ev?.reason });
-        },
+        // Closures capture the generation this session was opened under;
+        // the handlers no-op a superseded session (audit C3). Extracted
+        // to methods so the close/error race surface is unit-testable
+        // without a live ai.live.connect (same DI philosophy as the
+        // decoupled orchestrator).
+        onerror: (ev) => this._onSessionError(myGen, ev),
+        onclose: (ev) => this._onSessionClose(myGen, ev),
       },
     });
 
@@ -400,6 +543,80 @@ export class GeminiBridge extends EventEmitter {
     };
   }
 
+  // Extracted from open()'s onerror closure (audit C3 — testable seam).
+  // `myGen` is the session generation captured at open() time.
+  _onSessionError(myGen, ev) {
+    // Audit C3 — ignore a superseded session's error.
+    if (myGen !== this._sessionGen) return;
+    // Audit NEW-M4 — north star: a failure must not reach the user as
+    // silence/error if it is recoverable. If a goAway was already
+    // pending (we are in the ~60s pre-cap window) and we hold a valid
+    // resumption handle, an error here is far more likely the cap
+    // arriving early than an unrecoverable fault — prefer the
+    // resumption-handle reopen over guaranteeing teardown.
+    // _proactiveReopen fails CLEANLY (go_away_reopen:fail → proxy
+    // teardown) if the handle is dead, so this is strictly safer than
+    // wiping state and tearing down without trying. Decoupled-only
+    // (goAway only arms when decoupled) ⇒ legacy path unchanged: it
+    // still emits the fatal error exactly as the pre-P1-6 closure did.
+    if (this._decoupled && this._goAwayPending && this._sessionResumeHandle
+        && !this._userClosed && !this._goAwayReopenInFlight) {
+      setImmediate(() => this._proactiveReopen('error'));
+      return;
+    }
+    // Not recoverable (no goAway window / no handle / legacy / already
+    // bouncing). A fatal error makes any armed goAway fallback timer
+    // moot; clearing it prevents a post-teardown _proactiveReopen
+    // against a dead session.
+    if (this._goAwayTimer) { clearTimeout(this._goAwayTimer); this._goAwayTimer = null; }
+    this._goAwayPending = false;
+    this._goAwayDeadlineRetries = 0;
+    this.emit('event', {
+      kind: 'error', at: Date.now(), message: ev?.message || 'ws_error', fatal: true,
+    });
+  }
+
+  // Extracted from open()'s onclose closure (audit C3/M2 — testable
+  // seam). `myGen` is the session generation captured at open() time.
+  _onSessionClose(myGen, ev) {
+    // Audit C3 — a stale OLD-session close that arrives AFTER a newer
+    // session exists (the _proactiveReopen fire-and-forget close→reopen
+    // race) must NOT clobber the live session's `_closed`, synthesize a
+    // phantom turn_complete, or emit a `closed` that tears down a
+    // healthy NEW session. Hard no-op.
+    if (myGen !== this._sessionGen) return;
+    this._closed = true;
+    // D-GoAway (P1-6): this close is OUR intentional proactive bounce
+    // (close→reopen with the resumption handle). Suppress the `closed`
+    // event entirely so the proxy's reactive teardown / lazy-reopen path
+    // does not fight the bridge's proactive reopen (a non-1000 SDK close
+    // code would otherwise tear down a perfectly recoverable user
+    // session). The reopen() that follows emits go_away_reopen:ok/fail.
+    if (this._goAwayReopenInFlight) return;
+    // Audit M2 — this is a REAL upstream close (NOT our suppressed
+    // bounce) and the gen guard above proved it is the live session. If
+    // a goAway was pending, the proactive timer would ALSO fire
+    // _proactiveReopen → two ai.live.connect + handle replay. The
+    // connection is already gone; the proactive bounce is moot. Cancel
+    // it and let the reactive path (1000 ⇒ proxy lazy reopen on next
+    // turn_start; non-1000 ⇒ teardown) own it.
+    if (this._goAwayPending || this._goAwayTimer) {
+      if (this._goAwayTimer) { clearTimeout(this._goAwayTimer); this._goAwayTimer = null; }
+      this._goAwayPending = false;
+      this._goAwayDeadlineRetries = 0;
+    }
+    // js-genai#707 workaround: if Gemini sent us content this turn and
+    // is now closing normally without a turnComplete, synthesize one so
+    // turnEnd resolves. Strict gate: code=1000 + content seen. Any other
+    // close path (errors, mid-turn drops with no content) still rejects
+    // the awaiting promise as before.
+    if (ev?.code === 1000 && this._currentTurnReceivedContent) {
+      console.warn(`[google-live-workaround] synthesizing turn_complete on code=1000 close (sessionId=${this._sessionId})`);
+      this.emit('event', { kind: 'turn_complete', at: Date.now() });
+    }
+    this.emit('event', { kind: 'closed', at: Date.now(), code: ev?.code, reason: ev?.reason });
+  }
+
   _onMessage(m) {
     if (m.setupComplete) {
       this._setupCompleteAt = Date.now();
@@ -516,18 +733,164 @@ export class GeminiBridge extends EventEmitter {
         resumable: sru.resumable !== false, // default true unless explicit false
       });
     }
+    // D-GoAway (P1-6). The server warns it will soon disconnect. Do NOT
+    // reopen now (mid-turn) — arm a hard fallback timer and let the next
+    // turn_complete (VAD-silence) drive a clean resumption-handle reopen.
+    // Idempotent: a repeated goAway just refreshes the deadline.
+    // Audit C1 — HARD-GATED to decoupled: the proactive reopen's safety
+    // proof ("no history → regression-immune") only holds on the
+    // STT-only path. On legacy this whole block is dead code, so the
+    // legacy path is byte-identical to its pre-P1-6 reactive-only reopen.
+    if (this._decoupled && m?.goAway && !this._goAwayReopenInFlight) {
+      const timeLeftMs = parseGoAwayTimeLeftMs(m.goAway.timeLeft);
+      // Audit NEW-M2 — only reset the bounded re-arm counter on the
+      // FIRST goAway of a window. A repeated/refreshing goAway (the
+      // server re-warns as the cap nears) must NOT reset the 3-retry
+      // bound, else a server that re-warns each turn defeats C2's bound
+      // entirely and the deadline never force-reopens → server ABORT.
+      if (!this._goAwayPending) this._goAwayDeadlineRetries = 0;
+      this._goAwayPending = true;
+      // Audit NEW-S4 — compute once so the armed delay and the emitted
+      // deadlineInMs provably cannot diverge under a future edit.
+      const deadlineInMs = Math.max(0, timeLeftMs - GOAWAY_SAFETY_MARGIN_MS);
+      this._armGoAwayDeadline(deadlineInMs);
+      this.emit('event', { kind: 'go_away', at: Date.now(), timeLeftMs, deadlineInMs });
+    }
     if (m?.serverContent?.interrupted) {
+      // Audit NEW-M1 — barge-in / supersede ends the utterance WITHOUT a
+      // turn_complete (the user moved on). If we leave _utteranceInFlight
+      // true, a pending goAway deadline re-arms 3× against a phantom
+      // utterance, burning the 6s grace while the real cap elapses →
+      // server ABORT (the exact failure C2 exists to prevent). Clear it.
+      this._utteranceInFlight = false;
       this.emit('event', { kind: 'interrupted', at: Date.now() });
     }
     if (m?.serverContent?.turnComplete) {
       this._currentTurnReceivedContent = false;
       this._pendingInputTranscriptionThisTurn = null;
+      // Audit C2 — utterance window closed; the deadline fallback may
+      // now bounce safely (the input transcript for this turn already
+      // arrived just before turnComplete in this same envelope).
+      this._utteranceInFlight = false;
       this.emit('event', { kind: 'turn_complete', at: Date.now() });
+      // D-GoAway (P1-6): turn_complete IS the manual-VAD silence
+      // boundary — the safe place to bounce the connection. Defer the
+      // reopen a tick so every turn_complete listener (notably the
+      // proxy's bridge.turnEnd() await + the decoupled orchestrator's
+      // awaitTurnSpoken gate) runs FIRST, then proactively reopen with
+      // the resumption handle BEFORE the server ABORTS. Decoupled-gated
+      // via the goAway arm above (_goAwayPending only ever set there).
+      if (this._goAwayPending && !this._goAwayReopenInFlight) {
+        setImmediate(() => this._proactiveReopen('vad_silence'));
+      }
+    }
+  }
+
+  // D-GoAway (P1-6, audit C2/M4). Arm/re-arm the hard fallback timer.
+  // NOT unref'd: its on-time firing is the only thing between the user
+  // and a server ABORTED when no turn_complete arrives — deprioritizing
+  // it under event-loop load is an unforced UX risk. It is short-lived
+  // and explicitly cleared on reopen / close / real-close / fresh goAway
+  // so it never outlives its purpose.
+  _armGoAwayDeadline(delayMs) {
+    if (this._goAwayTimer) { clearTimeout(this._goAwayTimer); this._goAwayTimer = null; }
+    this._goAwayTimer = setTimeout(() => {
+      this._goAwayTimer = null;
+      // Audit C2 — NEVER force-close mid-utterance: 3.1 Live emits
+      // inputTranscription once at end-of-utterance, so a force-close
+      // here destroys the user's entire question (decoupled = no answer,
+      // dead air). Re-arm a short grace and let the next turn_complete
+      // drive the clean bounce. Bounded: a pathological monologue that
+      // outlasts every grace eventually force-reopens — a controlled
+      // reopen losing one in-flight question still beats an uncontrolled
+      // server ABORTED that loses it AND wedges the next turn.
+      if (this._utteranceInFlight && this._goAwayDeadlineRetries < 3) {
+        this._goAwayDeadlineRetries += 1;
+        this._armGoAwayDeadline(GOAWAY_SAFETY_MARGIN_MS);
+        return;
+      }
+      // No VAD-silence arrived in time. A controlled reopen still beats
+      // a server ABORTED.
+      this._proactiveReopen('deadline');
+    }, delayMs);
+  }
+
+  // D-GoAway (P1-6). Close → reopen with the stored resumption handle at
+  // a safe boundary. Reuses the existing reopen() machinery; onclose
+  // suppresses the `closed` event while `_goAwayReopenInFlight` so the
+  // proxy never sees this intentional bounce. Decoupled STT Live has no
+  // history/persona → reopen() is the trivial (regression-immune) case.
+  async _proactiveReopen(reason) {
+    if (this._goAwayReopenInFlight || this._userClosed) return;
+    this._goAwayReopenInFlight = true;
+    this._goAwayPending = false;
+    this._goAwayDeadlineRetries = 0;
+    // Audit NEW-M3 — the bounce ends the current utterance window
+    // regardless (a retry-3 force-reopen is, by definition, abandoning
+    // it). Leaving _utteranceInFlight true would make the NEXT goAway on
+    // the resumed session defer 3× against a phantom utterance (NEW-M1
+    // again, on the new session). A real new turn sets it true via
+    // turnStart().
+    this._utteranceInFlight = false;
+    if (this._goAwayTimer) { clearTimeout(this._goAwayTimer); this._goAwayTimer = null; }
+    this.emit('event', { kind: 'go_away_reopen', at: Date.now(), phase: 'start', reason });
+    try {
+      try { this._session?.close(); } catch {}
+      // onclose may not have run yet (close is async); force `_closed`
+      // so reopen() doesn't early-return "already open". Audit C4 — do
+      // NOT null `_currentTurnUsage` / `_currentTurnReceivedContent`
+      // here: that is the server-authoritative token count for a turn
+      // that may still be billing, and nulling it blinds the COGS
+      // kill-switch. reopen() (→ via the new session's turnStart) owns
+      // resetting that state for the NEXT turn; the bounce must leave
+      // the prior turn's billing intact.
+      this._closed = true;
+      // Audit C3 — the STALE OLD-session onclose is neutralized by the
+      // session-generation guard (reopen→open increments _sessionGen so
+      // the old closure's captured gen no longer matches). This
+      // setImmediate is STILL load-bearing (NEW-S3): it orders the old
+      // session's synchronous close-callback portion BEFORE the new
+      // connect, so the new session is built against settled state. Do
+      // NOT remove it as "dead" — the gen-guard handles staleness, this
+      // handles ordering.
+      await new Promise((r) => setImmediate(r));
+      await this.reopen();
+      this.emit('event', { kind: 'go_away_reopen', at: Date.now(), phase: 'ok', reason });
+    } catch (e) {
+      // Audit M5 — if the user closed mid-bounce, reopen() throws
+      // `bridge_user_closed`. That is an EXPECTED abort, not a failure:
+      // emit a distinct non-error phase so the proxy does NOT
+      // captureException / send upstream_closed / fire a second teardown
+      // racing the user-close path's own teardown.
+      if (this._userClosed) {
+        this.emit('event', {
+          kind: 'go_away_reopen', at: Date.now(), phase: 'aborted_user_closed', reason,
+        });
+      } else {
+        // reopen() already dropped the resumption handle on failure. The
+        // session is genuinely dead; surface it so the proxy tears down
+        // (the reactive 1000-close fallback can't help — past the cap).
+        this.emit('event', {
+          kind: 'go_away_reopen', at: Date.now(), phase: 'fail',
+          reason, message: e?.message || 'reopen_failed',
+        });
+      }
+    } finally {
+      // Held TRUE across the entire bounce (old-session close + reopen)
+      // so the OLD session's onclose is suppressed (belt to the gen
+      // guard's braces); reset only once the NEW session is live (or the
+      // bounce failed) — its future onclose must surface normally.
+      this._goAwayReopenInFlight = false;
     }
   }
 
   turnStart() {
     if (!this._session || this._closed) throw new Error('bridge_not_open');
+    // Audit C2 — the manual-VAD utterance window opens here and closes
+    // on the matching turn_complete. While true, the D-GoAway deadline
+    // fallback defers (force-closing now would destroy the in-flight
+    // question — 3.1 Live emits inputTranscription once at end-of-turn).
+    this._utteranceInFlight = true;
     this._currentTurnOutputBytes = 0;
     this._currentTurnInputBytes = 0;
     this._currentTurnUsage = null;
@@ -617,11 +980,19 @@ export class GeminiBridge extends EventEmitter {
   }
 
   async close() {
+    // Mark user-initiated FIRST so an in-flight D-GoAway proactive
+    // reopen aborts: reopen() throws on `_userClosed` and
+    // _proactiveReopen's top guard refuses re-entry (don't resurrect a
+    // session the user closed mid-bounce). Also kill the goAway fallback
+    // timer so it can't fire a reopen after teardown.
+    this._userClosed = true;
+    if (this._goAwayTimer) { clearTimeout(this._goAwayTimer); this._goAwayTimer = null; }
+    this._goAwayPending = false;
+    this._goAwayDeadlineRetries = 0;
+    this._utteranceInFlight = false;
     if (this._closed) return;
     try { this._session?.close(); } catch {}
     this._closed = true;
-    // Mark user-initiated so reopen() refuses (don't rebuild a closed-on-purpose bridge).
-    this._userClosed = true;
     // Audit C4 (2026-05-07). Drop the resumption handle on explicit close
     // so it can never be replayed across a user-driven session boundary.
     this._sessionResumeHandle = null;
@@ -632,7 +1003,20 @@ export class GeminiBridge extends EventEmitter {
   // _userClosed=false. Re-runs ai.live.connect with the original args
   // (which also sets sessionResumption.handle so conversation context
   // carries across the WS bounce — see open()).
+  // Audit M1/M2 — reentrancy-coalesced. The proactive D-GoAway bounce
+  // and the proxy's lazy turn_start reopen can both call reopen()
+  // concurrently while `_closed`; without coalescing that is two
+  // ai.live.connect calls + resumption-handle replay + two live
+  // sessions. All concurrent callers share the one in-flight promise
+  // and observe the same resolution / rejection.
   async reopen() {
+    if (this._reopenInFlight) return this._reopenInFlight;
+    this._reopenInFlight = this._reopenImpl();
+    try { return await this._reopenInFlight; }
+    finally { this._reopenInFlight = null; }
+  }
+
+  async _reopenImpl() {
     if (this._userClosed) throw new Error('bridge_user_closed');
     if (!this._lastOpenArgs) throw new Error('bridge_never_opened');
     if (!this._closed) return; // already open

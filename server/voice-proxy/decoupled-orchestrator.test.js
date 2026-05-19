@@ -196,6 +196,49 @@ test('M3: a retrieve that exceeds the ceiling degrades to persona-only (no dead 
   assert.equal(orch.metricsSnapshot().degraded.includes('r:timeout'), true);
 });
 
+// Audit M6 — on a ceiling-timeout the retrieval HTTP call is useless
+// (result never consumed) but still BILLING to its budget. The
+// orchestrator must abort the retrieve signal so the socket dies and
+// the billing tail stops the instant we stop waiting.
+test('M6: ceiling-timeout ABORTS the retrieve signal (kills the billing tail)', async () => {
+  let capturedSignal = null;
+  const { orch } = harness({
+    retrieveCeilingMs: 20,
+    retrieve: (q, signal) => {
+      capturedSignal = signal;
+      return new Promise((res) => setTimeout(() => res('late'), 5000));
+    },
+    generateDeepAnswer: () => genStream(['A.'], { operation: 'brain_deep_answer', text: 'A.' }),
+  });
+  orch.onUserTranscript('q', 1);
+  await tick();
+  assert.ok(capturedSignal && capturedSignal.aborted === false, 'retrieve in flight, not yet aborted');
+  await orch.onTurnComplete();
+  assert.equal(capturedSignal.aborted, true, 'over-ceiling retrieve socket aborted — no billing tail');
+});
+
+// Audit M7 — onUserTranscript after the fatal latch must NOT be a
+// silent no-op: a breadcrumb makes the "user spoke during the teardown
+// race" window greppable in triage (onFatal owns the user-visible 1011).
+test('M7: onUserTranscript after fatal logs a breadcrumb (not silent), no paid work', async () => {
+  const warns = [];
+  let deepCalls = 0;
+  const { orch, tts } = harness({
+    generateParaphrase: () => genThrow([], 'misconfigured'),
+    generateDeepAnswer: () => { deepCalls++; return genStream(['x'], { operation: 'brain_deep_answer', text: 'x' }); },
+    log: { warn: (m) => warns.push(m), error() {} },
+  });
+  orch.onUserTranscript('q1', 1);   // latches fatal via misconfigured
+  await tick();
+  warns.length = 0;                 // isolate the post-fatal breadcrumb
+  orch.onUserTranscript('q2', 2);   // user speaks again during teardown race
+  await tick();
+  assert.ok(warns.some((m) => /onUserTranscript after fatal/.test(m)),
+    'fatal early-return emits a triage breadcrumb');
+  assert.equal(deepCalls, 0, 'no second paid call after fatal');
+  assert.equal(tts.length, 0, 'nothing spoken for the post-fatal turn');
+});
+
 test('retrieve throws → swallowed, deep proceeds persona-only, not fatal', async () => {
   const { orch, tts, fatals } = harness({
     retrieve: async () => { throw new Error('shim 503'); },

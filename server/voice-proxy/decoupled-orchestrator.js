@@ -166,7 +166,16 @@ export function makeDecoupledOrchestrator({
 
   // ── Gemini input_transcription ────────────────────────────────────────
   function onUserTranscript(text, turnNumber) {
-    if (fatal) return; // C2 — session dying; no new paid work
+    if (fatal) {
+      // C2 — session dying; no new paid work. Audit M7 — NOT a silent
+      // return: onFatal already fired the user-visible WS 1011 + the
+      // single teardown (index.js owns that). This breadcrumb makes the
+      // "user spoke again during the teardown race" window observable
+      // instead of an invisible no-op, so a slow teardown that lets a
+      // late transcript through is greppable in triage.
+      log.warn?.(`[decoupled] onUserTranscript after fatal latch — dropped (session terminating, turn=${turnNumber})`);
+      return;
+    }
     // Audit C4/M2 — a new utterance supersedes a still-streaming
     // previous turn. The user moved on; abort the old turn so we don't
     // talk over them and so onInterrupted/turn_end can't target the
@@ -237,6 +246,11 @@ export function makeDecoupledOrchestrator({
           t.degraded.push('retrieve:timeout');
           session.degraded.push('r:timeout');
           envelopeText = null; // persona-only, deep answer starts NOW
+          // Audit M6 — the retrieval HTTP call is now useless (we will
+          // never consume its result) but still RUNNING and BILLING up
+          // to its budget. Abort it so the socket is killed and the
+          // billing tail stops the instant we stop waiting.
+          try { t.retrieveAbort.abort(); } catch {}
         } else {
           envelopeText = raced || null;
         }
