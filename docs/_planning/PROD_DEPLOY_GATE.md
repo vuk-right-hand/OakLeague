@@ -9,7 +9,7 @@ deploy — read this whole file first.
 
 ---
 
-## 🔴 HARD BLOCKER #1 — Dockerfile COPY is missing 4 proxy modules
+## 🔴 HARD BLOCKER #1 — Dockerfile COPY is missing proxy modules
 
 `server/voice-proxy/index.js` imports these files, but the `Dockerfile`
 `COPY` line (line ~27) does NOT ship them into the image:
@@ -18,9 +18,24 @@ deploy — read this whole file first.
 - `posthog-client.js`               (Day-13 RAG, commit `7f4a2ec`)
 - `retrieve-knowledge-v2-client.js` (Day-13 RAG)
 - `voice-session-state-writer.js`   (Day-13 RAG)
+- `decoupled-boot.js`               (DECOUPLED_BRAIN_PLAN P1-5 C3 gate —
+  direct import in `index.js provisionPricing()`)
+- `decoupled-orchestrator.js`       (P1-5.2 — NEW direct import in `index.js`)
+- `paraphrase.js`                   (P1-5.2 — NEW direct import in `index.js`)
+- `brain-bridge.js`                 (P1-5.2 — NEW direct import in `index.js`)
+- `brain-llm-common.js`             (imported by both bridges)
 
-Plus the **transitive** dependency: `retrieve-knowledge-v2-client.js`
-imports `internal-request-signature.js` — that must be COPY'd too.
+Plus the **transitive** dependencies (NOT caught by the verification
+command below — it only greps `index.js`'s direct imports):
+- `retrieve-knowledge-v2-client.js` → `internal-request-signature.js`
+- `decoupled-boot.js` → `brain-bridge.js` **and** `paraphrase.js`
+- `brain-bridge.js` → `brain-llm-common.js`
+- `paraphrase.js`   → `brain-llm-common.js`
+
+i.e. the decoupled closure that MUST also be COPY'd:
+`decoupled-boot.js`, `brain-bridge.js`, `paraphrase.js`,
+`brain-llm-common.js`. (Their `*.test.js` siblings must NOT be copied —
+prod image stays test-free.)
 
 **Consequence if you `fly deploy` anyway:** the container boots, hits
 `import { HumeTTSBridge } from './hume-bridge.js'`, the file isn't in the
@@ -57,6 +72,18 @@ do not deploy. (Also manually confirm transitive imports like
   vector path has the "double-answer / desync / escalating-latency" bug
   (the "57IQ donkey"). Day-13 v2 is gated OFF (env + per-creator flag);
   keep it off in prod.
+- **Prod-readiness gap (DECOUPLED_BRAIN_PLAN §12 F1, found 2026-05-18 by
+  the P0-4b real-API latency probe):** prod creator #1's corpus is NOT
+  v2-reprocessed — the v2 orchestrator returns `parents=0` for every
+  query against it (the old probe used v1 `creator_knowledge_topk`; v2
+  needs the parent-unit hybrid schema, which is unpopulated). Therefore,
+  even AFTER the RAG re-arch lands and v2 migrations apply, **flipping
+  creator #1 to `retrieval_version=2` / vector would yield empty
+  retrieval (confident ungrounded answers)** until a v2 corpus reprocess
+  (`scripts/seed-rag-test-fixture.mjs` is fixture-only — creator #1
+  needs the real reprocess pipeline: narrative_chunk → contextual-gen →
+  embed → parent-unit insert). Add "v2-reprocess creator #1's corpus +
+  verify parents>0" as a prerequisite to any creator-#1 vector flip.
 - **b985303 mic-fix divergence** must be resolved at the `main` merge.
 - **Hume migrations:** already applied to prod (`rbuuwwupxuanalvtipch`),
   including `20260522000001`. ✅ done.

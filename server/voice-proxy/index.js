@@ -39,6 +39,12 @@ import { CartesiaTTSBridge } from './cartesia-bridge.js';
 import { HumeTTSBridge } from './hume-bridge.js';
 import { decideQuotaGate } from './quota-gate.js';
 import { makeLogTurnCogs, installReaper, VOICE_TTS_LAYER_ENABLED, getCartesiaPricing, getHumePricing, _humePricingPrimeForBoot } from './proxy-handlers.js';
+// DECOUPLED_BRAIN_PLAN P1-5 C3 ordering gate — boot-prime decoupled
+// brain/paraphrase pricing FATAL-at-boot (same posture as Cartesia/Hume).
+import { provisionDecoupledBrainPricing } from './decoupled-boot.js';
+import { makeDecoupledOrchestrator } from './decoupled-orchestrator.js';
+import { generateParaphrase } from './paraphrase.js';
+import { generateDeepAnswer } from './brain-bridge.js';
 import { makeVoiceDeleteWorker } from './voice-delete-worker.js';
 import { makeSimliFaceDeleteWorker } from './simli-face-delete-worker.js';
 import { makeFaceUploadReaper } from './face-upload-reaper.js';
@@ -104,6 +110,33 @@ const HUME_API_KEY = process.env.HUME_API_KEY || '';
 // callers (bridge construction in this file, logTurnCogs in proxy-handlers)
 // read the same cached value. Eliminates the "two caches diverge" hazard.
 async function provisionPricing() {
+  // DECOUPLED_BRAIN_PLAN P1-5 C3 ordering gate — runs FIRST, BEFORE the
+  // !VOICE_TTS_LAYER_ENABLED early-return. Audit C2: a decoupled creator
+  // with α' off is itself FATAL (the deep-answer must reach the cloned
+  // voice), so this gate must NOT be reachable-skippable by the two
+  // flags disagreeing. Mirrors the Hume per-creator-override probe.
+  // Inert today by construction (M3 / P1-2 safety refinement: no creator
+  // can be flagged decoupled until the D12 persona compiler +
+  // admin_set_creator_decoupled RPC exist) → probe returns zero rows →
+  // no-op. The gate is IN PLACE the moment a creator is flagged.
+  // No `fatal` override → the default (console.error + process.exit(1))
+  // IS reachable here in real boot, intentionally, exactly like Hume's
+  // FATAL at ~L153. The return value is intentionally unused: on
+  // misconfig `fatal` has already process.exit'd; otherwise there is
+  // nothing to do (primed/deferred/inert are log-only states).
+  await provisionDecoupledBrainPricing({
+    ttsLayerEnabled: VOICE_TTS_LAYER_ENABLED,
+    probeAnyDecoupledCreator: async () => {
+      const { data, error } = await supabase
+        .from('creators')
+        .select('id')
+        .eq('decoupled', true)
+        .limit(1);
+      if (error) return { error: error.message };
+      return { found: Array.isArray(data) && data.length > 0 };
+    },
+  });
+
   if (!VOICE_TTS_LAYER_ENABLED) return; // α' off: TTS layer inert; skip both.
   // CARTESIA always validated (it's the historical default; envs that flip
   // VOICE_TTS_PROVIDER=hume still leave back-compat creators on cartesia
@@ -332,7 +365,7 @@ async function consumeTicket(ticketId, uaHash) {
     // + voice_id_env. The proxy never re-derives provider OR env from its
     // own envvars (Vuk-M5: ticket is the contract). Hume prosody is NULL on
     // cartesia tickets and ignored by the bridge selection.
-    .select('user_id, creator_id, session_id, expected_tier, purpose, avatar_provider, system_prompt, prefix_turns, tts_speed, brain_mode, tts_provider, hume_tts_speed, hume_trailing_silence, hume_voice_description, hume_model_version, voice_id_env')
+    .select('user_id, creator_id, session_id, expected_tier, purpose, avatar_provider, system_prompt, prefix_turns, tts_speed, brain_mode, decoupled, tts_provider, hume_tts_speed, hume_trailing_silence, hume_voice_description, hume_model_version, voice_id_env')
     .maybeSingle();
   if (error || !data) return null;
   // creator_id is NOT NULL by CHECK on new rows (migration 0041). A null here
@@ -375,6 +408,12 @@ async function consumeTicket(ticketId, uaHash) {
     // 'drawer' = legacy topic-tag overlap; 'vector' = per-turn pgvector
     // retrieval injected mid-session via the audio gate below.
     brainMode:      (data.brain_mode === 'vector' ? 'vector' : 'drawer'),
+    // DECOUPLED_BRAIN_PLAN P1-2 — D7 fail-safe: STRICT === true. Any
+    // other value (false/null/undefined/'true'/1/garbage) → false →
+    // legacy path. This is THE security boundary for "absent/unparseable
+    // → legacy"; never loosen to truthy. DB CHECK guarantees a true
+    // snapshot implies brain_mode='vector'.
+    decoupled:      (data.decoupled === true),
     // HUME_TTS_PLAN §6.1 — provider snapshot. NOT NULL by DB constraint
     // (migration 0002), but a stray null on a pre-migration ticket would
     // be a tts_provider mismatch trap below — coerce to a guard string.
@@ -722,7 +761,7 @@ function closeWs(ws, code, reason) {
 // (plan §1A.2). See SPIKE_A_DEFERRED_FIXUP_PLAN.md §1A.0 C-C fix.
 const sessionToWs = new Map();
 
-const { logTurnCogs, dropSession: dropCogsSession } = makeLogTurnCogs({
+const { logTurnCogs, logBrainLeg, dropSession: dropCogsSession } = makeLogTurnCogs({
   supabase,
   env: 'spike_a',
   onConsecutiveFailure: (sessionId) => {
@@ -831,6 +870,11 @@ wss.on('connection', async (ws, req) => {
   // (R3 M4 fix — application-layer trust chain). NEVER re-read from any
   // per-message field. `brainMode` selects which retrieval path runs.
   const brainMode = consumed.brainMode;          // 'drawer' | 'vector'
+  // DECOUPLED_BRAIN_PLAN P1-2 — bound ONCE from the consumed snapshot
+  // (R3-M4 trust chain), never re-read per-message. true ⇒ off-Live
+  // paraphrase→RAG→TTS path; the 1548/1572/981 decoupled branches
+  // (P1-5) gate on this. Byte-identical legacy when false.
+  const decoupled = consumed.decoupled === true; // strict; D7 fail-safe
   const ticketCreatorId = consumed.creatorId;    // used for creator_knowledge_topk
   const ticketUserId = consumed.userId;          // used for voice_retrieval_budget
   // Day-13 — snapshot consts from sessions (attachToSession / openSession).
@@ -978,7 +1022,7 @@ wss.on('connection', async (ws, req) => {
     // alongside the brain-prefix metrics so operators can grep one stream
     // for session-end signals. Skips emit entirely on drawer mode (no
     // retrieval ran).
-    if (brainMode === 'vector') {
+    if (brainMode === 'vector' && !decoupled) {
       console.log(
         `[ws ${connId}] vector.metrics injected=${injectionLandedCount} ` +
         `skipped_short=${retrievalSkippedShortUtteranceCount} ` +
@@ -988,6 +1032,21 @@ wss.on('connection', async (ws, req) => {
         `overflow=${injectionOverflowCount} ` +
         `session=${sessionId.slice(0, 8)}`,
       );
+    }
+    // DECOUPLED_BRAIN_PLAN P1-5.2 (§13 981) — decoupled emits its OWN
+    // metrics line (the vector counters are all-zero on this path; a
+    // misleading vector.metrics line is suppressed above via !decoupled).
+    if (decoupled && decoupledOrch) {
+      const m = decoupledOrch.metricsSnapshot();
+      if (m) {
+        console.log(
+          `[ws ${connId}] decoupled.metrics turn=${m.turnNumber} ` +
+          `barged=${m.barged} degraded=${(m.degraded || []).join(',') || 'none'} ` +
+          `para_first_ms=${m.paraphrase?.firstChunkMs ?? 'na'} ` +
+          `deep_first_ms=${m.deep?.firstChunkMs ?? 'na'} ` +
+          `session=${sessionId.slice(0, 8)}`,
+        );
+      }
     }
     // R4-M1 — null-check INSTANCES, not booleans. Either bridge may be
     // null if the open path bailed early.
@@ -1115,9 +1174,16 @@ wss.on('connection', async (ws, req) => {
       // for staged rollout (BRAIN_ENABLE_INPUT_TRANSCRIPTION_DRAWER).
       enableInputTranscription:
         consumed.brainMode === 'vector'
+        // DECOUPLED_BRAIN_PLAN P1-2 — decoupled needs the user transcript
+        // to feed the off-Live brain. `|| false` when decoupled off ⇒
+        // byte-identical legacy (§13 proof). Audit M4: use the ONCE-bound
+        // `decoupled` const (L869), NOT a re-read of consumed.decoupled —
+        // matches the §13 guard-site spec and removes future-drift risk
+        // if the bind ever gains a staging override.
+        || decoupled
         || process.env.BRAIN_ENABLE_INPUT_TRANSCRIPTION_DRAWER === '1',
     });
-    console.log(`[ws ${connId}] gemini.open start (tts_layer=${useTtsLayer} useTts=${useTts} provider=${ttsProvider} brain=${consumed.brainMode})`);
+    console.log(`[ws ${connId}] gemini.open start (tts_layer=${useTtsLayer} useTts=${useTts} provider=${ttsProvider} brain=${consumed.brainMode} decoupled=${decoupled})`);
     const t0 = Date.now();
     // Brain wire-up (PR-2 + pgvector RAG). systemInstruction + brainPrefix
     // ride the ticket; bridge.open() seeds prefix_turns post-setupComplete
@@ -1509,6 +1575,112 @@ wss.on('connection', async (ws, req) => {
     }
   }
 
+  // ── DECOUPLED_BRAIN_PLAN P1-5.2 — off-Live orchestrator ───────────────
+  // Built ONLY for a decoupled ticket (decoupled ⇒ brain_mode 'vector'
+  // by migration invariant). Owns the paraphrase→deep-answer utterance.
+  // The legacy vector/drawer path is byte-identical when `decoupled` is
+  // false: decoupledOrch stays null and every event site below is gated
+  // on it. North star: first audio fast, seamless handoff, instant
+  // barge-in, never silence/error to the user.
+  let decoupledOrch = null;
+  let decoupledFatalFired = false; // audit C2 — onFatal idempotency latch
+  if (decoupled) {
+    // Audit M5 — decoupled REQUIRES the α' TTS layer (the deep answer is
+    // spoken in the creator's cloned voice; CLAUDE.md hard rule). The
+    // boot gate FATALs this, but its probe can DEFER on a Supabase blip
+    // at Fly boot. This is the session-open backstop: without it every
+    // ttsSendText silently discards the entire paraphrase + deep answer
+    // → total silence to the user with no error (the "never silence"
+    // rule violated via a resilience seam).
+    if (!useTts) {
+      captureException(new Error('decoupled_without_tts_layer'), {
+        op: 'decoupled.no_tts', sessionId, ttsProvider,
+      });
+      return closeWs(ws, 1011, 'decoupled_no_tts_layer');
+    }
+    // retrieve(question, signal) → L2 envelope text | null. Mirrors the
+    // v1/v2 normalization of resolveInjectionAtTurnComplete but RETURNS
+    // the envelope instead of injecting it into Gemini (decoupled never
+    // injects — that is the legacy double-answer bug path).
+    const retrieveEnvelopeForDecoupled = async (question, signal) => {
+      if (retrievalVersionAtSession === 2 && !RAG_V2_PROXY_ENABLED) return null;
+      let result;
+      try {
+        if (retrievalVersionAtSession === 2) {
+          result = await callRetrieveKnowledgeV2({
+            userId: ticketUserId, creatorId: ticketCreatorId, sessionId,
+            rawUtterance: question, lastAssistantResponse: lastAssistantResponseClosure,
+            corpusVersionAtSession, budgetMs: 4000, signal,
+          });
+        } else {
+          result = await retrieveTopK({
+            supabase, geminiApiKey: GEMINI_API_KEY,
+            userId: ticketUserId, creatorId: ticketCreatorId,
+            queryText: question, sessionId,
+          });
+        }
+      } catch (e) {
+        captureException(e, { op: 'decoupled.retrieve', sessionId });
+        return null;
+      }
+      if (result && Array.isArray(result.posthogEvents) && result.posthogEvents.length > 0) {
+        posthogCaptureBatch({ events: result.posthogEvents, distinctId: ticketUserId, sessionId });
+      }
+      const passages = Array.isArray(result?.parents)
+        ? result.parents.map((p) => ({
+            text: p.text, sourceType: p.sourceType,
+            title: p.title ?? undefined,
+            score: typeof p.score === 'number' ? p.score : undefined,
+          }))
+        : Array.isArray(result?.passages)
+          ? result.passages.map((p) => ({ text: p.text, sourceType: p.sourceType }))
+          : [];
+      if (passages.length === 0) return null;
+      try {
+        const envelope = buildInjectionEnvelope({ passages });
+        return envelope && envelope.passageCount > 0 ? envelope.text : null;
+      } catch (e) {
+        captureException(e, { op: 'decoupled.envelope', sessionId });
+        return null;
+      }
+    };
+    decoupledOrch = makeDecoupledOrchestrator({
+      generateParaphrase,
+      generateDeepAnswer,
+      retrieve: retrieveEnvelopeForDecoupled,
+      ttsSendText: (t) => {
+        if (useTts && ttsBridge) {
+          try { ttsBridge.sendText(t); } catch (err) {
+            captureException(err, { op: 'tts.sendText', sessionId, ttsProvider });
+          }
+        }
+      },
+      logBrainLeg,
+      persona: consumed.systemPrompt || null,
+      apiKey: GEMINI_API_KEY,
+      userId: ticketUserId,
+      sessionId,
+      onFatal: () => {
+        // Audit C2 — idempotent. The orchestrator's `fatal` latch
+        // already blocks a second paid call, but onFatal can still be
+        // invoked once from each in-flight generator (paraphrase + deep)
+        // before the latch is observed; a second teardown + closeWs
+        // racing the first is the double-close hazard. Fire once.
+        if (decoupledFatalFired) return;
+        decoupledFatalFired = true;
+        try { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'error', code: 'cogs_misconfig', op: 'decoupled' })); } catch {}
+        teardown('decoupled_misconfigured').catch(() => {});
+        closeWs(ws, 1011, 'cogs_misconfig');
+      },
+      onPersonaNull: () => console.warn(`[ws ${connId}] brain_persona_null decoupled session=${sessionId.slice(0, 8)}`),
+      log: {
+        warn: (m) => console.warn(`[ws ${connId}] ${m}`),
+        error: (m) => console.error(`[ws ${connId}] ${m}`),
+      },
+      captureException,
+    });
+  }
+
   // ── Gemini events ─────────────────────────────────────────────────────
   bridge.on((e) => {
     if (closed) return;
@@ -1523,7 +1695,15 @@ wss.on('connection', async (ws, req) => {
       // fired synchronously. sendText is a no-op when bridge isn't open
       // or turn isn't started. Provider-neutral after HUME_TTS_PLAN §6.4
       // rename.
-      if (useTts && ttsBridge) {
+      //
+      // DECOUPLED_BRAIN_PLAN P1-5.2 (§13 — site identified during P1-5.2
+      // wiring, NOT in the original enumeration): in decoupled mode
+      // Gemini's own answer transcript MUST NOT reach TTS — the
+      // orchestrator drives TTS from the paraphrase + off-Live deep
+      // answer. Piping Gemini's discarded answer here would be a second
+      // voice over the orchestrator's. `&& !decoupled` ⇒ byte-identical
+      // when the flag is false (`&& !false` = unchanged predicate+body).
+      if (useTts && ttsBridge && !decoupled) {
         try { ttsBridge.sendText(e.text); } catch (err) {
           captureException(err, { op: 'tts.sendText', sessionId, ttsProvider });
         }
@@ -1546,6 +1726,16 @@ wss.on('connection', async (ws, req) => {
       // immediately after when its clarifier finishes generating). The race
       // resolves in resolveInjectionAtTurnComplete().
       if (brainMode !== 'vector') return;
+      // DECOUPLED_BRAIN_PLAN P1-5.2 (§13 1548) — decoupled replaces the
+      // entire retrieve→inject path with the off-Live orchestrator. Fires
+      // EVERY turn (B deleted; (A) is the sole gate — the short/trunc
+      // skips below are a vector-injection optimization that does not
+      // apply: the paraphrase is the dead-air mask on every utterance).
+      // Gated on decoupledOrch ⇒ byte-identical when the flag is false.
+      if (decoupled && decoupledOrch) {
+        decoupledOrch.onUserTranscript(e.text, turnNumber);
+        return;
+      }
       // Audit M3: skip retrieval for conversational fillers. The clarifier
       // pattern means turn N+1 ("maintaining habits") is often <20 chars
       // and doesn't carry substantive intent — the retrieval was already
@@ -1569,13 +1759,23 @@ wss.on('connection', async (ws, req) => {
       // same-envelope input_transcription set pendingInjection FIRST (R3 M1
       // belt-and-suspenders; bridge's _onMessage already iterates input
       // before turn_complete, but we don't trust that to never refactor).
-      if (brainMode === 'vector') {
+      if (brainMode === 'vector' && !decoupled) {
         forwardAudio = false;
         setImmediate(() => {
           resolveInjectionAtTurnComplete().catch((err) => {
             captureException(err, { op: 'vector.resolve_injection', sessionId });
             flushAudioHold();
           });
+        });
+      } else if (brainMode === 'vector' && decoupled && decoupledOrch) {
+        // DECOUPLED_BRAIN_PLAN P1-5.2 (§13 1572) — NO audio gate / NO
+        // Gemini injection on the decoupled path (forwardAudio stays
+        // true; nothing is injected back into Live). The orchestrator
+        // awaits retrieval and streams the deep answer to TTS, seamlessly
+        // continuing the paraphrase. `&& !decoupled` above ⇒ the legacy
+        // branch is byte-identical when the flag is false.
+        decoupledOrch.onTurnComplete().catch((err) => {
+          captureException(err, { op: 'decoupled.turn_complete', sessionId });
         });
       }
     } else if (e.kind === 'interrupted') {
@@ -1586,6 +1786,14 @@ wss.on('connection', async (ws, req) => {
       // injecting after the user already moved on.
       if (pendingInjection && typeof pendingInjection.abort === 'function') {
         try { pendingInjection.abort(); } catch {}
+      }
+      // DECOUPLED_BRAIN_PLAN P1-5.2 — barge-in: abort the in-flight
+      // paraphrase/deep generators + retrieval. Each throws with
+      // `.partial` (P0-4a server-billed) → the orchestrator still writes
+      // the cogs leg (M6). Gated ⇒ byte-identical when flag is false
+      // (pendingInjection is null on the decoupled path anyway).
+      if (decoupled && decoupledOrch) {
+        try { decoupledOrch.onInterrupted(); } catch {}
       }
     } else if (e.kind === 'error') {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'error', at: e.at, message: e.message }));
@@ -1867,6 +2075,19 @@ wss.on('connection', async (ws, req) => {
         }
       } else if (msg.type === 'turn_end') {
         const metrics = await bridge.turnEnd({ timeoutMs: msg.timeoutMs || 30_000 });
+        // DECOUPLED_BRAIN_PLAN P1-5.2 (audit C1) — the off-Live deep
+        // answer only STARTS streaming to TTS after Gemini's
+        // turn_complete (which is what `bridge.turnEnd()` above awaited),
+        // gated behind retrieval + the paraphrase. If we let
+        // `ttsBridge.turnEnd()` send `continue:false` now, it races AHEAD
+        // of the deep-answer stream and the creator's actual answer is
+        // truncated to just the hedge sentence — the inverse of the
+        // north star. Wait (bounded) for the orchestrator to finish
+        // speaking the turn. Decoupled-only ⇒ legacy path byte-identical.
+        if (decoupled && decoupledOrch) {
+          try { await decoupledOrch.awaitTurnSpoken(msg.timeoutMs || 30_000); }
+          catch (e) { captureException(e, { op: 'decoupled.awaitTurnSpoken', sessionId }); }
+        }
         let ttsMetrics = null;
         if (useTts && ttsBridge) {
           // R3-C1 / R4-C1 — always await; bridge resolves with partial:true
@@ -1909,9 +2130,18 @@ wss.on('connection', async (ws, req) => {
         // (which calls kickoffRetrieval reading the closure) could
         // observe stale turn-N-1 data.
         if (retrievalVersionAtSession === 2) {
-          const transcript = typeof metrics?.outputTranscript === 'string'
-            ? metrics.outputTranscript
-            : '';
+          // DECOUPLED_BRAIN_PLAN P1-5.2 / R4-M4 (§13 1911-1916, the ONLY
+          // non-byte-identical site): in decoupled mode Gemini's
+          // `metrics.outputTranscript` is its DISCARDED answer — wrong
+          // source for the next turn's retrieval rewrite. Use the
+          // off-Live deep-answer text instead. When `decoupled` is false
+          // the ternary's else-branch is the EXACT original expression ⇒
+          // byte-identical legacy.
+          const transcript = decoupled
+            ? ((decoupledOrch && decoupledOrch.lastAssistantResponse()) || '')
+            : (typeof metrics?.outputTranscript === 'string'
+              ? metrics.outputTranscript
+              : '');
           if (transcript.length >= MIN_PERSIST_CHARS) {
             lastAssistantResponseClosure = transcript.slice(0, VOICE_SESSION_STATE_MAX_CHARS);
             // Fire-and-forget. The writer never throws; errors land in

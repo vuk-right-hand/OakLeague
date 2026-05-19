@@ -95,6 +95,14 @@ export type MintVoiceTicketArgs = {
   //   (brain_mode='vector' → prefix_turns IS NULL) ∧ (brain_mode='drawer' → any)
   // Caller responsibility: route gates buildBrainPrefix on 'drawer'.
   brainMode?: 'drawer' | 'vector' | null;
+  // DECOUPLED_BRAIN_PLAN P1-2. Snapshot of creators.decoupled at
+  // session-open. false = legacy (drawer/vector mid-session injection);
+  // true = off-Live paraphrase→RAG generateContent→Hume. D7 fail-safe:
+  // undefined/null → false. DB invariant
+  // voice_tickets_decoupled_requires_vector_chk requires
+  //   decoupled=true → brain_mode='vector'. Caller must pass brainMode
+  //   'vector' whenever decoupled true (route responsibility).
+  decoupled?: boolean | null;
 };
 
 export type MintVoiceTicketResult = {
@@ -214,6 +222,10 @@ export async function mintVoiceTicket(args: MintVoiceTicketArgs): Promise<MintVo
       // retrieval injection. Default 'drawer' = legacy path. DB invariant
       // ensures prefix_turns is null when brain_mode='vector'.
       brain_mode:      args.brainMode ?? 'drawer',
+      // DECOUPLED_BRAIN_PLAN P1-2. D7 fail-safe: undefined/null → false
+      // (legacy). DB CHECK voice_tickets_decoupled_requires_vector_chk
+      // rejects decoupled=true unless brain_mode='vector'.
+      decoupled:       args.decoupled ?? false,
     })
     .select('ticket_id, expires_at')
     .single<{ ticket_id: string; expires_at: string }>();

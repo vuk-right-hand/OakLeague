@@ -339,12 +339,85 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
     }
   }
 
+  // DECOUPLED_BRAIN_PLAN P1-5.1b — the per-leg token COGS writer for the
+  // decoupled brain. ONE call per leg (paraphrase OR deep-answer), at the
+  // moment that leg resolves (NOT batched at turn_complete — they finish
+  // at different times and each bills-on-barge independently, P0-4a).
+  //
+  // `leg` is the bridge's terminal `{final,...}` OR its thrown `.partial`
+  // (M6). Both carry `operation` + `modelId` + `usdPer*Token` +
+  // `*Tokens` + `quotedAt`; `.partial` adds `billed:true` and may have
+  // NULL token counts (usageMetadata never arrived before the abort).
+  // A billed call MUST be cogs-visible — so on a partial we coerce null
+  // tokens → 0, write the row anyway, and flag `billed_partial` so it is
+  // a VISIBLE estimate, never a silent gap (kill-switch stays fed).
+  async function logBrainLeg(payload) {
+    const { userId, sessionId, turnNumber, leg } = payload;
+    if (!leg || (leg.operation !== 'brain_deep_answer' && leg.operation !== 'brain_paraphrase')) {
+      captureException(new Error('logBrainLeg: missing/invalid leg.operation'), {
+        op: 'cogs_insert_brain_leg', sessionId, userId, turnNumber,
+        operation: leg && leg.operation,
+      });
+      recordFailure(sessionId);
+      return { ok: false };
+    }
+    const isPartial = leg.billed === true;
+    const inTok  = Number.isFinite(leg.inputTokens)  ? leg.inputTokens  : 0;
+    const outTok = Number.isFinite(leg.outputTokens) ? leg.outputTokens : 0;
+    const inCost  = Number((inTok  * (leg.usdPerInputToken  || 0)).toFixed(6));
+    const outCost = Number((outTok * (leg.usdPerOutputToken || 0)).toFixed(6));
+    const meta = {
+      source: env,
+      model: leg.modelId || null,
+      quoted_at: leg.quotedAt || null,
+    };
+    // A partial with no usage = a billed call we could not size. Flag it
+    // so reconciliation can true it up; the row still exists (units/cost
+    // 0) rather than vanishing from the kill-switch's view.
+    if (isPartial && !Number.isFinite(leg.inputTokens) && !Number.isFinite(leg.outputTokens)) {
+      meta.token_estimate_unavailable = true;
+    }
+    try {
+      const { error } = await supabase.rpc('cogs_insert_brain_leg', {
+        p_user_id: userId,
+        p_session_id: sessionId,
+        p_turn_number: turnNumber,
+        p_operation: leg.operation,
+        p_input_tokens: inTok,
+        p_output_tokens: outTok,
+        p_input_cost: inCost,
+        p_output_cost: outCost,
+        p_environment: env,
+        p_billed_partial: isPartial,
+        p_metadata: meta,
+      });
+      if (error) {
+        console.error('[cogs_insert_brain_leg]', error);
+        captureException(error, {
+          op: 'cogs_insert_brain_leg', sessionId, userId, turnNumber,
+          operation: leg.operation, billed_partial: isPartial,
+        });
+        recordFailure(sessionId);
+        return { ok: false };
+      }
+      recordSuccess(sessionId);
+      return { ok: true, billedPartial: isPartial };
+    } catch (e) {
+      console.error('[cogs_insert_brain_leg] exception', e);
+      captureException(e, {
+        op: 'cogs_insert_brain_leg', sessionId, userId, turnNumber, operation: leg.operation,
+      });
+      recordFailure(sessionId);
+      return { ok: false };
+    }
+  }
+
   // Cleanup on session close — caller invokes when WS closes for any reason.
   function dropSession(sessionId) {
     failures.delete(sessionId);
   }
 
-  return { logTurnCogs, dropSession, _consecutiveFailures };
+  return { logTurnCogs, logBrainLeg, dropSession, _consecutiveFailures };
 }
 
 // ── makeRunReaper ───────────────────────────────────────────────────────────
