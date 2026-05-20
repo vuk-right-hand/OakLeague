@@ -21,8 +21,12 @@ BEGIN
   INSERT INTO public.admin_roles (user_id, email, role)
     VALUES (v_admin, 'brain-mode-admin@test', 'superadmin');
 
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-  VALUES (gen_random_uuid(), v_user, 'approved', 'Brain Mode Creator', 'brainmodec1')
+  -- topics + proof are NOT NULL on creator_applications (migration
+  -- 20260420000010); this test was pre-existing broken until 2026-05-21
+  -- (P1-10 cleanup). Same as the fix in admin_set_creator_decoupled's test.
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+  VALUES (gen_random_uuid(), v_user, 'approved', 'Brain Mode Creator', 'brainmodec1',
+          '[]'::jsonb, '[]'::jsonb)
   RETURNING id INTO v_app;
 
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status)
@@ -42,6 +46,9 @@ BEGIN
   -- 2: admin flips brain_mode → vector, recompile fires.
   PERFORM tests.set_authenticated(v_admin);
   PERFORM public.admin_set_creator_brain_mode(v_creator, 'vector');
+  -- P1-10 cleanup: reset role before SELECT so RLS on creators doesn't
+  -- hide the just-written row from the authenticated user's read path.
+  PERFORM tests.reset_role();
   SELECT brain_mode INTO v_mode FROM public.creators WHERE id = v_creator;
   RETURN NEXT is(v_mode::text, 'vector', '2: admin flipped brain_mode to vector');
 
@@ -51,7 +58,6 @@ BEGIN
    WHERE action = 'creator_brain_mode_set' AND target_id = v_creator
    ORDER BY created_at DESC LIMIT 1;
   RETURN NEXT is(v_prev, 'drawer', '3: admin_audit_log.before carries previous_mode');
-  PERFORM tests.reset_role();
 
   -- 4: NULL p_mode should raise (R3 Small fix). PostgREST would pass missing
   -- arg as default; we call explicitly with NULL to exercise the guard.

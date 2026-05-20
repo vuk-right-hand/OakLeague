@@ -120,7 +120,7 @@ export async function POST(req: NextRequest) {
       hume_trailing_silence, hume_trailing_silence_preview, hume_trailing_silence_dev,
       hume_voice_description, hume_voice_description_preview, hume_voice_description_dev,
       hume_model_version, hume_model_version_preview, hume_model_version_dev,
-      system_prompt, brain_status, tts_speed, brain_mode
+      system_prompt, brain_status, tts_speed, brain_mode, decoupled
     `)
     .eq('id', creatorId)
     .maybeSingle<{
@@ -155,6 +155,10 @@ export async function POST(req: NextRequest) {
       tts_speed: number | string | null;
       // pgvector RAG plan (M2). 'drawer' | 'vector'.
       brain_mode: 'drawer' | 'vector';
+      // DECOUPLED_BRAIN_PLAN P1-10. Mirrors the open route — forward
+      // creators.decoupled to mintVoiceTicket so a rollover preserves
+      // the decoupled state across the resumption boundary.
+      decoupled: boolean;
     }>();
   if (creatorErr) return json(500, { error: 'creator_lookup_failed' });
   if (!creatorRow) return json(404, { error: 'creator_not_found' });
@@ -518,6 +522,12 @@ export async function POST(req: NextRequest) {
       systemPrompt:   resolvedSystemPrompt,
       prefixTurns:    brainPrefix?.prefixTurns ?? null,
       brainMode:      creatorRow.brain_mode,
+      // DECOUPLED_BRAIN_PLAN P1-10. Forward creators.decoupled to the
+      // resumed ticket so the decoupled path survives a rollover (the
+      // OLD ticket already snapshotted decoupled but a refresh of the
+      // creator's flag between sessions should be respected on the new
+      // ticket — same pattern as brain_mode forwarding above).
+      decoupled:      creatorRow.decoupled ?? false,
       // Creator voice-speed (migration 20260511000006). Shared coercion
       // helper — see env-scoped-voice-id.ts.
       ttsSpeed: coerceNumericOrNull(creatorRow.tts_speed),

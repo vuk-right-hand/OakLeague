@@ -633,4 +633,34 @@ describe('/api/sessions/open — brain wire-up gates (R3 audit C1 + M1)', () => 
     const callArgs = mockMintVoiceTicket.mock.calls[0][0] as Record<string, unknown>;
     expect(callArgs.ttsSpeed).toBeNull();
   });
+
+  // DECOUPLED_BRAIN_PLAN P1-10 — route forwards creators.decoupled to
+  // mintVoiceTicket. Pre-P1-10 this field was provably inert at the
+  // route layer (whole-build audit: "route writer cannot reach
+  // decoupled today") — the proxy bridge always saw consumed.decoupled
+  // = false even with creators.decoupled = true. These tests lock the
+  // wiring so a future drift fails in CI.
+  it('P1-10: forwards decoupled=true through to mintVoiceTicket', async () => {
+    creatorLookupResult = {
+      data: {
+        ...((creatorLookupResult.data ?? {}) as Record<string, unknown>),
+        decoupled:  true,
+        brain_mode: 'vector', // admin RPC keeps these aligned
+      },
+      error: null,
+    };
+    const res = await POST(makeReq());
+    expect(res.status).toBe(200);
+    const callArgs = mockMintVoiceTicket.mock.calls[0][0] as Record<string, unknown>;
+    expect(callArgs.decoupled).toBe(true);
+    expect(callArgs.brainMode).toBe('vector');
+  });
+
+  it('P1-10: forwards decoupled=false on legacy creators', async () => {
+    // Default fixture has no `decoupled` field; route MUST coerce to false.
+    const res = await POST(makeReq());
+    expect(res.status).toBe(200);
+    const callArgs = mockMintVoiceTicket.mock.calls[0][0] as Record<string, unknown>;
+    expect(callArgs.decoupled).toBe(false);
+  });
 });

@@ -311,4 +311,16 @@ describe('/api/sessions/rollover — voice-ticket fatal (PR-2 round-2 M2)', () =
     expect(body.session_id).toBe('bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb');
     expect(rpcCalls.filter((c) => c.name === 'session_close').length).toBe(0);
   });
+
+  // DECOUPLED_BRAIN_PLAN P1-10 — rollover forwards creators.decoupled to
+  // mintVoiceTicket. Mirrors the open-route assertion so a rolled-over
+  // session preserves decoupled state across the resumption boundary.
+  it('P1-10: forwards decoupled flag through to mintVoiceTicket on rollover', async () => {
+    mockMintVoiceTicket.mockResolvedValue({ ticket: 'ticket-r1', expiresAt: new Date(Date.now() + 120_000).toISOString() });
+    const res = await POST(makeReq());
+    expect(res.status).toBe(200);
+    const callArgs = mockMintVoiceTicket.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    // Default fixture has no `decoupled` field → coerced to false (legacy).
+    expect(callArgs.decoupled).toBe(false);
+  });
 });

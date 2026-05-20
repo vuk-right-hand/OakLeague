@@ -168,7 +168,7 @@ export async function POST(req: NextRequest) {
       hume_voice_description, hume_voice_description_preview, hume_voice_description_dev,
       hume_model_version, hume_model_version_preview, hume_model_version_dev,
       tts_provider,
-      published_at, system_prompt, brain_status, tts_speed, brain_mode
+      published_at, system_prompt, brain_status, tts_speed, brain_mode, decoupled
     `)
     .eq('id', creatorId)
     .maybeSingle<{
@@ -207,6 +207,12 @@ export async function POST(req: NextRequest) {
       tts_speed: number | string | null;
       // pgvector RAG plan (M2). 'drawer' | 'vector'. Default 'drawer'.
       brain_mode: 'drawer' | 'vector';
+      // DECOUPLED_BRAIN_PLAN P1-10. Snapshot of creators.decoupled at
+      // session-open. Forwarded to mintVoiceTicket (line ~930) so the
+      // voice_tickets row is in sync with the creator's current flag.
+      // Pre-P1-10 this was provably inert at the route layer (whole-
+      // build audit "route writer cannot reach decoupled today").
+      decoupled: boolean;
     }>();
   if (creatorErr) return json(500, { error: 'creator_lookup_failed' });
   if (!creatorRow) return json(404, { error: 'creator_not_found' });
@@ -929,6 +935,19 @@ export async function POST(req: NextRequest) {
       systemPrompt: resolvedSystemPrompt,
       prefixTurns:  brainPrefix?.prefixTurns ?? null,
       brainMode:    creatorRow.brain_mode,
+      // DECOUPLED_BRAIN_PLAN P1-10. Forward the creator's decoupled
+      // flag → ticket → bridge. The DB CHECK
+      // voice_tickets_decoupled_requires_vector_chk rejects
+      // decoupled=true with brain_mode != 'vector'; the admin RPC
+      // admin_set_creator_decoupled auto-aligns the two AND
+      // admin_set_creator_brain_mode (20260523000002 hardening) now
+      // refuses to drawer-flip a decoupled=true creator. So if both
+      // RPCs are the only path that mutates these columns, the pair
+      // stays in sync. Defense-in-depth retained: if a future code
+      // path desyncs them (a direct UPDATE, a buggy new RPC), the
+      // ticket INSERT fires 23514 and the mint fails loudly rather
+      // than silently mismatching.
+      decoupled:    creatorRow.decoupled ?? false,
       // Creator voice-speed (migration 20260511000006). supabase-js
       // returns `numeric` as JS string; coerce at the boundary (R2 audit
       // C3). DB DEFAULT 1.0 guarantees a value, but defensive on
