@@ -1057,7 +1057,11 @@ wss.on('connection', async (ws, req) => {
         console.log(
           `[ws ${connId}] decoupled.metrics turns=${m.turns} ` +
           `last_turn=${m.lastTurnNumber ?? 'na'} ` +
-          `barged=${m.barged} degraded=${(m.degraded || []).join(',') || 'none'} ` +
+          `barged=${m.barged} ` +
+          // P1-10 audit M2 — spurious-barge + trivial-Q observability
+          `interrupted_suppressed=${m.interruptedSuppressed ?? 0} ` +
+          `trivial_turns=${m.trivialTurns ?? 0} ` +
+          `degraded=${(m.degraded || []).join(',') || 'none'} ` +
           `para_first_ms=${m.lastParaFirstMs ?? 'na'} ` +
           `deep_first_ms=${m.lastDeepFirstMs ?? 'na'} ` +
           `session=${sessionId.slice(0, 8)}`,
@@ -1816,21 +1820,66 @@ wss.on('connection', async (ws, req) => {
         });
       }
     } else if (e.kind === 'interrupted') {
-      if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'interrupted', at: e.at }));
-      // Day-13 audit-build C1 — cancel in-flight v2 retrieval on barge-in.
-      // Orchestrator can't be cancelled server-side (M4 deferred), but
-      // killing the HTTP socket here prevents a stale result from
-      // injecting after the user already moved on.
-      if (pendingInjection && typeof pendingInjection.abort === 'function') {
-        try { pendingInjection.abort(); } catch {}
+      // P1-10 spurious-barge fix (2026-05-20). Gemini Live emits
+      // `serverContent.interrupted` when ITS OWN audio generation is
+      // interrupted by incoming user audio — based on Gemini's internal
+      // timeline. In decoupled mode we DISCARD that audio (Cartesia/Hume
+      // is what the user actually hears), so Gemini's audio-gen timeline
+      // is irrelevant to whether the user is barging in. A user who waits
+      // for Cartesia to finish, then asks the next question, will still
+      // trigger Gemini's interrupted (because Gemini Live is still
+      // generating its own audio response in parallel). That spurious
+      // event used to abort the orchestrator + (until this commit) NEVER
+      // call ttsBridge.cancel(), leaving the Cartesia context orphaned →
+      // "Invalid context ID" on the next turn's first sendText → silent
+      // audio for the rest of the session.
+      //
+      // Heuristic: a REAL user barge only happens during ACTIVE TTS
+      // playback. If Cartesia/Hume hasn't emitted an audio chunk in
+      // >1000ms, no playback is being interrupted → suppress.
+      // P1-10 audit S3 — promote magic number. Cartesia chunks arrive
+      // at ~40ms intervals during synthesis; 1000ms is a 25× margin so
+      // a brief packet gap can't trip the heuristic into thinking
+      // playback ended.
+      const SPURIOUS_BARGE_IDLE_THRESHOLD_MS = 1000;
+      let suppress = false;
+      if (decoupled && useTts && ttsBridge && typeof ttsBridge.getLastChunkAt === 'function') {
+        const lastChunk = ttsBridge.getLastChunkAt() || 0;
+        const idleMs = lastChunk === 0 ? Infinity : (Date.now() - lastChunk);
+        if (idleMs > SPURIOUS_BARGE_IDLE_THRESHOLD_MS) {
+          suppress = true;
+          console.log(`[ws ${connId}] interrupted suppressed (decoupled, tts idle ${idleMs}ms — spurious Gemini interrupted)`);
+          // P1-10 audit M2 — observability: surface suppression rate in
+          // session metrics.
+          if (decoupledOrch && typeof decoupledOrch.recordInterruptedSuppressed === 'function') {
+            try { decoupledOrch.recordInterruptedSuppressed(); } catch {}
+          }
+        }
       }
-      // DECOUPLED_BRAIN_PLAN P1-5.2 — barge-in: abort the in-flight
-      // paraphrase/deep generators + retrieval. Each throws with
-      // `.partial` (P0-4a server-billed) → the orchestrator still writes
-      // the cogs leg (M6). Gated ⇒ byte-identical when flag is false
-      // (pendingInjection is null on the decoupled path anyway).
-      if (decoupled && decoupledOrch) {
-        try { decoupledOrch.onInterrupted(); } catch {}
+      if (!suppress) {
+        if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'interrupted', at: e.at }));
+        // P1-10 audit C2 — ORDER MATTERS. Cancel TTS bridge FIRST
+        // (synchronous: flips _turnDead=true + nulls _currentContextId
+        // → any in-flight paraphrase delta the orchestrator hasn't yet
+        // thrown out of its for-await will hit a no-op sendText). THEN
+        // abort the orchestrator. Pre-audit ordering let a 1-3 chunk
+        // burst of audio reach Cartesia AFTER the user already barged
+        // (microtask race between AbortSignal flip and the orchestrator
+        // generator's next iteration).
+        if (useTts && ttsBridge) {
+          try { ttsBridge.cancel(); } catch {}
+        }
+        // Day-13 audit-build C1 — cancel in-flight v2 retrieval on barge-in.
+        if (pendingInjection && typeof pendingInjection.abort === 'function') {
+          try { pendingInjection.abort(); } catch {}
+        }
+        // DECOUPLED_BRAIN_PLAN P1-5.2 — barge-in: abort the in-flight
+        // paraphrase/deep generators + retrieval. Each throws with
+        // `.partial` (P0-4a server-billed) → the orchestrator still writes
+        // the cogs leg (M6).
+        if (decoupled && decoupledOrch) {
+          try { decoupledOrch.onInterrupted(); } catch {}
+        }
       }
     } else if (e.kind === 'error') {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'error', at: e.at, message: e.message }));

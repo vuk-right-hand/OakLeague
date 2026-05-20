@@ -426,6 +426,11 @@ export class HumeTTSBridge extends EventEmitter {
     this._chunksReceivedThisTurn = 0;
     this._firstSendAtMs = 0;
     this._sentFirstChunkOfTurn = false;
+    // P1-10 spurious-barge fix (2026-05-20). Mirror of cartesia-bridge:
+    // wall-clock of the last audio_out chunk, used by the proxy's
+    // `interrupted` handler to distinguish a real user barge during
+    // Hume playback from a spurious Gemini Live interrupted event.
+    this._lastChunkAtMs = 0;
     // Unit-wide audit S3 (2026-05-13): declare here so grep finds it.
     // Set in turnStart (reset per turn) and read in sendText to latch
     // the one-shot cap-exceeded emit.
@@ -546,6 +551,8 @@ export class HumeTTSBridge extends EventEmitter {
     this._audioBytesThisTurn = 0;
     this._chunksReceivedThisTurn = 0;
     this._firstSendAtMs = 0;
+    // P1-10 audit C1 — reset per turn (mirrors cartesia-bridge).
+    this._lastChunkAtMs = 0;
     this._sentFirstChunkOfTurn = false;
     this._charCapEmittedThisTurn = false;
     // Audit M6 — re-arm: stop the drop-all window. Any leaked chunks from
@@ -712,6 +719,18 @@ export class HumeTTSBridge extends EventEmitter {
       this.on('event', handler);
       this._wsSend({ flush: true });
     });
+  }
+
+  /**
+   * P1-10 spurious-barge fix (2026-05-20). See cartesia-bridge.js for the
+   * full rationale. The proxy's `interrupted` handler reads this to
+   * distinguish a real user barge during Hume playback (chunk recent)
+   * from a spurious Gemini Live interrupted event (chunk stale or never
+   * arrived — Cartesia/Hume idle, Gemini's parallel audio-gen timeline
+   * is the only thing being "interrupted").
+   */
+  getLastChunkAt() {
+    return this._lastChunkAtMs;
   }
 
   /**
@@ -885,6 +904,7 @@ export class HumeTTSBridge extends EventEmitter {
       const bytes = this._resampler ? this._resampler.process(rawBytes) : rawBytes;
       this._audioBytesThisTurn += bytes.length;
       this._chunksReceivedThisTurn += 1;
+      this._lastChunkAtMs = Date.now(); // P1-10 spurious-barge anchor
       this.emit('event', {
         kind: 'audio_out',
         at: Date.now(),

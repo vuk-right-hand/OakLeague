@@ -31,7 +31,13 @@ primary_region = 'iad'
   # consider 'suspend' instead of 'stop' to shave wake time.
   auto_stop_machines = 'stop'
   auto_start_machines = true
-  min_machines_running = 0
+  # scaling-approved: DECOUPLED_BRAIN_PLAN P1-10 1c manual session (2026-05-20).
+  # Keep ONE machine warm so /api/sessions/open's 2s probe of /voice-config
+  # never lands on a cold-start (verified 2026-05-20: warm probe = 287ms,
+  # cold = 3s+ → exceeds the route's 2s timeout → cached failOpen → 503).
+  # Single machine = no horizontal-scaling concerns (per-session state still
+  # lives on one machine only). Cost: ~$1.50/month vs. $0 with scale-to-zero.
+  min_machines_running = 1
   processes = ['app']
 
   [[http_service.checks]]

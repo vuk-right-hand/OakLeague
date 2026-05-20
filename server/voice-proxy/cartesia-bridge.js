@@ -120,6 +120,13 @@ export class CartesiaTTSBridge extends EventEmitter {
     this._turnDead = false;
     this._charsThisTurn = 0;
     this._audioBytesThisTurn = 0;
+    // P1-10 spurious-barge fix (2026-05-20). Wall-clock of the last
+    // audio_out chunk we received from Cartesia. The proxy's `interrupted`
+    // handler reads this via getLastChunkAt() to distinguish a real user
+    // barge during playback (chunk seen <1s ago) from a spurious Gemini
+    // Live interrupted event (Cartesia idle, Gemini's parallel audio-gen
+    // timeline is the only thing being "interrupted"). 0 = no chunk yet.
+    this._lastChunkAtMs = 0;
     this._reconnecting = false;
     this._reconnectAttempt = 0;
     this._unknownTypeWarned = false;
@@ -190,6 +197,11 @@ export class CartesiaTTSBridge extends EventEmitter {
     this._turnDead = false;
     this._charsThisTurn = 0;
     this._audioBytesThisTurn = 0;
+    // P1-10 audit C1 — reset on turnStart so getLastChunkAt() reflects
+    // "last chunk in CURRENT turn", not turn N-1. Without this, the
+    // spurious-barge heuristic mis-classifies pre-playback interrupted
+    // events on turn N+1 (idleMs measured against turn N's last chunk).
+    this._lastChunkAtMs = 0;
     this._sentFirstChunkOfTurn = false;
     // Phase 0.5 (2026-05-07). Capture a bounded sample of what we send so a
     // Cartesia-side "Invalid transcript" rejection lands in logs with the
@@ -351,6 +363,18 @@ export class CartesiaTTSBridge extends EventEmitter {
     });
   }
 
+  /**
+   * P1-10 spurious-barge fix (2026-05-20). Wall-clock of the last
+   * audio_out chunk received from Cartesia, or 0 if no chunk arrived
+   * since open. The proxy's `interrupted` handler uses this to decide
+   * if Gemini's interrupted event reflects a real user barge during
+   * Cartesia playback (chunk recent) or a spurious event from Gemini
+   * Live's parallel audio-gen timeline (chunk stale / never arrived).
+   */
+  getLastChunkAt() {
+    return this._lastChunkAtMs;
+  }
+
   /** Barge-in. Synchronous flag set + cancel WS send (R3-M1 / R4-S1).
    *  Nulls `_currentContextId` (L-M1) so a stray `turnEnd` after cancel
    *  doesn't try to flush against a dead context — that path used to
@@ -447,6 +471,7 @@ export class CartesiaTTSBridge extends EventEmitter {
       if (typeof b64 !== 'string' || b64.length === 0) return;
       const bytes = Buffer.from(b64, 'base64');
       this._audioBytesThisTurn += bytes.length;
+      this._lastChunkAtMs = Date.now(); // P1-10 spurious-barge anchor
       this.emit('event', {
         kind: 'audio_out',
         at: Date.now(),

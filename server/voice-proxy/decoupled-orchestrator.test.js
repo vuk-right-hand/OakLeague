@@ -425,3 +425,158 @@ test('C2 deep-answer char ceiling soft-stops a runaway (≤ 4200c emitted, degra
   assert.ok((m.degraded || []).some((d) => d.includes('char_ceiling')),
     `C2: degraded list should record char_ceiling (got ${JSON.stringify(m.degraded)})`);
 });
+
+// ── P1-10 — trivial-Q classifier + skip deep_answer ────────────────────
+//
+// Real-session finding (2026-05-20): user asked "can you hear me?" and
+// got a long invented hedge ("Let me reflect on how to best frame this,
+// my friend - what you're really asking about is how a single fork in
+// the road of our worldview..."). The hedge is the paraphrase model
+// hallucinating because the prompt forced an ALWAYS-HEDGE behavior.
+//
+// Fix: orchestrator detects trivial Qs and skips the off-Live
+// deep_answer. The paraphrase IS the full answer (paraphrase.js's
+// PARAPHRASE_SYSTEM_SUFFIX now handles trivial Qs with a direct short
+// reply). These tests lock the orchestrator-side behavior.
+
+import { isTrivialQuestion } from './decoupled-orchestrator.js';
+
+test('P1-10: isTrivialQuestion classifies greetings + hearing checks + mic checks', () => {
+  // True positives (should be trivial)
+  const trivial = [
+    // Greetings
+    'hi', 'hello', 'hey', 'Hello!', 'hey,', 'sup', 'hola',
+    'hello hello', 'yo wassup', 'wassup', 'whats up', "what's up",
+    // Hearing checks (full-string anchored)
+    'can you hear me', 'can you hear me?',
+    'do you hear me',
+    'are you still listening to me',
+    'are you actually listening',
+    // "are you" variants
+    'are you there', 'are you there?', 'are you listening',
+    'are you on', 'are you with me',
+    // Time-of-day greetings
+    'good morning', 'good afternoon', 'good evening', 'good night',
+    // Mic / test
+    'test', 'testing', 'mic check', 'mic test', 'check',
+    'hello there', 'one two three',
+    // Closings / acknowledgments (P1-10 audit M4 — added)
+    'thanks', 'thank you', 'ty', 'tysm', 'appreciate it',
+    'bye', 'goodbye', 'see ya', 'see you', 'later', 'peace',
+    'ok', 'okay', 'got it', 'gotcha', 'cool', 'nice', 'cheers',
+    'alright', 'sounds good',
+  ];
+  for (const q of trivial) {
+    assert.equal(isTrivialQuestion(q), true, `trivial: "${q}"`);
+  }
+
+  // True negatives (should NOT be trivial — real questions).
+  // P1-10 audit C3 — these used to false-classify because the
+  // hearing-check / "are you" regex was mid-string anchored via \b…\b.
+  // After end-of-string anchoring they correctly route to substantive.
+  const substantive = [
+    '',
+    'What is one practical fundraising tip for a pre-seed founder?',
+    'how do I hire my first engineer',
+    // The C3 keystone false-positives — substantive questions that
+    // happen to contain "can you hear" / "are you here" prefixes:
+    'can you hear me on this question about pricing?',
+    'are you here for the call about my fundraise?',
+    'can you listen to a quick situation',
+    'do you hear what the market is saying about ai',
+    // Trivial-looking prefix + real continuation:
+    'thanks but actually what I meant was…',
+    'ok so my real question is about strategy',
+    // Quoted greeting inside a real question:
+    'I said "hi" to my mentor and he ignored me — what now?',
+    // Length cap (>60 chars) prevents false positives:
+    'hello there, I have a long-form question about hiring strategy',
+    // Comma-tail variants reclassify as substantive (per audit C3 note —
+    // appending an address turns hearing-check into a conversational opener
+    // that DOES warrant a real answer).
+    'can you hear me, friend? I have a real question',
+  ];
+  for (const q of substantive) {
+    assert.equal(isTrivialQuestion(q), false, `substantive: "${q}"`);
+  }
+});
+
+test('P1-10 audit M3: trivial Q does NOT pollute lastAssistantResponse (retrieval context)', async () => {
+  // The PRIOR substantive turn's response should survive a trivial turn.
+  // Without this, the next substantive turn's retrieval rewriter gets
+  // "Loud and clear, friend." as conversation context — useless.
+  const { orch } = harness();
+
+  // Turn 1: substantive — populates lastAssistantResponse.
+  orch.onUserTranscript('What is one practical fundraising tip?', 1);
+  await tick();
+  await orch.onTurnComplete();
+  const substantiveAnswer = orch.lastAssistantResponse();
+  assert.equal(substantiveAnswer, 'The grounded answer.',
+    'turn 1 substantive answer captured');
+
+  // Turn 2: trivial — must NOT overwrite lastAssistantResponse.
+  orch.onUserTranscript('can you hear me?', 2);
+  await tick();
+  await orch.onTurnComplete();
+  assert.equal(orch.lastAssistantResponse(), substantiveAnswer,
+    'M3: trivial turn must preserve PRIOR substantive lastAssistantResponse');
+});
+
+test('P1-10 audit M2: metricsSnapshot exposes interruptedSuppressed + trivialTurns', async () => {
+  const { orch } = harness();
+  orch.onUserTranscript('hi', 1);
+  await tick();
+  await orch.onTurnComplete();
+  orch.onUserTranscript('good morning', 2);
+  await tick();
+  await orch.onTurnComplete();
+
+  // Simulate the proxy's suppression-handler invocation.
+  orch.recordInterruptedSuppressed();
+  orch.recordInterruptedSuppressed();
+
+  const m = orch.metricsSnapshot();
+  assert.equal(m.trivialTurns, 2, 'trivialTurns counts trivial-Q-detected turns');
+  assert.equal(m.interruptedSuppressed, 2,
+    'interruptedSuppressed counts spurious-barge suppressions');
+});
+
+test('P1-10: trivial Q → paraphrase fires, deep_answer SKIPPED, no retrieval', async () => {
+  let deepCalls = 0;
+  let retrieveCalls = 0;
+  const { orch, legs } = harness({
+    generateParaphrase: () => genStream(['Loud and clear, ', 'friend. ', 'What\'s on your mind?'],
+      { operation: 'brain_paraphrase', text: 'Loud and clear, friend. What\'s on your mind?',
+        inputTokens: 8, outputTokens: 9, quotedAt: 'q', firstChunkMs: 5, latencyMs: 99, startedAt: 1 }),
+    generateDeepAnswer: () => { deepCalls++; return genStream(['x'], { operation: 'brain_deep_answer', text: 'x', firstChunkMs: 7 }); },
+    retrieve: async () => { retrieveCalls++; return null; },
+  });
+  orch.onUserTranscript('can you hear me?', 1);
+  await tick();
+  await orch.onTurnComplete();
+
+  assert.equal(deepCalls, 0, 'deep_answer MUST NOT fire on trivial Q');
+  assert.equal(retrieveCalls, 0, 'retrieve MUST NOT fire on trivial Q (no deep_answer will use it)');
+  assert.equal(legs.filter((l) => l.operation === 'brain_paraphrase').length, 1, 'paraphrase still fires on trivial Q');
+  assert.equal(legs.filter((l) => l.operation === 'brain_deep_answer').length, 0, 'no deep_answer cogs leg on trivial Q');
+  // P1-10 audit M3 — lastAssistantResponse NOT polluted with trivial-Q
+  // text (would poison next turn's retrieval rewriter context).
+  assert.equal(orch.lastAssistantResponse(), null,
+    'M3: trivial Q does NOT update lastAssistantResponse (no prior substantive turn → null)');
+});
+
+test('P1-10: substantive Q still fires BOTH paraphrase + deep_answer (regression guard)', async () => {
+  let deepCalls = 0;
+  const { orch, legs } = harness({
+    generateDeepAnswer: () => { deepCalls++; return genStream(['The ', 'grounded ', 'answer.'],
+      { operation: 'brain_deep_answer', text: 'The grounded answer.', inputTokens: 9, outputTokens: 9, quotedAt: 'q', firstChunkMs: 7, latencyMs: 99, startedAt: 2 }); },
+  });
+  orch.onUserTranscript('What is one practical fundraising tip?', 1);
+  await tick();
+  await orch.onTurnComplete();
+
+  assert.equal(deepCalls, 1, 'deep_answer MUST fire on substantive Q');
+  assert.equal(legs.filter((l) => l.operation === 'brain_paraphrase').length, 1);
+  assert.equal(legs.filter((l) => l.operation === 'brain_deep_answer').length, 1);
+});

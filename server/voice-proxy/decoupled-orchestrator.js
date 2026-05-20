@@ -40,6 +40,51 @@
 //
 // Fully DI'd so the UX-critical sequencing is unit-tested in isolation.
 
+// P1-10 trivial-Q classifier (2026-05-20). For greetings, hearing checks,
+// mic checks, and other conversational filler, the off-Live deep_answer
+// is wasted work: the user gets a hedged paraphrase ("Let me reflect on
+// how to best frame this…") followed by a slightly-different deep answer
+// ("Yeah I can hear you, what would you like to talk about?") for what
+// should be a single 5-word reply. On a detected trivial Q the
+// orchestrator now SKIPS the deep_answer entirely; the paraphrase IS the
+// answer (paraphrase.js's PARAPHRASE_SYSTEM_SUFFIX handles trivial Qs
+// directly, producing a short in-persona answer).
+//
+// The patterns are intentionally NARROW (false-positives waste a real
+// answer; false-negatives produce mild redundancy but still correct).
+// P1-10 audit C3 — all patterns anchored ^…$ so a substantive question
+// like "can you hear me on this question about pricing?" is NOT
+// misclassified. Pre-fix the hearing-check pattern matched mid-string
+// via `\b…\b`.
+// P1-10 audit M4 — added thanks/bye/ok/wassup/hello-hello coverage.
+// Length-bounded (60 chars) is defense-in-depth on top of anchoring.
+const TRIVIAL_Q_PATTERNS = [
+  // Greetings
+  /^(hi|hello|hey|yo|sup|hola)[\s,!?.]*$/i,
+  /^hello hello[\s,!?.]*$/i,
+  /^(yo |hey )?(wassup|whats up|what'?s up|wzup)[\s,!?.]*$/i,
+  // Hearing / connectivity checks (full-string anchored). The verb alt
+  // includes both bare "listen/listening" and "listen to/listening to" so
+  // "are you actually listening" matches; the optional adverb slot covers
+  // "still / actually / really" wraps without falsely admitting trailing
+  // clauses (anchored end-of-string defeats those).
+  /^(can|do|are) you (still |actually |really )?(hear|hearing|listen|listening|listen to|listening to)( me| us)?[\s,!?.]*$/i,
+  /^are you (there|listening|on|here|with me)[\s,!?.]*$/i,
+  // Greetings of time-of-day (full-string anchored)
+  /^good (morning|afternoon|evening|day|night)[\s,!?.]*$/i,
+  // Mic / test / check (full-string anchored)
+  /^(test(ing)?|check|mic check|mic test|hello there|one two three)[\s,!?.]*$/i,
+  // Closings / acknowledgments
+  /^(thanks?|thank you|ty|tysm|appreciate it|much obliged)[\s,!?.]*$/i,
+  /^(bye|goodbye|see ya|see you|later|peace|catch you later)[\s,!?.]*$/i,
+  /^(ok|okay|got it|gotcha|cool|nice|sweet|cheers|alright|sounds good)[\s,!?.]*$/i,
+];
+export function isTrivialQuestion(text) {
+  const t = (text || '').trim();
+  if (!t || t.length > 60) return false;
+  return TRIVIAL_Q_PATTERNS.some((re) => re.test(t));
+}
+
 export function makeDecoupledOrchestrator({
   generateParaphrase,
   generateDeepAnswer,
@@ -75,12 +120,31 @@ export function makeDecoupledOrchestrator({
   let fatal = false;          // C2 — latched on misconfigured; no 2nd paid call
   // C4 — per-session running tally (the teardown log was single-turn,
   // blind to a session that degraded on turns 1-4 but not turn 5).
-  const session = { turns: 0, barged: 0, degraded: [], lastParaFirstMs: null, lastDeepFirstMs: null };
+  const session = {
+    turns: 0,
+    barged: 0,
+    // P1-10 audit M2 — observability counter for spurious-barge events
+    // suppressed by the proxy's interrupted handler (Gemini Live's
+    // parallel audio-gen timeline emitting interrupted with no actual
+    // Cartesia/Hume playback being interrupted). Incremented by
+    // recordInterruptedSuppressed() called from index.js. A rising rate
+    // here indicates the architectural mismatch is hitting more often
+    // (e.g., model verbose mode increased, Cartesia speed slowed).
+    interruptedSuppressed: 0,
+    trivialTurns: 0,
+    degraded: [],
+    lastParaFirstMs: null,
+    lastDeepFirstMs: null,
+  };
 
   function freshTurn(turnNumber) {
     const t = {
       turnNumber,
       question: '',
+      // P1-10 (2026-05-20) — when true, the orchestrator skips
+      // generateDeepAnswer entirely; the paraphrase is the full answer.
+      // Set in onUserTranscript via isTrivialQuestion.
+      isTrivial: false,
       retrievePromise: null,
       retrieveAbort: makeAbort(),
       paraphraseAbort: makeAbort(),
@@ -245,13 +309,22 @@ export function makeDecoupledOrchestrator({
     }
     const t = freshTurn(turnNumber);
     t.question = typeof text === 'string' ? text : '';
+    // P1-10 — classify BEFORE starting paraphrase so the trivial flag is
+    // observable by onTurnComplete (and the paraphrase loop, for capturing
+    // lastAssistantResponse on the trivial path).
+    t.isTrivial = isTrivialQuestion(t.question);
+    if (t.isTrivial) {
+      session.trivialTurns += 1;
+      log.info?.(`[decoupled] trivial Q detected (turn=${turnNumber} q="${t.question.slice(0, 40).replace(/[\r\n]/g, ' ')}") — paraphrase will carry the full answer; deep_answer skipped`);
+    }
     turn = t;
     session.turns += 1;
 
     const hasQuestion = t.question.trim().length > 0;
     // Small — don't burn a retrieval call on an empty/garbage transcript
     // (the bridge will throw empty_input on the paraphrase/deep anyway).
-    t.retrievePromise = hasQuestion
+    // P1-10 — also skip retrieval on trivial Qs (no deep_answer will use it).
+    t.retrievePromise = hasQuestion && !t.isTrivial
       ? Promise.resolve()
           .then(() => retrieve(t.question, t.retrieveAbort.signal))
           .catch((e) => {
@@ -272,6 +345,13 @@ export function makeDecoupledOrchestrator({
         // Whole-build audit M4 — record firstChunkMs even on barge/degrade
         // (streamToTts now returns it lazily from the first delta event).
         if (r.firstChunkMs != null) session.lastParaFirstMs = r.firstChunkMs;
+        // P1-10 audit M3 — do NOT capture paraphrase text into
+        // lastAssistantResponse even on trivial Qs. Trivial answers are
+        // conversational filler with no semantic anchors; carrying them
+        // forward as the "last response" pollutes the next turn's
+        // retrieval context (callRetrieveKnowledgeV2's rewriter reads
+        // this). On trivial, lastCompleted stays pointed at the PRIOR
+        // substantive turn (or null if none).
         if (r.degraded && r.degraded !== 'misconfigured') {
           t.degraded.push(`paraphrase:${r.degraded}`);
           session.degraded.push(`p:${r.degraded}`);
@@ -290,6 +370,24 @@ export function makeDecoupledOrchestrator({
     if (!t || t.done) { resolveSpoken(t); return; }
     t.done = true;
     if (fatal) { resolveSpoken(t); return; }
+
+    // P1-10 — trivial Q: paraphrase IS the answer. Wait for it to finish
+    // streaming to TTS, then mark turn complete. No deep_answer, no
+    // retrieval wait.
+    //
+    // P1-10 audit M3 — DO NOT set lastCompleted = t on a trivial turn.
+    // lastAssistantResponse() reads lastCompleted and feeds it into
+    // callRetrieveKnowledgeV2 as conversation context for the NEXT
+    // turn. A trivial answer ("Loud and clear, Vuk. What's on your
+    // mind?") is conversational filler with no semantic anchors; it
+    // shouldn't poison the next turn's retrieval context. The PRIOR
+    // substantive turn's response remains the lastCompleted value.
+    if (t.isTrivial) {
+      try { await t.paraphraseSpoken; } catch {}
+      // lastCompleted intentionally NOT updated — see M3 above.
+      resolveSpoken(t);
+      return;
+    }
 
     try {
       // Audit M3 — bound the retrieval wait. The paraphrase bought a
@@ -386,6 +484,10 @@ export function makeDecoupledOrchestrator({
     return {
       turns: session.turns,
       barged: session.barged,
+      // P1-10 audit M2 — observability for spurious-barge suppression.
+      interruptedSuppressed: session.interruptedSuppressed,
+      // P1-10 — observability for trivial-Q skip rate.
+      trivialTurns: session.trivialTurns,
       degraded: session.degraded.slice(),
       lastParaFirstMs: session.lastParaFirstMs,
       lastDeepFirstMs: session.lastDeepFirstMs,
@@ -393,8 +495,18 @@ export function makeDecoupledOrchestrator({
     };
   }
 
+  // P1-10 audit M2 — counter advance called from index.js's `interrupted`
+  // handler when the suppression heuristic fires. Surfaces in
+  // metricsSnapshot() so a session-end log line + sentry/posthog records
+  // the rate. A rising rate in prod = the architectural mismatch is
+  // hitting more often (verbose model, slow Cartesia, etc.).
+  function recordInterruptedSuppressed() {
+    session.interruptedSuppressed += 1;
+  }
+
   return {
     onUserTranscript, onTurnComplete, onInterrupted,
     awaitTurnSpoken, lastAssistantResponse, metricsSnapshot,
+    recordInterruptedSuppressed,
   };
 }
