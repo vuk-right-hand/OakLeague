@@ -34,15 +34,23 @@
 -- now without the paired recompile would let a flipped creator open the
 -- next session with a stale wrong-path persona. The admin
 -- `admin_set_creator_decoupled` RPC therefore lands in a LATER P1
--- migration, coupled with the decoupled persona compiler. Until then the
--- staging-creator flip is done by a direct admin UPDATE under explicit
--- sign-off (one creator, plan §8).
+-- migration, coupled with the decoupled persona compiler.
+--
+-- 2026-05-20 update (post-P1-9 audit): the original "direct admin UPDATE
+-- under explicit sign-off" interim was reviewed and REJECTED as a
+-- workable path — even with the UPDATE, the session-open route layer
+-- doesn't forward `creators.decoupled` to `mintVoiceTicket`, so the
+-- bridge reads `consumed.decoupled=false` and runs LEGACY anyway
+-- (whole-build audit "route writer cannot reach decoupled today").
+-- Plan §M3 supersedes: NO direct UPDATE on any creator (staging OR
+-- prod) — wait for D12 + admin_set_creator_decoupled RPC + the
+-- session-open route patch (tracked as P1-10 in PROD_DEPLOY_GATE.md).
 
 ALTER TABLE public.creators
   ADD COLUMN decoupled boolean NOT NULL DEFAULT false;
 
 COMMENT ON COLUMN public.creators.decoupled IS
-  'Decoupled-brain path selector (DECOUPLED_BRAIN_PLAN). false = legacy (drawer or vector mid-session injection). true = paraphrase → off-Live RAG generateContent → Hume; REQUIRES brain_mode=''vector'' (decoupled is vector-class retrieval generated off the Live session). Fail-safe default false (D7). Flip is admin-only and MUST be paired with a decoupled-persona recompile (later P1 RPC); until that RPC ships, flip via direct admin UPDATE with explicit sign-off (one staging creator).';
+  'Decoupled-brain path selector (DECOUPLED_BRAIN_PLAN). false = legacy (drawer or vector mid-session injection). true = paraphrase → off-Live RAG generateContent → Hume; REQUIRES brain_mode=''vector'' (decoupled is vector-class retrieval generated off the Live session). Fail-safe default false (D7). Flip is admin-only and MUST be paired with a decoupled-persona recompile (later P1 RPC). NO direct UPDATE path: per plan §M3 + the P1-9 whole-build audit, no creator may be flagged true until D12 + admin_set_creator_decoupled RPC + the session-open route patch land (tracked as P1-10).';
 
 ALTER TABLE public.voice_tickets
   ADD COLUMN decoupled boolean NOT NULL DEFAULT false;

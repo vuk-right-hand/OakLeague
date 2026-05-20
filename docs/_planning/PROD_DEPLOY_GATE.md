@@ -1,15 +1,20 @@
 # PROD DEPLOY GATE — READ BEFORE ANY `fly deploy` OR `main` MERGE
 
-**Status: 🟡 PARTIAL — Step 2 (Dockerfile) cleared 2026-05-20. Step 3 (b985303) verified stale. Active blockers below.**
+**Status: 🟡 PARTIAL — Steps 2 (Dockerfile), 3 (b985303 stale), 4 (migrations) cleared. P1-9 sub-gates 1a + 1b cleared empirically 2026-05-20. 1c blocked on P1-10 (D12 + admin RPC + route patch) — see below.**
 
 **Active blockers (start here):**
-  • Step 1 — P1-9 sub-gates **1a / 1b / 1c**. 1a + 1b are automatable
-    real-API spikes (~$0.05 total); 1c is a manual staging-creator
-    session you have to drive.
-  • Step 4 — migration `20260522000101` (cogs_service ADD VALUE 'voyage')
-    must land in prod.
-
-ALL of 1a, 1b, 1c AND step 4 must clear before step 5.
+  • **P1-10 prerequisite for 1c** (also referred to as D12 + admin RPC
+    in DECOUPLED_BRAIN_PLAN — same workstream): build the D12
+    decoupled-persona compiler + `admin_set_creator_decoupled` RPC +
+    the session-open route patch that forwards `creators.decoupled` to
+    `mintVoiceTicket`. Without those, `creators.decoupled=true` is
+    provably inert at the route layer — a direct UPDATE would not
+    actually exercise the decoupled brain (the audit-confirmed "route
+    writer cannot reach decoupled today" finding). M3 is explicit that
+    no creator may be flagged `decoupled=true` by any path until the
+    persona-recompile RPC exists.
+  • Step 1c (manual staging-creator session) — runs cleanly AFTER P1-10.
+  • Once 1c clears: proceed to step 5 (`fly deploy`).
 
 Last updated: 2026-05-20. Branch: `rag-sota-phase-2-days-8-12`.
 This file is the single source of truth for "why is prod not deployed yet."
@@ -191,8 +196,9 @@ perspective.
          `VOICE_TTS_LAYER_ENABLED=1 VOICE_TTS_PROVIDER=cartesia`
          (or `hume`), `BRAIN_MODEL=…`, all pricing envs set.
    - [ ] Open a session against a staging creator that has
-         `creators.decoupled=true` (via the admin RPC — direct UPDATE
-         is FORBIDDEN per §M3) AND a real cloned voice.
+         `creators.decoupled=true` (via the **P1-10 admin RPC, pending**
+         — direct UPDATE remains FORBIDDEN per §M3) AND a real cloned
+         voice.
    - [ ] Ask 5+ questions across the creator's topic drawers.
          For EACH turn verify:
          (i)   paraphrase first-audio is fast (<2.2s p75 per (A)-gate);
@@ -254,22 +260,28 @@ perspective.
          `cogs_log` per-turn rows for `brain_paraphrase` and
          `brain_deep_answer` are present with sane tokens.
 
-   If ANY of 1a/1b/1c fails OR step 4 (migration `20260522000101`) has
-   not landed in prod, do NOT advance to step 5.
+   1a ✅ CLEARED 2026-05-20 (`gemini-3-flash-preview`, high=765/490
+   minimal=0/0; prod joiner excludes thought parts). 1b ✅ CLEARED
+   2026-05-20 (9/9 attacks held including base64-encoded + French
+   language-shift). 1c BLOCKED on P1-10 (D12 + admin RPC + route patch
+   — see Active Blockers at top of file).
+
+   If ANY of 1a/1b/1c fails, do NOT advance to step 5.
 2. ✅ Update `server/voice-proxy/Dockerfile` COPY to include the full
    transitive module closure. **Done 2026-05-20** — verification commands
    above are empty; `docker build` + module-resolution probe both green.
 3. ✅ b985303 mic-fix divergence — already in branch + main; no merge work.
-4. ⛔ **Apply migration `20260522000101` (cogs_service ADD VALUE 'voyage')
-   to prod** — promoted from "tracked follow-up" to ordered gate by the
-   P1-8 whole-build audit (M2). The decoupled path's `retrieveEnvelopeForDecoupled`
-   calls `callRetrieveKnowledgeV2` whenever a creator is on
-   `retrievalVersionAtSession=2`, and v2 telemetry writes `service='voyage'`.
-   Without the migration, every Voyage rerank row dies on the enum, the
-   per-row fallback fires a Sentry burst per turn, and Voyage spend is
-   absent from `cogs_log` (kill-switch under-fed). Must land BEFORE
-   step 5 OR before any creator is on `retrieval_version=2` — whichever
-   is first.
+4. ✅ **Migrations applied to prod 2026-05-20** — `20260522000101`
+   (cogs_service ADD VALUE 'voyage'), `20260522000102`
+   (creators.decoupled + voice_tickets.decoupled boolean), `20260522000103`
+   (cogs_insert_brain_leg RPC). All three additive + fail-safe defaults.
+   Apply confirmed via `supabase migration list --linked`. **Callability
+   note (audit M1):** PostgREST schema cache lags 60-300s after a
+   CREATE FUNCTION; the first `cogs_insert_brain_leg(...)` call within
+   that window returns PGRST202 (documented in `20260522000103` line
+   109-110). Verify callability with a named-arg probe BEFORE step 5
+   (`select * from cogs_insert_brain_leg(p_user_id => '00000000-…'::uuid, …)`
+   — expect a validation error from the function body, NOT PGRST202).
 5. ⛔ `fly deploy` the proxy (Hume-aware + re-architected). Confirm it
    boots (`/healthz`, logs show `voice-proxy listening`).
 6. ⛔ Push `rag-sota-phase-2-days-8-12` → `main` (triggers Vercel prod).
