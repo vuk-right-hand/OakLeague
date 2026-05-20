@@ -157,6 +157,10 @@ export async function* generateParaphrase({ persona, question, apiKey, signal, g
           usdPerOutputToken: pricing.usdPerOutputToken,
           inputTokens: ev.usage.inputTokens,
           outputTokens: ev.usage.outputTokens,
+          // P1-9 whole-build audit C3 — thoughts tokens land in cogs
+          // metadata so the PROD_DEPLOY_GATE 1c "thinking-off honored
+          // in the live session" check has a real datum to read.
+          thoughtsTokens: ev.usage.thoughtsTokens ?? null,
           quotedAt: pricing.quotedAt,
           startedAt: ev.startedAt, // M2 wall-clock anchor for the (A) gate
           firstChunkMs: ev.firstChunkMs,

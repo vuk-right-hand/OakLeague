@@ -370,6 +370,13 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
       source: env,
       model: leg.modelId || null,
       quoted_at: leg.quotedAt || null,
+      // P1-9 whole-build audit C3 — `thoughts_tokens` lands in cogs_log
+      // metadata so the PROD_DEPLOY_GATE 1c manual-session checklist
+      // has a real datum to read ("thinking-off honored on the live
+      // path"). null = SDK didn't surface thoughtsTokenCount (e.g.,
+      // model family where the field is absent); 0 = surfaced and
+      // honored; >0 = thinking was emitted (M1 (A)-gate red flag).
+      thoughts_tokens: Number.isFinite(leg.thoughtsTokens) ? leg.thoughtsTokens : null,
     };
     // A partial with no usage = a billed call we could not size. Flag it
     // so reconciliation can true it up; the row still exists (units/cost

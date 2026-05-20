@@ -825,6 +825,12 @@ export class GeminiBridge extends EventEmitter {
     this._goAwayReopenInFlight = true;
     this._goAwayPending = false;
     this._goAwayDeadlineRetries = 0;
+    // P1-9 whole-build audit M5 — operator-visible log line for the
+    // PROD_DEPLOY_GATE 1c manual session checklist. The structured
+    // `event` below is for downstream consumers (orchestrator
+    // metrics); this string is for `fly logs` / stderr-tail. Keep the
+    // exact wording — the gate doc greps for it.
+    console.warn(`[gemini-bridge] proactive D-GoAway reopen (sessionId=${this._sessionId} reason=${reason})`);
     // Audit NEW-M3 — the bounce ends the current utterance window
     // regardless (a retry-3 force-reopen is, by definition, abandoning
     // it). Leaving _utteranceInFlight true would make the NEXT goAway on

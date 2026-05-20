@@ -134,7 +134,9 @@ test('streamGenerate yields {delta}* then ONE terminal {final,text,usage,...}', 
   }));
   assert.deepEqual(deltas, ['a', 'b']);
   assert.equal(final.text, 'ab');
-  assert.deepEqual(final.usage, { inputTokens: 10, outputTokens: 2 });
+  // P1-9 whole-build audit C3 — usage now also carries thoughtsTokens
+  // (null when absent from the stub's usageMetadata).
+  assert.deepEqual(final.usage, { inputTokens: 10, outputTokens: 2, thoughtsTokens: null });
   assert.ok(final.firstChunkMs >= 0 && final.latencyMs >= 0);
   // M2 — wall-clock anchor for the orchestrator's (A) dead-air gate.
   assert.ok(Number.isFinite(final.startedAt) && final.startedAt <= Date.now());
@@ -200,4 +202,126 @@ test('streamGenerate: C3 — signal aborted BEFORE dispatch → timeout, .partia
     },
   );
   assert.equal(dispatched, false, 'must not even call generateContentStream when pre-aborted');
+});
+
+// ── P1-9 audit M3 — thought-part FILTER in the delta joiner ────────────
+//
+// 3.x emits multi-part chunks; a part can carry `thought:true` when the
+// server-side feature is on (whether by explicit includeThoughts:true or
+// any future SDK default). The pre-fix joiner CONCATENATED thought text
+// into the user-facing delta — would leak chain-of-thought into the
+// cloned-voice TTS output. These tests lock the filter in place so a
+// future "simplification" of the joiner is caught in CI.
+
+test('M3: a chunk with thought:true parts has them EXCLUDED from delta', async () => {
+  const client = {
+    models: {
+      async generateContentStream() {
+        return (async function* () {
+          yield { candidates: [{ content: { parts: [
+            { thought: true, text: 'Let me think step by step...' },
+            { text: 'Hello' },
+          ] } }] };
+          yield { candidates: [{ content: { parts: [
+            { thought: true, text: 'Now I should be polite.' },
+            { text: ' world.' },
+          ] } }], usageMetadata: { promptTokenCount: 3, candidatesTokenCount: 2 } };
+        })();
+      },
+    },
+  };
+  const { deltas, final } = await drain(streamGenerate({
+    client, model: 'gemini-3.1-flash-preview',
+    systemInstruction: 's', contents: [], ErrCls: TestErr,
+  }));
+  assert.deepEqual(deltas, ['Hello', ' world.'],
+    'M3: thought-part text MUST NOT appear in delta — only user-facing parts');
+  assert.equal(final.text, 'Hello world.',
+    'M3: terminal text MUST be the filtered-and-joined non-thought content');
+  // Drift guard — any "Let me think" or "polite" leak indicates the
+  // filter regressed (the prod bug the P1-9 audit caught).
+  assert.equal(final.text.includes('think'), false, 'no thought-part text in delta');
+  assert.equal(final.text.includes('polite'), false, 'no thought-part text in delta');
+});
+
+test('M3: a chunk with NO parts but a top-level `text` falls back to chunk.text', async () => {
+  // Some SDK responses use the convenience `chunk.text` accessor and
+  // omit parts. The filter path only triggers when parts is an array.
+  const client = {
+    models: {
+      async generateContentStream() {
+        return (async function* () {
+          yield { text: 'a' };
+          yield { text: 'b', usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 } };
+        })();
+      },
+    },
+  };
+  const { deltas, final } = await drain(streamGenerate({
+    client, model: 'gemini-2.5-flash', systemInstruction: 's', contents: [], ErrCls: TestErr,
+  }));
+  assert.deepEqual(deltas, ['a', 'b']);
+  assert.equal(final.text, 'ab');
+});
+
+test('whole-build M2: a stream of ONLY thought-parts → invalid_response_shape with billed partial', async () => {
+  // Whole-build audit M2 — after M3 filter, all-thought-only streams
+  // produce zero user-visible deltas. The terminal-empty-text guard
+  // already rejects this with `invalid_response_shape`, but the new
+  // failure mode (pre-fix, deltas leaked from thoughts) is suppressed.
+  // Locks the behavior so streamToTts degrades cleanly.
+  const client = {
+    models: {
+      async generateContentStream() {
+        return (async function* () {
+          yield { candidates: [{ content: { parts: [{ thought: true, text: 'thinking 1' }] } }] };
+          yield { candidates: [{ content: { parts: [{ thought: true, text: 'thinking 2' }] } }],
+                  usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 3, thoughtsTokenCount: 12 } };
+        })();
+      },
+    },
+  };
+  await assert.rejects(
+    () => drain(streamGenerate({
+      client, model: 'gemini-3.1-flash-preview',
+      systemInstruction: 's', contents: [], ErrCls: TestErr,
+    })),
+    (e) => {
+      assert.ok(e instanceof TestErr && e.code === 'invalid_response_shape');
+      assert.equal(e.partial.billed, true,
+        'server billed for thought tokens even though nothing user-visible came out');
+      assert.equal(e.partial.thoughtsTokens, 12, 'thoughtsTokens travel on the partial too');
+      return true;
+    },
+  );
+});
+
+test('M3: an ALL-thought-parts chunk yields NO delta (treated as zero progress)', async () => {
+  // A pathological model that emits only thinking on a chunk MUST NOT
+  // emit a phantom empty delta — that would advance firstChunkMs to the
+  // thinking-emit time instead of the first user-visible byte.
+  const client = {
+    models: {
+      async generateContentStream() {
+        return (async function* () {
+          yield { candidates: [{ content: { parts: [
+            { thought: true, text: 'thinking only here' },
+          ] } }] };
+          yield { candidates: [{ content: { parts: [
+            { text: 'real answer' },
+          ] } }], usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 } };
+        })();
+      },
+    },
+  };
+  const { deltas, final } = await drain(streamGenerate({
+    client, model: 'gemini-3.1-flash-preview',
+    systemInstruction: 's', contents: [], ErrCls: TestErr,
+  }));
+  assert.deepEqual(deltas, ['real answer']);
+  assert.equal(final.text, 'real answer');
+  // The terminal firstChunkMs records the time of 'real answer', not
+  // the all-thought chunk. We can't assert an exact value but it must
+  // be >= 0 and the only delta in `deltas` is the post-thought text.
+  assert.ok(final.firstChunkMs >= 0);
 });

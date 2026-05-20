@@ -1,6 +1,15 @@
 # PROD DEPLOY GATE — READ BEFORE ANY `fly deploy` OR `main` MERGE
 
-**Status: 🟡 PARTIAL — Blocker #1 (Dockerfile) cleared 2026-05-20. Branch still NOT cleared to merge `main` — see remaining ordered-checklist steps 4-6 below.**
+**Status: 🟡 PARTIAL — Step 2 (Dockerfile) cleared 2026-05-20. Step 3 (b985303) verified stale. Active blockers below.**
+
+**Active blockers (start here):**
+  • Step 1 — P1-9 sub-gates **1a / 1b / 1c**. 1a + 1b are automatable
+    real-API spikes (~$0.05 total); 1c is a manual staging-creator
+    session you have to drive.
+  • Step 4 — migration `20260522000101` (cogs_service ADD VALUE 'voyage')
+    must land in prod.
+
+ALL of 1a, 1b, 1c AND step 4 must clear before step 5.
 
 Last updated: 2026-05-20. Branch: `rag-sota-phase-2-days-8-12`.
 This file is the single source of truth for "why is prod not deployed yet."
@@ -123,9 +132,130 @@ perspective.
 ## ORDERED CHECKLIST — the first prod cutover (do in this order)
 
 1. 🟡 RAG decoupled paraphrase→brain re-architecture (DECOUPLED_BRAIN_PLAN
-   P1-1..P1-7 = LANDED on the branch as of `7be288c`; P1-8 = this commit;
-   P1-9 staging smoke + real-API run still PENDING). Branch may NOT
-   be deployed until P1-9 closes.
+   P1-1..P1-7 = LANDED on the branch as of `7be288c`; P1-8 Dockerfile +
+   90d7855 whole-build audit fixes also LANDED; **P1-9 staging smoke +
+   real-API run still PENDING**). Branch may NOT be deployed until P1-9
+   closes. P1-9 splits into three sub-gates; ALL must pass before step 5:
+
+   **1a — M1/M6 real-API spike (automatable, ~$0.05).** Closes the
+       (A)-gate re-trust on the pinned model. Run from repo root:
+   ```bash
+   # bash / WSL / git-bash:
+   GEMINI_API_KEY=… BRAIN_MODEL=gemini-3.1-flash-preview \
+     node scripts/brain-p19-thinking-spike.mjs
+   ```
+   ```powershell
+   # PowerShell (Windows native shell):
+   $env:GEMINI_API_KEY='…'; $env:BRAIN_MODEL='gemini-3.1-flash-preview'
+   node scripts/brain-p19-thinking-spike.mjs
+   ```
+   M1 (COMPARATIVE: thoughtsTokens under `'minimal'` is ≤25% of the
+   `'high'` baseline; baseline must show non-trivial thinking) AND M6
+   (FORCED positive control with `includeThoughts:true` confirms the
+   SDK shape, then asserts the prod `streamGenerate` delta excludes
+   thought-part text) MUST both pass. Exit 1 = re-trust not held; exit
+   2 = spike premise invalid (missing env, wrong model family, or no
+   thoughts emitted under `'high'` so the comparative oracle has no
+   baseline). The audit-applied joiner fix (`brain-llm-common.js`:
+   `.filter(p => !p.thought)`) is in `90d7855`+; this spike VERIFIES
+   it on the live SDK surface.
+
+   **1b — Real-corpus injection-rate run (automatable, ~$0.02).** Use
+       the fixture creator if creator #1's corpus is unavailable:
+   ```bash
+   # one-time, if not already seeded:
+   node scripts/seed-rag-test-fixture.mjs
+   # spike (bash / WSL):
+   GEMINI_API_KEY=… SUPABASE_URL=… SUPABASE_SERVICE_ROLE_KEY=… \
+     BRAIN_MODEL=gemini-3.1-flash-preview \
+     node scripts/brain-injection-generatecontent-spike.mjs \
+     --from-creator <fixture-or-real-creator-uuid>
+   ```
+   ```powershell
+   # PowerShell:
+   $env:GEMINI_API_KEY='…'; $env:SUPABASE_URL='…'
+   $env:SUPABASE_SERVICE_ROLE_KEY='…'; $env:BRAIN_MODEL='gemini-3.1-flash-preview'
+   node scripts/brain-injection-generatecontent-spike.mjs `
+     --from-creator <fixture-or-real-creator-uuid>
+   ```
+   Defense must hold (0 breaches) OR every breach is a clear refusal
+   that quotes the attack. Add `--l0` to also exercise the L0 index-
+   time neutralization layer end-to-end through the running
+   `/api/internal/preprocess` route. The spike now also exercises
+   base64-encoded + language-shift attacks (audit M4).
+
+   **1c — Staging-creator correctness session (manual, Vuk-driven).**
+       The "no filler" gate from the plan §13:1262. Cannot be automated
+       — requires browser + listening. Checklist:
+   - [ ] Boot the local proxy with the decoupled-aware build + α' on:
+         `VOICE_TTS_LAYER_ENABLED=1 VOICE_TTS_PROVIDER=cartesia`
+         (or `hume`), `BRAIN_MODEL=…`, all pricing envs set.
+   - [ ] Open a session against a staging creator that has
+         `creators.decoupled=true` (via the admin RPC — direct UPDATE
+         is FORBIDDEN per §M3) AND a real cloned voice.
+   - [ ] Ask 5+ questions across the creator's topic drawers.
+         For EACH turn verify:
+         (i)   paraphrase first-audio is fast (<2.2s p75 per (A)-gate);
+         (ii)  paraphrase → deep answer is SEAMLESS — one continuous
+               utterance, no dead air > ~250ms, no double-speak;
+         (iii) the deep answer SOUNDS LIKE THE CREATOR — content, tone,
+               vocabulary all in-persona (not a stock-AI hedge);
+         (iv)  barge-in halts the voice INSTANTLY (no tail);
+         (v)   the proxy's `decoupled.metrics turns=…` log line is
+               present at session-end with real numbers (no `na`).
+   - [ ] **L0 applied verification (audit M5):** sample one
+         `sample_content` row used by the session and confirm its
+         `sanitized_text` differs from `raw_text` for any row that
+         contained an injection-pattern phrase. If `sanitized_text =
+         raw_text` on every row in the corpus, L0 either never ran or
+         the corpus has no patterns to neutralize — flag for review.
+   - [ ] **cogs_log per-turn writes (audit M5):**
+         ```sql
+         SELECT operation, COUNT(*), AVG(cost_usd), MAX(cost_usd)
+         FROM cogs_log
+         WHERE session_id = '<staging-session-id>'
+           AND service = 'gemini'
+         GROUP BY operation;
+         ```
+         Expect 2 rows: `brain_paraphrase` and `brain_deep_answer`, COUNT
+         equal to turn count, AVG non-zero, MAX bounded (no 4000c overflow
+         spend). A missing operation row = silent COGS gap.
+   - [ ] **thoughts_tokens = 0 per turn (audit M5 + whole-build C3):**
+         the P1-9 audit-applied C3 plumbing now writes
+         `metadata->>'thoughts_tokens'` into `cogs_log` on every
+         brain_paraphrase + brain_deep_answer row. Query:
+         ```sql
+         SELECT turn_number, operation, metadata->>'thoughts_tokens' AS tt
+         FROM cogs_log
+         WHERE session_id = '<staging-session-id>'
+           AND service = 'gemini'
+         ORDER BY turn_number, operation;
+         ```
+         Expect `tt` = `0` or `null` on every row. `null` means the SDK
+         didn't surface `thoughtsTokenCount` (legacy model family); `0`
+         means surfaced + honored; non-zero ⇒ thinking-off NOT honored
+         in the live session (1a's comparative oracle is not enough on
+         its own — empirically prove it on the real path).
+   - [ ] At least ONE long session (>10 min) to exercise D-GoAway
+         proactive reopen. Tail the proxy stderr for the exact log
+         string `[gemini-bridge] proactive D-GoAway reopen` emitted by
+         `gemini-bridge.js _proactiveReopen`. At least ONE such line
+         MUST appear in the >10-min session AND the session must
+         continue without audible reconnect artifact. If the log line
+         text changes, update this bullet to match.
+   - [ ] **Cross-session burn-in (audit M5):** immediately after the
+         first session ends cleanly, open a SECOND session with a
+         different question pattern. Verify no cross-session state
+         bleed: `lastAssistantResponse`, `_sessionGen`, no leaked
+         `_utteranceInFlight`. Sentry should be clean for both.
+   - [ ] One ambiguous / out-of-corpus question to verify the
+         persona-only degrade (no fabricated specifics).
+   - [ ] Sentry / cogs_log show no red-flag end_reasons. The
+         `cogs_log` per-turn rows for `brain_paraphrase` and
+         `brain_deep_answer` are present with sane tokens.
+
+   If ANY of 1a/1b/1c fails OR step 4 (migration `20260522000101`) has
+   not landed in prod, do NOT advance to step 5.
 2. ✅ Update `server/voice-proxy/Dockerfile` COPY to include the full
    transitive module closure. **Done 2026-05-20** — verification commands
    above are empty; `docker build` + module-resolution probe both green.
