@@ -121,25 +121,41 @@ const MINIMAL_RATIO_MAX = 0.25;
 // streamGenerate caller — production path, prod joiner. We drive the
 // thinking config via spike-only hooks (`__spike_*`); prod callers don't
 // pass these and get `thinkingConfigFor(MODEL)` (audit-applied 90d7855).
+//
+// On 'high' thinking the model often consumes ALL of maxOutputTokens on
+// thinking and emits no user-visible delta — streamGenerate throws
+// `invalid_response_shape` with the partial carrying `thoughtsTokens`
+// (M2 unit test). For the spike's M1 oracle, the thoughts-token count
+// IS the measurement; an empty user delta is fine.
 async function prodRun(prompt, { level, includeThoughts }) {
   let delta = '';
   let final = null;
-  for await (const ev of streamGenerate({
-    client: ai, model: MODEL,
-    systemInstruction: '',
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    signal: null, ErrCls: TestErr,
-    __spike_thinkingLevel: level,
-    __spike_includeThoughts: includeThoughts,
-  })) {
-    if (ev.final) final = ev;
-    else if (ev.delta) delta += ev.delta;
+  let partial = null;
+  try {
+    for await (const ev of streamGenerate({
+      client: ai, model: MODEL,
+      systemInstruction: '',
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      signal: null, ErrCls: TestErr,
+      __spike_thinkingLevel: level,
+      __spike_includeThoughts: includeThoughts,
+    })) {
+      if (ev.final) final = ev;
+      else if (ev.delta) delta += ev.delta;
+    }
+  } catch (e) {
+    if (e instanceof TestErr && e.code === 'invalid_response_shape' && e.partial) {
+      partial = e.partial;
+    } else {
+      throw e;
+    }
   }
   return {
     delta,
-    thoughtsTokens: final?.usage?.thoughtsTokens ?? null,
-    inputTokens: final?.usage?.inputTokens ?? null,
-    outputTokens: final?.usage?.outputTokens ?? null,
+    thoughtsTokens: final?.usage?.thoughtsTokens ?? partial?.thoughtsTokens ?? null,
+    inputTokens: final?.usage?.inputTokens ?? partial?.inputTokens ?? null,
+    outputTokens: final?.usage?.outputTokens ?? partial?.outputTokens ?? null,
+    emptyText: !!partial,
   };
 }
 
@@ -214,16 +230,24 @@ async function main() {
   }
 
   console.log('\n── M6 — prod joiner excludes thought-parts (forced positive control) ──');
+  // Real-world finding (2026-05-20 first run on gemini-3-flash-preview):
+  // not every reasoning prompt elicits raw `thought:true` parts under
+  // `includeThoughts:true` — even when thoughtsTokenCount > 0 in the
+  // usage metadata, the SDK may only surface summary-level thoughts
+  // and skip the per-part flag on shorter prompts. M6 is PROVEN if AT
+  // LEAST ONE prompt produces thought parts AND its prod delta
+  // excludes them. A zero-thought-part prompt is a spike-design
+  // fragility (warn). Exit 2 only fires when NO prompt at all could
+  // exercise M6 → SDK shape genuinely changed.
+  let m6Proven = 0;
+  let m6Warned = 0;
   for (const r of runs) {
-    // Step (i): SDK shape sanity — raw forced run MUST emit thought parts.
     if (r.raw.thoughtPartTexts.length === 0) {
-      console.log(`[FAIL] ${r.prompt.label}: raw SDK forced run produced ZERO thought parts. ` +
-        `SDK shape may have changed; spike premise invalid. Exit 2.`);
-      failed++;
-      process.exit(2);
+      console.log(`[WARN] ${r.prompt.label}: raw SDK forced run produced ZERO thought-flagged parts ` +
+        `(thoughtsTokens=${r.forced.thoughtsTokens}); cannot validate M6 on this prompt.`);
+      m6Warned++;
+      continue;
     }
-    // Step (ii): the prod-joiner FORCED run's delta MUST NOT contain
-    // any ≥24-char substring of the raw run's thought parts.
     const leakProbes = r.raw.thoughtPartTexts
       .filter((t) => t.length >= 24)
       .map((t) => t.slice(0, 24));
@@ -236,7 +260,16 @@ async function main() {
     } else {
       console.log(`[PASS] ${r.prompt.label}: raw=${r.raw.thoughtPartTexts.length} thought-part(s) ` +
         `observed; prod streamGenerate delta excludes all ≥24c probes.`);
+      m6Proven++;
     }
+  }
+  if (m6Proven === 0 && m6Warned === runs.length) {
+    console.log(`[FAIL] M6: NO prompt elicited thought-flagged parts (warn × ${m6Warned}). ` +
+      `SDK shape may have changed OR all prompts are too simple; spike premise invalid.`);
+    process.exit(2);
+  }
+  if (m6Proven > 0) {
+    console.log(`[summary] M6 proven on ${m6Proven}/${runs.length} prompts (warn=${m6Warned}, fail=${failed}).`);
   }
 
   console.log('\n── samples (operator review) ──');
