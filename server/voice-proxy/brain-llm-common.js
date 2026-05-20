@@ -102,7 +102,32 @@ export function _resetClientsForTests() {
  * estimate; the contract guarantees the caller is never left with
  * nothing on the billed path).
  */
-export async function* streamGenerate({ client, model, systemInstruction, contents, signal, ErrCls }) {
+// Whole-build audit M5 — Gemini's server has no built-in "stop streaming
+// after X seconds of no progress." If the network half-opens or the server
+// stalls after the first delta, the for-await wedges forever, the
+// orchestrator's t.spoken never resolves, awaitTurnSpoken waits its full
+// 30s ceiling, and the user hears a few hundred ms of audio then 30s of
+// dead air. 8s no-progress is the latency-budget ceiling (P0-4b measured
+// 1st-chunk p95 ~ 1.5s; 8s = 5×). On expiry we throw 'timeout' with
+// `.partial.billed === true` (the server billed the partial response by
+// P0-4a) so the caller writes the cogs leg as a degrade.
+const CHUNK_DEADLINE_MS = 8000;
+
+// Whole-build audit C2 — uncapped per-turn TTS spend. The legacy
+// audio-out path's `OUTPUT_TRANSCRIPT_MAX_CHARS=4000` cap was load-bearing
+// for the 150% kill-switch (CLAUDE.md). On the decoupled text-out path,
+// nothing capped output until now: a verbose persona-only generation
+// could pump 30 KB into Cartesia at ~$0.000065/char ≈ $2/turn. Per-call
+// `maxOutputTokens` is the server-side guard; the orchestrator adds a
+// streaming-char ceiling as the second guard.
+const PARAPHRASE_MAX_OUTPUT_TOKENS = 120;   // hedged single sentence (~80 words)
+const DEEP_ANSWER_MAX_OUTPUT_TOKENS = 800;  // ~600 words; matches OUTPUT_TRANSCRIPT_MAX_CHARS=4000 budget
+function maxOutputTokensFor(op) {
+  if (op === 'brain_paraphrase') return PARAPHRASE_MAX_OUTPUT_TOKENS;
+  return DEEP_ANSWER_MAX_OUTPUT_TOKENS;
+}
+
+export async function* streamGenerate({ client, model, systemInstruction, contents, signal, ErrCls, operation }) {
   const startedAt = Date.now();
   let firstChunkMs = null;
   let fullText = '';
@@ -129,6 +154,9 @@ export async function* streamGenerate({ client, model, systemInstruction, conten
         systemInstruction,
         temperature: 0.4,
         thinkingConfig: thinkingConfigFor(model),
+        // Whole-build audit C2 — hard per-call output cap so a runaway
+        // generation can't pump uncapped chars into TTS.
+        maxOutputTokens: maxOutputTokensFor(operation),
         ...(signal ? { abortSignal: signal } : {}),
       },
     });
@@ -136,8 +164,30 @@ export async function* streamGenerate({ client, model, systemInstruction, conten
     throw mapErr(e, ErrCls, { text: '', lastUsage });
   }
 
+  // Whole-build audit M5 — chunk-deadline wrapping of the for-await loop.
+  // We can't pass a timeout to the SDK; instead race each `next()` against
+  // a deadline timer. On expiry, abort our read; `mapErr` classifies it as
+  // 'timeout' with `billed:true` partial state.
+  const iter = stream[Symbol.asyncIterator]();
   try {
-    for await (const chunk of stream) {
+    while (true) {
+      let timer;
+      let result;
+      try {
+        result = await Promise.race([
+          iter.next(),
+          new Promise((_res, rej) => {
+            timer = setTimeout(
+              () => rej(Object.assign(new Error('chunk deadline exceeded'), { name: 'AbortError' })),
+              CHUNK_DEADLINE_MS,
+            );
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      if (result.done) break;
+      const chunk = result.value;
       const delta =
         chunk?.text ??
         chunk?.candidates?.[0]?.content?.parts?.map((p) => p.text ?? '').join('') ??

@@ -358,3 +358,70 @@ test('the bridge {final} is handed to logBrainLeg verbatim', async () => {
   assert.equal(deep.inputTokens, 9);
   assert.equal(deep.quotedAt, 'q');
 });
+
+// ── whole-build audit C1 — metricsSnapshot SHAPE is the contract index.js reads
+//
+// metricsSnapshot field names are load-bearing: index.js's teardown log
+// (the (A)-gate first-audio metric) reads them by name. Before the fix
+// the reader was `m.turnNumber` / `m.paraphrase?.firstChunkMs` /
+// `m.deep?.firstChunkMs` and resolved to undefined every session. This
+// asserts the CURRENT field names — a future drift on either side fails
+// loudly instead of writing `na` to the log line.
+test('C1 metricsSnapshot exposes lastTurnNumber / lastParaFirstMs / lastDeepFirstMs', async () => {
+  const { orch } = harness();
+  orch.onUserTranscript('q', 7);
+  await tick();
+  await orch.onTurnComplete();
+  const m = orch.metricsSnapshot();
+  assert.ok(m, 'snapshot present after a turn ran');
+  assert.equal(m.turns, 1);
+  assert.equal(m.lastTurnNumber, 7);
+  assert.equal(typeof m.lastParaFirstMs, 'number', 'lastParaFirstMs populated post-final');
+  assert.equal(typeof m.lastDeepFirstMs, 'number', 'lastDeepFirstMs populated post-final');
+  // Drift guard — the pre-fix readers MUST NOT come back as a future
+  // refactor convenience or index.js will silently log undefined again.
+  assert.equal(m.turnNumber, undefined);
+  assert.equal(m.paraphrase, undefined);
+  assert.equal(m.deep, undefined);
+});
+
+// ── whole-build audit M4 — firstChunkMs captured on barge (no final)
+test('M4 firstChunkMs is captured even when the turn barges before final', async () => {
+  // Paraphrase yields a delta then never finals — barge mid-stream. The
+  // pre-fix path read firstChunkMs only from `final`; this asserts the
+  // streamToTts wall-clock capture lands the metric anyway.
+  const { orch } = harness({
+    generateParaphrase: ({ signal }) => genBargeable(['Let me think...'], signal,
+      { operation: 'brain_paraphrase', text: 'Let me think...', inputTokens: 5, outputTokens: 5, quotedAt: 'q', modelId: 'm', usdPerInputToken: 1, usdPerOutputToken: 1, billed: true }),
+  });
+  orch.onUserTranscript('q', 1);
+  await tick();
+  orch.onInterrupted(); // barge — paraphraseAbort fires
+  await tick();
+  await tick();
+  const m = orch.metricsSnapshot();
+  assert.equal(typeof m.lastParaFirstMs, 'number',
+    'M4: firstChunkMs landed in lastParaFirstMs even though no final event arrived');
+});
+
+// ── whole-build audit C2 — streaming char ceiling soft-stops a runaway
+test('C2 deep-answer char ceiling soft-stops a runaway (≤ 4200c emitted, degraded=char_ceiling)', async () => {
+  // 100 deltas × 50 chars = 5000c emitted upstream. The orchestrator must
+  // soft-stop within the ceiling+slack window (4200c) and mark the turn
+  // degraded='char_ceiling'.
+  const big = '. ' + 'x'.repeat(48); // 50 chars; the '.' is a sentence boundary
+  const deltas = Array.from({ length: 100 }, () => big);
+  const { orch, tts } = harness({
+    generateDeepAnswer: () => genStream(deltas,
+      { operation: 'brain_deep_answer', text: deltas.join(''), inputTokens: 9, outputTokens: 9, quotedAt: 'q', firstChunkMs: 7, latencyMs: 99, startedAt: 2 }),
+  });
+  orch.onUserTranscript('q', 1);
+  await tick();
+  await orch.onTurnComplete();
+  const total = tts.join('').length;
+  assert.ok(total <= 4200,
+    `C2: TTS-emitted chars must stay within ceiling+slack (got ${total}, ceiling=4000, slack=200)`);
+  const m = orch.metricsSnapshot();
+  assert.ok((m.degraded || []).some((d) => d.includes('char_ceiling')),
+    `C2: degraded list should record char_ceiling (got ${JSON.stringify(m.degraded)})`);
+});

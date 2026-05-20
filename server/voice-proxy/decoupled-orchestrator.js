@@ -104,14 +104,68 @@ export function makeDecoupledOrchestrator({
     if (t && !t.spokenResolved) { t.spokenResolved = true; t._resolveSpoken(); }
   }
 
-  async function streamToTts(gen, kind, turnNumber, { gateBeforeFirstSend } = {}) {
+  // Whole-build audit C2 — second-guard char ceiling (per-turn TTS spend).
+  // The server-side `maxOutputTokens` is the primary cap; this is the
+  // belt-and-suspenders cap on emitted CHARS reaching TTS, matched to
+  // gemini-bridge's load-bearing OUTPUT_TRANSCRIPT_MAX_CHARS=4000 (CLAUDE.md).
+  // The deep answer fits comfortably; a runaway gets aborted with the
+  // partial-text already streamed (no rude mid-word cut: we stop at the
+  // first newline or sentence-boundary AFTER the cap, with a 200-char
+  // slack window — the user hears a complete-sounding short answer).
+  const OUTPUT_CHAR_CEILING = 4000;
+  const OUTPUT_CHAR_SLACK = 200;
+
+  async function streamToTts(gen, kind, turnNumber, { gateBeforeFirstSend, deepAbort } = {}) {
+    // Whole-build audit M4 — capture firstChunkMs LOCALLY at first delta
+    // (the brain-llm-common.streamGenerate `firstChunkMs` field only lands
+    // on the terminal `final` event, never on deltas — so a barge mid-
+    // stream had no metric. Wall-clock from streamToTts entry is the
+    // user-observed "time to first audio" anchor, which is what the (A)
+    // gate measures end-to-end anyway).
+    const enteredAt = now();
     let firstSent = false;
     let final = null;
+    let firstChunkMs = null;
+    let charsEmitted = 0;
+    let overflowAborted = false;
     try {
       for await (const ev of gen) {
         if (ev.final) { final = ev; continue; }
         if (!firstSent && gateBeforeFirstSend) { await gateBeforeFirstSend; firstSent = true; }
-        if (ev.delta) ttsSendText(ev.delta);
+        if (ev.delta) {
+          if (firstChunkMs === null) firstChunkMs = now() - enteredAt;
+          // Whole-build audit C2 — once past the ceiling, ship up to the
+          // FIRST sentence boundary (so the cloned voice doesn't truncate
+          // mid-word) and then ABORT the rest of the stream. Pre-fix
+          // bug: shipped 1 byte per delta past the ceiling and kept
+          // iterating, which meant a model emitting `. xxx` 100× would
+          // happily ride all the way to its natural end — the cap did
+          // nothing. Correct semantics: hit a boundary OR hit the slack
+          // window, EITHER WAY stop processing the stream.
+          if (charsEmitted >= OUTPUT_CHAR_CEILING) {
+            const tail = ev.delta;
+            // Slack window: how many more chars are we allowed to emit?
+            const remaining = (OUTPUT_CHAR_CEILING + OUTPUT_CHAR_SLACK) - charsEmitted;
+            let endIdx = -1;
+            const scanLen = Math.min(tail.length, remaining);
+            for (let i = 0; i < scanLen; i++) {
+              const c = tail.charCodeAt(i);
+              if (c === 10 /* \n */ || c === 46 /* . */ || c === 33 /* ! */ || c === 63 /* ? */) {
+                endIdx = i + 1;
+                break;
+              }
+            }
+            if (endIdx < 0) endIdx = scanLen; // no boundary in window → hard cap
+            if (endIdx > 0) { ttsSendText(tail.slice(0, endIdx)); charsEmitted += endIdx; }
+            overflowAborted = true;
+            log.warn?.(`[decoupled] ${kind} char-ceiling exceeded — aborted at ${charsEmitted}c (turn=${turnNumber})`);
+            try { deepAbort?.abort?.(); } catch {}
+            try { gen?.return?.(); } catch {}
+            break;
+          }
+          ttsSendText(ev.delta);
+          charsEmitted += ev.delta.length;
+        }
       }
     } catch (e) {
       const code = e && e.code;
@@ -129,10 +183,14 @@ export function makeDecoupledOrchestrator({
         await safeLogLeg(e.partial, turnNumber, `${kind}.partial`);
       }
       log.warn?.(`[decoupled] ${kind} degraded (${code || 'unknown'}): ${e && e.message}`);
-      return { degraded: code || 'unknown', final: null };
+      return { degraded: code || 'unknown', final: null, firstChunkMs };
     }
     if (final) await safeLogLeg(final, turnNumber, kind);
-    return { degraded: null, final };
+    return {
+      degraded: overflowAborted ? 'char_ceiling' : null,
+      final,
+      firstChunkMs: firstChunkMs ?? final?.firstChunkMs ?? null,
+    };
   }
 
   async function safeLogLeg(leg, turnNumber, tag) {
@@ -208,8 +266,12 @@ export function makeDecoupledOrchestrator({
         const gen = generateParaphrase({
           persona, question: t.question, apiKey, signal: t.paraphraseAbort.signal,
         });
-        const r = await streamToTts(gen, 'brain_paraphrase', turnNumber);
-        if (r.final) session.lastParaFirstMs = r.final.firstChunkMs ?? session.lastParaFirstMs;
+        const r = await streamToTts(gen, 'brain_paraphrase', turnNumber, {
+          deepAbort: t.paraphraseAbort,
+        });
+        // Whole-build audit M4 — record firstChunkMs even on barge/degrade
+        // (streamToTts now returns it lazily from the first delta event).
+        if (r.firstChunkMs != null) session.lastParaFirstMs = r.firstChunkMs;
         if (r.degraded && r.degraded !== 'misconfigured') {
           t.degraded.push(`paraphrase:${r.degraded}`);
           session.degraded.push(`p:${r.degraded}`);
@@ -266,12 +328,18 @@ export function makeDecoupledOrchestrator({
       });
       const r = await streamToTts(gen, 'brain_deep_answer', t.turnNumber, {
         gateBeforeFirstSend: t.paraphraseSpoken,
+        deepAbort: t.deepAbort,
       });
+      // Whole-build audit M4 — first-chunk timing now lives outside `final`
+      // so it's captured on barge/degrade too. Order matters: set
+      // firstChunkMs before degraded-side-effects so the metrics line is
+      // populated for a session that ended on a single barged deep turn.
+      if (r.firstChunkMs != null) session.lastDeepFirstMs = r.firstChunkMs;
       if (r.final) {
         t.lastAssistantResponse = r.final.text;
         lastCompleted = t;                       // C4 — completed-turn snapshot
-        session.lastDeepFirstMs = r.final.firstChunkMs ?? session.lastDeepFirstMs;
-      } else if (r.degraded && r.degraded !== 'misconfigured') {
+      }
+      if (r.degraded && r.degraded !== 'misconfigured') {
         t.degraded.push(`deep:${r.degraded}`);
         session.degraded.push(`d:${r.degraded}`);
       }

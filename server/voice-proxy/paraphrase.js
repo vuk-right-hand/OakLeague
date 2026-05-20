@@ -145,6 +145,7 @@ export async function* generateParaphrase({ persona, question, apiKey, signal, g
       contents,
       signal,
       ErrCls: ParaphraseError,
+      operation: 'brain_paraphrase', // whole-build audit C2 — pins maxOutputTokens
     })) {
       if (ev.final) {
         yield {

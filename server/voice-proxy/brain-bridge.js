@@ -223,6 +223,7 @@ export async function* generateDeepAnswer({
       contents,
       signal,
       ErrCls: BrainBridgeError,
+      operation: 'brain_deep_answer', // whole-build audit C2 — pins maxOutputTokens
     })) {
       if (ev.final) {
         yield {

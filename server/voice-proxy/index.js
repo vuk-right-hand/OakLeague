@@ -1048,11 +1048,18 @@ wss.on('connection', async (ws, req) => {
     if (decoupled && decoupledOrch) {
       const m = decoupledOrch.metricsSnapshot();
       if (m) {
+        // Whole-build audit C1 — field names MUST match metricsSnapshot()
+        // (`lastTurnNumber` / `lastParaFirstMs` / `lastDeepFirstMs`); the
+        // pre-fix readers `m.turnNumber` / `m.paraphrase?.firstChunkMs` /
+        // `m.deep?.firstChunkMs` resolved to `undefined` on every session,
+        // turning the (A)-gate first-audio metric — the whole reason for
+        // the decoupled re-arch — into a blind log line.
         console.log(
-          `[ws ${connId}] decoupled.metrics turn=${m.turnNumber} ` +
+          `[ws ${connId}] decoupled.metrics turns=${m.turns} ` +
+          `last_turn=${m.lastTurnNumber ?? 'na'} ` +
           `barged=${m.barged} degraded=${(m.degraded || []).join(',') || 'none'} ` +
-          `para_first_ms=${m.paraphrase?.firstChunkMs ?? 'na'} ` +
-          `deep_first_ms=${m.deep?.firstChunkMs ?? 'na'} ` +
+          `para_first_ms=${m.lastParaFirstMs ?? 'na'} ` +
+          `deep_first_ms=${m.lastDeepFirstMs ?? 'na'} ` +
           `session=${sessionId.slice(0, 8)}`,
         );
       }
@@ -1612,6 +1619,14 @@ wss.on('connection', async (ws, req) => {
       captureException(new Error('decoupled_without_tts_layer'), {
         op: 'decoupled.no_tts', sessionId, ttsProvider,
       });
+      // Whole-build audit C3 — must teardown() BEFORE closeWs so the
+      // sessions row records `decoupled_no_tts_layer` as the end_reason
+      // (registry-classified red-flag in fatal-end-reasons.js). The pre-
+      // fix bare-close path fell into the WS onclose handler with
+      // teardown reason `client_close_1011_decoupled_no_tts_layer`,
+      // which is NOT in the registry → burn-in monitor classified a
+      // fleet-wide misconfig as ordinary user-hangup → alert dark.
+      await teardown('decoupled_no_tts_layer');
       return closeWs(ws, 1011, 'decoupled_no_tts_layer');
     }
     // retrieve(question, signal) → L2 envelope text | null. Mirrors the

@@ -37,6 +37,13 @@ export const FATAL_END_REASONS = Object.freeze([
   // but fatal; the burn-in monitor watches its rate (a spike ⇒ Gemini
   // resumption-handle rejection regression).
   'go_away_reopen_failed',
+  // DECOUPLED_BRAIN_PLAN P1-8 whole-build audit C3 — session-open
+  // backstop: decoupled requires the α' TTS layer, but the boot probe
+  // can DEFER on a Supabase blip and a live admin-flip can mint a
+  // decoupled ticket while α' is off. This teardown is the "never
+  // silence" rule's last line of defense; burn-in spikes here mean a
+  // fleet misconfig (admin flipped a creator without the proxy ready).
+  'decoupled_no_tts_layer',
 ]);
 
 export const FATAL_END_REASONS_SET = new Set(FATAL_END_REASONS);
