@@ -282,8 +282,39 @@ perspective.
    109-110). Verify callability with a named-arg probe BEFORE step 5
    (`select * from cogs_insert_brain_leg(p_user_id => '00000000-…'::uuid, …)`
    — expect a validation error from the function body, NOT PGRST202).
+4b. ⛔ **Apply migration `20260523000004` (Step-2 Haiku failover COGS).**
+   Widens `cogs_insert_brain_leg` with a trailing `p_service cogs_service
+   DEFAULT 'gemini'` arg + the `brain_deep_answer_failover` operation so the
+   Haiku failover leg writes under `service='anthropic'` and never collides
+   with the primary Gemini leg's idempotency slot. Additive + backward-compat
+   (the old 11-arg call site keeps working → 'gemini'). Replay-verified on a
+   local `db reset` 2026-05-21. Same PGRST202 schema-cache caveat as item 4 —
+   probe callability with the 12-arg signature before step 5.
 5. ⛔ `fly deploy` the proxy (Hume-aware + re-architected). Confirm it
    boots (`/healthz`, logs show `voice-proxy listening`).
+
+   **Step-2 Gemini→Haiku failover — 5 Fly secrets (OPTIONAL but recommended
+   for 503-resilience).** The failover is fail-SOFT: if these are unset the
+   proxy boots fine and logs `Gemini→Haiku failover DISABLED`; a Gemini 503
+   then degrades to persona-only (session survives, no crash). Set all five
+   to ARM it. Pricing is fail-closed — a partial set (model but no rate)
+   means the lazy getter throws `misconfigured` on the failover path, which
+   DEGRADES (never 1011s). Verified Haiku 4.5 rate 2026-05-21: $1/1M input,
+   $5/1M output.
+   ```bash
+   fly secrets set -a <proxy-app> \
+     ANTHROPIC_API_KEY=sk-ant-… \
+     ANTHROPIC_MODEL=claude-haiku-4-5-20251001 \
+     ANTHROPIC_USD_PER_INPUT_TOKEN=0.000001 \
+     ANTHROPIC_USD_PER_OUTPUT_TOKEN=0.000005 \
+     ANTHROPIC_QUOTED_AT=2026-05-21
+   ```
+   Guards: `ANTHROPIC_MODEL` MUST start with `claude-haiku-` and be a dated
+   pin (no `-latest`) — a non-Haiku string is rejected at use (cost guard,
+   ~30× blast radius on the live voice path). Optional tuning:
+   `BRAIN_FAILOVER_DETECT_MS` (default 2000) caps how long a STALLED Gemini
+   stream waits before failing over. On boot, confirm the log line
+   `[boot] Gemini→Haiku deep-answer failover ARMED`.
 6. ⛔ Push `rag-sota-phase-2-days-8-12` → `main` (triggers Vercel prod).
    Do step 5 before or together with this.
 7. ⛔ Only AFTER 4+5+6 green: optionally flip a single test prod creator to

@@ -17,6 +17,7 @@
 // client abort, so a barged turn MUST still be cogs-loggable).
 
 import { GoogleGenAI } from '@google/genai';
+import Anthropic from '@anthropic-ai/sdk';
 
 // CLAUDE.md voice rule — banned model strings. The ONE copy (was
 // duplicated verbatim in both bridges — M5 drift surface). Mirror of
@@ -32,6 +33,32 @@ export function assertModelAllowed(model, envName, ErrCls) {
     throw new ErrCls(
       'misconfigured',
       `${envName} invalid: ${model}. Banned: -latest, undated -preview.`,
+    );
+  }
+}
+
+// Step-2 (Gemini→Haiku failover) — the Anthropic cost guard, mirrored from
+// src/lib/voice/anthropic-client.ts (which is `import 'server-only'` and so
+// CANNOT run in this plain-Node Fly proxy — Step-2 audit C3). The Anthropic
+// API key works for EVERY model; a one-character env typo
+// (claude-haiku-4-5-… → claude-opus-4-…) silently switches the failover to
+// a ~30× model on the live voice path. Fail-closed: the model MUST start
+// with `claude-haiku-` AND must be a pinned dated id (no `-latest`, per
+// CLAUDE.md). Editing the family allow-list is a PR-reviewed code change,
+// never an env flip anyone can do.
+export function assertAnthropicModelAllowed(model, envName, ErrCls) {
+  if (!model) throw new ErrCls('misconfigured', `${envName} not set`);
+  if (/-latest$/i.test(model)) {
+    throw new ErrCls(
+      'misconfigured',
+      `${envName} invalid: ${model}. Banned: -latest — pin a dated Haiku id (e.g. claude-haiku-4-5-20251001).`,
+    );
+  }
+  if (!/^claude-haiku-/i.test(model)) {
+    throw new ErrCls(
+      'misconfigured',
+      `${envName} must be a claude-haiku-* model (cost guard); got ${model}. ` +
+        'Sonnet/Opus are not permitted via env — widen the allow-list in brain-llm-common.js if intentional.',
     );
   }
 }
@@ -81,6 +108,18 @@ export function clientFor(apiKey) {
   _clients.set(apiKey, n);
   return n;
 }
+// Step-2 — Anthropic client cache (parallel to the Gemini one). Per-apiKey,
+// no process-wide mutable defaults today. The Anthropic SDK is constructed
+// HERE (not via src/lib/voice/anthropic-client.ts, which is server-only and
+// unimportable in this Fly proxy — audit C3).
+const _anthropicClients = new Map();
+export function anthropicClientFor(apiKey) {
+  const c = _anthropicClients.get(apiKey);
+  if (c) return c;
+  const n = new Anthropic({ apiKey });
+  _anthropicClients.set(apiKey, n);
+  return n;
+}
 // Audit Small: parity with query-rewrite.ts:182-187 — test-only reset,
 // NODE_ENV-guarded so a stray prod caller can't race a live session.
 export function _resetClientsForTests() {
@@ -88,6 +127,7 @@ export function _resetClientsForTests() {
     throw new Error('_resetClientsForTests is test-only');
   }
   _clients.clear();
+  _anthropicClients.clear();
 }
 
 /**
@@ -158,11 +198,29 @@ function maxOutputTokensFor(op) {
 // re-implementation. Underscore-prefixed + named for grep so a code review
 // rejects any non-spike caller; behavior is a no-op when false/undefined,
 // which is the prod path.
-export async function* streamGenerate({ client, model, systemInstruction, contents, signal, ErrCls, operation, __spike_includeThoughts, __spike_thinkingLevel }) {
+export async function* streamGenerate({ client, model, systemInstruction, contents, signal, ErrCls, operation, failoverDetectMs, __spike_includeThoughts, __spike_thinkingLevel }) {
   const startedAt = Date.now();
   let firstChunkMs = null;
   let fullText = '';
   let lastUsage = null;
+  // Step-2 audit C5 — when the caller (the deep answer) can fail over, a
+  // STALLED Gemini stream (opened, but no first token) should be detected
+  // FAST and treated as failover-eligible, not left to eat the full 5s
+  // NO_DELTA_DEADLINE before degrading. A positive `failoverDetectMs`
+  // tightens the no-delta window AND marks the resulting error so mapErr
+  // codes it 'overloaded' (failover-eligible) instead of 'timeout'. The
+  // paraphrase path passes nothing → unchanged 5s 'timeout' behavior.
+  // Audit Small — failover-eligibility is keyed on whether the caller
+  // PASSED a detect window, NOT on a value-comparison (an operator setting
+  // BRAIN_FAILOVER_DETECT_MS to exactly NO_DELTA_DEADLINE_MS must not
+  // silently disable failover).
+  const noDeltaIsFailover = typeof failoverDetectMs === 'number' && failoverDetectMs > 0;
+  const noDeltaBudgetMs = noDeltaIsFailover ? failoverDetectMs : NO_DELTA_DEADLINE_MS;
+  const makeNoDeltaErr = () =>
+    Object.assign(new Error('no-delta deadline exceeded'), {
+      name: 'AbortError',
+      __noDeltaFailover: noDeltaIsFailover,
+    });
 
   // Audit C3 — a signal already aborted BEFORE we dispatch means the
   // request never reached the server: it did NOT bill. Throw a typed
@@ -218,7 +276,15 @@ export async function* streamGenerate({ client, model, systemInstruction, conten
   // inter-chunk timer, this fires if the cumulative time since stream
   // open elapses without ANY user-visible delta (all chunks were
   // thought-only after M3 filter).
+  // Step-2 audit C1 — for the FAILOVER path, anchor the budget at
+  // `startedAt` (pre-dispatch), NOT at post-open: the user-observed silence
+  // we're bounding includes stream-open latency. A Gemini that accepts the
+  // socket but is slow to return the stream object (the realistic overload
+  // shape) must still fail over within ~failoverDetectMs of the user
+  // finishing, not get a fresh budget after a slow open. The non-failover
+  // path keeps the original from-open semantics.
   const streamOpenedAt = Date.now();
+  const noDeltaAnchor = noDeltaIsFailover ? startedAt : streamOpenedAt;
   try {
     while (true) {
       let timer;
@@ -237,14 +303,11 @@ export async function* streamGenerate({ client, model, systemInstruction, conten
           // the timer for the REMAINING time-to-first-delta budget.
           new Promise((_res, rej) => {
             if (firstChunkMs !== null) return; // already had a delta; rely on chunk-deadline
-            const remaining = NO_DELTA_DEADLINE_MS - (Date.now() - streamOpenedAt);
+            const remaining = noDeltaBudgetMs - (Date.now() - noDeltaAnchor);
             if (remaining <= 0) {
-              return rej(Object.assign(new Error('no-delta deadline exceeded'), { name: 'AbortError' }));
+              return rej(makeNoDeltaErr());
             }
-            noDeltaTimer = setTimeout(
-              () => rej(Object.assign(new Error('no-delta deadline exceeded'), { name: 'AbortError' })),
-              remaining,
-            );
+            noDeltaTimer = setTimeout(() => rej(makeNoDeltaErr()), remaining);
           }),
         ]);
       } finally {
@@ -289,6 +352,20 @@ export async function* streamGenerate({ client, model, systemInstruction, conten
       }
     }
   } catch (e) {
+    // Step-2 audit C3 — tear down the underlying SDK stream before
+    // re-throwing. On a chunk/no-delta deadline (especially the failover
+    // path) the for-await is exited by a TIMER rejection, not by the
+    // iterator completing — without an explicit return() the HTTP stream is
+    // left open. FIRE-AND-FORGET (never `await`): the iterator is suspended
+    // in a pending network await, and awaiting return() can hang the catch
+    // until that await settles, wedging the whole failover. We only need to
+    // REQUEST teardown; the SDK closes the socket when it can. (P0-4a: the
+    // Gemini SERVER still bills a generation in full regardless of client
+    // teardown — this frees our socket but does NOT recover the server cost
+    // of a stall that had already begun generating; a documented kill-switch
+    // blind spot on the rare stall-then-failover path. The common open-time
+    // 503 never generated, so nothing leaks there.)
+    try { const r = iter.return?.(); if (r && typeof r.then === 'function') r.then(undefined, () => {}); } catch {}
     throw mapErr(e, ErrCls, { text: fullText, lastUsage });
   }
 
@@ -336,6 +413,40 @@ function billedPartial(text, lastUsage) {
 }
 
 function mapErr(e, ErrCls, partialState) {
+  // Step-2 audit M1+M2 — transient backend-capacity errors are
+  // FAILOVER-ELIGIBLE: a distinct `overloaded` code so generateDeepAnswer
+  // can retry on Claude Haiku. `@google/genai` surfaces ApiError.status as
+  // a NUMBER (503 UNAVAILABLE "model overloaded", 429 RESOURCE_EXHAUSTED);
+  // match on status first (reliable), message as a fallback. These are
+  // OPEN-TIME rejections — generation never ran, so Google did NOT bill
+  // → billed:false (no phantom cogs row; M2). Defensive: if deltas had
+  // already streamed (not expected for an open-time 503), the partial DID
+  // bill — preserve it so the leg is still written. An AbortError (barge)
+  // is NEVER overloaded.
+  // Step-2 audit C5 — a pre-first-delta STALL on a failover-capable caller
+  // is failover-eligible (Gemini opened but delivered nothing within the
+  // tight detect window). No token was delivered → treat as not-billed
+  // (billed:false): no phantom Gemini leg, and on the failover-success path
+  // this error is swallowed anyway. An input-only billing tail on a true
+  // stall is a negligible, documented under-count.
+  if (e?.__noDeltaFailover === true) {
+    const err = new ErrCls('overloaded', 'no first token within failover-detect window');
+    err.partial = { text: '', inputTokens: null, outputTokens: null, thoughtsTokens: null, billed: false };
+    return err;
+  }
+  const status = typeof e?.status === 'number' ? e.status : null;
+  const isOverloaded =
+    e?.name !== 'AbortError' &&
+    (status === 503 ||
+      status === 429 ||
+      /\b(unavailable|overloaded|resource[_ ]exhausted)\b/i.test(e?.message || ''));
+  if (isOverloaded) {
+    const err = new ErrCls('overloaded', e?.message || 'overloaded');
+    err.partial = partialState.text
+      ? billedPartial(partialState.text, partialState.lastUsage)
+      : { text: '', inputTokens: null, outputTokens: null, thoughtsTokens: null, billed: false };
+    return err;
+  }
   const code = e?.name === 'AbortError' ? 'timeout' : 'network_error';
   const err = new ErrCls(code, e?.message || code);
   // P1-9 whole-build audit M7 — open-time DNS/TLS failures
@@ -351,4 +462,220 @@ function mapErr(e, ErrCls, partialState) {
     ? { text: '', inputTokens: null, outputTokens: null, thoughtsTokens: null, billed: false }
     : billedPartial(partialState.text, partialState.lastUsage);
   return err;
+}
+
+// ── Step-2: Claude Haiku failover generator ─────────────────────────────
+//
+// streamGenerateAnthropic mirrors streamGenerate's CONTRACT exactly so the
+// orchestrator / streamToTts / cogs path are unchanged on failover:
+//   yields `{ delta }` per non-empty text fragment, then EXACTLY ONE
+//   `{ final:true, text, usage:{inputTokens,outputTokens,thoughtsTokens},
+//      startedAt, firstChunkMs, latencyMs }`.
+//
+// It accepts the SAME Gemini-shaped `{ systemInstruction, contents }` the
+// brain bridge already assembles (with the P0-5 L1/L2/L3 injection defense)
+// and maps it to Anthropic's `{ system, messages }` internally so the
+// failover call in generateDeepAnswer is symmetric with the primary call.
+//
+// EVERY streamGenerate guard is replicated (audit M4): chunk-deadline +
+// no-delta-deadline racing, max_tokens cap, thinking-block FILTER, the
+// `.partial`/billed cogs contract. The contract DIVERGES from Gemini on ONE
+// axis (audit C2): Anthropic does NOT bill-in-full on a client abort — it
+// stops generating when the connection closes and bills only the tokens
+// emitted up to the abort. The P0-4a "server bills in full on client abort"
+// rule is GEMINI-ONLY and explicitly does NOT transfer here. We therefore
+// track cumulative `output_tokens` per message_delta and bill the
+// partial-to-abort, never a full-gen estimate.
+
+// Map Gemini-shaped contents → Anthropic messages. Anthropic requires the
+// first message be role:user and STRICT user/assistant alternation (Gemini
+// is lenient). The L3 model-ack turn (role:'model') becomes role:'assistant'.
+// Audit M3 — fail LOUD on a shape Anthropic would reject (or that would
+// silently drop the injection-defense turn structure).
+export function geminiContentsToAnthropicMessages(contents, ErrCls) {
+  const messages = [];
+  for (const c of contents || []) {
+    const role = c?.role === 'model' ? 'assistant' : 'user';
+    const text = Array.isArray(c?.parts)
+      ? c.parts.map((p) => (p && typeof p.text === 'string' ? p.text : '')).join('')
+      : '';
+    messages.push({ role, content: text });
+  }
+  if (messages.length === 0 || messages[0].role !== 'user') {
+    throw new ErrCls('misconfigured', 'anthropic messages must start with a user turn');
+  }
+  for (let i = 1; i < messages.length; i++) {
+    if (messages[i].role === messages[i - 1].role) {
+      throw new ErrCls('misconfigured', 'anthropic messages must strictly alternate user/assistant');
+    }
+  }
+  return messages;
+}
+
+// Audit C2 — the Anthropic billed-partial shape. `billed:true` means the
+// request reached the server (we saw input_tokens via message_start); the
+// token counts are the LAST observed cumulative values (the terminal
+// message_delta carrying the final count does NOT arrive on abort).
+function anthropicBilledPartial(text, inputTokens, outputTokens) {
+  return {
+    text,
+    inputTokens: inputTokens ?? null,
+    outputTokens: outputTokens ?? null,
+    // Extended thinking is OFF for the Haiku failover; no separate
+    // thinking-token field on this path. Kept for cogs-shape parity.
+    thoughtsTokens: null,
+    billed: true,
+  };
+}
+
+function mapAnthropicErr(e, ErrCls, { text, inputTokens, outputTokens }) {
+  const status = typeof e?.status === 'number' ? e.status : null;
+  const name = e?.name || '';
+  let code;
+  // Anthropic overload is 529 (their dedicated code) or 503; 429 is rate
+  // limit. All transient. (We're already on the fallback here, so the
+  // orchestrator just degrades — but the code is honest.)
+  if (status === 529 || status === 503 || status === 429) code = 'overloaded';
+  else if (name === 'AbortError' || name === 'APIUserAbortError') code = 'timeout';
+  else code = 'network_error';
+  const err = new ErrCls(code, e?.message || code);
+  // Billed iff the request reached the server (message_start gave us
+  // input_tokens). A pre-dispatch abort / connection-refused did NOT bill
+  // → billed:false, no phantom row (mirrors the Gemini M7 reasoning).
+  const billed = inputTokens !== null && inputTokens !== undefined;
+  err.partial = billed
+    ? anthropicBilledPartial(text, inputTokens, outputTokens)
+    : { text: '', inputTokens: null, outputTokens: null, thoughtsTokens: null, billed: false };
+  return err;
+}
+
+export async function* streamGenerateAnthropic({ client, model, systemInstruction, contents, signal, ErrCls, operation }) {
+  const startedAt = Date.now();
+  let firstChunkMs = null;
+  let fullText = '';
+  let inputTokens = null;   // from message_start
+  let outputTokens = null;  // cumulative, last seen message_delta (C2)
+
+  // Mirror streamGenerate's pre-dispatch abort guard — a signal already
+  // aborted means the request never reached the server: it did NOT bill.
+  if (signal?.aborted) {
+    const err = new ErrCls('timeout', 'aborted before dispatch (anthropic not billed)');
+    err.partial = { text: '', inputTokens: null, outputTokens: null, thoughtsTokens: null, billed: false };
+    throw err;
+  }
+
+  // throws misconfigured on a bad message shape (M3) — BEFORE any paid call.
+  const messages = geminiContentsToAnthropicMessages(contents, ErrCls);
+
+  let stream;
+  try {
+    stream = await client.messages.create(
+      {
+        model,
+        // Anthropic REQUIRES max_tokens. Match the Gemini deep-answer
+        // budget (audit M4) so the failover answer is the same length.
+        max_tokens: maxOutputTokensFor(operation),
+        temperature: 0.4,
+        system: systemInstruction,
+        messages,
+        stream: true,
+      },
+      // Audit M5 — barge-in: the AbortSignal goes in the request options
+      // (2nd arg). On abort the SDK aborts the underlying fetch → iteration
+      // throws → mapAnthropicErr classifies it 'timeout' with a billed
+      // partial-to-abort.
+      signal ? { signal } : undefined,
+    );
+  } catch (e) {
+    throw mapAnthropicErr(e, ErrCls, { text: '', inputTokens, outputTokens });
+  }
+
+  const iter = stream[Symbol.asyncIterator]();
+  const streamOpenedAt = Date.now();
+  try {
+    while (true) {
+      let timer;
+      let noDeltaTimer;
+      let result;
+      try {
+        result = await Promise.race([
+          iter.next(),
+          new Promise((_res, rej) => {
+            timer = setTimeout(
+              () => rej(Object.assign(new Error('chunk deadline exceeded'), { name: 'AbortError' })),
+              CHUNK_DEADLINE_MS,
+            );
+          }),
+          new Promise((_res, rej) => {
+            if (firstChunkMs !== null) return; // already had a delta
+            const remaining = NO_DELTA_DEADLINE_MS - (Date.now() - streamOpenedAt);
+            if (remaining <= 0) {
+              return rej(Object.assign(new Error('no-delta deadline exceeded'), { name: 'AbortError' }));
+            }
+            noDeltaTimer = setTimeout(
+              () => rej(Object.assign(new Error('no-delta deadline exceeded'), { name: 'AbortError' })),
+              remaining,
+            );
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+        if (noDeltaTimer) clearTimeout(noDeltaTimer);
+      }
+      if (result.done) break;
+      const event = result.value;
+      const type = event?.type;
+      if (type === 'message_start') {
+        const u = event.message?.usage;
+        if (u) {
+          if (typeof u.input_tokens === 'number') inputTokens = u.input_tokens;
+          if (typeof u.output_tokens === 'number') outputTokens = u.output_tokens;
+        }
+      } else if (type === 'message_delta') {
+        // output_tokens is CUMULATIVE here (audit C2). Keep the latest.
+        // Audit M1 — do NOT overwrite inputTokens from message_delta: the
+        // authoritative full prompt count arrives ONCE in message_start;
+        // message_delta usage may omit it or echo a cache-adjusted value,
+        // either of which would clobber the correct number.
+        const u = event.usage;
+        if (u && typeof u.output_tokens === 'number') outputTokens = u.output_tokens;
+      } else if (type === 'content_block_delta') {
+        // Audit M4 — ONLY text deltas reach TTS. `thinking_delta` /
+        // `input_json_delta` are filtered so chain-of-thought never
+        // streams into the cloned voice (defensive; extended thinking is
+        // off for Haiku, but a future config flip must not leak).
+        const d = event.delta;
+        if (d?.type === 'text_delta' && typeof d.text === 'string' && d.text) {
+          if (firstChunkMs === null) firstChunkMs = Date.now() - startedAt;
+          fullText += d.text;
+          yield { delta: d.text };
+        }
+      }
+    }
+  } catch (e) {
+    // Tear down the underlying request so a deadline-fired race doesn't
+    // leave the HTTP stream running (and billing) in the background.
+    try { stream.controller?.abort?.(); } catch {}
+    throw mapAnthropicErr(e, ErrCls, { text: fullText, inputTokens, outputTokens });
+  }
+
+  if (!fullText || fullText.trim().length === 0) {
+    // A content-filtered / empty response still billed input on the server.
+    const err = new ErrCls('invalid_response_shape', 'anthropic stream produced empty text');
+    err.partial = anthropicBilledPartial(fullText, inputTokens, outputTokens);
+    throw err;
+  }
+
+  yield {
+    final: true,
+    text: fullText,
+    usage: {
+      inputTokens: inputTokens ?? 0,
+      outputTokens: outputTokens ?? 0,
+      thoughtsTokens: null,
+    },
+    startedAt,
+    firstChunkMs,
+    latencyMs: Date.now() - startedAt,
+  };
 }

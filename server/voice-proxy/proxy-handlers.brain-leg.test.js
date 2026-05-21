@@ -55,6 +55,44 @@ test('logBrainLeg: valid {final} deep-answer → cogs_insert_brain_leg with summ
   assert.equal(args.p_metadata.quoted_at, '2026-05-18');
   assert.equal(args.p_metadata.source, 'production');
   assert.ok(!('token_estimate_unavailable' in args.p_metadata));
+  // Step-2 C1 — a leg with no `service` defaults to 'gemini' (primary path).
+  assert.equal(args.p_service, 'gemini');
+});
+
+test('logBrainLeg: Step-2 — failover leg writes operation=...failover + p_service=anthropic (no collision)', async () => {
+  const sb = fakeSupabase();
+  const { logBrainLeg } = makeLogTurnCogs({ supabase: sb, env: 'production' });
+  const failoverLeg = {
+    final: true,
+    operation: 'brain_deep_answer_failover',
+    service: 'anthropic',
+    text: 'haiku-carried grounded answer',
+    modelId: 'claude-haiku-4-5-20251001',
+    usdPerInputToken: 0.000001,  // $1/1M
+    usdPerOutputToken: 0.000005, // $5/1M
+    inputTokens: 1200,
+    outputTokens: 85,
+    quotedAt: '2026-05-21',
+    startedAt: Date.now(),
+  };
+  const r = await logBrainLeg({ userId: 'u1', sessionId: 's1', turnNumber: 3, leg: failoverLeg });
+  assert.deepEqual(r, { ok: true, billedPartial: false });
+  const { args } = sb.calls[0];
+  // C1 — distinct operation + service so the failover leg can never share
+  // the primary Gemini leg's idempotency slot (session,turn,service,op).
+  assert.equal(args.p_operation, 'brain_deep_answer_failover');
+  assert.equal(args.p_service, 'anthropic');
+  assert.equal(args.p_input_cost, Number((1200 * 0.000001).toFixed(6)));   // 0.0012
+  assert.equal(args.p_output_cost, Number((85 * 0.000005).toFixed(6)));    // 0.000425
+  assert.equal(args.p_metadata.model, 'claude-haiku-4-5-20251001');
+});
+
+test('logBrainLeg: an unknown service on the leg is coerced to gemini (RPC re-guards anyway)', async () => {
+  const sb = fakeSupabase();
+  const { logBrainLeg } = makeLogTurnCogs({ supabase: sb, env: 'production' });
+  await logBrainLeg({ userId: 'u1', sessionId: 's1', turnNumber: 1, leg: { ...FINAL_DEEP, service: 'openai' } });
+  // Only 'anthropic' opts into the non-default; anything else → 'gemini'.
+  assert.equal(sb.calls[0].args.p_service, 'gemini');
 });
 
 test('logBrainLeg: M6 — barged .partial with NULL tokens → coerced 0, billed_partial, estimate-unavailable flag', async () => {

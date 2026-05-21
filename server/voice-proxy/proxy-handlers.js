@@ -351,9 +351,19 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
   // A billed call MUST be cogs-visible — so on a partial we coerce null
   // tokens → 0, write the row anyway, and flag `billed_partial` so it is
   // a VISIBLE estimate, never a silent gap (kill-switch stays fed).
+  // Step-2 (Gemini→Haiku failover) — the valid leg operations. The
+  // failover leg ('brain_deep_answer_failover') is the Haiku call that
+  // ran when Gemini 503'd; it writes under service='anthropic' so the
+  // 150% kill-switch sees the spend AND it never collides with the
+  // primary Gemini leg's idempotency slot (migration 20260523000004).
+  const BRAIN_LEG_OPERATIONS = new Set([
+    'brain_deep_answer',
+    'brain_paraphrase',
+    'brain_deep_answer_failover',
+  ]);
   async function logBrainLeg(payload) {
     const { userId, sessionId, turnNumber, leg } = payload;
-    if (!leg || (leg.operation !== 'brain_deep_answer' && leg.operation !== 'brain_paraphrase')) {
+    if (!leg || !BRAIN_LEG_OPERATIONS.has(leg.operation)) {
       captureException(new Error('logBrainLeg: missing/invalid leg.operation'), {
         op: 'cogs_insert_brain_leg', sessionId, userId, turnNumber,
         operation: leg && leg.operation,
@@ -361,6 +371,12 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
       recordFailure(sessionId);
       return { ok: false };
     }
+    // Step-2 audit C1 — provider attribution travels on the leg. Gemini
+    // (primary) legs omit `service` → default 'gemini'; the Haiku failover
+    // bridge sets service='anthropic'. Anything outside the two-provider
+    // set is a bridge bug — coerce to 'gemini' is WRONG (mis-attributes
+    // Haiku spend), so we trust the bridge but the RPC re-guards (22023).
+    const service = leg.service === 'anthropic' ? 'anthropic' : 'gemini';
     const isPartial = leg.billed === true;
     const inTok  = Number.isFinite(leg.inputTokens)  ? leg.inputTokens  : 0;
     const outTok = Number.isFinite(leg.outputTokens) ? leg.outputTokens : 0;
@@ -397,6 +413,7 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
         p_environment: env,
         p_billed_partial: isPartial,
         p_metadata: meta,
+        p_service: service,
       });
       if (error) {
         console.error('[cogs_insert_brain_leg]', error);

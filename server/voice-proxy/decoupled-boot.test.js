@@ -53,6 +53,38 @@ test('decoupled creator present + pricing OK → primed, no fatal', async () => 
   assert.equal(calls.length, 0);
 });
 
+test('Step-2 — a FAILING Anthropic failover probe is SOFT: still primed, never fatal', async () => {
+  // A missing/invalid Anthropic config must NOT crash the fleet — the
+  // failover is optional resilience (audit C4). The boot only warns.
+  const { fatal, calls } = spyFatal();
+  let anthropicProbed = false;
+  const r = await provisionDecoupledBrainPricing({
+    probeAnyDecoupledCreator: async () => ({ found: true }),
+    getBrain: () => {},
+    getParaphrase: () => {},
+    getAnthropic: () => { anthropicProbed = true; throw new Error('ANTHROPIC_MODEL not set'); },
+    log: SILENT, fatal,
+  });
+  assert.equal(anthropicProbed, true, 'the soft probe ran');
+  assert.equal(r.primed, true, 'brain/paraphrase primed — boot succeeds despite no failover');
+  assert.equal(r.fatal, false);
+  assert.equal(calls.length, 0, 'a missing FALLBACK is never fatal-at-boot');
+});
+
+test('Step-2 — Anthropic probe success does not change the primed result', async () => {
+  const { fatal, calls } = spyFatal();
+  const r = await provisionDecoupledBrainPricing({
+    probeAnyDecoupledCreator: async () => ({ found: true }),
+    getBrain: () => {},
+    getParaphrase: () => {},
+    getAnthropic: () => ({ modelId: 'claude-haiku-4-5-20251001' }),
+    log: SILENT, fatal,
+  });
+  assert.equal(r.primed, true);
+  assert.equal(r.fatal, false);
+  assert.equal(calls.length, 0);
+});
+
 test('C2 — decoupled creator present + α\' (VOICE_TTS_LAYER_ENABLED) OFF → FATAL, pricing never probed', async () => {
   const { fatal, calls } = spyFatal();
   let getBrainCalled = false;

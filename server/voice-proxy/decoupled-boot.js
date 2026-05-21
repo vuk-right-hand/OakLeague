@@ -27,7 +27,7 @@
 // side effect. Mirrors the proxy idiom (proxy-handlers
 // `_humePricingPrimeForBoot`, retrieve-knowledge-v2-client `getConfig`).
 
-import { getBrainPricing } from './brain-bridge.js';
+import { getBrainPricing, getAnthropicBrainPricing } from './brain-bridge.js';
 import { getParaphrasePricing } from './paraphrase.js';
 
 /**
@@ -53,6 +53,12 @@ export async function provisionDecoupledBrainPricing({
   ttsLayerEnabled = true,
   getBrain = getBrainPricing,
   getParaphrase = getParaphrasePricing,
+  // Step-2 — Claude Haiku failover pricing. SOFT (warn-only) by design:
+  // the failover is OPTIONAL resilience, so a missing/invalid Anthropic
+  // config must NEVER be fatal-at-boot (that would crash-loop the fleet
+  // over a fallback, the opposite of audit C4's intent). We probe it only
+  // to surface "failover is disabled" in the boot log, never to block boot.
+  getAnthropic = getAnthropicBrainPricing,
   log = console,
   fatal = (msg) => { console.error(msg); process.exit(1); },
 }) {
@@ -96,6 +102,15 @@ export async function provisionDecoupledBrainPricing({
       return { primed: false, fatal: true };
     }
     log.log?.('[boot] decoupled brain pricing primed (creator(s) flagged decoupled)');
+    // Step-2 — SOFT probe of the Haiku failover config. Never fatal: a
+    // missing fallback is no worse than no fallback (audit C4). Just make
+    // the state visible at boot so ops know whether 503-resilience is armed.
+    try {
+      getAnthropic();
+      log.log?.('[boot] Gemini→Haiku deep-answer failover ARMED (Anthropic pricing valid)');
+    } catch (e) {
+      log.warn?.(`[boot] Gemini→Haiku failover DISABLED — Anthropic config invalid/missing: ${e?.message || e}. Sessions degrade to persona-only on a Gemini 503 (no crash). Set ANTHROPIC_API_KEY/ANTHROPIC_MODEL/ANTHROPIC_USD_PER_*_TOKEN/ANTHROPIC_QUOTED_AT Fly secrets to arm it.`);
+    }
     return { primed: true, fatal: false };
   }
   if (probeFailed) {

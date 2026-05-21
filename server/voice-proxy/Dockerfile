@@ -1,5 +1,6 @@
 # Voice proxy image. Minimal Node runtime.
-# Deps: @google/genai (Live client), @supabase/supabase-js (sessions/cogs),
+# Deps: @google/genai (Live client + deep-answer), @anthropic-ai/sdk (Step-2
+# Claude Haiku deep-answer failover), @supabase/supabase-js (sessions/cogs),
 # ws (WebSocket server), @sentry/node (error capture with ticket-scrub).
 #
 # IMPORTANT: every first-party source file must be COPY'd here. A previous

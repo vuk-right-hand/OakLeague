@@ -148,6 +148,11 @@ export function makeDecoupledOrchestrator({
     // (e.g., model verbose mode increased, Cartesia speed slowed).
     interruptedSuppressed: 0,
     trivialTurns: 0,
+    // Step-2 — how many deep answers were carried by the Claude Haiku
+    // failover (Gemini returned 'overloaded' / stalled before first token).
+    // A rising rate in prod is the early-warning that Gemini reliability
+    // degraded; surfaced in metricsSnapshot → session-end log + posthog.
+    deepFailedOver: 0,
     degraded: [],
     lastParaFirstMs: null,
     lastDeepFirstMs: null,
@@ -474,6 +479,8 @@ export function makeDecoupledOrchestrator({
       if (r.firstChunkMs != null) session.lastDeepFirstMs = r.firstChunkMs;
       if (r.final) {
         t.lastAssistantResponse = r.final.text;
+        // Step-2 — count a Haiku-carried turn (the final event flags it).
+        if (r.final.failedOver === true) session.deepFailedOver += 1;
         // C4 — completed-turn snapshot. M3: a trivial Q answered by the deep
         // path (paraphrase-off mode) is still conversational filler — do NOT
         // make it the lastCompleted that feeds next-turn retrieval context.
@@ -541,6 +548,8 @@ export function makeDecoupledOrchestrator({
       interruptedSuppressed: session.interruptedSuppressed,
       // P1-10 — observability for trivial-Q skip rate.
       trivialTurns: session.trivialTurns,
+      // Step-2 — Haiku failover rate (Gemini 503/stall early-warning).
+      deepFailedOver: session.deepFailedOver,
       degraded: session.degraded.slice(),
       lastParaFirstMs: session.lastParaFirstMs,
       lastDeepFirstMs: session.lastDeepFirstMs,

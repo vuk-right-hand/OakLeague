@@ -36,10 +36,13 @@
 
 import {
   assertModelAllowed,
+  assertAnthropicModelAllowed,
   numOrThrow,
   clientFor,
+  anthropicClientFor,
   _resetClientsForTests,
   streamGenerate,
+  streamGenerateAnthropic,
 } from './brain-llm-common.js';
 
 export { _resetClientsForTests };
@@ -97,6 +100,49 @@ export function getBrainPricing() {
 
   _brainConfig = { modelId: model, usdPerInputToken, usdPerOutputToken, quotedAt };
   return _brainConfig;
+}
+
+// ── Step-2 (Gemini→Haiku failover) pricing — fail-closed, lazy-throw ────
+//
+// The Claude Haiku FALLBACK rate envs. Same fail-closed posture as
+// getBrainPricing, with ONE deliberate difference in how a misconfig is
+// HANDLED (audit C4): a missing/invalid Anthropic config must NEVER 1011
+// the session. generateDeepAnswer catches a 'misconfigured' from this
+// getter on the failover path and degrades to persona-only (re-throwing
+// the ORIGINAL Gemini `overloaded` error) — a broken FALLBACK is no worse
+// than having no fallback. The throw here is therefore an internal signal,
+// not a session-fatal like the primary BRAIN_* path.
+//
+// Fly secrets required (documented in the deploy runbook):
+//   ANTHROPIC_API_KEY · ANTHROPIC_MODEL (claude-haiku-*, dated) ·
+//   ANTHROPIC_USD_PER_INPUT_TOKEN · ANTHROPIC_USD_PER_OUTPUT_TOKEN ·
+//   ANTHROPIC_QUOTED_AT
+let _anthropicConfig = null;
+
+export function _resetAnthropicConfigForTests() {
+  _anthropicConfig = null;
+}
+
+export function getAnthropicBrainPricing() {
+  if (_anthropicConfig) return _anthropicConfig;
+
+  const model = process.env.ANTHROPIC_MODEL;
+  // Haiku-only cost guard + dated-pin (no -latest) — brain-llm-common.
+  assertAnthropicModelAllowed(model, 'ANTHROPIC_MODEL', BrainBridgeError);
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    throw new BrainBridgeError('misconfigured', 'ANTHROPIC_API_KEY not set');
+  }
+  const usdPerInputToken = numOrThrow('ANTHROPIC_USD_PER_INPUT_TOKEN', BrainBridgeError);
+  const usdPerOutputToken = numOrThrow('ANTHROPIC_USD_PER_OUTPUT_TOKEN', BrainBridgeError);
+  const quotedAt = process.env.ANTHROPIC_QUOTED_AT;
+  if (!quotedAt) {
+    throw new BrainBridgeError('misconfigured', 'ANTHROPIC_QUOTED_AT not set');
+  }
+
+  _anthropicConfig = { apiKey, modelId: model, usdPerInputToken, usdPerOutputToken, quotedAt };
+  return _anthropicConfig;
 }
 
 // ── P0-5 prompt assembly: L1 / L2 / L3 ─────────────────────────────────
@@ -200,6 +246,7 @@ export async function* generateDeepAnswer({
   apiKey,
   signal,
   genaiClient,
+  anthropicClient,
 }) {
   // Audit C3 — the empty_input guard MUST run BEFORE getBrainPricing().
   // An empty STT transcript is a no-paid-call skip by definition; it must
@@ -215,6 +262,21 @@ export async function* generateDeepAnswer({
   const pricing = getBrainPricing(); // throws misconfigured → caller 1011
   const client = genaiClient || clientFor(apiKey);
 
+  // Step-2 audit C5 — the no-delta STALL detection window for the deep
+  // answer specifically. A fast 503 fails over immediately (open-time
+  // reject); this caps how long a STALLED Gemini stream (opened, no first
+  // token) waits before it's treated as failover-eligible. Default 2000ms
+  // (the (A)-gate first-chunk p95 is ~2.2s, so 2s is tight but past the
+  // healthy first-token; tune via env without a redeploy if it false-trips).
+  const failoverDetectMs = Number.parseInt(process.env.BRAIN_FAILOVER_DETECT_MS || '', 10) || 2000;
+
+  // Step-2 audit M7 — the failover decision ("did any delta reach TTS
+  // yet?") MUST live HERE, inside the generator that knows whether it has
+  // yielded. Once a `{delta}` has streamed to TTS we are committed to the
+  // Gemini voice for this turn; a mid-stream 503 (not expected — overload
+  // is open-time) degrades, it does NOT failover (that would double-speak
+  // over the partial already spoken).
+  let deltaCount = 0;
   try {
     for await (const ev of streamGenerate({
       client,
@@ -224,6 +286,7 @@ export async function* generateDeepAnswer({
       signal,
       ErrCls: BrainBridgeError,
       operation: 'brain_deep_answer', // whole-build audit C2 — pins maxOutputTokens
+      failoverDetectMs, // C5 — fast stall detection → failover-eligible
     })) {
       if (ev.final) {
         yield {
@@ -248,20 +311,130 @@ export async function* generateDeepAnswer({
           latencyMs: ev.latencyMs,
         };
       } else {
+        deltaCount += 1;
         yield ev; // { delta }
       }
     }
+    return; // primary (Gemini) succeeded — no failover.
   } catch (e) {
+    // Step-2 — FAILOVER. Google returned a transient capacity error
+    // ('overloaded' — 503 UNAVAILABLE "model overloaded" / 429) BEFORE any
+    // delta reached TTS. Retry the SAME turn on Claude Haiku, transparently
+    // continuing to yield the same {delta}/{final} contract. The caller
+    // (orchestrator/streamToTts) never knows the provider switched.
+    if (e && e.code === 'overloaded' && deltaCount === 0) {
+      // Audit M5 — no Gemini cogs leg is lost by swallowing `e` here:
+      // deltaCount===0 ⟺ streamGenerate yielded zero `{delta}` ⟺ its
+      // `fullText` is empty ⟺ mapErr's overloaded branch set
+      // `partial.billed:false` (an open-time/stall 503 that never produced
+      // text did not bill). So there is never a billed Gemini partial to
+      // write on this path; only the Haiku leg (distinct service+operation
+      // slot) is written downstream.
+      yield* failoverToHaiku({
+        systemInstruction,
+        contents,
+        signal,
+        anthropicClient,
+        originalError: e,
+      });
+      return;
+    }
     // M6 — server billed regardless of client abort (P0-4a). Attach the
-    // pricing identity onto the partial so the caller writes the billed
-    // cogs leg from ONE object (never left guessing the rate).
+    // Gemini pricing identity onto the partial so the caller writes the
+    // billed cogs leg from ONE object (never left guessing the rate).
     if (e && e.partial) {
       e.partial.operation = 'brain_deep_answer'; // M3 — verb on the billed leg
+      e.partial.service = 'gemini';
       e.partial.modelId = pricing.modelId;
       e.partial.usdPerInputToken = pricing.usdPerInputToken;
       e.partial.usdPerOutputToken = pricing.usdPerOutputToken;
       e.partial.quotedAt = pricing.quotedAt;
       // thoughtsTokens already on partial via billedPartial() (C3).
+    }
+    throw e;
+  }
+}
+
+/**
+ * Step-2 — the Claude Haiku failover leg. Async generator yielding the
+ * SAME {delta}/{final} contract as generateDeepAnswer, but:
+ *   - final/partial carry `operation:'brain_deep_answer_failover'` +
+ *     `service:'anthropic'` so the cogs leg is correctly attributed AND
+ *     can never collide with the primary Gemini leg's idempotency slot
+ *     (migration 20260523000004; audit C1).
+ *   - `failedOver:true` on the final so the orchestrator can count failover
+ *     rate (metricsSnapshot).
+ *
+ * Audit C4 — a BROKEN FALLBACK CONFIG MUST NOT 1011 THE SESSION. If the
+ * Anthropic pricing/secrets are missing or invalid (a likely state until
+ * the Fly secrets are set), we DEGRADE: re-throw the ORIGINAL Gemini
+ * `overloaded` error (degrade bucket, billed:false) so the orchestrator
+ * falls back to persona-only and the session survives — exactly as if no
+ * fallback existed. A missing fallback is never more fatal than no fallback.
+ */
+async function* failoverToHaiku({ systemInstruction, contents, signal, anthropicClient, originalError }) {
+  let pricing;
+  let client;
+  try {
+    pricing = getAnthropicBrainPricing(); // throws misconfigured if secrets unset
+    client = anthropicClient || anthropicClientFor(pricing.apiKey);
+  } catch (cfgErr) {
+    // Fallback misconfigured → degrade, do NOT escalate to a fatal. The
+    // original overloaded error is already degrade-bucket + billed:false.
+    if (cfgErr && cfgErr.code === 'misconfigured') {
+      throw originalError;
+    }
+    throw cfgErr; // unexpected non-config error — let it surface
+  }
+
+  try {
+    for await (const ev of streamGenerateAnthropic({
+      client,
+      model: pricing.modelId,
+      systemInstruction,
+      contents,
+      signal,
+      ErrCls: BrainBridgeError,
+      operation: 'brain_deep_answer', // pins max_tokens to the deep-answer budget
+    })) {
+      if (ev.final) {
+        yield {
+          final: true,
+          operation: 'brain_deep_answer_failover',
+          service: 'anthropic',
+          failedOver: true,
+          text: ev.text,
+          modelId: pricing.modelId,
+          usdPerInputToken: pricing.usdPerInputToken,
+          usdPerOutputToken: pricing.usdPerOutputToken,
+          inputTokens: ev.usage.inputTokens,
+          outputTokens: ev.usage.outputTokens,
+          thoughtsTokens: null, // Haiku extended-thinking off on this path
+          quotedAt: pricing.quotedAt,
+          startedAt: ev.startedAt,
+          firstChunkMs: ev.firstChunkMs,
+          latencyMs: ev.latencyMs,
+        };
+      } else {
+        yield ev; // { delta }
+      }
+    }
+  } catch (e) {
+    // Haiku ALSO failed (both-fail). A misconfig discovered mid-stream
+    // (defensive — config was checked above) still must NOT 1011: degrade
+    // to the original overloaded error. Otherwise attach the Anthropic
+    // pricing identity to the billed partial so the failover cogs leg is
+    // still writable (audit C2/M6 — Anthropic bills partial-to-abort).
+    if (e && e.code === 'misconfigured') {
+      throw originalError;
+    }
+    if (e && e.partial) {
+      e.partial.operation = 'brain_deep_answer_failover';
+      e.partial.service = 'anthropic';
+      e.partial.modelId = pricing.modelId;
+      e.partial.usdPerInputToken = pricing.usdPerInputToken;
+      e.partial.usdPerOutputToken = pricing.usdPerOutputToken;
+      e.partial.quotedAt = pricing.quotedAt;
     }
     throw e;
   }

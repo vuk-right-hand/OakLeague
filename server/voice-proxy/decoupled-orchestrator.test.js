@@ -429,6 +429,29 @@ test('C2 deep-answer char ceiling soft-stops a runaway (≤ 4200c emitted, degra
     `C2: degraded list should record char_ceiling (got ${JSON.stringify(m.degraded)})`);
 });
 
+// ── Step-2 — Haiku failover metric ──────────────────────────────────────
+test('Step-2: metricsSnapshot.deepFailedOver counts a Haiku-carried (failedOver) turn', async () => {
+  const { orch } = harness({
+    paraphraseEnabled: false,
+    generateDeepAnswer: () => genStream(['Haiku ', 'answer.'], {
+      operation: 'brain_deep_answer_failover', service: 'anthropic', failedOver: true,
+      text: 'Haiku answer.', inputTokens: 5, outputTokens: 5, quotedAt: 'q', firstChunkMs: 7, latencyMs: 50, startedAt: 2,
+    }),
+  });
+  orch.onUserTranscript('what is the moat?', 1);
+  await tick();
+  await orch.onTurnComplete();
+  assert.equal(orch.metricsSnapshot().deepFailedOver, 1);
+});
+
+test('Step-2: a normal Gemini turn leaves deepFailedOver at 0', async () => {
+  const { orch } = harness({ paraphraseEnabled: false });
+  orch.onUserTranscript('what is the moat?', 1);
+  await tick();
+  await orch.onTurnComplete();
+  assert.equal(orch.metricsSnapshot().deepFailedOver, 0);
+});
+
 // ── P1-10 — trivial-Q classifier + skip deep_answer ────────────────────
 //
 // Real-session finding (2026-05-20): user asked "can you hear me?" and
