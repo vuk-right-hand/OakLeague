@@ -219,11 +219,27 @@ export async function POST(req: Request) {
   const force = searchParams.get('force') === '1';
   const { data: creator, error: creatorErr } = await sb
     .from('creators')
-    .select('id, voice_id')
+    .select('id, voice_id, user_id')
     .eq('id', creatorId)
-    .maybeSingle<{ id: string; voice_id: string | null }>();
+    .maybeSingle<{ id: string; voice_id: string | null; user_id: string }>();
   if (creatorErr) return jsonError(500, 'creator_lookup_failed');
   if (!creator) return jsonError(404, 'creator_not_found');
+
+  // P0-3 consent gate: refuse to clone a voice with no recorded voice_clone
+  // consent for the creator's user. Override path: an admin records out-of-band
+  // consent via POST /api/admin/creator-consent (admin_attest_creator_consent),
+  // which inserts a row here and unblocks. Existing creators were backfilled
+  // (migration 20260523000007).
+  const { count: voiceConsentCount, error: consentErr } = await sb
+    .from('creator_consents')
+    .select('id', { head: true, count: 'exact' })
+    .eq('user_id', creator.user_id)
+    .eq('consent_type', 'voice_clone')
+    .is('revoked_at', null);
+  if (consentErr) return jsonError(500, 'consent_lookup_failed');
+  if ((voiceConsentCount ?? 0) === 0) {
+    return jsonError(403, 'consent_missing', 'no voice_clone consent on record; record it in the Consent panel before cloning');
+  }
   if (creator.voice_id && !force) {
     return jsonError(409, 'already_cloned', 'creator already has a voice; pass ?force=1 to overwrite');
   }

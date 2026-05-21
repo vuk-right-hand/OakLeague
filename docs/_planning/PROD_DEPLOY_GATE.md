@@ -88,6 +88,23 @@ perspective.
 
 ---
 
+## Corpus reprocess worker env (FIVE_CREATOR_ONBOARDING_READINESS P0-2)
+
+**Before onboarding any creator who needs a v2 corpus reprocess**, confirm the
+deployed Fly proxy has ALL THREE set (`server/voice-proxy/index.js` boot gate,
+~line 2498-2528):
+- `GEMINI_API_KEY`
+- `INTERNAL_API_BASE_URL`
+- `INTERNAL_API_SECRET` — **must be ≥ 32 chars** (a shorter value logs an error
+  and DISABLES the worker without crashing boot, so the proxy looks "healthy").
+
+If any is missing/short, the admin "Re-process v2" button enqueues
+`corpus_reprocess_jobs` that sit `pending` forever with no error. The admin
+panel now shows a "worker may be offline" warning after ~30s of
+pending-with-no-processing (P0-2 stall detection), but the real fix is env
+config. Verify with `fly ssh console -C "env | grep -E 'GEMINI_API_KEY|INTERNAL_API'"`
+(check presence + the secret's length, not the secret value).
+
 ## Other carry-forward gates (from Hume agent handoff + Day-13)
 
 - **Deploy ordering:** `fly deploy` the Hume-aware proxy **before or together
@@ -290,8 +307,52 @@ perspective.
    (the old 11-arg call site keeps working → 'gemini'). Replay-verified on a
    local `db reset` 2026-05-21. Same PGRST202 schema-cache caveat as item 4 —
    probe callability with the 12-arg signature before step 5.
+4c. ⛔ **Apply migration `20260523000005` (Phase 3 variable-depth persona).**
+   `CREATE OR REPLACE _creator_brain_compile_unsafe` — splits the "1-3 concise
+   sentences" depth directive out of the common header: re-appended
+   BYTE-IDENTICALLY on legacy (drawer/vector) personas, DROPPED from decoupled
+   personas (the deep-answer assembler `buildDepthClause` now supplies a
+   tier-aware depth clause per turn). No signature change (same `uuid` arg),
+   called only via PERFORM inside `admin_set_creator_decoupled` → no PGRST202
+   concern. **POST-APPLY: recompile every existing decoupled creator** (admin
+   Recompile button / `admin_set_creator_decoupled` / one-shot script) so the
+   baked directive is removed from their stored persona. Until recompiled,
+   `buildDepthClause`'s C3 self-heal detects "concise sentences" in the persona
+   and FORCES brief depth + warns — a missed recompile degrades to today's
+   behavior, never a contradiction. Verify with the persona-shape pgTAP test
+   (`creator_brain_compile_persona_shape` — asserts legacy keeps brevity,
+   decoupled drops it) after a local `db reset`.
 5. ⛔ `fly deploy` the proxy (Hume-aware + re-architected). Confirm it
    boots (`/healthz`, logs show `voice-proxy listening`).
+
+   **Phase 3 variable-depth — `BRAIN_DEPTH_MODE` Fly secret (OPTIONAL, A/B'd).**
+   Variable depth is OFF unless `BRAIN_DEPTH_MODE` is the EXACT string
+   `variable` (strict ===; unset/`0`/`brief`/typo → today's 1-3-sentence brief
+   behavior). This is the A/B kill-switch: **rollback = unset the secret + the
+   next session is brief again** (no redeploy of logic needed; env-only).
+   ```bash
+   fly secrets set -a <proxy-app> BRAIN_DEPTH_MODE=variable   # ARM the A/B
+   fly secrets unset -a <proxy-app> BRAIN_DEPTH_MODE           # ROLLBACK to brief
+   ```
+   **PRE-FLIGHT (do NOT skip):** run `node --env-file=.env.local
+   scripts/brain-depth-ab-spike.mjs` first and confirm all verdicts PASS —
+   never A/B a depth behavior that hasn't been measured on the real model
+   (bifurcation holds + nothing exceeds the 4000-char ceiling).
+
+   **⚠️ COGS / kill-switch interaction (variable mode).** The kill-switch is a
+   TIME budget (cloned-voice seconds), and a longer answer = more TTS seconds =
+   faster quota burn. That's WHY tier bifurcates: free is capped at ~150 words
+   so its exposure stays bounded; paid (~450 words) gets the full story. When
+   `BRAIN_DEPTH_MODE=variable`, expect higher per-turn `output_tokens` on the
+   `brain_deep_answer` cogs leg (paid story ≈ 5-8× brief) AND on the
+   `brain_deep_answer_failover` (anthropic) leg when Gemini 503s on a long
+   answer — the Haiku leg inherits the same depth clause (same systemInstruction)
+   so a failed-over story is just as long + billed at the Haiku rate. Watch
+   `metricsSnapshot.lastDeepChars` (session-end) for answers brushing the
+   4000-char ceiling, and the daily COGS viewer for a step-change in
+   per-session brain spend after the flip. Hard caps unchanged: `max_tokens`
+   (800 ≈ ~600 words) and the orchestrator's OUTPUT_CHAR_CEILING sentence-stop
+   both still bound a runaway regardless of mode.
 
    **Step-2 Gemini→Haiku failover — 5 Fly secrets (OPTIONAL but recommended
    for 503-resilience).** The failover is fail-SOFT: if these are unset the

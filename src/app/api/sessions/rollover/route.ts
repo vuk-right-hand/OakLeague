@@ -120,7 +120,7 @@ export async function POST(req: NextRequest) {
       hume_trailing_silence, hume_trailing_silence_preview, hume_trailing_silence_dev,
       hume_voice_description, hume_voice_description_preview, hume_voice_description_dev,
       hume_model_version, hume_model_version_preview, hume_model_version_dev,
-      system_prompt, brain_status, tts_speed, brain_mode, decoupled
+      published_at, system_prompt, brain_status, tts_speed, brain_mode, decoupled
     `)
     .eq('id', creatorId)
     .maybeSingle<{
@@ -148,6 +148,10 @@ export async function POST(req: NextRequest) {
       hume_model_version: string | null;
       hume_model_version_preview: string | null;
       hume_model_version_dev: string | null;
+      // C3 (FIVE_CREATOR_ONBOARDING_READINESS P0-1): gate rollover on
+      // publication too, so a takedown/unpublish during a live session also
+      // blocks the 15-min rollover (a rollover IS a new session).
+      published_at: string | null;
       system_prompt: string | null;
       brain_status: 'pending' | 'queued' | 'training' | 'ready' | 'errored';
       // numeric → string coercion (R2 audit C3). See open route.ts:165
@@ -205,7 +209,11 @@ export async function POST(req: NextRequest) {
   // brain_status='errored'; allow training/ready when persona exists.
   const brainReady =
     creatorRow.system_prompt !== null && creatorRow.brain_status !== 'errored';
-  if (!brainReady) {
+  // C3 — mirror sessions/open: an unpublished creator (takedown / consent
+  // withdrawal mid-session) must not get a fresh rollover session minted.
+  // Admin-preview bypass preserved for both gates.
+  const published = creatorRow.published_at !== null;
+  if (!brainReady || !published) {
     const { data: adminRow } = await admin
       .from('admin_roles')
       .select('user_id')
@@ -213,21 +221,27 @@ export async function POST(req: NextRequest) {
       .is('revoked_at', null)
       .maybeSingle();
     if (!adminRow) {
-      if (shouldEmitBrainNotReady(creatorId)) {
-        Sentry.captureMessage('brain.not_ready', {
-          level: 'error',
-          extra: {
-            path: 'rollover',
-            creator_id: creatorId,
-            brain_status: creatorRow.brain_status,
-            system_prompt_present: creatorRow.system_prompt !== null,
-          },
+      if (!brainReady) {
+        if (shouldEmitBrainNotReady(creatorId)) {
+          Sentry.captureMessage('brain.not_ready', {
+            level: 'error',
+            extra: {
+              path: 'rollover',
+              creator_id: creatorId,
+              brain_status: creatorRow.brain_status,
+              system_prompt_present: creatorRow.system_prompt !== null,
+            },
+          });
+        }
+        return json(409, {
+          error: 'brain_not_ready',
+          creator_id: creatorId,
+          brain_status: creatorRow.brain_status,
         });
       }
       return json(409, {
-        error: 'brain_not_ready',
+        error: 'creator_not_published',
         creator_id: creatorId,
-        brain_status: creatorRow.brain_status,
       });
     }
     captureServerSafe(callerUserId, 'brain_admin_preview', {

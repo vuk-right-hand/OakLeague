@@ -4,6 +4,7 @@ import * as Sentry from '@sentry/nextjs';
 import { supabaseServer } from '@/lib/supabase/server';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import { ANON_ID_COOKIE, readAnonId } from '@/lib/feed/anon-id';
+import { CONSENT_VERSIONS } from '@/lib/consent';
 
 function safeNext(next: string | null): string {
   if (!next || !next.startsWith('/') || next.startsWith('//')) return '/';
@@ -76,6 +77,25 @@ export async function GET(req: NextRequest) {
     }
     const jar = await cookies();
     jar.delete(ANON_ID_COOKIE);
+  }
+
+  // P0-4: record ToS/Privacy acceptance (implicit by sign-in — the login page
+  // shows "by continuing you agree to …"). Idempotent + version-aware: only
+  // writes when unset OR the stored version isn't the current one, so a
+  // re-login never overwrites the ORIGINAL acceptance timestamp for the same
+  // version. Never block auth on this bookkeeping.
+  try {
+    const admin = supabaseAdmin();
+    await admin
+      .from('profiles')
+      .update({ tos_accepted_at: new Date().toISOString(), tos_version: CONSENT_VERSIONS.tos })
+      .eq('id', user.id)
+      // tos_version.is.null included because `neq` is NULL-blind in SQL
+      // (NULL <> 'x' is NULL, not true) — a row with a null version would
+      // otherwise never be re-stamped (auditor M6).
+      .or(`tos_accepted_at.is.null,tos_version.is.null,tos_version.neq.${CONSENT_VERSIONS.tos}`);
+  } catch (e) {
+    Sentry.captureException(e, { extra: { op: 'auth_callback_tos_accept', user_id: user.id } });
   }
 
   // Consume email-signup claim nonce (idempotent; zero-rows == silent ignore).

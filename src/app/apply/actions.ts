@@ -1,10 +1,11 @@
 'use server';
 
 import { z } from 'zod';
-import { cookies } from 'next/headers';
+import { cookies, headers } from 'next/headers';
 import { revalidatePath } from 'next/cache';
 import { getCallerUserId } from '@/lib/auth-guards';
 import { supabaseServer } from '@/lib/supabase/server';
+import { buildApplyConsents } from '@/lib/consent';
 
 const TopicSchema = z.object({
   slug: z.string().regex(/^[a-z0-9_-]{2,40}$/),
@@ -25,6 +26,10 @@ const Input = z.object({
   bio: z.string().max(2000).optional().default(''),
   topics: z.array(TopicSchema).min(1).max(5),
   proof: ProofSchema,
+  // P0-3: both consent boxes are required. z.literal(true) fails validation if
+  // unchecked → invalid_input (the form also disables submit until both set).
+  accept_tos: z.literal(true),
+  accept_voice_likeness: z.literal(true),
 });
 
 const KNOWN_ERRORS = new Set([
@@ -35,6 +40,8 @@ const KNOWN_ERRORS = new Set([
   'invite_claim_missing_invitation_id',
   'needs_invite',
   'unauthorized',
+  'consent_required',
+  'bad_consent',
 ]);
 
 function parseStructuredError(msg: string | undefined): string {
@@ -64,6 +71,19 @@ export async function submitCreatorApplication(
     return { ok: false, error: 'duplicate_topic_slug' };
   }
 
+  // Capture ip + user-agent for the consent record (supplementary provenance —
+  // the authenticated user_id is the real evidence). Prefer Vercel's
+  // platform-set client-IP headers (x-real-ip / x-vercel-forwarded-for), which
+  // are NOT client-spoofable, over the leftmost x-forwarded-for hop, which is
+  // attacker-controlled (auditor M4). Best-effort, untrusted if absent.
+  const hdrs = await headers();
+  const ip = (
+    hdrs.get('x-real-ip') ||
+    hdrs.get('x-vercel-forwarded-for') ||
+    (hdrs.get('x-forwarded-for') ?? '').split(',')[0]
+  ).trim().slice(0, 64) || null;
+  const userAgent = hdrs.get('user-agent')?.slice(0, 512) || null;
+
   const supabase = await supabaseServer();
   const { error } = await supabase.rpc('submit_creator_application', {
     p_claim_nonce: nonce,
@@ -72,6 +92,9 @@ export async function submitCreatorApplication(
     p_bio: parsed.data.bio || null,
     p_topics: parsed.data.topics,
     p_proof: parsed.data.proof,
+    p_consents: buildApplyConsents(),
+    p_ip: ip,
+    p_user_agent: userAgent,
   });
 
   if (error) {

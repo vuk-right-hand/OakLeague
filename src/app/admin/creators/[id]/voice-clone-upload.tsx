@@ -46,6 +46,9 @@ const ERROR_COPY: Record<string, { title: string; body: string }> = {
   cross_origin: { title: 'Cross-origin request blocked', body: 'Refresh from the admin tab.' },
   rate_lookup_failed: { title: 'Rate-limit lookup failed', body: 'Retry in a moment.' },
   creator_not_found: { title: 'Creator not found', body: 'This creator may have been deleted. Refresh.' },
+  // P0-3 consent gate.
+  consent_missing: { title: 'No voice consent on record', body: 'Record voice_clone consent in the Consent panel above (or have the creator re-apply) before cloning.' },
+  consent_lookup_failed: { title: 'Consent check failed', body: 'Transient database error — retry in a moment.' },
   // R3-M5 (UX) gap fillers — codes the route returns that previously
   // fell through to the generic fallback.
   bad_multipart: { title: 'Upload was malformed', body: 'Refresh and try again.' },

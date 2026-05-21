@@ -244,7 +244,15 @@ export async function POST(req: NextRequest) {
   // Admin-preview escape still applies for caller with active admin role.
   const brainReady =
     creatorRow.system_prompt !== null && creatorRow.brain_status !== 'errored';
-  if (!brainReady) {
+  // C3 (FIVE_CREATOR_ONBOARDING_READINESS P0-1): an UNPUBLISHED creator must
+  // not be servable to non-admins, even when brain_status='ready'. Removing
+  // the hooks from the feed (RLS published_at gate) is not enough — a
+  // takedown / consent-withdrawal (admin_set_creator_published(…, false))
+  // must actually STOP new sessions, not just hide the entry point. The
+  // admin-preview bypass below applies to BOTH the brain-not-ready and
+  // not-published gates so admins can still open an unpublished creator.
+  const published = creatorRow.published_at !== null;
+  if (!brainReady || !published) {
     const { data: adminRow } = await admin
       .from('admin_roles')
       .select('user_id')
@@ -252,22 +260,30 @@ export async function POST(req: NextRequest) {
       .is('revoked_at', null)
       .maybeSingle();
     if (!adminRow) {
-      // PR-2 audit C4: dedupe per-creator with 5min TTL so a single
-      // misconfigured creator can't pump 1000 Sentry events/min.
-      if (shouldEmitBrainNotReady(creatorId)) {
-        Sentry.captureMessage('brain.not_ready', {
-          level: 'error',
-          extra: {
-            creator_id: creatorId,
-            brain_status: creatorRow.brain_status,
-            system_prompt_present: creatorRow.system_prompt !== null,
-          },
+      // brain_not_ready takes precedence over not_published — a creator with
+      // no persona is a harder failure than one merely awaiting publish.
+      if (!brainReady) {
+        // PR-2 audit C4: dedupe per-creator with 5min TTL so a single
+        // misconfigured creator can't pump 1000 Sentry events/min.
+        if (shouldEmitBrainNotReady(creatorId)) {
+          Sentry.captureMessage('brain.not_ready', {
+            level: 'error',
+            extra: {
+              creator_id: creatorId,
+              brain_status: creatorRow.brain_status,
+              system_prompt_present: creatorRow.system_prompt !== null,
+            },
+          });
+        }
+        return json(409, {
+          error: 'brain_not_ready',
+          creator_id: creatorId,
+          brain_status: creatorRow.brain_status,
         });
       }
       return json(409, {
-        error: 'brain_not_ready',
+        error: 'creator_not_published',
         creator_id: creatorId,
-        brain_status: creatorRow.brain_status,
       });
     }
     Sentry.addBreadcrumb({

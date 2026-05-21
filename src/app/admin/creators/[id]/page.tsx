@@ -7,6 +7,8 @@ import { BrainRecompileButton } from './brain-recompile-button';
 import { CorpusReprocessPanel } from './corpus-reprocess-panel';
 import { CorpusComparePanel } from './corpus-compare-panel';
 import { TtsProviderPanel } from './tts-provider-panel';
+import { PublishPanel } from './publish-panel';
+import { ConsentPanel } from './consent-panel';
 
 export const dynamic = 'force-dynamic';
 
@@ -18,6 +20,7 @@ export const dynamic = 'force-dynamic';
 
 type Creator = {
   id: string;
+  user_id: string;
   handle: string | null;
   display_name: string | null;
   creator_type: string;
@@ -35,6 +38,9 @@ type Creator = {
   // RAG SOTA Day-6: retrieval_version (1=legacy, 2=v2 hybrid). Defaults to 1
   // for every creator until admin flips it post-corpus-reprocess.
   retrieval_version: number;
+  // pgvector RAG (M2). 'drawer' | 'vector'. Drives whether the publish
+  // readiness gate requires embedded v2 chunks (only for vector + v2).
+  brain_mode: 'drawer' | 'vector';
   // HUME_TTS_PLAN §6.11. NULL on tts_provider = inherit env.
   // Audit S5 (unit-wide) — all three env-scoped Hume columns selected so
   // the status cells can display the env that matches the admin's current
@@ -107,9 +113,9 @@ export default async function AdminCreatorDetail({
   const [{ data: creator }, { data: topics }, { data: samples }] = await Promise.all([
     sb.from('creators')
       .select(`
-        id, handle, display_name, creator_type, brain_status, voice_id,
+        id, user_id, handle, display_name, creator_type, brain_status, voice_id,
         simli_face_id, published_at, created_at, updated_at, application_id,
-        bio, system_prompt, brain_compiled_at, retrieval_version,
+        bio, system_prompt, brain_compiled_at, retrieval_version, brain_mode,
         tts_provider,
         hume_voice_id, hume_voice_id_preview, hume_voice_id_dev,
         hume_voice_name, hume_voice_name_preview, hume_voice_name_dev,
@@ -223,6 +229,65 @@ export default async function AdminCreatorDetail({
   const readySamples = sampleRows.filter((s) => s.fetch_status === 'ready').length;
   const erroredSamples = sampleRows.filter((s) => s.fetch_status === 'errored').length;
 
+  // P0-1 publish readiness. The corpus check is "≥1 sample with raw_text" —
+  // the SAME gate the reprocess/enqueue + publish RPC use (NOT fetch_status,
+  // which nothing sets to 'ready' for real creators — auditor M5). The v2
+  // chunk check only matters for vector + retrieval_version=2 creators
+  // (auditor C1: a populated narrative unit with un-embedded children
+  // retrieves nothing, so gate on embedded children).
+  // Auditor M4: capture errors — a swallowed count failure would render a
+  // misleading red check the publish RPC (which uses EXISTS, not count) might
+  // actually accept. The checklist button is advisory; the RPC is the real
+  // gate, so red-on-error is fail-closed, but we log so the discrepancy is
+  // visible rather than silent.
+  const { count: corpusCount, error: corpusErr } = await sb
+    .from('sample_content')
+    .select('id', { count: 'exact', head: true })
+    .eq('creator_id', id)
+    .not('raw_text', 'is', null);
+  if (corpusErr) console.error('[admin/creators] corpus readiness count failed', corpusErr);
+
+  const isVectorV2 = creator.brain_mode === 'vector' && creator.retrieval_version === 2;
+  let v2ChunksOk: boolean | null = null;
+  if (isVectorV2) {
+    const { count: v2Count, error: v2Err } = await sb
+      .from('sample_content_chunks')
+      .select('id', { count: 'exact', head: true })
+      .eq('creator_id', id)
+      .eq('chunker_version', 2)
+      .not('embedding', 'is', null);
+    if (v2Err) console.error('[admin/creators] v2 chunk readiness count failed', v2Err);
+    v2ChunksOk = (v2Count ?? 0) > 0;
+  }
+
+  // P0-3 consent status — which consent types are ACTIVE (revoked_at IS NULL)
+  // for this creator's user. Holistic-audit M3: select revoked_at and treat a
+  // revoked row as NOT present, else the panel shows a withdrawn consent as
+  // green and the publish checklist looks ready when it isn't.
+  const { data: consentRows } = await sb
+    .from('creator_consents')
+    .select('consent_type, version, source, accepted_at, revoked_at')
+    .eq('user_id', creator.user_id)
+    .order('accepted_at', { ascending: false });
+  const activeConsentTypes = new Set(
+    (consentRows ?? []).filter((r) => r.revoked_at == null).map((r) => r.consent_type as string),
+  );
+
+  // Publish readiness — includes ACTIVE voice/likeness consent (holistic-audit
+  // C1/M3): a creator cloned-then-revoked still has voice_id/face_id, so consent
+  // must be a first-class checklist item, matching the publish RPC's new
+  // voice_consent_missing / likeness_consent_missing preconditions.
+  const readiness = {
+    voice: !!creator.voice_id,
+    face: !!creator.simli_face_id,
+    persona: creator.system_prompt !== null,
+    notErrored: creator.brain_status !== 'errored',
+    corpus: (corpusCount ?? 0) > 0,
+    v2Chunks: v2ChunksOk,
+    voiceConsent: activeConsentTypes.has('voice_clone'),
+    likenessConsent: activeConsentTypes.has('likeness'),
+  };
+
   return (
     <main>
       <a href="/admin/creators" style={{ fontSize: 13, opacity: 0.7 }}>← Creators</a>
@@ -262,6 +327,20 @@ export default async function AdminCreatorDetail({
 
       <section style={{ marginBottom: 32 }}>
         <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>
+          Publication
+          <span style={{ opacity: 0.5, fontSize: 13, fontWeight: 400 }}>
+            {' '}— gate the creator into the feed once every check is green
+          </span>
+        </h2>
+        <PublishPanel
+          creatorId={creator.id}
+          initialPublishedAt={creator.published_at}
+          readiness={readiness}
+        />
+      </section>
+
+      <section style={{ marginBottom: 32 }}>
+        <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>
           Corpus re-process (v2)
           <span style={{ opacity: 0.5, fontSize: 13, fontWeight: 400 }}>
             {' '}— enqueue full v2 pipeline for every ready sample
@@ -278,6 +357,31 @@ export default async function AdminCreatorDetail({
           </span>
         </h2>
         <CorpusComparePanel creatorId={creator.id} retrievalVersion={creator.retrieval_version} />
+      </section>
+
+      <section style={{ marginBottom: 32 }}>
+        <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>
+          Consent
+          <span style={{ opacity: 0.5, fontSize: 13, fontWeight: 400 }}>
+            {' '}— voice/likeness required before cloning; attest if given out-of-band
+          </span>
+        </h2>
+        <ConsentPanel
+          creatorId={creator.id}
+          present={{
+            voice_clone: activeConsentTypes.has('voice_clone'),
+            likeness: activeConsentTypes.has('likeness'),
+            tos: activeConsentTypes.has('tos'),
+            content_license: activeConsentTypes.has('content_license'),
+          }}
+          rows={(consentRows ?? []).map((r) => ({
+            consent_type: r.consent_type as string,
+            version: r.version as string,
+            source: r.source as string,
+            accepted_at: r.accepted_at as string,
+            revoked_at: (r.revoked_at as string | null) ?? null,
+          }))}
+        />
       </section>
 
       <section style={{ marginBottom: 32 }}>

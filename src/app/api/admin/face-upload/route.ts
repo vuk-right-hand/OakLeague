@@ -179,11 +179,25 @@ export async function POST(req: Request) {
   const force = searchParams.get('force') === '1';
   const { data: creator, error: creatorErr } = await sb
     .from('creators')
-    .select('id, handle, simli_face_id')
+    .select('id, handle, simli_face_id, user_id')
     .eq('id', creatorId)
-    .maybeSingle<{ id: string; handle: string | null; simli_face_id: string | null }>();
+    .maybeSingle<{ id: string; handle: string | null; simli_face_id: string | null; user_id: string }>();
   if (creatorErr) return jsonError(500, 'creator_lookup_failed');
   if (!creator) return jsonError(404, 'creator_not_found');
+
+  // P0-3 consent gate: refuse to upload a face/likeness with no recorded
+  // likeness consent. Override via POST /api/admin/creator-consent
+  // (admin_attest_creator_consent). Existing creators were backfilled.
+  const { count: likenessConsentCount, error: consentErr } = await sb
+    .from('creator_consents')
+    .select('id', { head: true, count: 'exact' })
+    .eq('user_id', creator.user_id)
+    .eq('consent_type', 'likeness')
+    .is('revoked_at', null);
+  if (consentErr) return jsonError(500, 'consent_lookup_failed');
+  if ((likenessConsentCount ?? 0) === 0) {
+    return jsonError(403, 'consent_missing', 'no likeness consent on record; record it in the Consent panel before uploading a face');
+  }
   if (creator.simli_face_id && !force) {
     return jsonError(409, 'already_face_trained', 'creator already has a face; pass ?force=1 to overwrite');
   }

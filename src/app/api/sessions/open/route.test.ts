@@ -574,6 +574,24 @@ describe('/api/sessions/open — brain wire-up gates (R3 audit C1 + M1)', () => 
     expect((await res.json()).error).toBe('brain_not_ready');
   });
 
+  it('returns 409 creator_not_published when published_at is null for a non-admin (C3)', async () => {
+    creatorLookupResult = {
+      data: {
+        ...((creatorLookupResult.data ?? {}) as Record<string, unknown>),
+        // Brain fully ready, but unpublished (e.g. taken down / not yet live).
+        system_prompt: 'You are Test Creator.',
+        brain_status: 'ready',
+        published_at: null,
+      },
+      error: null,
+    };
+    const res = await POST(makeReq());
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe('creator_not_published');
+    // Must NOT proceed to session_open RPC for a non-admin caller.
+    expect(rpcCalls.map((c) => c.name)).not.toContain('session_open');
+  });
+
   it('ALLOWS brain_status=training when persona populated (whole-build C1 — loosened gate)', async () => {
     // Pre-fix: this would 409. Post-fix: training+persona is the
     // post-approval steady state and should be allowed.

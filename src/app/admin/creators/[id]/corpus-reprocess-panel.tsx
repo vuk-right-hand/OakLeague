@@ -3,9 +3,10 @@
 // /admin/creators/[id] — Day-6 corpus re-process panel.
 //
 // Two buttons:
-//   * "Re-process v2" — enqueues every ready sample. Skips pending/processing
-//     rows (idempotent if you click it twice during a run).
-//   * "Force re-process" — re-enqueues every ready sample regardless of
+//   * "Re-process v2" — enqueues every sample with raw_text (the real gate is
+//     raw_text IS NOT NULL, NOT fetch_status). Skips pending/processing rows
+//     (idempotent if you click it twice during a run).
+//   * "Force re-process" — re-enqueues every such sample regardless of
 //     status, with a confirm() guard because it will discard half-finished
 //     job state and restart from scratch (still safe — the worker's
 //     enqueue_version sentinel handles the race).
@@ -20,6 +21,7 @@
 // leak a request. Mounted ref guards setState after unmount.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { isWorkerLikelyStalled } from './corpus-reprocess-stall';
 
 type EnqueueResponse = {
   ok: boolean;
@@ -57,6 +59,15 @@ export function CorpusReprocessPanel({ creatorId }: { creatorId: string }) {
   const [lastResult, setLastResult] = useState<EnqueueResponse | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // P0-2: surface a likely-offline worker (pending jobs that never start
+  // processing). pendingSinceRef marks when pending-with-no-processing began.
+  const [stalled, setStalled] = useState(false);
+  const pendingSinceRef = useRef<number | null>(null);
+  // Holistic-audit C2: a DECREASING pending count is proof the worker is alive
+  // (it's draining the queue) even if a poll never catches the brief
+  // 'processing' window. Track the prior pending count to reset the timer on
+  // forward progress and avoid a false "worker offline" warning.
+  const lastPendingRef = useRef<number | null>(null);
 
   // Audit-1 M1: abort previous POST on new click and seq-tag every fetch so
   // a late-arriving response cannot overwrite a newer one.
@@ -118,6 +129,27 @@ export function CorpusReprocessPanel({ creatorId }: { creatorId: string }) {
 
   // Initial poll on mount.
   useEffect(() => { void pollOnce(); }, [pollOnce]);
+
+  // P0-2 stall detection. Recomputed on every poll (the panel polls every 5s
+  // while pending>0). Tracks how long pending-with-no-processing has persisted;
+  // a live worker flips a job to 'processing' within a poll cycle.
+  useEffect(() => {
+    const c = status?.counts;
+    const pending = c?.pending ?? 0;
+    const processing = c?.processing ?? 0;
+    const prevPending = lastPendingRef.current;
+    const draining = prevPending !== null && pending < prevPending; // forward progress
+    if (pending > 0 && processing === 0 && !draining) {
+      if (pendingSinceRef.current === null) pendingSinceRef.current = Date.now();
+    } else {
+      // processing active, queue empty, OR pending dropped since last poll →
+      // worker is alive; reset the stall timer.
+      pendingSinceRef.current = null;
+    }
+    lastPendingRef.current = pending;
+    const secs = pendingSinceRef.current ? (Date.now() - pendingSinceRef.current) / 1000 : 0;
+    setStalled(isWorkerLikelyStalled({ pending, processing }, secs));
+  }, [status]);
 
   const enqueue = useCallback(async (force: boolean) => {
     if (busy) return;
@@ -234,6 +266,28 @@ export function CorpusReprocessPanel({ creatorId }: { creatorId: string }) {
           <span style={{ fontSize: 12, color: '#ff6b6b' }}>error: {error}</span>
         )}
       </div>
+
+      {stalled && (
+        <div
+          role="alert"
+          style={{
+            marginBottom: 8,
+            padding: '8px 10px',
+            border: '1px solid #a37a2a',
+            borderRadius: 4,
+            background: 'rgba(163,122,42,0.12)',
+            color: '#d6a44a',
+            fontSize: 12,
+            lineHeight: 1.45,
+          }}
+        >
+          ⚠️ Jobs are pending but none have started processing — the corpus
+          reprocess worker may be offline. Check the Fly proxy has
+          <code> GEMINI_API_KEY</code>, <code>INTERNAL_API_BASE_URL</code>, and
+          <code> INTERNAL_API_SECRET</code> (≥32 chars) set, and that it&apos;s
+          running.
+        </div>
+      )}
 
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 12, marginBottom: 8 }}>
         <CountChip label="pending"     value={counts.pending ?? 0}    accent="#aaaa44" />

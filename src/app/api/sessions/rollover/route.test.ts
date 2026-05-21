@@ -103,6 +103,9 @@ let rolloverResult: { data: unknown; error: unknown } = {
   data: [{ new_session_id: 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb', tier: 'free', daily_limit_remaining_s: 600 }],
   error: null,
 };
+// C3 (P0-1): the creators mock's published_at. Default published; a test
+// flips it to null to exercise the new not-published rollover gate.
+let creatorPublishedAt: string | null = '2026-01-01T00:00:00Z';
 
 function makeSb() {
   return {
@@ -132,6 +135,8 @@ function makeAdmin() {
                   // route doesn't 409 these test cases.
                   system_prompt: 'You are Test Creator. Topics: x. Answer briefly.',
                   brain_status: 'ready',
+                  // C3 (P0-1): rollover now gates on publication too.
+                  published_at: creatorPublishedAt,
                   // Creator voice-speed (migration 20260511000006). Mock
                   // as string to mirror supabase-js's numeric → string
                   // coercion.
@@ -254,6 +259,19 @@ describe('/api/sessions/rollover — voice-ticket fatal (PR-2 round-2 M2)', () =
     const closeCalls = rpcCalls.filter((c) => c.name === 'session_close');
     expect(closeCalls.length).toBe(1);
     expect((closeCalls[0].args as { p_end_reason?: string }).p_end_reason).toBe('voice_ticket_mint_failed');
+  });
+
+  it('returns 409 creator_not_published when published_at is null for a non-admin (C3)', async () => {
+    creatorPublishedAt = null;
+    try {
+      const res = await POST(makeReq());
+      expect(res.status).toBe(409);
+      expect((await res.json()).error).toBe('creator_not_published');
+      // Must NOT mint a fresh rollover session for an unpublished creator.
+      expect(rpcCalls.map((c) => c.name)).not.toContain('session_rollover');
+    } finally {
+      creatorPublishedAt = '2026-01-01T00:00:00Z';
+    }
   });
 
   it('on bad_ua (programmer error): masks as 500 voice_ticket_mint_failed', async () => {
