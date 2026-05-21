@@ -198,7 +198,7 @@ function maxOutputTokensFor(op) {
 // re-implementation. Underscore-prefixed + named for grep so a code review
 // rejects any non-spike caller; behavior is a no-op when false/undefined,
 // which is the prod path.
-export async function* streamGenerate({ client, model, systemInstruction, contents, signal, ErrCls, operation, failoverDetectMs, __spike_includeThoughts, __spike_thinkingLevel }) {
+export async function* streamGenerate({ client, model, systemInstruction, contents, signal, ErrCls, operation, maxOutputTokensOverride, failoverDetectMs, __spike_includeThoughts, __spike_thinkingLevel }) {
   const startedAt = Date.now();
   let firstChunkMs = null;
   let fullText = '';
@@ -258,8 +258,12 @@ export async function* streamGenerate({ client, model, systemInstruction, conten
         temperature: 0.4,
         thinkingConfig,
         // Whole-build audit C2 — hard per-call output cap so a runaway
-        // generation can't pump uncapped chars into TTS.
-        maxOutputTokens: maxOutputTokensFor(operation),
+        // generation can't pump uncapped chars into TTS. Phase 3 C2: a
+        // positive override (free + variable depth → tighter cap) wins; else
+        // the operation default (deep answer 800 / paraphrase 120).
+        maxOutputTokens: (typeof maxOutputTokensOverride === 'number' && maxOutputTokensOverride > 0)
+          ? maxOutputTokensOverride
+          : maxOutputTokensFor(operation),
         ...(signal ? { abortSignal: signal } : {}),
       },
     });
@@ -549,7 +553,7 @@ function mapAnthropicErr(e, ErrCls, { text, inputTokens, outputTokens }) {
   return err;
 }
 
-export async function* streamGenerateAnthropic({ client, model, systemInstruction, contents, signal, ErrCls, operation }) {
+export async function* streamGenerateAnthropic({ client, model, systemInstruction, contents, signal, ErrCls, operation, maxOutputTokensOverride }) {
   const startedAt = Date.now();
   let firstChunkMs = null;
   let fullText = '';
@@ -572,9 +576,12 @@ export async function* streamGenerateAnthropic({ client, model, systemInstructio
     stream = await client.messages.create(
       {
         model,
-        // Anthropic REQUIRES max_tokens. Match the Gemini deep-answer
-        // budget (audit M4) so the failover answer is the same length.
-        max_tokens: maxOutputTokensFor(operation),
+        // Anthropic REQUIRES max_tokens. Match the Gemini deep-answer budget
+        // (audit M4) so the failover answer is the same length — Phase 3 C2:
+        // inherit the same tier-aware override the primary path used.
+        max_tokens: (typeof maxOutputTokensOverride === 'number' && maxOutputTokensOverride > 0)
+          ? maxOutputTokensOverride
+          : maxOutputTokensFor(operation),
         temperature: 0.4,
         system: systemInstruction,
         messages,

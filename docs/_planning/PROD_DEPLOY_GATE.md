@@ -337,22 +337,34 @@ config. Verify with `fly ssh console -C "env | grep -E 'GEMINI_API_KEY|INTERNAL_
    **PRE-FLIGHT (do NOT skip):** run `node --env-file=.env.local
    scripts/brain-depth-ab-spike.mjs` first and confirm all verdicts PASS —
    never A/B a depth behavior that hasn't been measured on the real model
-   (bifurcation holds + nothing exceeds the 4000-char ceiling).
+   (bifurcation holds + nothing exceeds the 4000-char ceiling). **The spike's
+   `BRAIN_MODEL` MUST equal the prod `BRAIN_MODEL` secret** (audit M1 —
+   depth-following is model-specific; the spike hard-fails if `BRAIN_MODEL` is
+   unset rather than silently defaulting). Set the same model in `.env.local`
+   before running.
 
    **⚠️ COGS / kill-switch interaction (variable mode).** The kill-switch is a
    TIME budget (cloned-voice seconds), and a longer answer = more TTS seconds =
-   faster quota burn. That's WHY tier bifurcates: free is capped at ~150 words
-   so its exposure stays bounded; paid (~450 words) gets the full story. When
+   faster quota burn. That's WHY tier bifurcates: free is bounded BOTH by the
+   ~150-word soft instruction AND a tier-aware HARD cap (`maxOutputTokens=280`
+   ≈ ~215 words, audit C2) so its exposure is actually enforced, not just
+   requested; paid (premium/boardroom) gets the full story (~450-word soft
+   target under the 800-token / ~600-word default hard cap). When
    `BRAIN_DEPTH_MODE=variable`, expect higher per-turn `output_tokens` on the
    `brain_deep_answer` cogs leg (paid story ≈ 5-8× brief) AND on the
    `brain_deep_answer_failover` (anthropic) leg when Gemini 503s on a long
-   answer — the Haiku leg inherits the same depth clause (same systemInstruction)
-   so a failed-over story is just as long + billed at the Haiku rate. Watch
-   `metricsSnapshot.lastDeepChars` (session-end) for answers brushing the
-   4000-char ceiling, and the daily COGS viewer for a step-change in
-   per-session brain spend after the flip. Hard caps unchanged: `max_tokens`
-   (800 ≈ ~600 words) and the orchestrator's OUTPUT_CHAR_CEILING sentence-stop
-   both still bound a runaway regardless of mode.
+   answer — the Haiku leg inherits the same depth clause AND the same tier-aware
+   `max_tokens` (same systemInstruction + cap) so a failed-over story is just as
+   long + billed at the Haiku rate. Watch `metricsSnapshot.maxDeepChars`
+   (session-end, running max) for answers brushing the 4000-char ceiling, and
+   the daily COGS viewer for a step-change in per-session brain spend after the
+   flip. **Stall-then-failover blind spot (audit M4):** a Gemini stall AFTER
+   generation began but BEFORE the first delta bills server-side but is counted
+   `billed:false` (overloaded path) — longer paid targets enlarge each such
+   uncounted leak. Bounded per-turn, but watch the failover rate
+   (`deepFailedOver`) alongside it. Hard caps unchanged otherwise: paid
+   `max_tokens` 800 + the orchestrator's OUTPUT_CHAR_CEILING sentence-stop both
+   still bound a runaway regardless of mode.
 
    **Step-2 Gemini→Haiku failover — 5 Fly secrets (OPTIONAL but recommended
    for 503-resilience).** The failover is fail-SOFT: if these are unset the

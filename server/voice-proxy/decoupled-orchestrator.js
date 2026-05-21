@@ -122,6 +122,12 @@ export function makeDecoupledOrchestrator({
   // product lives with it). Flip PARAPHRASE_ENABLED=1 only when a model
   // generation can produce a GROUNDED opener fast enough to be worth it.
   paraphraseEnabled = false,
+  // Phase 3 — session tier (snapshot from sessions.tier_at_session via
+  // consumed.tier). Gates the variable-depth word budget in the deep-answer
+  // assembler (free tighter, paid full). Default 'free' = the SAFE (tighter)
+  // budget if a caller ever omits it — never accidentally hand a free session
+  // the paid-length budget. Inert unless BRAIN_DEPTH_MODE=variable.
+  tier = 'free',
   log = console,
   captureException = () => {},
   now = () => Date.now(),
@@ -156,6 +162,12 @@ export function makeDecoupledOrchestrator({
     degraded: [],
     lastParaFirstMs: null,
     lastDeepFirstMs: null,
+    // Phase 3 — RUNNING MAX char length across the session's deep answers
+    // (audit Small — a per-turn "last" would miss a mid-session ceiling
+    // brusher). Read straight off session-end metrics for the depth A/B: are
+    // paid sessions getting longer answers, and is anything approaching the
+    // OUTPUT_CHAR_CEILING?
+    maxDeepChars: null,
   };
 
   function freshTurn(turnNumber) {
@@ -467,6 +479,12 @@ export function makeDecoupledOrchestrator({
         question: t.question,
         apiKey,
         signal: t.deepAbort.signal,
+        // Phase 3 — tier-aware depth + M2 trivial floor. A trivial Q only
+        // reaches the deep answer when paraphrase is OFF (it falls through
+        // persona-only); forceBrief keeps that reply short instead of letting
+        // variable mode answer "hey" with a 450-word story.
+        tier,
+        forceBrief: t.isTrivial,
       });
       const r = await streamToTts(gen, 'brain_deep_answer', t.turnNumber, {
         gateBeforeFirstSend: t.paraphraseSpoken,
@@ -479,6 +497,12 @@ export function makeDecoupledOrchestrator({
       if (r.firstChunkMs != null) session.lastDeepFirstMs = r.firstChunkMs;
       if (r.final) {
         t.lastAssistantResponse = r.final.text;
+        // Phase 3 — track the LONGEST deep answer this session (depth A/B +
+        // ceiling watch). Substantive turns only; a trivial persona-only reply
+        // isn't representative of the depth experiment.
+        if (!t.isTrivial && typeof r.final.text === 'string') {
+          session.maxDeepChars = Math.max(session.maxDeepChars ?? 0, r.final.text.length);
+        }
         // Step-2 — count a Haiku-carried turn (the final event flags it).
         if (r.final.failedOver === true) session.deepFailedOver += 1;
         // C4 — completed-turn snapshot. M3: a trivial Q answered by the deep
@@ -553,6 +577,9 @@ export function makeDecoupledOrchestrator({
       degraded: session.degraded.slice(),
       lastParaFirstMs: session.lastParaFirstMs,
       lastDeepFirstMs: session.lastDeepFirstMs,
+      // Phase 3 — longest deep-answer char length this session (depth A/B +
+      // ceiling watch).
+      maxDeepChars: session.maxDeepChars,
       lastTurnNumber: turn ? turn.turnNumber : null,
     };
   }

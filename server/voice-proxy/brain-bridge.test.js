@@ -18,6 +18,8 @@ import assert from 'node:assert/strict';
 import {
   generateDeepAnswer,
   assembleBrainContents,
+  buildDepthClause,
+  resolveDeepAnswerMaxTokens,
   getBrainPricing,
   _resetBrainConfigForTests,
   _resetClientsForTests,
@@ -190,6 +192,126 @@ test('assembleBrainContents: M2 — envelope without matched salted markers fail
       (e) => e instanceof BrainBridgeError && e.code === 'misconfigured' && /injection envelope/i.test(e.message),
     );
   }
+});
+
+// ── Phase 3 — buildDepthClause + tier-aware depth in assembleBrainContents ──
+
+// Depth env helper: BRAIN_DEPTH_MODE flips brief↔variable. Save/restore so
+// tests don't leak the env into the streaming tests below.
+function withDepthMode(mode, fn) {
+  const saved = process.env.BRAIN_DEPTH_MODE;
+  if (mode === undefined) delete process.env.BRAIN_DEPTH_MODE;
+  else process.env.BRAIN_DEPTH_MODE = mode;
+  try { return fn(); } finally {
+    if (saved === undefined) delete process.env.BRAIN_DEPTH_MODE;
+    else process.env.BRAIN_DEPTH_MODE = saved;
+  }
+}
+
+test('buildDepthClause: C4 fail-safe — anything but exact "variable" is BRIEF', () => {
+  for (const mode of [undefined, '', '0', 'brief', 'Variable', 'VARIABLE', 'variabl', 'true']) {
+    withDepthMode(mode, () => {
+      const c = buildDepthClause({ tier: 'premium' });
+      assert.match(c, /1-3 concise sentences/, `mode=${JSON.stringify(mode)} must be brief`);
+      assert.doesNotMatch(c, /under ~\d+ words/, `mode=${JSON.stringify(mode)} must not be variable`);
+    });
+  }
+});
+
+test('buildDepthClause: variable mode bifurcates tier word budget (free 150 / paid 450)', () => {
+  withDepthMode('variable', () => {
+    assert.match(buildDepthClause({ tier: 'free' }), /under ~150 words/);
+    assert.match(buildDepthClause({ tier: 'premium' }), /under ~450 words/);
+    assert.match(buildDepthClause({ tier: 'boardroom' }), /under ~450 words/);
+    // Unknown/missing tier falls to the SAFE tighter (free) budget.
+    assert.match(buildDepthClause({ tier: undefined }), /under ~150 words/);
+    assert.match(buildDepthClause({ tier: 'enterprise' }), /under ~150 words/);
+  });
+});
+
+test('buildDepthClause: M2 — forceBrief (trivial/greeting floor) overrides variable', () => {
+  withDepthMode('variable', () => {
+    const c = buildDepthClause({ tier: 'premium', forceBrief: true });
+    assert.match(c, /1-3 concise sentences/);
+    assert.doesNotMatch(c, /under ~\d+ words/);
+  });
+});
+
+test('buildDepthClause: C3 self-heal — stale persona with brevity directive forces brief + warns', () => {
+  withDepthMode('variable', () => {
+    const warns = [];
+    const orig = console.warn;
+    console.warn = (m) => warns.push(m);
+    try {
+      const stale = 'You are Vuk. Answer in 1-3 concise sentences. Speak as yourself.';
+      const c = buildDepthClause({ tier: 'premium', persona: stale });
+      assert.match(c, /1-3 concise sentences/, 'stale persona → brief');
+      assert.doesNotMatch(c, /under ~\d+ words/);
+      assert.equal(warns.length, 1);
+      assert.match(warns[0], /needs a recompile/i);
+    } finally { console.warn = orig; }
+  });
+});
+
+test('buildDepthClause: M3 self-heal does NOT false-positive on a bio mentioning "concise sentences"', () => {
+  withDepthMode('variable', () => {
+    // A writing/comms coach bio — the bare bigram "concise sentences" appears
+    // but NOT the full compiled directive. Must still get the variable clause.
+    const bioPersona = 'You are Pat. I teach founders to write concise sentences. Speak as yourself.';
+    const c = buildDepthClause({ tier: 'premium', persona: bioPersona });
+    assert.match(c, /under ~450 words/, 'bio bigram must NOT trip the self-heal');
+  });
+});
+
+test('resolveDeepAnswerMaxTokens: only free+variable tightens; everything else = null (op default)', () => {
+  withDepthMode('variable', () => {
+    assert.equal(resolveDeepAnswerMaxTokens({ tier: 'free' }), 280, 'free+variable → tighter hard cap');
+    assert.equal(resolveDeepAnswerMaxTokens({ tier: undefined }), 280, 'unknown tier → free cap');
+    assert.equal(resolveDeepAnswerMaxTokens({ tier: 'premium' }), null, 'paid keeps 800 (null)');
+    assert.equal(resolveDeepAnswerMaxTokens({ tier: 'boardroom' }), null, 'boardroom keeps 800 (null)');
+    assert.equal(resolveDeepAnswerMaxTokens({ tier: 'free', forceBrief: true }), null, 'forceBrief → op default');
+    assert.equal(
+      resolveDeepAnswerMaxTokens({ tier: 'free', persona: 'Answer in 1-3 concise sentences.' }),
+      null, 'stale persona → op default (will be brief anyway)');
+  });
+  withDepthMode(undefined, () => {
+    assert.equal(resolveDeepAnswerMaxTokens({ tier: 'free' }), null, 'brief mode → op default (no tighten)');
+  });
+});
+
+test('buildDepthClause: depthMode param overrides env (DI for tests/A/B harness)', () => {
+  withDepthMode(undefined, () => {
+    // env is brief, but explicit depthMode wins.
+    assert.match(buildDepthClause({ tier: 'premium', depthMode: 'variable' }), /under ~450 words/);
+  });
+  withDepthMode('variable', () => {
+    assert.match(buildDepthClause({ tier: 'premium', depthMode: 'brief' }), /1-3 concise sentences/);
+  });
+});
+
+test('assembleBrainContents: depth clause is appended AFTER L1 hierarchy clause', () => {
+  withDepthMode('variable', () => {
+    const { systemInstruction } = assembleBrainContents({
+      persona: 'You are Vuk.', referenceEnvelopeText: ENV_OK, question: 'Tell me the story?', tier: 'premium',
+    });
+    const l1 = systemInstruction.indexOf('SECURITY:');
+    const depth = systemInstruction.indexOf('LENGTH:');
+    assert.ok(l1 > 0 && depth > l1, 'LENGTH (depth) must come AFTER SECURITY (L1)');
+    assert.match(systemInstruction, /under ~450 words/);
+  });
+});
+
+test('assembleBrainContents: tier + forceBrief thread into the depth clause', () => {
+  withDepthMode('variable', () => {
+    const free = assembleBrainContents({
+      persona: 'p', referenceEnvelopeText: ENV_OK, question: 'Q?', tier: 'free',
+    }).systemInstruction;
+    assert.match(free, /under ~150 words/);
+    const floored = assembleBrainContents({
+      persona: 'p', referenceEnvelopeText: ENV_OK, question: 'Q?', tier: 'premium', forceBrief: true,
+    }).systemInstruction;
+    assert.match(floored, /1-3 concise sentences/);
+  });
 });
 
 // ── generateDeepAnswer: streaming + cogs + thinking-off + taxonomy ──────

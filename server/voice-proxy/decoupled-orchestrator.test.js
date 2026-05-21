@@ -664,3 +664,56 @@ test('paraphrase OFF: trivial Q does NOT become lastCompleted (M3 — no retriev
   assert.equal(orch.lastAssistantResponse(), null,
     'trivial deep answer is filler — must not feed next-turn retrieval context');
 });
+
+// ── Phase 3 audit C3 — tier + forceBrief plumbing into generateDeepAnswer ──
+// This is the exact surface the audit C1 bug lived on: the orchestrator must
+// forward its `tier` and `forceBrief: t.isTrivial` to generateDeepAnswer.
+// Without this test, a regression (or a wrong tier source) ships silently.
+
+test('Phase 3 C3: substantive turn forwards tier + forceBrief:false to generateDeepAnswer', async () => {
+  let deepArgs = null;
+  const { orch } = harness({
+    paraphraseEnabled: false,
+    tier: 'premium',
+    generateDeepAnswer: (args) => { deepArgs = args; return genStream(['ok.'],
+      { operation: 'brain_deep_answer', text: 'ok.', firstChunkMs: 7 }); },
+    retrieve: async () => null,
+  });
+  orch.onUserTranscript('walk me through your first 1000 users', 1);
+  await tick();
+  await orch.onTurnComplete();
+  assert.ok(deepArgs, 'generateDeepAnswer was called');
+  assert.equal(deepArgs.tier, 'premium', 'session tier threads through');
+  assert.equal(deepArgs.forceBrief, false, 'substantive Q is not force-briefed');
+});
+
+test('Phase 3 C3: trivial turn (paraphrase off) forwards forceBrief:true (M2 floor)', async () => {
+  let deepArgs = null;
+  const { orch } = harness({
+    paraphraseEnabled: false,
+    tier: 'premium',
+    generateDeepAnswer: (args) => { deepArgs = args; return genStream(['Yep.'],
+      { operation: 'brain_deep_answer', text: 'Yep.', firstChunkMs: 7 }); },
+    retrieve: async () => null,
+  });
+  orch.onUserTranscript('hello hello', 1);
+  await tick();
+  await orch.onTurnComplete();
+  assert.ok(deepArgs, 'generateDeepAnswer was called (paraphrase off → trivial falls through)');
+  assert.equal(deepArgs.forceBrief, true, 'trivial Q force-briefs the deep answer');
+});
+
+test('Phase 3 C3: tier defaults to free when omitted (safe tighter budget)', async () => {
+  let deepArgs = null;
+  const { orch } = harness({
+    paraphraseEnabled: false,
+    // tier intentionally omitted → factory default 'free'
+    generateDeepAnswer: (args) => { deepArgs = args; return genStream(['ok.'],
+      { operation: 'brain_deep_answer', text: 'ok.', firstChunkMs: 7 }); },
+    retrieve: async () => null,
+  });
+  orch.onUserTranscript('explain product-market fit', 1);
+  await tick();
+  await orch.onTurnComplete();
+  assert.equal(deepArgs.tier, 'free', 'omitted tier → free (never the looser paid budget)');
+});

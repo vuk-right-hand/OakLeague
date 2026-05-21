@@ -1719,6 +1719,14 @@ wss.on('connection', async (ws, req) => {
       apiKey: GEMINI_API_KEY,
       userId: ticketUserId,
       sessionId,
+      // Phase 3 (audit C1) — session tier snapshot. The AUTHORITATIVE source
+      // is sess.tier (sessions.tier_at_session, set by the kill-switch trigger
+      // at session-open), NOT consumed.* (the ticket-consume result carries
+      // expectedTier, never `tier`). Gates the variable-depth word budget
+      // (free tighter, paid full). Coerce any non-paid/unknown value to 'free'
+      // — the SAFE tighter budget; a session must never accidentally get the
+      // paid length budget from a stray tier string.
+      tier: (sess.tier === 'premium' || sess.tier === 'boardroom') ? sess.tier : 'free',
       onFatal: () => {
         // Audit C2 — idempotent. The orchestrator's `fatal` latch
         // already blocks a second paid call, but onFatal can still be
@@ -1877,6 +1885,11 @@ wss.on('connection', async (ws, req) => {
       // call ttsBridge.cancel(), leaving the Cartesia context orphaned →
       // "Invalid context ID" on the next turn's first sendText → silent
       // audio for the rest of the session.
+      // NOTE (DECOUPLED_STT_OUTPUT_COST_PLAN, 2026-05-21): the maxOutputTokens
+      // cap shrinks Gemini's discarded parallel-audio window from ~5.6s to
+      // ~0.6s, so spurious interrupteds fire far less often — but the heuristic
+      // below keys off Cartesia's getLastChunkAt(), not Gemini's timeline, so
+      // its correctness is unchanged; only the spurious RATE drops.
       //
       // Heuristic: a REAL user barge only happens during ACTIVE TTS
       // playback. If Cartesia/Hume hasn't emitted an audio chunk in
