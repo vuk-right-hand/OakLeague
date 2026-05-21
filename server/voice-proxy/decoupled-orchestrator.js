@@ -100,12 +100,28 @@ export function makeDecoupledOrchestrator({
   // Audit M3 — hard ceiling on awaiting retrieval before the deep
   // answer starts. Past this, ground on nothing (C2 persona-only) so
   // the user never hears dead air after the hedge. P0 measured retrieval
-  // p95 ≈ 2022ms; 2500 gives margin while bounding worst-case silence.
-  retrieveCeilingMs = 2500,
+  // p95 ≈ 2022ms.
+  // 2026-05-21 — bumped 2500 → 3500. Before the decoupled latency fix,
+  // retrieval (~2.5s measured live) hid entirely inside Gemini's 7-21s
+  // discarded-generation wait, so the ceiling never bit. Now the deep
+  // answer starts at the transcript (+250ms) and retrieval is ON the
+  // critical path: a 2.6s retrieve against a 2500ms ceiling = coin-flip
+  // persona-only fallback. 3500 keeps grounding (the north star) while
+  // still bounding worst-case silence to 3.5s if retrieval truly hangs.
+  // Real fix for the latency is making retrieve faster (dead semantic
+  // cache + starved rerank — see next pass), not a looser ceiling.
+  retrieveCeilingMs = 3500,
   // Audit C1 — max time the turn_end handler waits for the deep answer
   // to finish speaking before it lets ttsBridge.turnEnd() send
   // continue:false. Bounded so a hung generator can't wedge teardown.
   turnSpokenTimeoutMs = 30000,
+  // DECOUPLED_BRAIN_PLAN — paraphrase (the dead-air latency mask) is OFF by
+  // default. When false, the deep answer is the SOLE voice: no hedge opener,
+  // no two-mode trivial path, no confidence-then-retreat contradiction. The
+  // ~1.5-2s pre-answer silence is the accepted trade (every SOTA voice
+  // product lives with it). Flip PARAPHRASE_ENABLED=1 only when a model
+  // generation can produce a GROUNDED opener fast enough to be worth it.
+  paraphraseEnabled = false,
   log = console,
   captureException = () => {},
   now = () => Date.now(),
@@ -315,7 +331,8 @@ export function makeDecoupledOrchestrator({
     t.isTrivial = isTrivialQuestion(t.question);
     if (t.isTrivial) {
       session.trivialTurns += 1;
-      log.info?.(`[decoupled] trivial Q detected (turn=${turnNumber} q="${t.question.slice(0, 40).replace(/[\r\n]/g, ' ')}") — paraphrase will carry the full answer; deep_answer skipped`);
+      // Audit M1 — log length only, never the raw utterance (PII).
+      log.info?.(`[decoupled] trivial Q detected (turn=${turnNumber} chars=${t.question.length}) — deep_answer ${paraphraseEnabled ? 'skipped; paraphrase carries it' : 'runs persona-only'}`);
     }
     turn = t;
     session.turns += 1;
@@ -333,6 +350,17 @@ export function makeDecoupledOrchestrator({
             return null;
           })
       : Promise.resolve(null);
+
+    if (!paraphraseEnabled) {
+      // Paraphrase OFF (default) — deep answer is the sole voice. Resolve
+      // paraphraseSpoken NOW so the deep answer's `gateBeforeFirstSend`
+      // opens with zero delay (it streams as soon as retrieval resolves).
+      // No paraphrase generation, no paraphrase cogs leg, no two-voice
+      // handoff (kills the turn-4 Cartesia context-handoff failure mode +
+      // the trivial-Q double-talk by construction).
+      if (t._resolveParaphraseSpoken) t._resolveParaphraseSpoken();
+      return;
+    }
 
     (async () => {
       try {
@@ -369,6 +397,11 @@ export function makeDecoupledOrchestrator({
     const t = turn;
     if (!t || t.done) { resolveSpoken(t); return; }
     t.done = true;
+    // DIAG (2026-05-21) — phase timing so we can SEE where pre-audio latency
+    // goes (retrieval wait vs deep-answer first token vs total). Logged once
+    // per substantive turn below.
+    const tcStart = now();
+    let retrieveDoneMs = null;
     if (fatal) { resolveSpoken(t); return; }
 
     // P1-10 — trivial Q: paraphrase IS the answer. Wait for it to finish
@@ -382,12 +415,17 @@ export function makeDecoupledOrchestrator({
     // mind?") is conversational filler with no semantic anchors; it
     // shouldn't poison the next turn's retrieval context. The PRIOR
     // substantive turn's response remains the lastCompleted value.
-    if (t.isTrivial) {
+    if (t.isTrivial && paraphraseEnabled) {
+      // Paraphrase carried the full trivial answer; nothing else to do.
       try { await t.paraphraseSpoken; } catch {}
       // lastCompleted intentionally NOT updated — see M3 above.
       resolveSpoken(t);
       return;
     }
+    // Paraphrase OFF + trivial Q: fall through to the deep answer below. It
+    // runs persona-only (retrieval was skipped for trivial in
+    // onUserTranscript) and gives a short conversational reply ("Yes, loud
+    // and clear"). Still NOT recorded as lastCompleted (filler, no anchors).
 
     try {
       // Audit M3 — bound the retrieval wait. The paraphrase bought a
@@ -415,6 +453,7 @@ export function makeDecoupledOrchestrator({
           envelopeText = raced || null;
         }
       }
+      retrieveDoneMs = now() - tcStart;
       if (t.deepAbort.signal.aborted || fatal) return; // barged/fatal pre-stream
 
       const gen = generateDeepAnswer({
@@ -435,11 +474,25 @@ export function makeDecoupledOrchestrator({
       if (r.firstChunkMs != null) session.lastDeepFirstMs = r.firstChunkMs;
       if (r.final) {
         t.lastAssistantResponse = r.final.text;
-        lastCompleted = t;                       // C4 — completed-turn snapshot
+        // C4 — completed-turn snapshot. M3: a trivial Q answered by the deep
+        // path (paraphrase-off mode) is still conversational filler — do NOT
+        // make it the lastCompleted that feeds next-turn retrieval context.
+        if (!t.isTrivial) lastCompleted = t;
       }
       if (r.degraded && r.degraded !== 'misconfigured') {
         t.degraded.push(`deep:${r.degraded}`);
         session.degraded.push(`d:${r.degraded}`);
+      }
+      // Per-turn latency breakdown (retrieve wait / deep first-token / total /
+      // grounded). Useful observability, but audit M1 — gate behind
+      // VOICE_DIAG_LOGS so it isn't a warn-level line on EVERY prod turn
+      // (drowns real warns + log-volume cost). Flip the Fly secret to debug.
+      if (process.env.VOICE_DIAG_LOGS === '1') {
+        log.warn?.(
+          `[decoupled] turn ${t.turnNumber} timing: retrieve_ms=${retrieveDoneMs} ` +
+          `deep_first_ms=${r.firstChunkMs ?? 'na'} deep_total_ms=${r.final?.latencyMs ?? 'na'} ` +
+          `grounded=${envelopeText ? 'y' : 'n'} degraded=${r.degraded || 'none'}`,
+        );
       }
     } catch (e) {
       captureException(e, { op: 'decoupled.onTurnComplete', sessionId, turnNumber: t.turnNumber });

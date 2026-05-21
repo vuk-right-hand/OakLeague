@@ -62,6 +62,9 @@ function harness(overrides = {}) {
     persona: 'You are Alex.', apiKey: 'k', userId: 'u', sessionId: 's',
     onFatal: (c) => fatals.push(c),
     onPersonaNull: () => { personaNull++; },
+    // Existing suite exercises the paraphrase-ON behavior; the off-path has
+    // its own dedicated tests below. Default-on here keeps these explicit.
+    paraphraseEnabled: true,
     log: { warn() {}, error() {} },
     captureException: () => {},
   };
@@ -579,4 +582,62 @@ test('P1-10: substantive Q still fires BOTH paraphrase + deep_answer (regression
   assert.equal(deepCalls, 1, 'deep_answer MUST fire on substantive Q');
   assert.equal(legs.filter((l) => l.operation === 'brain_paraphrase').length, 1);
   assert.equal(legs.filter((l) => l.operation === 'brain_deep_answer').length, 1);
+});
+
+// ── paraphrase OFF (PARAPHRASE_ENABLED=0 — the default) ───────────────────
+
+test('paraphrase OFF: substantive Q → ONLY deep_answer fires, deep is sole voice', async () => {
+  let paraCalls = 0;
+  let deepCalls = 0;
+  const { orch, legs, tts } = harness({
+    paraphraseEnabled: false,
+    generateParaphrase: () => { paraCalls++; return genStream(['nope'], { operation: 'brain_paraphrase', text: 'nope' }); },
+    generateDeepAnswer: () => { deepCalls++; return genStream(['The ', 'grounded ', 'answer.'],
+      { operation: 'brain_deep_answer', text: 'The grounded answer.', inputTokens: 9, outputTokens: 9, quotedAt: 'q', firstChunkMs: 7, latencyMs: 99, startedAt: 2 }); },
+  });
+  orch.onUserTranscript('What is one practical fundraising tip?', 1);
+  await tick();
+  await orch.onTurnComplete();
+
+  assert.equal(paraCalls, 0, 'paraphrase MUST NOT fire when disabled');
+  assert.equal(deepCalls, 1, 'deep_answer fires as sole voice');
+  assert.equal(legs.filter((l) => l.operation === 'brain_paraphrase').length, 0, 'no paraphrase cogs leg');
+  assert.equal(legs.filter((l) => l.operation === 'brain_deep_answer').length, 1);
+  assert.deepEqual(tts, ['The ', 'grounded ', 'answer.'], 'only deep-answer text reaches TTS — no hedge opener');
+});
+
+test('paraphrase OFF: trivial Q → deep_answer FIRES (not skipped), persona-only, retrieval still skipped', async () => {
+  let deepCalls = 0;
+  let retrieveCalls = 0;
+  let deepEnvelope = 'UNSET';
+  const { orch, legs } = harness({
+    paraphraseEnabled: false,
+    generateDeepAnswer: ({ referenceEnvelopeText }) => {
+      deepCalls++; deepEnvelope = referenceEnvelopeText;
+      return genStream(['Yes, ', 'loud and clear.'], { operation: 'brain_deep_answer', text: 'Yes, loud and clear.', firstChunkMs: 7 });
+    },
+    retrieve: async () => { retrieveCalls++; return 'should not be used'; },
+  });
+  orch.onUserTranscript('can you hear me?', 1);
+  await tick();
+  await orch.onTurnComplete();
+
+  assert.equal(deepCalls, 1, 'deep_answer FIRES on trivial Q when paraphrase off (avoids dead silence)');
+  assert.equal(retrieveCalls, 0, 'retrieval still skipped on trivial Q');
+  assert.equal(deepEnvelope, null, 'deep answer runs persona-only (no reference envelope) on trivial Q');
+  assert.equal(legs.filter((l) => l.operation === 'brain_paraphrase').length, 0, 'no paraphrase leg');
+  assert.equal(legs.filter((l) => l.operation === 'brain_deep_answer').length, 1);
+});
+
+test('paraphrase OFF: trivial Q does NOT become lastCompleted (M3 — no retrieval-context pollution)', async () => {
+  const { orch } = harness({
+    paraphraseEnabled: false,
+    generateDeepAnswer: () => genStream(['Yes, loud and clear.'], { operation: 'brain_deep_answer', text: 'Yes, loud and clear.', firstChunkMs: 7 }),
+    retrieve: async () => null,
+  });
+  orch.onUserTranscript('hello hello', 1);
+  await tick();
+  await orch.onTurnComplete();
+  assert.equal(orch.lastAssistantResponse(), null,
+    'trivial deep answer is filler — must not feed next-turn retrieval context');
 });

@@ -72,3 +72,7 @@ artifacts/spike-b/
 /face-test*.png
 /face-test*.jpg
 /face-test*.jpeg
+
+# Diagnostic spike logs (transient, not source)
+/spike-run.log
+/spike-*.log

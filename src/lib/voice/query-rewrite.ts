@@ -107,7 +107,18 @@ export const QUERY_REWRITE_QUOTED_AT = process.env.QUERY_REWRITE_QUOTED_AT || '2
 // budget already.
 const LAST_ASSISTANT_MAX_CHARS = 1500;
 const USER_UTTERANCE_MAX_CHARS = 800;
-const REWRITE_TIMEOUT_MS_HARD_CAP = 3000;
+// 2026-05-21 (audit M2): set to 1800. History: 3000 (let a slow rewrite eat
+// the whole retrieval budget → 504, zero parents, session 69b43a47) → 1200
+// (knee-jerk too tight). MEASURED healthy rewrite latencies in prod were
+// 622 / 827 / 1116 / 1169ms — a 1200ms cap left only 31–84ms of headroom on
+// the slow-but-VALID ones, and a clipped rewrite falls back to the raw
+// utterance which ALSO skips the cache and embeds literal "tell me more about
+// that" → poisoned retrieval. The rewrite is load-bearing follow-up
+// disambiguation, NOT optional, so we must not clip healthy ones. With the C1
+// fix the pipeline budget is now 3000ms (not the broken 2500), so 1800ms
+// rewrite + ~300 embed + ~250 topk + ~500 rerank still fits. Re-derive if the
+// budget changes again.
+const REWRITE_TIMEOUT_MS_HARD_CAP = 1800;
 const MIN_REMAINING_MS = 500;
 
 // Heuristic for "looks like a follow-up that needs context". Used only
@@ -226,12 +237,22 @@ export async function rewriteQuery(input: RewriteInput): Promise<RewriteResult> 
   try {
     const c = clientFor(input.geminiApiKey);
     const prompt = buildPrompt({ utterance: rawUtterance, lastAsst });
+    // Disable thinking — query rewrite is a trivial JSON-shaping task; thinking
+    // adds 1-2s of latency before the first token (the silent default-on
+    // behavior of gemini-2.5-flash) and was the direct cause of the rewrite
+    // timing out + 504-ing retrieval. Family-aware shape mirrors
+    // brain-llm-common.js#thinkingConfigFor (2.5: thinkingBudget, 3.x: level).
+    const isV3 = /^gemini-3(\.|-)/i.test(QUERY_REWRITE_MODEL);
+    const thinkingConfig = isV3
+      ? { thinkingLevel: 'minimal' as const }
+      : { thinkingBudget: 0 };
     const flashPromise = c.models.generateContent({
       model: QUERY_REWRITE_MODEL,
       contents: prompt,
       config: {
         temperature: 0.0,
         responseMimeType: 'application/json',
+        thinkingConfig,
       },
     });
     const timeoutPromise = new Promise<never>((_, reject) => {

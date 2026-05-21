@@ -280,13 +280,26 @@ await provisionPricing();
 // Skip when v2 is intentionally not wired (default for prod until Day-15).
 // DECOUPLED_BRAIN_PLAN P1-6 (audit M6). The orchestrator abandons the
 // retrieval wait at this ceiling (persona-only degrade so the deep
-// answer starts immediately — no dead air after the hedge). The
-// retrieval HTTP budget MUST be locked to the SAME value: a larger
-// budget = the orchestrator gives up at 2500ms while the v2 shim keeps
-// running and BILLING to 4000ms producing a result nobody consumes.
-// P0 measured retrieve p95 ≈ 2022ms so the common case clears with
-// margin; the tail is bounded and billing-capped, not a silent leak.
-const DECOUPLED_RETRIEVE_CEILING_MS = 2500;
+// answer starts immediately — no dead air after the hedge).
+//
+// 2026-05-21 (audit C1) — TWO distinct timers, NOT one. They were both 2500
+// and that was the bug: the v2 shim's internal deadline and the orchestrator's
+// patience expired at the SAME instant, so a ~2.5s retrieve (measured live:
+// 2462–2502ms — right on the cliff) was a coin-flip between grounded and a
+// silent persona-only miss that ALSO billed a full pipeline for nothing.
+// Once the deep answer moved onto the critical path (the early-trigger fix),
+// this cliff went live. Split + raised:
+//   • BUDGET (3000) — what the v2 pipeline races against internally
+//     (rewrite+embed+topk+rerank). Bills are capped at this.
+//   • CEILING (3500) — how long the orchestrator WAITS for retrieval before
+//     persona-only. MUST be > BUDGET + HTTP/network overhead so the budget's
+//     result is actually consumable (the old "lock to same value" reasoning
+//     was wrong — it guaranteed the result was discarded). Constraint that
+//     still holds: BUDGET ≤ CEILING, so the shim never bills past the point
+//     the orchestrator gave up.
+// P0 measured retrieve p95 ≈ 2022ms; common case clears both with margin.
+const DECOUPLED_RETRIEVE_BUDGET_MS = 3000;
+const DECOUPLED_RETRIEVE_CEILING_MS = 3500;
 const RAG_V2_PROXY_ENABLED = process.env.RAG_V2_PROXY_ENABLED === '1';
 if (RAG_V2_PROXY_ENABLED) {
   if (!process.env.RAG_V2_SHIM_URL) {
@@ -1644,8 +1657,19 @@ wss.on('connection', async (ws, req) => {
         if (retrievalVersionAtSession === 2) {
           result = await callRetrieveKnowledgeV2({
             userId: ticketUserId, creatorId: ticketCreatorId, sessionId,
-            rawUtterance: question, lastAssistantResponse: lastAssistantResponseClosure,
-            corpusVersionAtSession, budgetMs: DECOUPLED_RETRIEVE_CEILING_MS, signal,
+            rawUtterance: question,
+            // 2026-05-21 (audit C2) — prefer the orchestrator's EAGER
+            // lastAssistantResponse(): the early-trigger fix means the deep
+            // answer's `final` lands (and lastCompleted updates) seconds before
+            // this turn's `turn_end` handler writes lastAssistantResponseClosure
+            // (which is gated on Gemini's slow turn_complete). A quick follow-up
+            // ("tell me more about that") arriving in that window would otherwise
+            // rewrite against the turn-N-1 answer. The closure remains the
+            // durable fallback for the Gemini-Live 15-min reopen (when the
+            // orchestrator's in-memory lastCompleted is gone).
+            lastAssistantResponse:
+              (decoupledOrch && decoupledOrch.lastAssistantResponse()) || lastAssistantResponseClosure,
+            corpusVersionAtSession, budgetMs: DECOUPLED_RETRIEVE_BUDGET_MS, signal,
           });
         } else {
           result = await retrieveTopK({
@@ -1708,12 +1732,18 @@ wss.on('connection', async (ws, req) => {
         closeWs(ws, 1011, 'cogs_misconfig');
       },
       onPersonaNull: () => console.warn(`[ws ${connId}] brain_persona_null decoupled session=${sessionId.slice(0, 8)}`),
-      // Audit M6 — explicitly LOCK the orchestrator's retrieval ceiling
-      // to the same constant the retrieve HTTP budget uses (above), so
-      // the two can never drift: the orchestrator stops waiting at
-      // exactly the point the shim self-cancels + the retrieve abort
-      // fires (orchestrator side), killing the wasted billing tail.
+      // 2026-05-21 (audit C1) — the orchestrator CEILING (3500) is
+      // deliberately LARGER than the retrieve HTTP BUDGET (3000, above), so
+      // the pipeline's result can actually be consumed instead of discarded
+      // at the cliff. BUDGET ≤ CEILING still holds (the shim self-cancels at
+      // 3000, the orchestrator waits to 3500), so the wasted-billing-tail
+      // concern the old "lock to same value" comment worried about is still
+      // covered — the shim never bills past the orchestrator's patience.
       retrieveCeilingMs: DECOUPLED_RETRIEVE_CEILING_MS,
+      // DECOUPLED_BRAIN_PLAN — paraphrase OFF by default. Strict === '1'
+      // parse (CLAUDE.md flag convention). When 0/unset the deep answer is
+      // the sole voice (no hedge, no double-talk, no contradiction).
+      paraphraseEnabled: process.env.PARAPHRASE_ENABLED === '1',
       log: {
         warn: (m) => console.warn(`[ws ${connId}] ${m}`),
         error: (m) => console.error(`[ws ${connId}] ${m}`),
@@ -1775,6 +1805,20 @@ wss.on('connection', async (ws, req) => {
       // Gated on decoupledOrch ⇒ byte-identical when the flag is false.
       if (decoupled && decoupledOrch) {
         decoupledOrch.onUserTranscript(e.text, turnNumber);
+        // DECOUPLED LATENCY FIX (2026-05-21) — start the REAL deep answer the
+        // INSTANT we have the final user transcript. Do NOT wait for Gemini's
+        // serverContent.turnComplete: in decoupled mode Gemini still generates
+        // a full AUDIO answer we DISCARD, and turn_complete only fires AFTER
+        // that wasted generation. PROVEN by [latency] timestamps: transcript
+        // ready at +228ms / +260ms, but turn_complete at +6693ms / +20894ms —
+        // 7-21s of dead air scaling with answer length. Triggering here
+        // collapses it to retrieval + deep_first (~3s, grounded). The
+        // serverContent.turnComplete branch below still calls onTurnComplete
+        // as a fallback (empty/garbage-transcript turns never reach here); the
+        // orchestrator's `t.done` guard makes the second call a no-op.
+        decoupledOrch.onTurnComplete().catch((err) => {
+          captureException(err, { op: 'decoupled.turn_complete_early', sessionId });
+        });
         return;
       }
       // Audit M3: skip retrieval for conversational fillers. The clarifier
@@ -2195,17 +2239,24 @@ wss.on('connection', async (ws, req) => {
           }
         }
       } else if (msg.type === 'turn_end') {
+        // 2026-05-21 (audit M6) — capture the turn being ended BEFORE the
+        // await below. `bridge.turnEnd()` waits for Gemini's turn_complete
+        // (+7–21s in decoupled mode), and the user can start the NEXT turn in
+        // that window (turn_start increments `turnNumber`). The early-trigger
+        // fix means THIS turn's deep answer already finished speaking, so if a
+        // newer turn superseded it we must NOT run the TTS finalization here —
+        // `ttsBridge.turnEnd()` flushes the bridge's `_currentContextId`, which
+        // now belongs to the NEWER turn, and would cut its audio mid-word.
+        const endingTurn = turnNumber;
         const metrics = await bridge.turnEnd({ timeoutMs: msg.timeoutMs || 30_000 });
-        // DECOUPLED_BRAIN_PLAN P1-5.2 (audit C1) — the off-Live deep
-        // answer only STARTS streaming to TTS after Gemini's
-        // turn_complete (which is what `bridge.turnEnd()` above awaited),
-        // gated behind retrieval + the paraphrase. If we let
-        // `ttsBridge.turnEnd()` send `continue:false` now, it races AHEAD
-        // of the deep-answer stream and the creator's actual answer is
-        // truncated to just the hedge sentence — the inverse of the
-        // north star. Wait (bounded) for the orchestrator to finish
-        // speaking the turn. Decoupled-only ⇒ legacy path byte-identical.
-        if (decoupled && decoupledOrch) {
+        const superseded = decoupled && turnNumber !== endingTurn;
+        // DECOUPLED_BRAIN_PLAN P1-5.2 — the off-Live deep answer streams to TTS
+        // gated behind retrieval. Wait (bounded) for the orchestrator to finish
+        // speaking THIS turn before continue:false, so the answer isn't
+        // truncated to the hedge. Skipped when superseded (M6): that turn
+        // already spoke and `turn` now points at the newer one.
+        // Decoupled-only ⇒ legacy path byte-identical.
+        if (decoupled && decoupledOrch && !superseded) {
           // Audit Small — floor the wait at 5s. A buggy/malicious client
           // sending a tiny timeoutMs would otherwise let continue:false
           // race ahead of the deep answer = the exact C1 truncation this
@@ -2215,8 +2266,11 @@ wss.on('connection', async (ws, req) => {
           try { await decoupledOrch.awaitTurnSpoken(spokenWaitMs); }
           catch (e) { captureException(e, { op: 'decoupled.awaitTurnSpoken', sessionId }); }
         }
+        if (superseded) {
+          console.warn(`[ws ${connId}] turn_end superseded — turn ${endingTurn} finalized cogs-only (turn ${turnNumber} now live, TTS finalize skipped)`);
+        }
         let ttsMetrics = null;
-        if (useTts && ttsBridge) {
+        if (useTts && ttsBridge && !superseded) {
           // R3-C1 / R4-C1 — always await; bridge resolves with partial:true
           // on timeout/error so logTurnCogs (and the Gemini legs) always
           // land. NEVER throw out of this path.

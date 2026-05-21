@@ -457,6 +457,18 @@ async function runOrchestrator(
     rewriteFallback: boolean,
   ): RetrieveKnowledgeV2Result => {
     telemetry.totalLatencyMs = Date.now() - startedAt;
+    // Per-stage latency breakdown (rewrite/embed/topk/rerank/total). Useful
+    // observability, but audit M1 — gate behind RAG_DIAG_LOGS so it isn't a
+    // warn-level line on EVERY retrieve in prod. Flip the env to debug.
+    if (process.env.RAG_DIAG_LOGS === '1') {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[retrieve-knowledge] timing: rewrite=${telemetry.rewrite?.latencyMs ?? 'na'} `
+        + `embed=${telemetry.embed?.latencyMs ?? 'na'} topk=${telemetry.retrieve?.latencyMs ?? 'na'} `
+        + `rerank=${telemetry.rerank?.latencyMs ?? 'na'}(fb=${telemetry.rerank?.fallback ?? 'na'}) `
+        + `total=${telemetry.totalLatencyMs} cacheHit=${telemetry.cacheHit ?? false}`,
+      );
+    }
     return { parents, telemetry, budgetExceeded, rewriteFallback };
   };
 
@@ -835,10 +847,16 @@ async function fetchParentNarrativesByIds(args: {
 }): Promise<ParentNarrativeRow[]> {
   if (args.ids.length === 0) return [];
   try {
+    // `source_type` lives on the PARENT sample_content row, NOT on
+    // sample_content_narrative_units (that table has no such column — selecting
+    // it directly errored every turn, killing the semantic cache: parents
+    // fetched=0 → always fell through to a fresh ~2s retrieve). Join through the
+    // sample_id FK to read it. (The topk_v2 RPC already does this server-side;
+    // this is the cache-hit re-fetch path, which had drifted.)
     const { data, error } = await withDeadline(
       args.admin
         .from('sample_content_narrative_units')
-        .select('id, text, title, source_type')
+        .select('id, text, title, sample_content!inner(source_type)')
         .eq('creator_id', args.creatorId)
         .in('id', args.ids),
       args.deadlineMs,
@@ -851,14 +869,30 @@ async function fetchParentNarrativesByIds(args: {
       );
       return [];
     }
-    type Row = { id: string; text: string; title: string | null; source_type: string };
+    // PostgREST returns the embedded to-one as an object; tolerate an array
+    // shape too (some PostgREST versions/relationship-detection return [{...}]).
+    type EmbeddedSample = { source_type: string };
+    type Row = {
+      id: string;
+      text: string;
+      title: string | null;
+      sample_content: EmbeddedSample | EmbeddedSample[] | null;
+    };
     const rows = (data ?? []) as Row[];
-    return rows.map((r) => ({
-      id: r.id,
-      text: r.text,
-      title: r.title,
-      sourceType: r.source_type,
-    }));
+    return rows.flatMap((r) => {
+      const sc = Array.isArray(r.sample_content) ? r.sample_content[0] : r.sample_content;
+      // Audit C3 — the `!inner` join + NOT-NULL `sample_id` FK (ON DELETE
+      // CASCADE) means every unit HAS a parent sample with a valid enum
+      // source_type, so this should never fire. But if it somehow does (orphan
+      // mid-delete), DROP the row rather than inject a sourceless envelope
+      // ("--- BEGIN (source: ) ---" would confuse the brain). Fail closed.
+      if (!sc || !sc.source_type) {
+        // eslint-disable-next-line no-console
+        console.warn(`[retrieve-knowledge] parent ${r.id} has no source_type — dropping`);
+        return [];
+      }
+      return [{ id: r.id, text: r.text, title: r.title, sourceType: sc.source_type }];
+    });
   } catch (e) {
     const why = isDeadlineExceeded(e) ? 'deadline_exceeded' : (e as Error)?.message ?? 'unknown';
     // eslint-disable-next-line no-console

@@ -78,7 +78,15 @@ import { createHash } from 'node:crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { vectorToPgText, HALFVEC_DIM, VectorEncodingError } from './halfvec';
 
-export const CACHE_DEFAULT_THRESHOLD = 0.92;
+// 2026-05-21 (audit C3) — raised 0.92 → 0.95. The cache-HIT return path was
+// dead until the source_type fetch bug was fixed today, so it ships to prod
+// effectively un-exercised. For a cloned-voice product the failure modes are
+// asymmetric: a cache MISS just costs a fresh ~2.5s retrieve (correct answer);
+// a false cache HIT serves a DIFFERENT question's answer in the creator's
+// voice (catastrophic — the inverse of "HOLY FUCK that's him"). 0.95 only
+// reuses near-identical query intent. Tune down later with empirical hit-rate
+// data once the path has real traffic.
+export const CACHE_DEFAULT_THRESHOLD = 0.95;
 export const CACHE_DEFAULT_TTL_SECONDS = 604800; // 7 days; DB clamps to [60, 30d]
 export const CACHE_MAX_PARENT_IDS = 50; // matches DB CHECK
 

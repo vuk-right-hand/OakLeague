@@ -397,16 +397,24 @@ describe('narrativeChunk — Zod schema bounds', () => {
     expect(result).toBeNull();
   });
 
-  it('rejects unit with text > 8000 chars (schema_violation → retry → null)', async () => {
+  it('SPLITS a unit with text > 8000 chars locally instead of rejecting (defensive splitter rescue)', async () => {
+    // 2026-05-21 — behavior change: the defensive splitter (splitOversizedUnit)
+    // now rescues oversized units before Zod validates, rather than failing the
+    // whole response → retry → null. A >8000-char unit is cut at paragraph/
+    // sentence/space boundaries into consecutive parts, each ≤8000.
     const oversized = {
       units: [{ title: 'ok', text: 'y'.repeat(8001) }],
     };
-    mockGenerateContent
-      .mockResolvedValueOnce(flashOk(oversized))
-      .mockResolvedValueOnce(flashOk(oversized));
+    mockGenerateContent.mockResolvedValueOnce(flashOk(oversized));
 
     const result = await narrativeChunk({ sanitizedDocument: 'doc' });
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result!.units.length).toBeGreaterThanOrEqual(2);
+    for (const u of result!.units) {
+      expect(u.text.length).toBeLessThanOrEqual(8000);
+    }
+    // Rescued on the first response — no wasted retry.
+    expect(mockGenerateContent).toHaveBeenCalledTimes(1);
   });
 
   it('rejects unit with empty title (schema min(1))', async () => {

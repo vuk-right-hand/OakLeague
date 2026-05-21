@@ -547,13 +547,18 @@ export function makeCorpusReprocessWorker({
   if (internalApiSecret.length < 32) {
     throw new Error('internalApiSecret too short (>=32 chars required)');
   }
-  // Day-5-audit M5: HTTPS-only. The Fly→Vercel hop goes over the public
-  // internet; an http:// base URL leaks the bearer secret cleartext on
-  // every chunk call. Reject at construction time so a typo'd env never
-  // ships.
-  if (!/^https:\/\//i.test(internalApiBaseUrl)) {
+  // Day-5-audit M5: HTTPS-only for non-localhost. The Fly→Vercel hop goes
+  // over the public internet; an http:// base URL leaks the bearer secret
+  // cleartext on every chunk call. Reject at construction time so a typo'd
+  // env never ships. Exception: http://localhost or 127.0.0.1 — bytes never
+  // leave the dev machine, so cleartext is fine; production deploys never
+  // set such a URL.
+  const isHttpLocalhost = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(
+    internalApiBaseUrl,
+  );
+  if (!/^https:\/\//i.test(internalApiBaseUrl) && !isHttpLocalhost) {
     throw new Error(
-      `internalApiBaseUrl must use https://; got "${internalApiBaseUrl}". Bearer secret would leak cleartext over plain http on every fetch.`,
+      `internalApiBaseUrl must use https:// (or http://localhost for dev); got "${internalApiBaseUrl}". Bearer secret would leak cleartext over plain http on every fetch.`,
     );
   }
 
@@ -981,6 +986,11 @@ export function makeCorpusReprocessWorker({
       anthropicCacheReadInputTokens  = 0;
       anthropicOutputTokens          = 0;
 
+      // chunk_index is unique per (sample_id, chunker_version) — must be a
+      // sample-wide running counter across narrative units, NOT a per-unit
+      // local index (would collide on the new 3-col UNIQUE added 2026-05-23).
+      let sampleChunkIndex = 0;
+
       for (let unitIdx = 0; unitIdx < units.length; unitIdx++) {
         if (timeLeft() < 0) {
           await bumpFailure(jobId, 'claim_timeout_during_units');
@@ -1160,7 +1170,7 @@ export function makeCorpusReprocessWorker({
             '_insert_chunk_v2_unsafe',
             {
               p_parent_unit_id:  parentUnitId,
-              p_chunk_index:     i,
+              p_chunk_index:     sampleChunkIndex,
               p_text:            child.text,
               p_chunk_context:   childChunkContexts[i],
               p_token_count:     tokenCount,
@@ -1169,6 +1179,7 @@ export function makeCorpusReprocessWorker({
               p_embedding_model: EMBEDDING_MODEL,
             },
           );
+          sampleChunkIndex++;
           if (insErr) {
             await bumpFailure(jobId, `chunk_insert_failed:${insErr.message}`);
             captureException(insErr, { op: 'reprocess_worker.insert_chunk_v2', jobId });

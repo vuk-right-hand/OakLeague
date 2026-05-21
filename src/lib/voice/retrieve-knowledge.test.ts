@@ -96,7 +96,9 @@ type ParentRow = {
   id: string;
   text: string;
   title: string | null;
-  source_type: string;
+  // source_type is read via the sample_content FK embed (it lives on the
+  // parent sample, not the narrative unit). Mock the PostgREST to-one shape.
+  sample_content: { source_type: string };
 };
 
 /** Build a supabase admin mock with controllable rpc + from chains. */
@@ -257,8 +259,8 @@ describe('retrieveKnowledgeV2 — cache HIT path', () => {
         cached_row_id: 'cache-uuid',
       },
       parentFetchRows: [
-        { id: 'pu-a', text: 'Parent A text', title: 'A', source_type: 'transcript' },
-        { id: 'pu-b', text: 'Parent B text', title: 'B', source_type: 'book_or_doc' },
+        { id: 'pu-a', text: 'Parent A text', title: 'A', sample_content: { source_type: 'transcript' } },
+        { id: 'pu-b', text: 'Parent B text', title: 'B', sample_content: { source_type: 'book_or_doc' } },
       ],
     });
     const r = await retrieveKnowledgeV2({ ...BASE_ARGS, supabaseAdmin: admin });
@@ -288,8 +290,8 @@ describe('retrieveKnowledgeV2 — cache HIT path', () => {
       },
       parentFetchRows: [
         // Returned in arbitrary order — the orchestrator must sort by score.
-        { id: 'pu-low', text: 'low score text', title: null, source_type: 't' },
-        { id: 'pu-high', text: 'high score text', title: null, source_type: 't' },
+        { id: 'pu-low', text: 'low score text', title: null, sample_content: { source_type: 't' } },
+        { id: 'pu-high', text: 'high score text', title: null, sample_content: { source_type: 't' } },
       ],
     });
     const r = await retrieveKnowledgeV2({ ...BASE_ARGS, supabaseAdmin: admin });
@@ -484,8 +486,8 @@ describe('retrieveKnowledgeV2 — Day-11 audit fixes', () => {
       },
       // Only 2 of 3 rows come back — one was deleted.
       parentFetchRows: [
-        { id: 'pu-a', text: 'A', title: null, source_type: 'transcript' },
-        { id: 'pu-b', text: 'B', title: null, source_type: 'transcript' },
+        { id: 'pu-a', text: 'A', title: null, sample_content: { source_type: 'transcript' } },
+        { id: 'pu-b', text: 'B', title: null, sample_content: { source_type: 'transcript' } },
       ],
     });
     const r = await retrieveKnowledgeV2({ ...BASE_ARGS, supabaseAdmin: admin });
@@ -558,7 +560,7 @@ describe('retrieveKnowledgeV2 — Day-11 audit fixes', () => {
         cached_row_id: 'r',
       },
       parentFetchRows: [
-        { id: 'pu-a', text: 'A', title: null, source_type: 'transcript' },
+        { id: 'pu-a', text: 'A', title: null, sample_content: { source_type: 'transcript' } },
       ],
     });
     await retrieveKnowledgeV2({ ...BASE_ARGS, supabaseAdmin: admin });

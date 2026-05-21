@@ -93,6 +93,88 @@ export class NarrativeChunkError extends Error {
 }
 
 
+// ── Defensive oversized-unit splitter ─────────────────────────────────────
+//
+// Flash sometimes emits narrative units whose `text` exceeds HARD_MAX_UNIT_CHARS
+// (8000) even when the prompt forbids it. Rather than rejecting the whole
+// response and retrying (which hits the same deterministic merge), we split
+// oversized units locally at paragraph → sentence → space boundaries.
+// Schema validation becomes a backstop, not the load-bearing chunker.
+
+function findSplitPoint(text: string, target: number): number {
+  // Prefer paragraph break, then newline, then sentence end, then space.
+  // Look up to 1000 chars past target for a clean boundary.
+  const windowEnd = Math.min(target + 1000, text.length);
+  const slice = text.slice(0, windowEnd);
+  const minAcceptable = Math.floor(target * 0.5);
+
+  const paraIdx = slice.lastIndexOf('\n\n', target);
+  if (paraIdx > minAcceptable) return paraIdx + 2;
+
+  const newlineIdx = slice.lastIndexOf('\n', target);
+  if (newlineIdx > minAcceptable) return newlineIdx + 1;
+
+  const sentenceIdx = Math.max(
+    slice.lastIndexOf('. ', target),
+    slice.lastIndexOf('? ', target),
+    slice.lastIndexOf('! ', target),
+  );
+  if (sentenceIdx > minAcceptable) return sentenceIdx + 2;
+
+  const spaceIdx = slice.lastIndexOf(' ', target);
+  if (spaceIdx > minAcceptable) return spaceIdx + 1;
+
+  return target; // last resort: hard cut
+}
+
+function splitOversizedUnit(unit: { title: string; text: string }): {
+  title: string;
+  text: string;
+}[] {
+  const TARGET_PART_SIZE = 6000; // well under HARD_MAX_UNIT_CHARS=8000
+  // Reserve room for " (part NN)" suffix so the title doesn't exceed cap.
+  const baseTitle = unit.title.length > HARD_MAX_TITLE_CHARS - 12
+    ? unit.title.slice(0, HARD_MAX_TITLE_CHARS - 12)
+    : unit.title;
+
+  const parts: { title: string; text: string }[] = [];
+  let remaining = unit.text;
+  let partNum = 1;
+
+  while (remaining.length > HARD_MAX_UNIT_CHARS) {
+    const splitAt = findSplitPoint(remaining, TARGET_PART_SIZE);
+    const piece = remaining.slice(0, splitAt).trim();
+    if (piece.length > 0) {
+      parts.push({ title: `${baseTitle} (part ${partNum})`, text: piece });
+      partNum++;
+    }
+    remaining = remaining.slice(splitAt).trim();
+  }
+
+  if (remaining.length > 0) {
+    parts.push({
+      title: parts.length > 0 ? `${baseTitle} (part ${partNum})` : unit.title,
+      text: remaining,
+    });
+  }
+
+  // Audit M3 — postcondition: EVERY part must be ≤ HARD_MAX_UNIT_CHARS so the
+  // DB CHECK (text BETWEEN 1 AND 8000) and the Zod schema are backstops, not
+  // the gate. The loop above already guarantees this (it exits at remaining ≤
+  // 8000 and findSplitPoint always advances ≥ target*0.5), but a future edit
+  // to findSplitPoint could break that invariant — hard-cut any straggler so
+  // the splitter's contract holds by construction, not by reasoning.
+  const safe: { title: string; text: string }[] = [];
+  for (const p of parts) {
+    if (p.text.length <= HARD_MAX_UNIT_CHARS) { safe.push(p); continue; }
+    for (let off = 0, n = 1; off < p.text.length; off += HARD_MAX_UNIT_CHARS, n++) {
+      safe.push({ title: `${baseTitle} (part ${partNum + n - 1})`, text: p.text.slice(off, off + HARD_MAX_UNIT_CHARS).trim() });
+    }
+  }
+  return safe;
+}
+
+
 // ── Gemini client (lazy, singleton) ────────────────────────────────────────
 
 let _client: GoogleGenAI | null = null;
@@ -137,6 +219,8 @@ function buildPrompt(args: {
   return `You are a content editor splitting a document into self-contained narrative units for a retrieval system.
 
 ${titleLine}Each unit should be a complete idea, story, or section that makes sense on its own when surfaced to a reader. Aim for ~${TARGET_UNIT_MIN_TOKENS}-${TARGET_UNIT_MAX_TOKENS} tokens per unit. Give each unit a short descriptive title (≤${HARD_MAX_TITLE_CHARS} chars).
+
+HARD LIMIT: each unit's "text" field MUST be ≤${HARD_MAX_UNIT_CHARS} characters. If a single narrative beat would exceed ${HARD_MAX_UNIT_CHARS} chars, split it at a paragraph or sentence boundary into two or more consecutive units that together cover the same content. Never emit a "text" longer than ${HARD_MAX_UNIT_CHARS} chars under any circumstance.
 
 If the document is a narrative talk, units are story beats. If it's a reference doc, units are logical sections. Mix is fine — let the document tell you.
 
@@ -197,6 +281,14 @@ async function callFlashOnce(args: {
     total_token_count: 0,
   };
   try {
+    // Disable thinking mode — structured-output JSON task at temp 0.2;
+    // reasoning tokens add 10-20s of latency before first output token and
+    // don't improve schema adherence. Family-aware shape (2.5: thinkingBudget,
+    // 3.x: thinkingLevel) mirrors server/voice-proxy/brain-llm-common.js#thinkingConfigFor.
+    const isV3 = /^gemini-3(\.|-)/i.test(NARRATIVE_CHUNK_MODEL);
+    const thinkingConfig = isV3
+      ? { thinkingLevel: 'minimal' as const }
+      : { thinkingBudget: 0 };
     const flashPromise = c.models.generateContent({
       model: NARRATIVE_CHUNK_MODEL,
       contents: buildPrompt({
@@ -208,6 +300,19 @@ async function callFlashOnce(args: {
         // Lower temperature for structured output — consistent schema over creativity.
         temperature: 0.2,
         responseMimeType: 'application/json',
+        thinkingConfig,
+        // gemini-2.5-flash silently defaults maxOutputTokens to 8192 (model max
+        // is 65535). A 70K-char doc needs ~18K tokens of structured JSON; without
+        // an explicit cap the response truncates mid-JSON → Zod parse fails →
+        // fallback_to_v1. Verified 2026-05-20 against Google AI Dev Forum + the
+        // google-gemini/gemini-cli#23081 silent-truncation issue.
+        // 2026-05-21 (audit M4) — 32768 → 65535 (model max). A large doc whose
+        // units re-emit most of the source text as JSON `text` fields can
+        // exceed 32768 output tokens and truncate; the local splitter only
+        // runs on SUCCESSFULLY parsed JSON, so it cannot rescue a truncated
+        // response. Max headroom here; the real ceiling is the input doc size
+        // (chunk the input for pathologically large samples — future work).
+        maxOutputTokens: 65535,
       },
     });
     const timeoutPromise = new Promise<never>((_, reject) => {
@@ -264,6 +369,44 @@ async function callFlashOnce(args: {
       args.attempt,
       `JSON.parse: ${(e as Error)?.message ?? 'unknown'}`,
     );
+  }
+
+  // Defensive splitter — if Flash emitted any unit with text > 8000 chars,
+  // split it locally before Zod validates. See splitOversizedUnit header.
+  if (
+    parsed != null &&
+    typeof parsed === 'object' &&
+    'units' in (parsed as Record<string, unknown>) &&
+    Array.isArray((parsed as { units: unknown }).units)
+  ) {
+    const rawUnits = (parsed as { units: Array<{ title?: unknown; text?: unknown }> }).units;
+    const splitUnits: { title: string; text: string }[] = [];
+    let splitFiredCount = 0;
+    for (const u of rawUnits) {
+      if (
+        u != null &&
+        typeof u.title === 'string' &&
+        typeof u.text === 'string'
+      ) {
+        if (u.text.length > HARD_MAX_UNIT_CHARS) {
+          splitFiredCount++;
+          for (const piece of splitOversizedUnit({ title: u.title, text: u.text })) {
+            splitUnits.push(piece);
+          }
+        } else {
+          splitUnits.push({ title: u.title, text: u.text });
+        }
+      } else {
+        // Pass through malformed unit; Zod will reject with a clearer error.
+        splitUnits.push(u as unknown as { title: string; text: string });
+      }
+    }
+    if (splitFiredCount > 0) {
+      console.log(
+        `[narrative-chunk] split ${splitFiredCount} oversized unit(s) locally → ${splitUnits.length} total units`,
+      );
+    }
+    (parsed as { units: unknown }).units = splitUnits;
   }
 
   const result = NarrativeChunkResponseSchema.safeParse(parsed);
@@ -375,19 +518,19 @@ export async function narrativeChunk(
     });
     return { units: r1.units, attempt: 1, ms: Date.now() - t0, usage: r1.usage };
   } catch (e) {
-    // Attempt 1 failed. Only retry on the recoverable codes — schema /
-    // invalid_json / transport are all worth a stricter second try.
-    // api_key_missing or empty_input mean we shouldn't retry at all.
+    // DIAG (2026-05-20): surface per-attempt failure codes so operator can
+    // see WHY the chunker fell back to v1. Remove once root cause is known.
+    if (e instanceof NarrativeChunkError) {
+      console.error(
+        `[narrative-chunk] attempt 1 failed: code=${e.code} msg=${(e.message || '').slice(0, 500)}`,
+      );
+    } else {
+      console.error('[narrative-chunk] attempt 1 failed (non-NCE):', e);
+    }
     if (e instanceof NarrativeChunkError) {
       if (e.code === 'api_key_missing' || e.code === 'empty_input') {
         throw e;
       }
-      // Attempt 2: stricter prompt with explicit JSON shape example.
-      // Day-5-audit C2: attempt-1 spent tokens even though we threw before
-      // capturing them (callFlashOnce raises on parse/schema failure with
-      // usage left at zero). The lost tokens are inherent retry waste and
-      // we don't surface them — the cogs_log emitted by the caller covers
-      // the successful attempt only. This is a known small undercount.
       try {
         const r2 = await callFlashOnce({
           sanitizedDocument: args.sanitizedDocument,
@@ -396,12 +539,18 @@ export async function narrativeChunk(
           attempt: 2,
         });
         return { units: r2.units, attempt: 2, ms: Date.now() - t0, usage: r2.usage };
-      } catch {
-        // Second failure — caller falls back to v1 chunker.
+      } catch (e2) {
+        // DIAG (2026-05-20)
+        if (e2 instanceof NarrativeChunkError) {
+          console.error(
+            `[narrative-chunk] attempt 2 failed: code=${e2.code} msg=${(e2.message || '').slice(0, 500)}`,
+          );
+        } else {
+          console.error('[narrative-chunk] attempt 2 failed (non-NCE):', e2);
+        }
         return null;
       }
     }
-    // Non-NarrativeChunkError exceptions bubble up.
     throw e;
   }
 }
