@@ -28,15 +28,21 @@ BEGIN
     VALUES (v_cuid, 'FRS', 'frs', 'ready', now())
     RETURNING id INTO v_cid;
 
-  -- 1. service-role gate (the test runs as superuser by default — switch to
-  -- authenticated role first).
-  PERFORM tests.set_authenticated(v_admin);
+  -- 1. service-role gate. C-1 FIX: set ONLY the jwt to a non-service role —
+  -- do NOT switch the DB role via tests.set_authenticated. Calling this
+  -- no-EXECUTE SECURITY DEFINER function as the 'authenticated' role SEGFAULTS
+  -- PostgreSQL 17.6 (grant-check crash, uncatchable). Staying on a role that
+  -- HAS execute lets the call enter the body and hit the internal service_role
+  -- guard cleanly. Prod-safe: authenticated never reaches this reaper.
+  -- (See memory project_pg17_secdef_role_segfault + face_clone_finalize test.)
+  PERFORM set_config('request.jwt.claims', json_build_object('role','authenticated')::text, true);
   RETURN NEXT throws_like(
     'SELECT public.face_clone_uploads_reap_stale_pending(30)',
     '%service_role only%',
     '1: anon/auth caller blocked'
   );
-  PERFORM tests.reset_role();
+  -- service_role jwt for steps 2-5 (reset_role's '' claims are unparseable).
+  PERFORM set_config('request.jwt.claims', json_build_object('role','service_role')::text, true);
 
   -- 2. Range guard: 4 rejected (below 5), 1500 rejected (above 1440).
   RETURN NEXT throws_like(

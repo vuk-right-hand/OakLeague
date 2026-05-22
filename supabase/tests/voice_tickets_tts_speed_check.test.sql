@@ -27,29 +27,29 @@ BEGIN
 
   -- 1) NULL tts_speed accepted (legacy ticket path).
   INSERT INTO public.voice_tickets
-    (ticket_id, user_id, creator_id, session_id, expected_tier, purpose,
+    (ticket_id, user_id, creator_id, session_id, expected_tier, purpose, tts_provider,
      avatar_provider, expires_at, bound_ua_hash, tts_speed)
   VALUES
-    (gen_random_uuid(), v_user, v_creator, v_session, 'free', 'voice_session',
+    (gen_random_uuid(), v_user, v_creator, v_session, 'free', 'voice_session', 'cartesia',
      'simli', now() + interval '120 seconds', repeat('a', 64), NULL);
   RETURN NEXT ok(true, '1: NULL tts_speed accepted');
 
   -- 2) tts_speed=1.0 accepted.
   INSERT INTO public.voice_tickets
-    (ticket_id, user_id, creator_id, session_id, expected_tier, purpose,
+    (ticket_id, user_id, creator_id, session_id, expected_tier, purpose, tts_provider,
      avatar_provider, expires_at, bound_ua_hash, tts_speed)
   VALUES
-    (gen_random_uuid(), v_user, v_creator, v_session, 'free', 'voice_session',
+    (gen_random_uuid(), v_user, v_creator, v_session, 'free', 'voice_session', 'cartesia',
      'simli', now() + interval '120 seconds', repeat('b', 64), 1.0);
   RETURN NEXT ok(true, '2: tts_speed=1.0 accepted');
 
   -- 3) tts_speed=0.5 (below 0.6 floor) rejected.
   BEGIN
     INSERT INTO public.voice_tickets
-      (ticket_id, user_id, creator_id, session_id, expected_tier, purpose,
+      (ticket_id, user_id, creator_id, session_id, expected_tier, purpose, tts_provider,
        avatar_provider, expires_at, bound_ua_hash, tts_speed)
     VALUES
-      (gen_random_uuid(), v_user, v_creator, v_session, 'free', 'voice_session',
+      (gen_random_uuid(), v_user, v_creator, v_session, 'free', 'voice_session', 'cartesia',
        'simli', now() + interval '120 seconds', repeat('c', 64), 0.5);
     RETURN NEXT fail('3: tts_speed=0.5 should have raised 23514');
   EXCEPTION WHEN check_violation THEN
@@ -60,10 +60,10 @@ BEGIN
   -- 4) tts_speed=2.0 (above 1.5 ceiling) rejected.
   BEGIN
     INSERT INTO public.voice_tickets
-      (ticket_id, user_id, creator_id, session_id, expected_tier, purpose,
+      (ticket_id, user_id, creator_id, session_id, expected_tier, purpose, tts_provider,
        avatar_provider, expires_at, bound_ua_hash, tts_speed)
     VALUES
-      (gen_random_uuid(), v_user, v_creator, v_session, 'free', 'voice_session',
+      (gen_random_uuid(), v_user, v_creator, v_session, 'free', 'voice_session', 'cartesia',
        'simli', now() + interval '120 seconds', repeat('d', 64), 2.0);
     RETURN NEXT fail('4: tts_speed=2.0 should have raised 23514');
   EXCEPTION WHEN check_violation THEN

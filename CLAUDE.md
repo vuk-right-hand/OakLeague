@@ -69,6 +69,13 @@ Test data integrity, webhooks, RLS, voice session lifecycle, barge-in, COGS guar
 Skip tests for basic UI and standard routing.
 Real-API gated test (`RUN_REAL_API_TESTS=1`) for the voice provider — single canned WAV → real Gemini → assert response. Catches silent model deprecation.
 
+### Schema-change blast radius + full-suite discipline (2026-05-22 — learned the hard way)
+A schema change is not done when YOUR new test is green. It's done when the WHOLE suite is green.
+- **Any migration that adds `NOT NULL`, changes a function signature/arg types, renames, or alters an enum → grep + update EVERY dependent test AND caller in the SAME change**, then run the FULL `npm run db:test` (not just the file you added). "My new test passes" while old tests rot is the lazy path that accumulates silent drift (we ended up with `creator_applications.topics`/`voice_tickets.tts_provider` NOT-NULL drift, an `admin_set_creator_retrieval_version` signature mismatch, and a `tests.set_role` helper referenced but never created — all hidden until a full run).
+- **A test that CRASHES Postgres (segfault/PANIC → "the database system is in recovery mode") is a P0, never a known-nuisance.** pg_prove runs files alphabetically against one DB; a crash masks EVERY test sorting after it as a spurious "recovery mode" failure. One crasher hid ~19 real reds for who-knows-how-long. Fix a DB-crasher the day it appears; until then you cannot trust "the suite is green."
+- **Green ≠ correct.** When a test fails because the schema/enum/signature changed, decide which side is right BEFORE editing: is the test stale (fix the test) or did prod code/schema regress (fix the code)? Get evidence (does prod code write that enum value? does the route call that signature?) — never make a test green by papering over a real bug.
+- **pgTAP role-guard trap (PG 17.6):** never assert "non-service caller blocked" by `set_config('role', 'authenticated')` + CALLING a SECURITY DEFINER fn that REVOKEs `authenticated` — it SEGFAULTS the backend. Use `has_function_privilege(...)` or set only the jwt while staying on a role that has EXECUTE. See `.claude_learnings.md` 2026-05-22.
+
 ---
 
 ## Hard Rules — These Override Everything

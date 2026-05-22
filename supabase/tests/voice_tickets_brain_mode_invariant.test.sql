@@ -18,8 +18,8 @@ DECLARE
 BEGIN
   -- Build the minimal chain: profile (handle_new_user trigger does it),
   -- creator_application, creator, session.
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-  VALUES (gen_random_uuid(), v_user, 'approved', 'Test Creator', 'brainmodeinv1')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+  VALUES (gen_random_uuid(), v_user, 'approved', 'Test Creator', 'brainmodeinv1', '[]'::jsonb, '{}'::jsonb)
   RETURNING id INTO v_app;
 
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status, brain_mode)
@@ -35,8 +35,8 @@ BEGIN
   -- 1: vector + prefix_turns array → must fail.
   BEGIN
     INSERT INTO public.voice_tickets
-      (user_id, bound_ua_hash, creator_id, session_id, expected_tier, avatar_provider, expires_at, brain_mode, prefix_turns)
-    VALUES (v_user, repeat('a', 64), v_creator, v_session, 'free', 'simli', now() + interval '2 minutes', 'vector',
+      (user_id, bound_ua_hash, creator_id, session_id, expected_tier, tts_provider, avatar_provider, expires_at, brain_mode, prefix_turns)
+    VALUES (v_user, repeat('a', 64), v_creator, v_session, 'free', 'cartesia', 'simli', now() + interval '2 minutes', 'vector',
             '[{"role":"user","parts":[{"text":"x"}]}]'::jsonb);
     RETURN NEXT fail('1: vector + prefix_turns array should have CHECK-violated');
   EXCEPTION WHEN check_violation THEN
@@ -45,16 +45,16 @@ BEGIN
 
   -- 2: vector + null prefix_turns → OK.
   INSERT INTO public.voice_tickets
-    (user_id, bound_ua_hash, creator_id, session_id, expected_tier, avatar_provider, expires_at, brain_mode, prefix_turns)
-  VALUES (v_user, repeat('b', 64), v_creator, v_session, 'free', 'simli', now() + interval '2 minutes', 'vector', NULL)
+    (user_id, bound_ua_hash, creator_id, session_id, expected_tier, tts_provider, avatar_provider, expires_at, brain_mode, prefix_turns)
+  VALUES (v_user, repeat('b', 64), v_creator, v_session, 'free', 'cartesia', 'simli', now() + interval '2 minutes', 'vector', NULL)
   RETURNING ticket_id INTO v_ticket;
   RETURN NEXT pass('2: vector + null prefix_turns → OK');
   DELETE FROM public.voice_tickets WHERE ticket_id = v_ticket;
 
   -- 3: drawer + non-null prefix_turns → OK.
   INSERT INTO public.voice_tickets
-    (user_id, bound_ua_hash, creator_id, session_id, expected_tier, avatar_provider, expires_at, brain_mode, prefix_turns)
-  VALUES (v_user, repeat('c', 64), v_creator, v_session, 'free', 'simli', now() + interval '2 minutes', 'drawer',
+    (user_id, bound_ua_hash, creator_id, session_id, expected_tier, tts_provider, avatar_provider, expires_at, brain_mode, prefix_turns)
+  VALUES (v_user, repeat('c', 64), v_creator, v_session, 'free', 'cartesia', 'simli', now() + interval '2 minutes', 'drawer',
           '[{"role":"user","parts":[{"text":"x"}]}]'::jsonb)
   RETURNING ticket_id INTO v_ticket;
   RETURN NEXT pass('3: drawer + non-null prefix_turns → OK');
@@ -62,8 +62,8 @@ BEGIN
 
   -- 4: drawer + null prefix_turns → OK.
   INSERT INTO public.voice_tickets
-    (user_id, bound_ua_hash, creator_id, session_id, expected_tier, avatar_provider, expires_at, brain_mode, prefix_turns)
-  VALUES (v_user, repeat('d', 64), v_creator, v_session, 'free', 'simli', now() + interval '2 minutes', 'drawer', NULL)
+    (user_id, bound_ua_hash, creator_id, session_id, expected_tier, tts_provider, avatar_provider, expires_at, brain_mode, prefix_turns)
+  VALUES (v_user, repeat('d', 64), v_creator, v_session, 'free', 'cartesia', 'simli', now() + interval '2 minutes', 'drawer', NULL)
   RETURNING ticket_id INTO v_ticket;
   RETURN NEXT pass('4: drawer + null prefix_turns → OK');
 END;

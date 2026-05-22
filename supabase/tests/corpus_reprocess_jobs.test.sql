@@ -43,8 +43,8 @@ BEGIN
   INSERT INTO public.admin_roles (user_id, email, role)
     VALUES (v_admin, 'crj-admin@test', 'superadmin');
 
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user, 'approved', 'CRJ Creator', 'crjcreator')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user, 'approved', 'CRJ Creator', 'crjcreator', '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app;
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status)
     VALUES (gen_random_uuid(), v_user, v_app, 'CRJ Creator', 'crjcreator', 'ready')
@@ -152,11 +152,14 @@ BEGIN
   );
 
   -- 10: corpus_reprocess_mark_done with matching version → marks done, returns uuid.
-  -- Setup: row at status='processing', enqueue_version=1.
+  -- Setup: row at status='processing', enqueue_version=1. Pin enqueue_version=1
+  -- explicitly — test 7's reap bumped it 1→2 (Day-5 C5 fencing), so without
+  -- this reset the "matching version" call would mismatch the post-reap value.
   UPDATE public.corpus_reprocess_jobs
      SET status = 'processing',
          claimed_by = 'fly-test-host',
-         claimed_at = now()
+         claimed_at = now(),
+         enqueue_version = 1
    WHERE id = v_job;
   SELECT public.corpus_reprocess_mark_done(v_job, 1) INTO v_done_ret;
   SELECT status INTO v_status FROM public.corpus_reprocess_jobs WHERE id = v_job;

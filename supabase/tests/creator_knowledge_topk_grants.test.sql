@@ -9,7 +9,10 @@ SELECT plan(3);
 
 SELECT ok(
   NOT has_function_privilege(
-    'public'::regrole,
+    -- PUBLIC is a pseudo-role (not in pg_roles), so 'public'::regrole raised
+    -- "role public does not exist". has_function_privilege takes the text
+    -- 'public' to mean the PUBLIC pseudo-role (verified on local DB).
+    'public',
     'public.creator_knowledge_topk(uuid, halfvec, integer, numeric)',
     'EXECUTE'
   ),

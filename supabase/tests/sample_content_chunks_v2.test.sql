@@ -32,22 +32,22 @@ DECLARE
   v_topk_n      int;
   v_dummy_vec   halfvec(768);
 BEGIN
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user, 'approved', 'CV2 Creator', 'cv2creator')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user, 'approved', 'CV2 Creator', 'cv2creator', '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app;
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status)
     VALUES (gen_random_uuid(), v_user, v_app, 'CV2 Creator', 'cv2creator', 'ready')
     RETURNING id INTO v_creator;
   INSERT INTO public.creator_topics (creator_id, slug, title, sort_order)
-    VALUES (v_creator, 'topicA', 'Topic A', 0);
+    VALUES (v_creator, 'topic_a', 'Topic A', 0);
   INSERT INTO public.sample_content (id, creator_id, source_type, title, raw_text, topic_tags, fetch_status)
     VALUES (gen_random_uuid(), v_creator, 'transcript', 'CV2 Sample',
-            'lorem ipsum dolor sit amet', ARRAY['topicA'], 'ready')
+            'lorem ipsum dolor sit amet', ARRAY['topic_a'], 'ready')
     RETURNING id INTO v_sample;
   INSERT INTO public.sample_content_narrative_units
     (sample_id, creator_id, unit_index, title, text, token_count, topic_tags)
     VALUES (v_sample, v_creator, 0, 'Unit Zero',
-            'Parent unit text body here.', 100, ARRAY['topicA'])
+            'Parent unit text body here.', 100, ARRAY['topic_a'])
     RETURNING id INTO v_unit;
 
   -- Audit-4 C2 fix: a 768-dim ZERO vector produces undefined cosine distance
@@ -66,7 +66,7 @@ BEGIN
     (sample_id, creator_id, chunk_index, text, token_count, topic_tags, embedding, embedded_at)
   VALUES
     (v_sample, v_creator, 0, 'Legacy v1 chunk one with leverage content.',
-     20, ARRAY['topicA'], v_dummy_vec, now())
+     20, ARRAY['topic_a'], v_dummy_vec, now())
   RETURNING id INTO v_chunk_v1;
   SELECT chunker_version INTO v_default
     FROM public.sample_content_chunks WHERE id = v_chunk_v1;
@@ -78,7 +78,7 @@ BEGIN
       (sample_id, creator_id, chunk_index, text, token_count, topic_tags,
        embedding, embedded_at, chunker_version)
     VALUES
-      (v_sample, v_creator, 99, 'should fail', 10, ARRAY['topicA'],
+      (v_sample, v_creator, 99, 'should fail', 10, ARRAY['topic_a'],
        v_dummy_vec, now(), 3);
     RETURN NEXT fail('2: chunker_version=3 should have raised check_violation');
   EXCEPTION WHEN check_violation THEN
@@ -92,7 +92,7 @@ BEGIN
        topic_tags, embedding, embedded_at, chunker_version, parent_unit_id)
     VALUES
       (v_sample, v_creator, 98, 'short text', repeat('x', 1001), 10,
-       ARRAY['topicA'], v_dummy_vec, now(), 2, v_unit);
+       ARRAY['topic_a'], v_dummy_vec, now(), 2, v_unit);
     RETURN NEXT fail('3: chunk_context>1000 should have raised check_violation');
   EXCEPTION WHEN check_violation THEN
     RETURN NEXT pass('3: CHECK rejects chunk_context>1000 chars');
@@ -106,7 +106,7 @@ BEGIN
     p_text            := 'leverage builds compounding wealth over time',
     p_chunk_context   := 'This excerpt discusses how leverage compounds',
     p_token_count     := 50,
-    p_topic_tags      := ARRAY['topicA'],
+    p_topic_tags      := ARRAY['topic_a'],
     p_embedding       := v_dummy_vec
   ) INTO v_chunk_v2;
   SELECT text_search INTO v_ts_v
@@ -135,7 +135,7 @@ BEGIN
       p_text            := 'should fail',
       p_chunk_context   := 'ctx',
       p_token_count     := 5,
-      p_topic_tags      := ARRAY['topicA'],
+      p_topic_tags      := ARRAY['topic_a'],
       p_embedding       := v_dummy_vec
     );
     RETURN NEXT fail('6: missing parent unit should have raised');

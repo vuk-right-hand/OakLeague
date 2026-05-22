@@ -29,29 +29,29 @@ DECLARE
   v_ok        boolean;
 BEGIN
   -- Helper: each creator gets its own fresh row via inline INSERT.
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user1, 'approved', 'CEB Creator1', 'cebcreator1')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user1, 'approved', 'CEB Creator1', 'cebcreator1', '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app;
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status)
     VALUES (gen_random_uuid(), v_user1, v_app, 'CEB Creator1', 'cebcreator1', 'ready')
     RETURNING id INTO v_creator1;
 
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user2, 'approved', 'CEB Creator2', 'cebcreator2')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user2, 'approved', 'CEB Creator2', 'cebcreator2', '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app;
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status)
     VALUES (gen_random_uuid(), v_user2, v_app, 'CEB Creator2', 'cebcreator2', 'ready')
     RETURNING id INTO v_creator2;
 
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user3, 'approved', 'CEB Creator3', 'cebcreator3')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user3, 'approved', 'CEB Creator3', 'cebcreator3', '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app;
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status)
     VALUES (gen_random_uuid(), v_user3, v_app, 'CEB Creator3', 'cebcreator3', 'ready')
     RETURNING id INTO v_creator3;
 
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user4, 'approved', 'CEB Creator4', 'cebcreator4')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user4, 'approved', 'CEB Creator4', 'cebcreator4', '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app;
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status)
     VALUES (gen_random_uuid(), v_user4, v_app, 'CEB Creator4', 'cebcreator4', 'ready')
@@ -91,8 +91,8 @@ BEGIN
   );
 
   -- 6: Default cap inclusive boundary — exactly $10 → true (audit-6 small).
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user5, 'approved', 'CEB Creator5', 'cebcreator5')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user5, 'approved', 'CEB Creator5', 'cebcreator5', '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app;
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status)
     VALUES (gen_random_uuid(), v_user5, v_app, 'CEB Creator5', 'cebcreator5', 'ready')

@@ -29,15 +29,15 @@ DECLARE
   v_real_samples_pre     int;
   v_real_samples_post    int;
 BEGIN
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user1, 'approved', 'Fixture Creator', 'tffixturec')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user1, 'approved', 'Fixture Creator', 'tffixturec', '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app1;
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status, is_test_fixture)
     VALUES (gen_random_uuid(), v_user1, v_app1, 'Fixture Creator', 'tffixturec', 'ready', true)
     RETURNING id INTO v_fixture;
 
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user2, 'approved', 'Real Creator', 'tfrealc')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user2, 'approved', 'Real Creator', 'tfrealc', '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app2;
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status)
     VALUES (gen_random_uuid(), v_user2, v_app2, 'Real Creator', 'tfrealc', 'ready')

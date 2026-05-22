@@ -29,8 +29,8 @@ DECLARE
   v_enq_v2    int;
 BEGIN
   -- v1 creator (default retrieval_version=1).
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user_v1, 'approved', 'V1 Creator', 'v1creator')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user_v1, 'approved', 'V1 Creator', 'v1creator', '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app;
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status)
     VALUES (gen_random_uuid(), v_user_v1, v_app, 'V1 Creator', 'v1creator', 'ready')
@@ -39,8 +39,8 @@ BEGIN
     VALUES (v_creator_v1, 'topic-a', 'Topic A', 0);
 
   -- v2 creator (explicit retrieval_version=2).
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user_v2, 'approved', 'V2 Creator', 'v2creator')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user_v2, 'approved', 'V2 Creator', 'v2creator', '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app;
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status, retrieval_version)
     VALUES (gen_random_uuid(), v_user_v2, v_app, 'V2 Creator', 'v2creator', 'ready', 2)

@@ -23,8 +23,8 @@ DECLARE
   v_v1_after    int;
   v_v2_after    int;
 BEGIN
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user, 'approved', 'FEJ Creator', 'fejcreator')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user, 'approved', 'FEJ Creator', 'fejcreator', '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app;
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status)
     VALUES (gen_random_uuid(), v_user, v_app, 'FEJ Creator', 'fejcreator', 'ready')

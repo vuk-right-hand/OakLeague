@@ -55,8 +55,12 @@ DECLARE
   v_creator     uuid;
   v_parent_id1  uuid := gen_random_uuid();
   v_parent_id2  uuid := gen_random_uuid();
-  v_hash1       bytea := decode(md5('hello world')::text, 'hex');
-  v_hash2       bytea := decode(md5('hola mundo')::text, 'hex');
+  -- query_text_hash is a 32-byte sha256 in production; semantic_query_cache_upsert
+  -- enforces octet_length = 32 exactly (md5 → 16 bytes is rejected → NULL). Use
+  -- sha256 so the SUCCESS-path upserts actually insert. (decode(md5(...),'hex')
+  -- is 16 bytes — 32 hex CHARS, not 32 bytes — which silently NULLed every insert.)
+  v_hash1       bytea := sha256('hello world'::bytea);                     -- 32 bytes
+  v_hash2       bytea := sha256('hola mundo'::bytea);                      -- 32 bytes
   v_short_hash  bytea := decode(md5('x')::text || md5('x')::text, 'hex');  -- 32 bytes valid
   v_too_short   bytea := decode('aa', 'hex');                              -- 1 byte (invalid)
   v_inserted_id uuid;
@@ -352,7 +356,7 @@ BEGIN
   -- ── 15: stale corpus_version → NULL ───────────────────────────────────
   v_inserted_id := public.semantic_query_cache_upsert(
     v_creator, 999, pg_temp.unit_vec(13),
-    decode(md5('stale')::text, 'hex'),
+    sha256('stale'::bytea),
     ARRAY[v_parent_id1], ARRAY[0.5]::float[], 3600
   );
   RETURN NEXT ok(
@@ -364,7 +368,7 @@ BEGIN
   -- ── 16: array-length mismatch → NULL ──────────────────────────────────
   v_inserted_id := public.semantic_query_cache_upsert(
     v_creator, 1, pg_temp.unit_vec(14),
-    decode(md5('mismatch')::text, 'hex'),
+    sha256('mismatch'::bytea),
     ARRAY[v_parent_id1, v_parent_id2], ARRAY[0.5]::float[], 3600
   );
   RETURN NEXT ok(
@@ -376,7 +380,7 @@ BEGIN
   -- ── 17: empty arrays → NULL ───────────────────────────────────────────
   v_inserted_id := public.semantic_query_cache_upsert(
     v_creator, 1, pg_temp.unit_vec(15),
-    decode(md5('empty')::text, 'hex'),
+    sha256('empty'::bytea),
     ARRAY[]::uuid[], ARRAY[]::float[], 3600
   );
   RETURN NEXT ok(
@@ -387,7 +391,7 @@ BEGIN
   -- ── 18: oversized arrays (>50) → NULL ─────────────────────────────────
   v_inserted_id := public.semantic_query_cache_upsert(
     v_creator, 1, pg_temp.unit_vec(16),
-    decode(md5('big')::text, 'hex'),
+    sha256('big'::bytea),
     (SELECT array_agg(gen_random_uuid()) FROM generate_series(1,51)),
     (SELECT array_agg(0.5::float)        FROM generate_series(1,51)),
     3600

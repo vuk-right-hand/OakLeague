@@ -41,8 +41,8 @@ BEGIN
     VALUES (v_creator, v_user, 'Test Creator', 'tc_'||substr(v_user::text,1,8), 'human');
 
   -- Live session row.
-  INSERT INTO public.sessions (id, user_id, creator_id, tier_at_session, started_at, status)
-    VALUES (v_session, v_user, v_creator, 'free', now() - interval '10 seconds', 'live');
+  INSERT INTO public.sessions (id, user_id, creator_id, tier_at_session, started_at, status, model_used)
+    VALUES (v_session, v_user, v_creator, 'free', now() - interval '10 seconds', 'active', 'gemini_3_1_flash_live_preview');
 
   -- Open pause row — this is the trigger for the ambiguity bug.
   INSERT INTO public.session_pauses (session_id, paused_at)

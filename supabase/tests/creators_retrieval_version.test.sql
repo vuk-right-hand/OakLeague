@@ -10,7 +10,7 @@
 -- 7. CHECK constraint rejects UPDATE creators SET retrieval_version=3 directly.
 
 BEGIN;
-SELECT plan(7);
+SELECT plan(8);
 
 CREATE FUNCTION pg_temp.run() RETURNS SETOF text LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -28,8 +28,8 @@ BEGIN
   INSERT INTO public.admin_roles (user_id, email, role)
     VALUES (v_admin, 'rv-admin@test', 'superadmin');
 
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-  VALUES (gen_random_uuid(), v_user, 'approved', 'RV Creator', 'rvcreator1')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+  VALUES (gen_random_uuid(), v_user, 'approved', 'RV Creator', 'rvcreator1', '[]'::jsonb, '{}'::jsonb)
   RETURNING id INTO v_app;
 
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status, brain_mode)
@@ -60,6 +60,13 @@ BEGIN
 
   PERFORM tests.set_authenticated(v_admin);
   PERFORM public.admin_set_creator_retrieval_version(v_creator, 2::smallint);
+  -- Read back as the test superuser (BYPASSRLS), NOT as v_admin. v_admin is an
+  -- admin_roles superadmin but does NOT own this creator (v_user does) and the
+  -- creator is unpublished, so creators RLS ('own read' / 'public read when
+  -- published') returns ZERO rows to v_admin → a blind read sees NULL and the
+  -- flip+recompile (done via the SECURITY DEFINER RPC, which bypassed RLS) is
+  -- invisible. reset_role first, then read.
+  PERFORM tests.reset_role();
   SELECT retrieval_version, system_prompt INTO v_after, v_sys_post
     FROM public.creators WHERE id = v_creator;
   RETURN NEXT is(v_after::int, 2, '3a: admin flipped retrieval_version to 2');
@@ -69,7 +76,6 @@ BEGIN
   );
 
   -- 4: admin_audit_log row carries before/after.
-  PERFORM tests.reset_role();
   SELECT before->>'retrieval_version', after->>'retrieval_version'
     INTO v_audit_v1, v_audit_v2
     FROM public.admin_audit_log

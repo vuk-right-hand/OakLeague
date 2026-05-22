@@ -25,8 +25,8 @@ DECLARE
   v_visible   int;
   v_other_n   int;
 BEGIN
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user, 'approved', 'NU Creator', 'nucreator')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user, 'approved', 'NU Creator', 'nucreator', '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app;
 
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status)

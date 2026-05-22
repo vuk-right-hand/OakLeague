@@ -28,8 +28,8 @@ SELECT plan(4);
 
 -- 1. NEGATIVE: voice_session without avatar_provider → 23514
 SELECT throws_ok(
-  $$ INSERT INTO public.voice_tickets (user_id, creator_id, bound_ua_hash, expires_at, purpose)
-     VALUES (gen_random_uuid(), gen_random_uuid(), repeat('a', 64), now()+interval '1m', 'voice_session') $$,
+  $$ INSERT INTO public.voice_tickets (user_id, creator_id, bound_ua_hash, expires_at, purpose, tts_provider)
+     VALUES (gen_random_uuid(), gen_random_uuid(), repeat('a', 64), now()+interval '1m', 'voice_session', 'cartesia') $$,
   '23514',
   NULL,
   'voice_session ticket without avatar_provider rejected (CHECK fires)'
@@ -38,8 +38,8 @@ SELECT throws_ok(
 -- 2. POSITIVE: voice_session with avatar_provider='simli' → only 23503 FK
 --    miss (proves the CHECK passed; we'd see 23514 if it were the bug).
 SELECT throws_ok(
-  $$ INSERT INTO public.voice_tickets (user_id, creator_id, bound_ua_hash, expires_at, purpose, avatar_provider)
-     VALUES (gen_random_uuid(), gen_random_uuid(), repeat('a', 64), now()+interval '1m', 'voice_session', 'simli') $$,
+  $$ INSERT INTO public.voice_tickets (user_id, creator_id, bound_ua_hash, expires_at, purpose, avatar_provider, tts_provider)
+     VALUES (gen_random_uuid(), gen_random_uuid(), repeat('a', 64), now()+interval '1m', 'voice_session', 'simli', 'cartesia') $$,
   '23503',
   NULL,
   'voice_session ticket WITH avatar_provider=simli passes CHECK (only FK miss downstream)'
@@ -47,8 +47,8 @@ SELECT throws_ok(
 
 -- 3. POSITIVE: voice_clone without avatar_provider passes CHECK
 SELECT throws_ok(
-  $$ INSERT INTO public.voice_tickets (user_id, creator_id, bound_ua_hash, expires_at, purpose)
-     VALUES (gen_random_uuid(), gen_random_uuid(), repeat('a', 64), now()+interval '1m', 'voice_clone') $$,
+  $$ INSERT INTO public.voice_tickets (user_id, creator_id, bound_ua_hash, expires_at, purpose, tts_provider)
+     VALUES (gen_random_uuid(), gen_random_uuid(), repeat('a', 64), now()+interval '1m', 'voice_clone', 'cartesia') $$,
   '23503',
   NULL,
   'voice_clone ticket without avatar_provider passes CHECK (only FK miss downstream)'
@@ -56,8 +56,8 @@ SELECT throws_ok(
 
 -- 4. NEGATIVE: voice_clone with avatar_provider rejected (purpose mismatch)
 SELECT throws_ok(
-  $$ INSERT INTO public.voice_tickets (user_id, creator_id, bound_ua_hash, expires_at, purpose, avatar_provider)
-     VALUES (gen_random_uuid(), gen_random_uuid(), repeat('a', 64), now()+interval '1m', 'voice_clone', 'simli') $$,
+  $$ INSERT INTO public.voice_tickets (user_id, creator_id, bound_ua_hash, expires_at, purpose, avatar_provider, tts_provider)
+     VALUES (gen_random_uuid(), gen_random_uuid(), repeat('a', 64), now()+interval '1m', 'voice_clone', 'simli', 'cartesia') $$,
   '23514',
   NULL,
   'voice_clone ticket WITH avatar_provider rejected (CHECK fires)'

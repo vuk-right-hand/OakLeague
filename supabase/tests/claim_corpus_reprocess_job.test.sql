@@ -31,8 +31,8 @@ DECLARE
   v_seen      int;
   v_enq_ret   int;
 BEGIN
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user, 'approved', 'CCRJ Creator', 'ccrjcreator')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user, 'approved', 'CCRJ Creator', 'ccrjcreator', '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app;
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status)
     VALUES (gen_random_uuid(), v_user, v_app, 'CCRJ Creator', 'ccrjcreator', 'ready')
@@ -40,26 +40,29 @@ BEGIN
   INSERT INTO public.creator_topics (creator_id, slug, title, sort_order)
     VALUES (v_creator, 'topic-a', 'Topic A', 0);
 
-  -- Two samples + queue rows. We'll claim them in created_at order.
+  -- Two samples + queue rows. We claim them in created_at order (FIFO).
+  -- IMPORTANT: created_at DEFAULT now() = TRANSACTION-start time, which is FROZEN
+  -- across the whole txn — pg_sleep does NOT advance it, so a default insert would
+  -- give both rows the SAME created_at and claim's `ORDER BY created_at, id` would
+  -- tiebreak on the RANDOM uuid → coin-flip on which is "FIFO-oldest" (flaky).
+  -- Set created_at explicitly so v_job1 is deterministically older than v_job2.
+  -- (In prod, jobs are enqueued in SEPARATE txns → distinct created_at naturally.)
   INSERT INTO public.sample_content (id, creator_id, source_type, title, raw_text, topic_tags, fetch_status)
     VALUES (gen_random_uuid(), v_creator, 'transcript', 'CCRJ S1', 'one', ARRAY['topic-a'], 'ready')
     RETURNING id INTO v_sample1;
-  INSERT INTO public.corpus_reprocess_jobs (sample_id, target_version, status, enqueue_version)
-    VALUES (v_sample1, 2, 'pending', 7)
+  INSERT INTO public.corpus_reprocess_jobs (sample_id, target_version, status, enqueue_version, created_at)
+    VALUES (v_sample1, 2, 'pending', 7, now() - interval '2 seconds')
     RETURNING id INTO v_job1;
-
-  -- Tiny sleep to guarantee created_at ordering on cluster with high clock res.
-  PERFORM pg_sleep(0.05);
 
   INSERT INTO public.sample_content (id, creator_id, source_type, title, raw_text, topic_tags, fetch_status)
     VALUES (gen_random_uuid(), v_creator, 'transcript', 'CCRJ S2', 'two', ARRAY['topic-a'], 'ready')
     RETURNING id INTO v_sample2;
-  INSERT INTO public.corpus_reprocess_jobs (sample_id, target_version, status, enqueue_version)
-    VALUES (v_sample2, 2, 'pending', 3)
+  INSERT INTO public.corpus_reprocess_jobs (sample_id, target_version, status, enqueue_version, created_at)
+    VALUES (v_sample2, 2, 'pending', 3, now() - interval '1 second')
     RETURNING id INTO v_job2;
 
   -- 1: Happy path — claim returns job1 (FIFO), correct fields.
-  PERFORM tests.set_role('service_role');
+  PERFORM set_config('request.jwt.claims', json_build_object('role','service_role')::text, true);
   DECLARE
     v_returned_job uuid;
     v_returned_sample uuid;
@@ -136,19 +139,20 @@ BEGIN
     '6: claimed_by > 128 chars is truncated, not rejected'
   );
 
-  -- 7: ACL — non-service-role cannot execute.
-  PERFORM tests.set_authenticated(v_other);
-  BEGIN
-    PERFORM public.claim_corpus_reprocess_job('hacker');
-    RETURN NEXT fail('7: authenticated caller should not have EXECUTE on claim_corpus_reprocess_job');
-  EXCEPTION WHEN insufficient_privilege THEN
-    RETURN NEXT pass('7: ACL — authenticated callers cannot claim (insufficient_privilege)');
-  END;
-  PERFORM tests.reset_role();
+  -- 7: ACL — authenticated lacks EXECUTE. C-1 FIX: assert via has_function_privilege.
+  -- Calling this no-EXECUTE SECURITY DEFINER fn AS the 'authenticated' role to
+  -- prove the block SEGFAULTS PostgreSQL 17.6 (grant-level privilege-check crash,
+  -- uncatchable — the EXCEPTION handler can't trap a backend segfault). The grant
+  -- assertion proves the same property crash-free.
+  -- (See memory project_pg17_secdef_role_segfault.)
+  RETURN NEXT ok(
+    NOT has_function_privilege('authenticated', 'public.claim_corpus_reprocess_job(text)', 'EXECUTE'),
+    '7: ACL — authenticated callers cannot claim (no EXECUTE grant)'
+  );
 
   -- 8: FIFO + lock — fresh state, two consecutive claims return different rows.
   UPDATE public.corpus_reprocess_jobs SET status='pending', attempts=0, claimed_by=NULL, claimed_at=NULL;
-  PERFORM tests.set_role('service_role');
+  PERFORM set_config('request.jwt.claims', json_build_object('role','service_role')::text, true);
   DECLARE
     v_claim1 uuid;
     v_claim2 uuid;

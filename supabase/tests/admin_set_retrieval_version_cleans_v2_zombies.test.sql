@@ -36,8 +36,8 @@ BEGIN
     VALUES (v_admin, 'asrvcvz-admin@test', 'superadmin');
 
   -- Creator 1 — will be downgraded.
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user1, 'approved', 'ASRVCVZ C1', 'asrvcvzc1')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user1, 'approved', 'ASRVCVZ C1', 'asrvcvzc1', '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app;
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status, retrieval_version)
     VALUES (gen_random_uuid(), v_user1, v_app, 'ASRVCVZ C1', 'asrvcvzc1', 'ready', 2)
@@ -70,8 +70,8 @@ BEGIN
             'gemini-embedding-001', now(), v_unit1, 2);
 
   -- Creator 2 — control (also v2; must NOT be touched by creator1's downgrade).
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user2, 'approved', 'ASRVCVZ C2', 'asrvcvzc2')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user2, 'approved', 'ASRVCVZ C2', 'asrvcvzc2', '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app;
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status, retrieval_version)
     VALUES (gen_random_uuid(), v_user2, v_app, 'ASRVCVZ C2', 'asrvcvzc2', 'ready', 2)
@@ -95,7 +95,7 @@ BEGIN
   -- 5: 1→2 flip does NOT delete anything. (Quick sub-test on a fresh creator —
   --    skip; covered implicitly by the v2→v2 no-op below.)
   PERFORM tests.set_authenticated(v_admin);
-  PERFORM public.admin_set_creator_retrieval_version(v_creator1, 2);  -- 2→2 no-op
+  PERFORM public.admin_set_creator_retrieval_version(v_creator1, 2::smallint);  -- 2→2 no-op
   PERFORM tests.reset_role();
   SELECT count(*) INTO v_chunks_v2_n
     FROM public.sample_content_chunks WHERE creator_id = v_creator1 AND chunker_version = 2;
@@ -113,7 +113,7 @@ BEGIN
 
   -- 1+2+3+4: do the actual v2→v1 downgrade on creator1 and verify.
   PERFORM tests.set_authenticated(v_admin);
-  PERFORM public.admin_set_creator_retrieval_version(v_creator1, 1);
+  PERFORM public.admin_set_creator_retrieval_version(v_creator1, 1::smallint);
   PERFORM tests.reset_role();
 
   -- 1: v2 chunks gone.
@@ -145,10 +145,15 @@ BEGIN
   );
 
   -- 7: audit log carries deletion counts on downgrade.
+  -- creator1 has TWO audit rows (the 2→2 no-op at test 5, then this 2→1
+  -- downgrade) and now() is frozen within the txn, so created_at ties —
+  -- ORDER BY created_at is non-deterministic between them. Filter to the
+  -- downgrade row explicitly by its post-state (retrieval_version=1).
   SELECT after INTO v_audit_after
     FROM public.admin_audit_log
    WHERE target_id = v_creator1
      AND action = 'creator_retrieval_version_set'
+     AND after->>'retrieval_version' = '1'
    ORDER BY created_at DESC
    LIMIT 1;
   RETURN NEXT ok(
@@ -166,8 +171,8 @@ BEGIN
     v_creator3 uuid;
     v_app3 uuid;
   BEGIN
-    INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-      VALUES (gen_random_uuid(), v_user3, 'approved', 'ASRVCVZ C3', 'asrvcvzc3')
+    INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+      VALUES (gen_random_uuid(), v_user3, 'approved', 'ASRVCVZ C3', 'asrvcvzc3', '[]'::jsonb, '{}'::jsonb)
       RETURNING id INTO v_app3;
     INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status, retrieval_version)
       VALUES (gen_random_uuid(), v_user3, v_app3, 'ASRVCVZ C3', 'asrvcvzc3', 'ready', 1)
@@ -176,7 +181,7 @@ BEGIN
       VALUES (v_creator3, 'topic-a', 'Topic A', 0);
 
     PERFORM tests.set_authenticated(v_admin);
-    PERFORM public.admin_set_creator_retrieval_version(v_creator3, 2);  -- 1→2 upgrade
+    PERFORM public.admin_set_creator_retrieval_version(v_creator3, 2::smallint);  -- 1→2 upgrade
     PERFORM tests.reset_role();
 
     SELECT after INTO v_audit_after

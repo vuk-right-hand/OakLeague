@@ -102,26 +102,28 @@ BEGIN
     format('4: ON DELETE CASCADE removed state row (remaining=%s)', v_row_count)
   );
 
-  -- ── 5: CHECK last_assistant_response ≤ 2000 chars ─────────────────────
+  -- ── 5: CHECK last_assistant_response ≤ 4000 chars ─────────────────────
+  -- Cap was bumped 2000 → 4000 by migration 20260521000010 to match the
+  -- Gemini Live outputTranscript per-turn cap (4001 must violate, 2001 must NOT).
   BEGIN
     INSERT INTO public.voice_session_state (session_id, last_assistant_response)
-    VALUES (v_session1, repeat('a', 2001));
-    RETURN NEXT fail('5: 2001-char response should have raised CHECK');
+    VALUES (v_session1, repeat('a', 4001));
+    RETURN NEXT fail('5: 4001-char response should have raised CHECK');
   EXCEPTION
     WHEN check_violation THEN
-      RETURN NEXT pass('5: CHECK rejects last_assistant_response > 2000 chars');
+      RETURN NEXT pass('5: CHECK rejects last_assistant_response > 4000 chars');
     WHEN OTHERS THEN
       RETURN NEXT fail(format('5: unexpected sqlstate %s', SQLSTATE));
   END;
 
-  -- ── 6: CHECK last_user_query ≤ 2000 chars ─────────────────────────────
+  -- ── 6: CHECK last_user_query ≤ 4000 chars ─────────────────────────────
   BEGIN
     INSERT INTO public.voice_session_state (session_id, last_user_query)
-    VALUES (v_session1, repeat('q', 2001));
-    RETURN NEXT fail('6: 2001-char user query should have raised CHECK');
+    VALUES (v_session1, repeat('q', 4001));
+    RETURN NEXT fail('6: 4001-char user query should have raised CHECK');
   EXCEPTION
     WHEN check_violation THEN
-      RETURN NEXT pass('6: CHECK rejects last_user_query > 2000 chars');
+      RETURN NEXT pass('6: CHECK rejects last_user_query > 4000 chars');
     WHEN OTHERS THEN
       RETURN NEXT fail(format('6: unexpected sqlstate %s', SQLSTATE));
   END;

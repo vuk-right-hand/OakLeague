@@ -25,10 +25,10 @@ BEGIN
   -- 1) Empty system_prompt (octet_length=0) violates CHECK.
   BEGIN
     INSERT INTO public.voice_tickets
-      (ticket_id, user_id, creator_id, session_id, expected_tier, purpose,
+      (ticket_id, user_id, creator_id, session_id, expected_tier, purpose, tts_provider,
        avatar_provider, expires_at, bound_ua_hash, system_prompt)
     VALUES
-      (gen_random_uuid(), v_user, v_creator, v_session, 'free', 'voice_session',
+      (gen_random_uuid(), v_user, v_creator, v_session, 'free', 'voice_session', 'cartesia',
        'simli', now() + interval '120 seconds', repeat('a', 64), '');
     RETURN NEXT fail('1: empty system_prompt should have been rejected');
   EXCEPTION WHEN OTHERS THEN
@@ -39,10 +39,10 @@ BEGIN
   -- 2) Oversized (>2000 octets) system_prompt violates CHECK.
   BEGIN
     INSERT INTO public.voice_tickets
-      (ticket_id, user_id, creator_id, session_id, expected_tier, purpose,
+      (ticket_id, user_id, creator_id, session_id, expected_tier, purpose, tts_provider,
        avatar_provider, expires_at, bound_ua_hash, system_prompt)
     VALUES
-      (gen_random_uuid(), v_user, v_creator, v_session, 'free', 'voice_session',
+      (gen_random_uuid(), v_user, v_creator, v_session, 'free', 'voice_session', 'cartesia',
        'simli', now() + interval '120 seconds', repeat('a', 64), repeat('x', 2001));
     RETURN NEXT fail('2: oversized system_prompt should have been rejected');
   EXCEPTION WHEN OTHERS THEN
@@ -52,10 +52,10 @@ BEGIN
 
   -- 3) Valid persona-shaped system_prompt + null prefix_turns → accepted.
   INSERT INTO public.voice_tickets
-    (ticket_id, user_id, creator_id, session_id, expected_tier, purpose,
+    (ticket_id, user_id, creator_id, session_id, expected_tier, purpose, tts_provider,
      avatar_provider, expires_at, bound_ua_hash, system_prompt)
   VALUES
-    (gen_random_uuid(), v_user, v_creator, v_session, 'free', 'voice_session',
+    (gen_random_uuid(), v_user, v_creator, v_session, 'free', 'voice_session', 'cartesia',
      'simli', now() + interval '120 seconds', repeat('a', 64), 'You are X. Topics: y. Answer briefly.');
   RETURN NEXT ok(true, '3: valid system_prompt accepted');
 
@@ -70,10 +70,10 @@ BEGIN
     v_big_text text := repeat('a', 80000);
   BEGIN
     INSERT INTO public.voice_tickets
-      (ticket_id, user_id, creator_id, session_id, expected_tier, purpose,
+      (ticket_id, user_id, creator_id, session_id, expected_tier, purpose, tts_provider,
        avatar_provider, expires_at, bound_ua_hash, prefix_turns)
     VALUES
-      (gen_random_uuid(), v_user, v_creator, v_session, 'free', 'voice_session',
+      (gen_random_uuid(), v_user, v_creator, v_session, 'free', 'voice_session', 'cartesia',
        'simli', now() + interval '120 seconds', repeat('a', 64),
        jsonb_build_array(
          jsonb_build_object('role', 'user', 'parts', jsonb_build_array(jsonb_build_object('text', v_big_text)))

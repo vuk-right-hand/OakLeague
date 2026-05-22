@@ -12,7 +12,7 @@
 -- 4. creator_not_found raises 42704.
 
 BEGIN;
-SELECT plan(5);
+SELECT plan(6);
 
 CREATE FUNCTION pg_temp.run() RETURNS SETOF text LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -52,8 +52,8 @@ BEGIN
 
   -- 2: existing caller approve_creator_application still works unchanged.
   -- Creator 1 via approve flow.
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user1, 'submitted', 'BC Creator One', 'bccreator1')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user1, 'submitted', 'BC Creator One', 'bccreator1', '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app1;
   PERFORM tests.set_authenticated(v_admin);
   SELECT public.approve_creator_application(v_app1) INTO v_creator1;
@@ -63,8 +63,8 @@ BEGIN
     '2: approve_creator_application still compiles persona unchanged');
 
   -- 3: persona generated under retrieval_version=2 (manually flip then recompile).
-  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle)
-    VALUES (gen_random_uuid(), v_user2, 'approved', 'BC Creator Two', 'bccreator2')
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user2, 'approved', 'BC Creator Two', 'bccreator2', '[]'::jsonb, '{}'::jsonb)
     RETURNING id INTO v_app2;
   INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status, brain_mode, retrieval_version)
     VALUES (gen_random_uuid(), v_user2, v_app2, 'BC Creator Two', 'bccreator2', 'ready', 'vector', 2)
