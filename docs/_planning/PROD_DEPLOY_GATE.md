@@ -1,22 +1,38 @@
 # PROD DEPLOY GATE — READ BEFORE ANY `fly deploy` OR `main` MERGE
 
-**Status: 🟡 PARTIAL — Steps 2 (Dockerfile), 3 (b985303 stale), 4 (migrations) cleared. P1-9 sub-gates 1a + 1b cleared empirically 2026-05-20. 1c blocked on P1-10 (D12 + admin RPC + route patch) — see below.**
+**Status: 🟡 PARTIAL — Steps 2 (Dockerfile), 3 (b985303 stale) cleared. P1-9 sub-gates 1a + 1b cleared empirically 2026-05-20. P1-10 (D12 + admin RPC + route patch) is now CODE-COMPLETE on the branch (was the named blocker). Remaining: 1c manual session + apply the branch's NEW migrations to prod + fly deploy + main push.**
 
-**Active blockers (start here):**
-  • **P1-10 prerequisite for 1c** (also referred to as D12 + admin RPC
-    in DECOUPLED_BRAIN_PLAN — same workstream): build the D12
-    decoupled-persona compiler + `admin_set_creator_decoupled` RPC +
-    the session-open route patch that forwards `creators.decoupled` to
-    `mintVoiceTicket`. Without those, `creators.decoupled=true` is
-    provably inert at the route layer — a direct UPDATE would not
-    actually exercise the decoupled brain (the audit-confirmed "route
-    writer cannot reach decoupled today" finding). M3 is explicit that
-    no creator may be flagged `decoupled=true` by any path until the
-    persona-recompile RPC exists.
-  • Step 1c (manual staging-creator session) — runs cleanly AFTER P1-10.
-  • Once 1c clears: proceed to step 5 (`fly deploy`).
+**Active blockers (start here) — updated 2026-05-22:**
+  • **P1-10 ✅ CODE-COMPLETE on the branch** (was the blocker for 1c):
+    `admin_set_creator_decoupled` RPC (`20260523000001`) + the guard
+    (`20260523000002`); the D12 decoupled-persona compiler
+    (`20260523000005`, drops the brevity directive from decoupled
+    personas); and the session-open route patch
+    (`src/app/api/sessions/open/route.ts:171/210/954` forwards
+    `creators.decoupled` → `mintVoiceTicket`). Direct UPDATE of
+    `creators.decoupled` remains FORBIDDEN — use the RPC (which recompiles).
+  • **Step 1c (manual staging-creator session)** — Vuk-driven, browser +
+    listening (cannot be automated). This is now the FIRST real gate.
+  • **Apply the branch's migrations to prod** (NOT yet applied; need explicit
+    auth — see "RAG migrations" + steps 4b/4c/4d below): `20260522000100`
+    (retrieval_version snapshot), `20260522000104` (session_rollover REGRESSION
+    FIX — see below), `20260523000001/000002/000010` (decoupled admin RPCs +
+    published RPC), `20260523000004` (failover COGS), `20260523000005`
+    (variable-depth persona + post-apply recompile).
+  • Then step 5 (`fly deploy`) → step 6 (`main` push).
 
-Last updated: 2026-05-20. Branch: `rag-sota-phase-2-days-8-12`.
+  • **⚠️ NEW REGRESSION FIX — `20260522000104_session_rollover_restore_close_old_session`
+    (2026-05-22).** Migrations `20260521000009`/`20260522000100` accidentally
+    inverted `session_rollover`'s old-session guard + dropped the
+    close-the-old-session UPDATE → EVERY paid-tier rollover (15-min Gemini cap
+    overlap) hit `old_session_still_open` (sessions cut off at 15 min) AND
+    charged 0s to quota (COGS kill-switch blinded). `20260522000104` restores
+    the proven close-the-open-old-session body + keeps the version snapshot.
+    MUST be applied to prod with the rest of the RAG migration set, and BEFORE
+    any paid creator relies on rollover. Pinned by pgTAP
+    `session_open_hook_creator_mismatch_rejected` tests 4/5/6.
+
+Last updated: 2026-05-22. Branch: `rag-sota-phase-2-days-8-12`.
 This file is the single source of truth for "why is prod not deployed yet."
 If you are a new session/agent and prod voice is broken or you're about to
 deploy — read this whole file first.
@@ -104,6 +120,14 @@ panel now shows a "worker may be offline" warning after ~30s of
 pending-with-no-processing (P0-2 stall detection), but the real fix is env
 config. Verify with `fly ssh console -C "env | grep -E 'GEMINI_API_KEY|INTERNAL_API'"`
 (check presence + the secret's length, not the secret value).
+
+## ⚠️ FLAG (2026-05-22) — creator #1 `vuk_lehendas` is LIVE on the un-gated path
+
+Confirmed via prod read: `vuk_lehendas` (74e897d8) is **published + `decoupled=true` + `brain_mode='vector'`** — the ONLY prod creator on this path (blast radius = 1). A real visitor opening it gets the decoupled brain (works — 1c-tested, latency great) BUT:
+- **vector retrieval against a v1 corpus** → won't recall v2-only stories (the "lumberjack" gap); persona-only/degraded grounding. The documented vector "double-answer/desync" risk applies.
+- COGS accounting is now FIXED (12-arg leg applies as of the 2026-05-22 push) — kill-switch no longer blind.
+
+**Decision (Vuk, 2026-05-22): leave it live, flag for follow-up — not unpublish.** Follow-up owed before this is "clean": (a) v2-reprocess vuk_lehendas's corpus + verify parents>0 (gate F1 below), (b) clear the vector double-answer bug (the RAG re-arch), OR (c) flip `brain_mode` back to drawer until (a)+(b) land. Revisit when real users start hitting the feed.
 
 ## Other carry-forward gates (from Hume agent handoff + Day-13)
 
@@ -299,7 +323,10 @@ config. Verify with `fly ssh console -C "env | grep -E 'GEMINI_API_KEY|INTERNAL_
    109-110). Verify callability with a named-arg probe BEFORE step 5
    (`select * from cogs_insert_brain_leg(p_user_id => '00000000-…'::uuid, …)`
    — expect a validation error from the function body, NOT PGRST202).
-4b. ⛔ **Apply migration `20260523000004` (Step-2 Haiku failover COGS).**
+4b. ✅ **APPLIED TO PROD 2026-05-22** (via `supabase db push --include-all`; the
+   whole 8-migration pending chain went together). Probe confirmed the 12-arg
+   `cogs_insert_brain_leg` is callable on prod (returned a `22023` body
+   validation error, not PGRST202 → schema cache reloaded). **Apply migration `20260523000004` (Step-2 Haiku failover COGS).**
    Widens `cogs_insert_brain_leg` with a trailing `p_service cogs_service
    DEFAULT 'gemini'` arg + the `brain_deep_answer_failover` operation so the
    Haiku failover leg writes under `service='anthropic'` and never collides
@@ -307,7 +334,9 @@ config. Verify with `fly ssh console -C "env | grep -E 'GEMINI_API_KEY|INTERNAL_
    (the old 11-arg call site keeps working → 'gemini'). Replay-verified on a
    local `db reset` 2026-05-21. Same PGRST202 schema-cache caveat as item 4 —
    probe callability with the 12-arg signature before step 5.
-4c. ⛔ **Apply migration `20260523000005` (Phase 3 variable-depth persona).**
+4c. ✅ **APPLIED TO PROD 2026-05-22** + **vuk_lehendas RECOMPILED** (via
+   `_creator_brain_compile_unsafe` — the sanctioned path; brevity directive
+   confirmed dropped from its decoupled persona, 240→207 chars). **Apply migration `20260523000005` (Phase 3 variable-depth persona).**
    `CREATE OR REPLACE _creator_brain_compile_unsafe` — splits the "1-3 concise
    sentences" depth directive out of the common header: re-appended
    BYTE-IDENTICALLY on legacy (drawer/vector) personas, DROPPED from decoupled
@@ -322,6 +351,30 @@ config. Verify with `fly ssh console -C "env | grep -E 'GEMINI_API_KEY|INTERNAL_
    behavior, never a contradiction. Verify with the persona-shape pgTAP test
    (`creator_brain_compile_persona_shape` — asserts legacy keeps brevity,
    decoupled drops it) after a local `db reset`.
+4d. ✅ **APPLIED TO PROD 2026-05-22.** All 8 pending migrations
+   (`20260522000104` rollover fix, `20260523000004`/`000005`, and the
+   onboarding/consent/ToS set `20260523000006-000010` from commit `6ff93d2`)
+   pushed together via `--include-all` (000104 was out-of-order vs the already-
+   applied 2026-05-23 remote migrations — safe, nothing applied after it on
+   remote touches `session_rollover`). `migration list --linked` shows all 8 on
+   Remote. **NOTE: DB is now ahead of deployed code** — the Fly proxy + Vercel
+   still run the pre-deploy build. Safe because every migration is additive /
+   backward-compat (old 11-arg cogs call → 12-arg default 'gemini'; new consent/
+   publish RPCs simply unused until their routes deploy). Original step text:
+   **Apply the remaining branch migrations to prod (2026-05-22 set).** All
+   additive / CREATE OR REPLACE; replay-verified on a local `db reset`
+   2026-05-22 (full pgTAP suite 225/225 green after). Apply in order:
+   - `20260522000100` — sessions snapshot `corpus_version`/`retrieval_version`
+     at open + rollover. (Doc previously listed this as not-yet-applied.)
+   - `20260522000104` — **session_rollover regression FIX** (restores the
+     close-the-open-old-session contract + keeps the snapshot). Without it,
+     paid rollover is broken in prod (15-min cutoff + 0s quota charge). No
+     PGRST202 concern (called via RPC, not PostgREST).
+   - `20260523000001` (`admin_set_creator_decoupled`) + `20260523000002`
+     (brain_mode↔decoupled guard) + `20260523000010` (`admin_set_creator_published`).
+   - (4b/4c above cover `20260523000004`/`20260523000005`.)
+   **POST-APPLY:** recompile every existing decoupled creator (per 4c) so the
+   baked brevity directive is dropped from stored personas.
 5. ⛔ `fly deploy` the proxy (Hume-aware + re-architected). Confirm it
    boots (`/healthz`, logs show `voice-proxy listening`).
 

@@ -57,8 +57,21 @@ fixed to cast; the `tests.set_role` references were replaced with jwt-set /
 `has_function_privilege`; `corpus_reprocess_mark_done` RPC verified correct, test
 t10 was the wrong side). Suite green.
 
-**Still open:** C-5 (decoupled early-trigger returns before `truncationSuspected`) —
-voice-proxy code, not pgTAP; not part of this DB-suite greening.
+**Still open:** ~~C-5~~ ✅ DONE 2026-05-22 (threaded the truncation signal into the
+decoupled early-trigger: skip retrieval + forceBrief + `truncated_turns` metric;
+auditor-cleared, 376/376 voice-proxy tests green).
+
+## 2026-05-22 — prod migration apply + creator #1 flag
+- **All 8 pending migrations applied to prod** (`supabase db push --include-all`):
+  `20260522000104` (session_rollover regression fix), `20260523000004` (12-arg
+  COGS leg — fixes the kill-switch-blinding PGRST202 that surfaced in local
+  testing-against-prod), `20260523000005` (variable-depth persona) + the
+  onboarding/consent/ToS set `000006-000010`. COGS fn verified callable;
+  vuk_lehendas recompiled.
+- **⚠️ FLAG (tracked in PROD_DEPLOY_GATE):** creator #1 `vuk_lehendas` is live on
+  the un-gated decoupled+vector path against a v1 corpus (the "lumberjack" recall
+  gap). Decision: leave live, follow up with v2 reprocess / vector-bug clearance /
+  drawer-flip before real users hit the feed.
 
 ---
 

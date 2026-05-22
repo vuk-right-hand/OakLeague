@@ -1074,6 +1074,11 @@ wss.on('connection', async (ws, req) => {
           // P1-10 audit M2 — spurious-barge + trivial-Q observability
           `interrupted_suppressed=${m.interruptedSuppressed ?? 0} ` +
           `trivial_turns=${m.trivialTurns ?? 0} ` +
+          // C-5 audit C1 — truncated-transcript turns (persona-only, retrieval
+          // skipped). Surfaced here so the skip is OBSERVABLE/tunable in prod,
+          // not buried in the degraded string. A rising rate = Gemini STT
+          // dropping long utterances.
+          `truncated_turns=${m.truncatedTurns ?? 0} ` +
           `degraded=${(m.degraded || []).join(',') || 'none'} ` +
           `para_first_ms=${m.lastParaFirstMs ?? 'na'} ` +
           `deep_first_ms=${m.lastDeepFirstMs ?? 'na'} ` +
@@ -1812,7 +1817,19 @@ wss.on('connection', async (ws, req) => {
       // apply: the paraphrase is the dead-air mask on every utterance).
       // Gated on decoupledOrch ⇒ byte-identical when the flag is false.
       if (decoupled && decoupledOrch) {
-        decoupledOrch.onUserTranscript(e.text, turnNumber);
+        // C-5 — apply the SAME truncation heuristic the legacy vector path uses
+        // below. The early-trigger used to return before that check, so a >12s
+        // utterance whose transcript Gemini dropped >40% of would silently
+        // ground + answer a PARTIAL question (decoupled answers from the
+        // transcript, not the discarded audio). Pass the flag so the
+        // orchestrator skips retrieval (persona-only) and records it; count it
+        // on the same metric the legacy path reports.
+        const decoupledTruncated = truncationSuspected(e.text, e.durationSec);
+        if (decoupledTruncated) {
+          retrievalSkippedTruncationCount += 1;
+          console.warn(`[ws ${connId}] input_transcription truncated (decoupled) — persona-only deep answer (chars=${e.text.length} sec=${Number(e.durationSec).toFixed(2)})`);
+        }
+        decoupledOrch.onUserTranscript(e.text, turnNumber, { truncationSuspected: decoupledTruncated });
         // DECOUPLED LATENCY FIX (2026-05-21) — start the REAL deep answer the
         // INSTANT we have the final user transcript. Do NOT wait for Gemini's
         // serverContent.turnComplete: in decoupled mode Gemini still generates
@@ -2273,12 +2290,24 @@ wss.on('connection', async (ws, req) => {
         // already spoke and `turn` now points at the newer one.
         // Decoupled-only ⇒ legacy path byte-identical.
         if (decoupled && decoupledOrch && !superseded) {
-          // Audit Small — floor the wait at 5s. A buggy/malicious client
-          // sending a tiny timeoutMs would otherwise let continue:false
-          // race ahead of the deep answer = the exact C1 truncation this
-          // gate exists to prevent. Client cannot shrink it below 5s;
-          // can still extend it (e.g. 60s) for a long answer.
-          const spokenWaitMs = Math.max(msg.timeoutMs || 30_000, 5_000);
+          // Audit Small — floor the wait so a buggy/malicious client sending a
+          // tiny timeoutMs can't let continue:false race ahead of the deep
+          // answer (the exact C1 truncation this gate prevents). Client cannot
+          // shrink it below the floor; can still extend it (e.g. 60s).
+          // Floor = 30s (audit M3): the wait covers deep-answer GENERATION
+          // streaming to TTS, whose worst case is retrieval (≤retrieveCeilingMs
+          // 3.5s) + a Haiku FAILOVER (Gemini stalls ~2s, then Haiku streams a
+          // full tier-aware ~450-word answer FROM SCRATCH) — which a hand-picked
+          // 15s could still blow through, truncating to the hedge (the exact C1
+          // failure). So we floor at the orchestrator's OWN hard cap
+          // (turnSpokenTimeoutMs = 30s): the client can EXTEND but never shrink
+          // the wait below the bound the orchestrator already enforces, so the
+          // gate can't truncate a generation the orchestrator would still allow.
+          // Today's client sends NO timeoutMs (→ 30s), so behavior is unchanged;
+          // this hardens the variable-depth + failover ramp. resolveSpoken on a
+          // finished/superseded turn returns INSTANTLY, so the floor only bites
+          // an unresolved turn — exactly the case it must not cut short.
+          const spokenWaitMs = Math.max(msg.timeoutMs || 30_000, 30_000);
           try { await decoupledOrch.awaitTurnSpoken(spokenWaitMs); }
           catch (e) { captureException(e, { op: 'decoupled.awaitTurnSpoken', sessionId }); }
         }

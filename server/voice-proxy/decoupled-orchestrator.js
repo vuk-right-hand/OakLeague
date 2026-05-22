@@ -154,6 +154,10 @@ export function makeDecoupledOrchestrator({
     // (e.g., model verbose mode increased, Cartesia speed slowed).
     interruptedSuppressed: 0,
     trivialTurns: 0,
+    // C-5 — turns whose user transcript looked truncated (>12s audio, transcript
+    // <60% of expected chars). Retrieval skipped + persona-only. A rising rate
+    // in prod = Gemini STT dropping long utterances; surfaced in metricsSnapshot.
+    truncatedTurns: 0,
     // Step-2 — how many deep answers were carried by the Claude Haiku
     // failover (Gemini returned 'overloaded' / stalled before first token).
     // A rising rate in prod is the early-warning that Gemini reliability
@@ -320,7 +324,18 @@ export function makeDecoupledOrchestrator({
   }
 
   // ── Gemini input_transcription ────────────────────────────────────────
-  function onUserTranscript(text, turnNumber) {
+  // opts.truncationSuspected (C-5): index.js's early-trigger passes the SAME
+  // truncation heuristic the legacy vector path applies. The early-trigger
+  // used to fire BEFORE that check, so a >12s utterance whose transcript Gemini
+  // dropped >40% of would silently ground retrieval on a PARTIAL question and
+  // answer it confidently — and decoupled answers from the TRANSCRIPT (not the
+  // discarded audio), so truncation hits harder here than legacy. When set we
+  // skip retrieval (persona-only, matching legacy) AND record it so the quality
+  // loss is OBSERVABLE instead of silent (the C-5 symptom).
+  // (opts read defensively — `= {}` only defaults `undefined`, not an explicit
+  // null; read the field off a guarded ref so a stray null/non-object can't throw.)
+  function onUserTranscript(text, turnNumber, opts) {
+    const truncationSuspected = !!(opts && opts.truncationSuspected === true);
     if (fatal) {
       // C2 — session dying; no new paid work. Audit M7 — NOT a silent
       // return: onFatal already fired the user-visible WS 1011 + the
@@ -351,6 +366,23 @@ export function makeDecoupledOrchestrator({
       // Audit M1 — log length only, never the raw utterance (PII).
       log.info?.(`[decoupled] trivial Q detected (turn=${turnNumber} chars=${t.question.length}) — deep_answer ${paraphraseEnabled ? 'skipped; paraphrase carries it' : 'runs persona-only'}`);
     }
+    // C-5 — suspected-truncated transcript (heuristic owned by index.js
+    // `truncationSuspected`: >12s audio AND transcript < 60% of expected chars;
+    // NB its denominator is BYTES-SENT, not speech-seconds, so a frame-dropped
+    // long utterance can false-negative — a known limitation we accept). Skip
+    // retrieval (grounding on a partial question is worse than persona-only) and
+    // flag it so it isn't a silent quality loss. Length only in the log (PII).
+    // Asymmetry vs legacy (intentional): the decoupled branch honors the
+    // truncation skip but NOT the short-utterance skip — a short utterance is
+    // fine to answer persona-only, but a TRUNCATED long one must not ground +
+    // answer a fragment confidently.
+    t.truncationSuspected = truncationSuspected;
+    if (t.truncationSuspected) {
+      session.truncatedTurns += 1;
+      t.degraded.push('truncation');   // per-turn verbose form
+      session.degraded.push('trunc');  // session-compact form (same event)
+      log.warn?.(`[decoupled] input transcript truncation suspected (turn=${turnNumber} chars=${t.question.length}) — deep answer runs BRIEF persona-only (retrieval skipped)`);
+    }
     turn = t;
     session.turns += 1;
 
@@ -358,7 +390,8 @@ export function makeDecoupledOrchestrator({
     // Small — don't burn a retrieval call on an empty/garbage transcript
     // (the bridge will throw empty_input on the paraphrase/deep anyway).
     // P1-10 — also skip retrieval on trivial Qs (no deep_answer will use it).
-    t.retrievePromise = hasQuestion && !t.isTrivial
+    // C-5 — and skip on suspected truncation (don't ground on a partial Q).
+    t.retrievePromise = hasQuestion && !t.isTrivial && !t.truncationSuspected
       ? Promise.resolve()
           .then(() => retrieve(t.question, t.retrieveAbort.signal))
           .catch((e) => {
@@ -497,8 +530,11 @@ export function makeDecoupledOrchestrator({
         // reaches the deep answer when paraphrase is OFF (it falls through
         // persona-only); forceBrief keeps that reply short instead of letting
         // variable mode answer "hey" with a 450-word story.
+        // C-5 (audit M1) — also force brief on a SUSPECTED-TRUNCATED question:
+        // we only half-heard it, so a short exploratory persona-only reply beats
+        // a confident 450-word monologue answering a fragment.
         tier,
-        forceBrief: t.isTrivial,
+        forceBrief: t.isTrivial || t.truncationSuspected,
       });
       const r = await streamToTts(gen, 'brain_deep_answer', t.turnNumber, {
         gateBeforeFirstSend: t.paraphraseSpoken,
@@ -586,6 +622,8 @@ export function makeDecoupledOrchestrator({
       interruptedSuppressed: session.interruptedSuppressed,
       // P1-10 — observability for trivial-Q skip rate.
       trivialTurns: session.trivialTurns,
+      // C-5 — suspected-truncated-transcript turns (persona-only, retrieval skipped).
+      truncatedTurns: session.truncatedTurns,
       // Step-2 — Haiku failover rate (Gemini 503/stall early-warning).
       deepFailedOver: session.deepFailedOver,
       degraded: session.degraded.slice(),

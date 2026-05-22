@@ -311,6 +311,52 @@ test('retrieve throws → swallowed, deep proceeds persona-only, not fatal', asy
   assert.ok(tts.includes('ok.'));
 });
 
+// ── C-5: suspected-truncated transcript ─────────────────────────────────
+// A >12s utterance whose transcript Gemini dropped >40% of must NOT silently
+// ground retrieval on the partial question. Skip retrieval (persona-only) and
+// record it so the quality loss is observable (was silent before).
+test('C-5: truncationSuspected skips retrieval, runs persona-only, and is recorded', async () => {
+  let retrieveCalls = 0;
+  let deepEnvelope = 'UNSET';
+  let deepForceBrief = null;
+  const { orch } = harness({
+    paraphraseEnabled: false,
+    retrieve: async () => { retrieveCalls++; return '--- BEGIN REFERENCE a1b2c3 ---\nx\n--- END REFERENCE a1b2c3 ---'; },
+    generateDeepAnswer: ({ referenceEnvelopeText, forceBrief }) => {
+      deepEnvelope = referenceEnvelopeText;
+      deepForceBrief = forceBrief;
+      return genStream(['A.'], { operation: 'brain_deep_answer', text: 'A.' });
+    },
+  });
+  orch.onUserTranscript('a long question that got cut off mid', 1, { truncationSuspected: true });
+  await orch.onTurnComplete();
+  assert.equal(retrieveCalls, 0, 'retrieval skipped on suspected truncation');
+  assert.equal(deepEnvelope, null, 'deep answer runs persona-only (no grounding on a partial Q)');
+  assert.equal(deepForceBrief, true, 'audit M1: truncated Q answered BRIEF, not a confident 450-word reply to a fragment');
+  const m = orch.metricsSnapshot();
+  assert.equal(m.truncatedTurns, 1, 'truncated turn counted');
+  assert.ok((m.degraded || []).includes('trunc'), 'truncation recorded in degraded (observable, not silent)');
+});
+
+test('C-5 control: without the flag, retrieval runs + grounds (no regression)', async () => {
+  let retrieveCalls = 0;
+  let deepEnvelope = 'UNSET';
+  const { orch } = harness({
+    paraphraseEnabled: false,
+    retrieve: async () => { retrieveCalls++; return '--- BEGIN REFERENCE a1b2c3 ---\nx\n--- END REFERENCE a1b2c3 ---'; },
+    generateDeepAnswer: ({ referenceEnvelopeText }) => {
+      deepEnvelope = referenceEnvelopeText;
+      return genStream(['A.'], { operation: 'brain_deep_answer', text: 'A.' });
+    },
+  });
+  orch.onUserTranscript('q', 1);
+  await orch.onTurnComplete();
+  assert.equal(retrieveCalls, 1, 'retrieval runs when not truncated');
+  assert.ok(typeof deepEnvelope === 'string' && deepEnvelope.includes('BEGIN REFERENCE'),
+    'grounded envelope passed to the deep answer');
+  assert.equal(orch.metricsSnapshot().truncatedTurns, 0, 'no truncated turn counted');
+});
+
 // ── barge-in cogs (C3) ──────────────────────────────────────────────────
 
 test('barge mid-paraphrase: server billed → billed:true partial leg IS written', async () => {
