@@ -28,6 +28,51 @@ function client(apiKey) {
 
 const DEFAULT_SYSTEM = 'You are a helpful mentor. Answer in one concise sentence.';
 
+// DECOUPLED_STT_OUTPUT_COST_PLAN (spiked 2026-05-21, real Gemini). In decoupled
+// mode the Live session is STT-only, but responseModalities:[AUDIO] forces it to
+// generate a FULL audio answer EVERY turn that we discard — measured ~5.6s /
+// ~145 tok, billed ~$0.0157/session (~14% of COGS, 8.7× the STT we keep).
+//
+// The fix is an API-level maxOutputTokens cap (NOT a "reply ok" systemInstruction
+// — spike S10 proved a degenerate instruction BREAKS turn_complete: it never
+// fires / arrives a turn late, destabilizing the lifecycle). The cap cuts the
+// discarded output ~86-95% AND keeps turn_complete reliable + ~3× FASTER (~1.9s
+// vs ~6.7s), transcript intact, socket healthy (spike S11). Top-level field
+// (generationConfig is SDK-deprecated). ~24 is the safe value: 8 was flaky at the
+// degenerate threshold; 16/24/32 all clean 3/3. The discarded output is GARBAGE
+// in decoupled mode → truncating it is harmless; the INPUT transcript the brain
+// reads is a separate stream, intact at every cap value.
+//
+// HARD-GATED on _decoupled: legacy/α' (non-decoupled) pipes Gemini's OWN output
+// transcript to Cartesia — capping there would truncate the real answer. Env
+// DECOUPLED_MAX_OUTPUT_TOKENS overrides; explicit 0 = off (operator insurance);
+// unset/garbage/negative = default 24; a small positive (1..15) is CLAMPED up to
+// the floor (audit M2: =8 destabilized turn_complete; an operator chasing COGS
+// must not be able to silently re-trigger the S10/S11 lifecycle break).
+//
+// COGS note (audit M4): the cap deliberately gets NO new pricing var — output is
+// still AUDIO, just less of it; the existing `gemini_audio_out` leg
+// (proxy-handlers.js, responseTokenCount → audio rate) prices the smaller spend
+// correctly and the kill-switch sees a real-but-lower number. Do NOT invent a
+// "capped-output" rate. Spike evidence: scripts/decoupled-stt-text-mode-spike.mjs
+// (S1: TEXT dead), -ok-neuter-spike.mjs (S10: instruction neuter breaks
+// turn_complete), -maxtokens-spike.mjs (S11: cap is the fix; respTok reported the
+// CAPPED count so the COGS truth-path is correct).
+const DECOUPLED_MAX_OUTPUT_TOKENS_DEFAULT = 24;
+const DECOUPLED_MAX_OUTPUT_TOKENS_FLOOR = 16; // spike S11: top-level 8 flaky, 16 clean
+export function parseDecoupledMaxOutputTokens(raw) {
+  if (raw === undefined || raw === null || raw === '') return DECOUPLED_MAX_OUTPUT_TOKENS_DEFAULT;
+  const n = Number(raw);
+  // Integer ≥ 0 only (Number('12.5') is non-integer → default). 0 = explicit off.
+  if (!Number.isInteger(n) || n < 0) return DECOUPLED_MAX_OUTPUT_TOKENS_DEFAULT;
+  if (n === 0) return 0;
+  if (n < DECOUPLED_MAX_OUTPUT_TOKENS_FLOOR) {
+    console.warn(`[gemini-bridge] DECOUPLED_MAX_OUTPUT_TOKENS=${n} below safe floor ${DECOUPLED_MAX_OUTPUT_TOKENS_FLOOR}; clamping up (spike S11: <16 destabilizes turn_complete)`);
+    return DECOUPLED_MAX_OUTPUT_TOKENS_FLOOR;
+  }
+  return n;
+}
+
 // Brain wire-up (PR-2 / R3 audit M7). Margin between sendClientContent
 // (single user-turn prefix_turns seed) and the bridge resolving open(). The proxy
 // sends `ready` to the client right after open() resolves; the user's
@@ -189,6 +234,10 @@ export class GeminiBridge extends EventEmitter {
     // reactive-only reopen behavior. Default false ⇒ inert in prod
     // (creators.decoupled default false, no route writer yet).
     decoupled = false,
+    // DECOUPLED_STT_OUTPUT_COST_PLAN — token cap on the discarded STT-mode
+    // generation. DI'd for tests; defaults to the env (explicit 0 = off,
+    // unset/garbage = 24). Inert unless `decoupled` (see _decoupledOutputCapConfig).
+    decoupledMaxOutputTokens = parseDecoupledMaxOutputTokens(process.env.DECOUPLED_MAX_OUTPUT_TOKENS),
   } = {}) {
     super();
     if (!apiKey) throw new Error('GEMINI_API_KEY missing');
@@ -197,6 +246,7 @@ export class GeminiBridge extends EventEmitter {
     this._discardAudioOut = !!discardAudioOut;
     this._enableInputTranscription = !!enableInputTranscription;
     this._decoupled = !!decoupled;
+    this._decoupledMaxOutputTokens = decoupledMaxOutputTokens;
     this._session = null;
     this._inputBytes = 0;
     this._outputBytes = 0;
@@ -316,6 +366,17 @@ export class GeminiBridge extends EventEmitter {
     };
   }
 
+  // DECOUPLED_STT_OUTPUT_COST_PLAN — the maxOutputTokens cap for the discarded
+  // STT-mode generation, or {} when not applicable. Pure + gated so the legacy
+  // vs decoupled config difference is unit-testable without a live connect.
+  // Gated on _decoupled (legacy/α' must stay uncapped) AND cap > 0 (0 = off).
+  _decoupledOutputCapConfig() {
+    if (this._decoupled && this._decoupledMaxOutputTokens > 0) {
+      return { maxOutputTokens: this._decoupledMaxOutputTokens };
+    }
+    return {};
+  }
+
   async open({ model, sessionId, systemInstruction, brainPrefix }) {
     // Phase 0.5 fix (2026-05-07). Capture open args so reopen() can
     // re-call with identical params on Google's documented post-turn
@@ -330,6 +391,10 @@ export class GeminiBridge extends EventEmitter {
 
     const config = {
       responseModalities: [Modality.AUDIO],
+      // DECOUPLED_STT_OUTPUT_COST_PLAN — caps the discarded STT-mode generation
+      // (decoupled-gated; {} on legacy/α' → byte-identical). Spread early so an
+      // explicit field below always wins if the two ever overlap.
+      ...this._decoupledOutputCapConfig(),
       systemInstruction: systemInstruction || DEFAULT_SYSTEM,
       // Phase 0.5 (2026-05-07). Opt into session resumption so Gemini
       // emits sessionResumptionUpdate handles. Empty object = "enable;

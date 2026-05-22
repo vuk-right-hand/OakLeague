@@ -412,7 +412,21 @@ export function makeDecoupledOrchestrator({
   // ── Gemini turn_complete ──────────────────────────────────────────────
   async function onTurnComplete() {
     const t = turn;
-    if (!t || t.done) { resolveSpoken(t); return; }
+    if (!t) { resolveSpoken(t); return; }
+    // t.done — a prior onTurnComplete is ALREADY handling this turn. In
+    // decoupled mode onTurnComplete fires twice: the early-trigger at
+    // input_transcription (index.js) and the redundant Gemini-turn_complete
+    // fallback. The IN-FLIGHT first call owns resolveSpoken (its finally fires
+    // only after the deep answer has fully streamed to TTS). Calling
+    // resolveSpoken HERE resolves t.spoken EARLY → index.js's turn_end handler
+    // awaitTurnSpoken() returns immediately → ttsBridge.turnEnd() closes the
+    // Cartesia context (_turnDead=true) → every subsequent deep-answer sendText
+    // silently no-ops → 0 chars to Cartesia → dead air (cogs:
+    // cartesia/voice_tts_characters=0 despite deep_first_ms set). Latent since
+    // the early-trigger; EXPOSED when maxOutputTokens made Gemini's
+    // turn_complete fire BEFORE the deep answer finished (the "relying on
+    // Gemini being slow" trap). The fallback must NOT resolve — just return.
+    if (t.done) return;            // fallback — in-flight call owns resolveSpoken (block above)
     t.done = true;
     // DIAG (2026-05-21) — phase timing so we can SEE where pre-audio latency
     // goes (retrieval wait vs deep-answer first token vs total). Logged once

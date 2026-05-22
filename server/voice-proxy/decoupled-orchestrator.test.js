@@ -92,6 +92,63 @@ test('paraphrase speaks first; deep answer NEVER overlaps it', async () => {
   assert.equal(orch.lastAssistantResponse(), 'The grounded answer.');
 });
 
+// ── redundant onTurnComplete must not resolve spoken early (silent-Cartesia) ──
+
+test('redundant onTurnComplete (early-trigger + Gemini fallback) does NOT resolve spoken before the deep answer finishes streaming', async () => {
+  // The silent-Cartesia bug: onTurnComplete fires twice in decoupled mode
+  // (early at input_transcription + the Gemini turn_complete fallback). If the
+  // second (t.done) call resolves spoken, index.js's awaitTurnSpoken() returns
+  // early → ttsBridge.turnEnd() closes the Cartesia context → the still-
+  // streaming deep answer's sendText no-ops → 0 chars → dead air. Exposed when
+  // maxOutputTokens made Gemini's turn_complete beat the deep answer.
+  const rel = deferred();
+  const { orch, tts } = harness({
+    paraphraseEnabled: false, // prod default — deep answer is the sole voice
+    generateDeepAnswer: () => genGated(['The answer.'], rel.promise,
+      { operation: 'brain_deep_answer', text: 'The answer.', firstChunkMs: 7, latencyMs: 9, startedAt: 2 }),
+  });
+  orch.onUserTranscript('q', 1);
+  const tc1 = orch.onTurnComplete();          // early-trigger — streams, then hangs on rel
+  await tick();
+  await orch.onTurnComplete();                // Gemini turn_complete fallback (t.done)
+  let spokenResolved = false;
+  orch.awaitTurnSpoken(10_000).then(() => { spokenResolved = true; });
+  await tick();
+  assert.equal(spokenResolved, false,
+    'spoken must NOT resolve while the deep answer is mid-stream (else ttsBridge.turnEnd closes Cartesia → silence)');
+  assert.deepEqual(tts, ['The answer.'], 'deep answer delta already streamed to TTS');
+  rel.resolve();
+  await tc1;
+  await tick();
+  assert.equal(spokenResolved, true, 'spoken resolves once the deep answer finishes streaming');
+});
+
+test('audit M2 — fallback onTurnComplete DURING retrieval (before any deep delta) is the exact shipped timing; still must not resolve spoken', async () => {
+  // The token cap made Gemini turn_complete fire while the first call was still
+  // awaiting RETRIEVAL — before a single deep-answer delta. This pins that window.
+  const relRetrieve = deferred();
+  const { orch, tts } = harness({
+    paraphraseEnabled: false,
+    retrieve: async () => { await relRetrieve.promise; return null; }, // hangs → no delta yet
+    generateDeepAnswer: () => genStream(['Grounded answer.'],
+      { operation: 'brain_deep_answer', text: 'Grounded answer.', firstChunkMs: 3, latencyMs: 4, startedAt: 1 }),
+  });
+  orch.onUserTranscript('q', 1);
+  const tc1 = orch.onTurnComplete();   // blocks in retrieval — no delta emitted
+  await tick();
+  await orch.onTurnComplete();         // fallback fires MID-retrieval (the shipped trigger)
+  let resolved = false;
+  orch.awaitTurnSpoken(10_000).then(() => { resolved = true; });
+  await tick();
+  assert.equal(resolved, false, 'fallback must not resolve spoken while retrieval is still pending');
+  assert.deepEqual(tts, [], 'no deep delta yet — retrieval not done');
+  relRetrieve.resolve();
+  await tc1;
+  await tick();
+  assert.equal(resolved, true, 'spoken resolves after the deep answer streams');
+  assert.deepEqual(tts, ['Grounded answer.'], 'deep answer reaches TTS once retrieval completes');
+});
+
 // ── C1: awaitTurnSpoken gates ttsBridge.turnEnd() ───────────────────────
 
 test('C1: awaitTurnSpoken does NOT resolve until the deep answer finished streaming', async () => {

@@ -1823,7 +1823,10 @@ wss.on('connection', async (ws, req) => {
         // collapses it to retrieval + deep_first (~3s, grounded). The
         // serverContent.turnComplete branch below still calls onTurnComplete
         // as a fallback (empty/garbage-transcript turns never reach here); the
-        // orchestrator's `t.done` guard makes the second call a no-op.
+        // orchestrator's `t.done` guard makes the second call RETURN WITHOUT
+        // resolving spoken — the in-flight first call owns resolveSpoken (it
+        // resolves only after the deep answer fully streams). Resolving here
+        // would close the Cartesia context mid-answer → silent avatar.
         decoupledOrch.onTurnComplete().catch((err) => {
           captureException(err, { op: 'decoupled.turn_complete_early', sessionId });
         });

@@ -11,7 +11,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { GeminiBridge, parseGoAwayTimeLeftMs } from './gemini-bridge.js';
+import { GeminiBridge, parseGoAwayTimeLeftMs, parseDecoupledMaxOutputTokens } from './gemini-bridge.js';
 
 function makeBridgeWithStubSession(opts = {}) {
   const bridge = new GeminiBridge({ apiKey: 'test-key', ...opts });
@@ -108,6 +108,61 @@ test('C3: no usageMetadata in any message → _currentTurnUsage stays null', () 
   assert.equal(bridge._currentTurnUsage, null,
     'missing metadata must stay null so downstream can distinguish from real zeros');
   off();
+});
+
+// ── DECOUPLED_STT_OUTPUT_COST_PLAN — discarded-output token cap ──────────
+// Spike 2026-05-21: TEXT-out dead (1011), "ok" neuter breaks turn_complete;
+// the fix is a decoupled-gated maxOutputTokens cap (~24). These lock the env
+// parse + the legacy-vs-decoupled gating (legacy must stay UNcapped).
+
+test('parseDecoupledMaxOutputTokens: unset/empty/garbage/negative → default 24', () => {
+  assert.equal(parseDecoupledMaxOutputTokens(undefined), 24);
+  assert.equal(parseDecoupledMaxOutputTokens(null), 24);
+  assert.equal(parseDecoupledMaxOutputTokens(''), 24);
+  assert.equal(parseDecoupledMaxOutputTokens('abc'), 24);
+  assert.equal(parseDecoupledMaxOutputTokens('-5'), 24);
+  assert.equal(parseDecoupledMaxOutputTokens('12.5'), 24, 'non-integer → default');
+});
+
+test('parseDecoupledMaxOutputTokens: explicit 0 = off, valid ints ≥ floor pass through', () => {
+  assert.equal(parseDecoupledMaxOutputTokens('0'), 0, 'explicit 0 = operator off-switch');
+  assert.equal(parseDecoupledMaxOutputTokens('16'), 16);
+  assert.equal(parseDecoupledMaxOutputTokens('24'), 24);
+  assert.equal(parseDecoupledMaxOutputTokens('64'), 64);
+});
+
+test('parseDecoupledMaxOutputTokens: audit M2 — small positives (1..15) clamp up to floor 16', () => {
+  // Spike S11: top-level maxOutputTokens=8 destabilized turn_complete. An
+  // operator chasing COGS with =4/=8 must not silently re-trigger that break.
+  assert.equal(parseDecoupledMaxOutputTokens('8'), 16, '8 (flaky in spike) clamps to floor');
+  assert.equal(parseDecoupledMaxOutputTokens('1'), 16);
+  assert.equal(parseDecoupledMaxOutputTokens('15'), 16);
+});
+
+test('decoupled bridge caps maxOutputTokens; legacy is UNcapped (byte-identical)', () => {
+  const legacy = new GeminiBridge({ apiKey: 'k' }); // decoupled defaults false
+  assert.deepEqual(legacy._decoupledOutputCapConfig(), {},
+    'legacy/α\' path must not inject maxOutputTokens — Gemini transcript feeds Cartesia');
+
+  const decoupled = new GeminiBridge({ apiKey: 'k', decoupled: true, decoupledMaxOutputTokens: 24 });
+  assert.deepEqual(decoupled._decoupledOutputCapConfig(), { maxOutputTokens: 24 });
+});
+
+test('decoupled bridge with cap=0 (operator off) injects no maxOutputTokens', () => {
+  const off = new GeminiBridge({ apiKey: 'k', decoupled: true, decoupledMaxOutputTokens: 0 });
+  assert.deepEqual(off._decoupledOutputCapConfig(), {},
+    'cap 0 = off even on the decoupled path');
+});
+
+test('audit reopen — cap config is stateless so a reopen\'s fresh open() re-includes it', () => {
+  // open() (and every reopen path) rebuilds `config` from scratch and calls
+  // _decoupledOutputCapConfig() each time; _lastOpenArgs carries no config. So
+  // the cap can't be consumed/dropped across reopens. Prove the method is
+  // idempotent (no internal state mutated between calls).
+  const b = new GeminiBridge({ apiKey: 'k', decoupled: true, decoupledMaxOutputTokens: 24 });
+  assert.deepEqual(b._decoupledOutputCapConfig(), { maxOutputTokens: 24 }, 'fresh connect');
+  assert.deepEqual(b._decoupledOutputCapConfig(), { maxOutputTokens: 24 }, 'reopen #1');
+  assert.deepEqual(b._decoupledOutputCapConfig(), { maxOutputTokens: 24 }, 'reopen #2');
 });
 
 // ── Pipeline α' upgrade tests ───────────────────────────────────────────
