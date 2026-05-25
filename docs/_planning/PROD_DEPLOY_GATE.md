@@ -1,6 +1,6 @@
 # PROD DEPLOY GATE — READ BEFORE ANY `fly deploy` OR `main` MERGE
 
-**Status: 🟡 PARTIAL — Steps 2 (Dockerfile), 3 (b985303 stale) cleared. P1-9 sub-gates 1a + 1b cleared empirically 2026-05-20. P1-10 (D12 + admin RPC + route patch) is now CODE-COMPLETE on the branch (was the named blocker). Remaining: 1c manual session + apply the branch's NEW migrations to prod + fly deploy + main push.**
+**Status: 🟢 1c CLEARED + PROXY DEPLOYED (2026-05-25). Steps 2/3 cleared; P1-9 (1a/1b) + P1-10 code-complete; the RAG/decoupled migration set (incl. `20260522000104` rollover fix) is APPLIED to prod (Vuk-confirmed); Step 1c manual session PASSED (subjective "exactly him", no mid-word cut + COGS billing-integrity spot-check); Step 5 `fly deploy` DONE (build `48e1e1df1524e8` — Haiku failover ARMED, depth=variable, inject_top_k=1). REMAINING: Step 6 `main` push (HELD by choice — Vercel-side only) + apply NEW migration `20260525000100` (BM25 OR, committed, DEFERRED). Do NOT blind `supabase db push` — it would drag the unaudited profile migrations.**
 
 **Active blockers (start here) — updated 2026-05-22:**
   • **P1-10 ✅ CODE-COMPLETE on the branch** (was the blocker for 1c):
@@ -11,15 +11,25 @@
     (`src/app/api/sessions/open/route.ts:171/210/954` forwards
     `creators.decoupled` → `mintVoiceTicket`). Direct UPDATE of
     `creators.decoupled` remains FORBIDDEN — use the RPC (which recompiles).
-  • **Step 1c (manual staging-creator session)** — Vuk-driven, browser +
-    listening (cannot be automated). This is now the FIRST real gate.
-  • **Apply the branch's migrations to prod** (NOT yet applied; need explicit
-    auth — see "RAG migrations" + steps 4b/4c/4d below): `20260522000100`
-    (retrieval_version snapshot), `20260522000104` (session_rollover REGRESSION
-    FIX — see below), `20260523000001/000002/000010` (decoupled admin RPCs +
-    published RPC), `20260523000004` (failover COGS), `20260523000005`
-    (variable-depth persona + post-apply recompile).
-  • Then step 5 (`fly deploy`) → step 6 (`main` push).
+  • **Step 1c ✅ CLEARED 2026-05-25** — manual staging session passed:
+    subjective "exactly him" recognition with NO mid-word cut, PLUS the COGS
+    billing-integrity spot-check (per-turn `brain_deep_answer` legs present,
+    real costs, quota meters + kill-switch fed truthfully — see
+    `scripts/diag-cogs-recent.mjs`).
+  • **Apply the branch's migrations to prod ✅ DONE** (Vuk-confirmed 2026-05-25):
+    `20260522000100`, `20260522000104` (rollover fix), `20260523000001/000002/000010`,
+    `20260523000004`, `20260523000005` are LIVE on prod. ⏳ NEW: `20260525000100`
+    (BM25 OR-semantics) is committed but NOT applied — proven read-only on prod
+    data, low-risk, DEFERRED (recall improvement; needs the #4 eval harness to
+    validate its RRF weight). Do NOT `supabase db push` blind (it would also
+    apply the unaudited profile migrations `20260525000001-10`); apply
+    `20260525000100` surgically or coordinate with the profile set.
+  • **Step 5 (`fly deploy`) ✅ DONE 2026-05-25** — build `48e1e1df1524e8`; boot
+    log confirms Haiku failover ARMED + `decoupled depth=variable inject_top_k=1`.
+    **Step 6 (`main` push) ⏳ HELD by choice:** the "exactly him" UX lives in the
+    PROXY (now deployed); `main` ships only Vercel-side retrieval/rewrite-cap
+    changes (the `RAG_CACHE_DISABLED` flag is inert when unset) — do it
+    deliberately and coordinate with the profile workstream's eventual merge.
 
   • **⚠️ NEW REGRESSION FIX — `20260522000104_session_rollover_restore_close_old_session`
     (2026-05-22).** Migrations `20260521000009`/`20260522000100` accidentally
@@ -32,7 +42,7 @@
     any paid creator relies on rollover. Pinned by pgTAP
     `session_open_hook_creator_mismatch_rejected` tests 4/5/6.
 
-Last updated: 2026-05-22. Branch: `rag-sota-phase-2-days-8-12`.
+Last updated: 2026-05-25. Branch: `rag-sota-phase-2-days-8-12`.
 This file is the single source of truth for "why is prod not deployed yet."
 If you are a new session/agent and prod voice is broken or you're about to
 deploy — read this whole file first.
