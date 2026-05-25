@@ -40,17 +40,19 @@
 // orchestrator owns the write.
 //
 // BUDGET ALLOCATION (cross-cutting unit audit M7):
-//   `deadlineMs` is the caller's overall budget. This module's hard cap
-//   is REWRITE_TIMEOUT_MS_HARD_CAP=3000; fast-fails when <500ms remains.
-//   The Day-11 orchestrator typically allocates ~30% of the turn budget
-//   to rewrite, ~10% to embed, ~30% to rerank, leaving ~30% headroom.
+//   `deadlineMs` is the caller's overall budget. This module's hard cap is
+//   REWRITE_TIMEOUT_MS_HARD_CAP (default 2200 since 2026-05-23; env
+//   QUERY_REWRITE_TIMEOUT_MS, clamped ≤ 3000); fast-fails when <500ms remains.
+//   The orchestrator runs inside the proxy's DECOUPLED_RETRIEVE_BUDGET_MS
+//   (default 3500): ~2200 rewrite + ~350 embed + ~160 topk + ~600 rerank.
 //   Pin per-step ceilings in `RAG_TURN_BUDGET_*` env constants when
 //   they're added.
 //
 // Budget contract: caller passes `deadlineMs` (absolute epoch ms). This
-// module computes its own timeout = min(3000, deadlineMs - now()). If less
-// than MIN_REMAINING_MS remains, fast-fail to fallback (return user
-// utterance verbatim) without burning a Gemini call. Day-9 audit M4.
+// module computes its own timeout = min(REWRITE_TIMEOUT_MS_HARD_CAP,
+// deadlineMs - now()). If less than MIN_REMAINING_MS remains, fast-fail to
+// fallback (return user utterance verbatim) without burning a Gemini call.
+// Day-9 audit M4.
 //
 // Failure policy: this module NEVER throws. Every error path returns
 // `{ rewritten: userUtterance, ... }` as a fallback so the retrieval
@@ -118,8 +120,48 @@ const USER_UTTERANCE_MAX_CHARS = 800;
 // fix the pipeline budget is now 3000ms (not the broken 2500), so 1800ms
 // rewrite + ~300 embed + ~250 topk + ~500 rerank still fits. Re-derive if the
 // budget changes again.
-const REWRITE_TIMEOUT_MS_HARD_CAP = 1800;
+//
+// 2026-05-23 (Vuk): default raised 1800→2200 in tandem with the proxy's
+// retrieve budget (3000→3500) + ceiling (3500→4000). 2200 rewrite + ~350 embed
+// + ~160 topk + ~600 rerank ≈ 3310ms fits the 3500 budget. Env-overridable
+// (QUERY_REWRITE_TIMEOUT_MS) so we can re-tune after the live test without a
+// redeploy; boot-fatal on a malformed value (NaN → every rewrite instantly
+// fails the deadline → permanently degraded). MUST stay ≤ the proxy budget.
+// Hard upper bound (audit C2): the rewrite must NEVER be allowed to eat the
+// whole proxy retrieve budget. The proxy's DECOUPLED_RETRIEVE_BUDGET_MS default
+// is 3500 and embed+topk+rerank need ~1100ms, so a rewrite cap above ~2500 would
+// starve the rest of the pipeline → guaranteed deadline_exceeded → 504 →
+// persona-only on every cache-miss turn. We clamp to an absolute 3000 ceiling
+// (boot-throw above it) since the two values live in different deploy units
+// (this cap on Vercel, the budget on Fly) and no single process can assert
+// `cap + downstream ≤ budget`. The boot log below makes the effective cap
+// greppable in Vercel logs so a proxy/Vercel skew is visible, not silent.
+const REWRITE_TIMEOUT_MS_ABS_MAX = 3000;
+const REWRITE_TIMEOUT_MS_HARD_CAP = (() => {
+  const raw = process.env.QUERY_REWRITE_TIMEOUT_MS;
+  if (raw === undefined || raw === null || raw === '') return 2200;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`QUERY_REWRITE_TIMEOUT_MS must be a positive finite number; got '${raw}'`);
+  }
+  if (n > REWRITE_TIMEOUT_MS_ABS_MAX) {
+    throw new Error(
+      `QUERY_REWRITE_TIMEOUT_MS (${n}) exceeds the ${REWRITE_TIMEOUT_MS_ABS_MAX}ms ceiling — ` +
+      `a rewrite this slow starves embed/topk/rerank inside the proxy retrieve budget. ` +
+      `Raise DECOUPLED_RETRIEVE_BUDGET_MS deliberately and re-derive before lifting this.`,
+    );
+  }
+  return Math.floor(n);
+})();
 const MIN_REMAINING_MS = 500;
+
+// Boot telemetry (audit C2) — one greppable line so a Fly/Vercel deploy skew
+// (proxy budget raised, Vercel still on the old rewrite cap) is visible. Skipped
+// in test to keep vitest output clean.
+if (process.env.NODE_ENV !== 'test') {
+  // eslint-disable-next-line no-console
+  console.log(`[query-rewrite] boot effective_rewrite_cap_ms=${REWRITE_TIMEOUT_MS_HARD_CAP} (default 2200, env QUERY_REWRITE_TIMEOUT_MS)`);
+}
 
 // Heuristic for "looks like a follow-up that needs context". Used only
 // to set the noContextAfterResumption flag — the rewrite still runs.
@@ -146,8 +188,8 @@ export type RewriteInput = {
   geminiApiKey: string;
   /**
    * Absolute epoch ms when the caller's overall budget expires. The
-   * rewriter computes its own timeout as min(3000, deadlineMs - now()).
-   * If <500ms remains, the rewriter fast-fails to fallback.
+   * rewriter computes its own timeout as min(REWRITE_TIMEOUT_MS_HARD_CAP,
+   * deadlineMs - now()). If <500ms remains, the rewriter fast-fails to fallback.
    */
   deadlineMs: number;
 };

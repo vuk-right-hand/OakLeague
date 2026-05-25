@@ -297,9 +297,47 @@ await provisionPricing();
 //     was wrong — it guaranteed the result was discarded). Constraint that
 //     still holds: BUDGET ≤ CEILING, so the shim never bills past the point
 //     the orchestrator gave up.
-// P0 measured retrieve p95 ≈ 2022ms; common case clears both with margin.
-const DECOUPLED_RETRIEVE_BUDGET_MS = 3000;
-const DECOUPLED_RETRIEVE_CEILING_MS = 3500;
+// P0 measured retrieve p95 ≈ 2022ms (common case clears with wide margin); the
+// budget/ceiling below are sized for the slow-but-VALID worst case, not the p95.
+// 2026-05-23 (Vuk): headroom raised 3000→3500 budget / 3500→4000 ceiling so a
+// slow-but-VALID rewrite (cap raised to 2200 in query-rewrite.ts) plus
+// embed(~350)+topk(~160)+rerank(~600) ≈ 3310ms still lands INSIDE the budget
+// instead of timing out → persona-only "I don't know". TRADEOFF: paraphrase is
+// OFF, so the ceiling is pure dead-air before the deep answer's first word;
+// 4000 = up to 4s silence + first-token. The proper cover for a longer wait is
+// enabling the paraphrase bridge (PARAPHRASE_ENABLED=1). Both env-overridable so
+// we can re-tune after the live test WITHOUT a redeploy. Invariant BUDGET ≤
+// CEILING is enforced below (the shim self-cancels at BUDGET, the orchestrator
+// waits to CEILING, so we never bill past the orchestrator's patience).
+const _envPosInt = (name, dflt) => {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || raw === '') return dflt;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    console.error(`FATAL: ${name} must be a positive finite number; got '${raw}'`);
+    process.exit(1);
+  }
+  return Math.floor(n);
+};
+const DECOUPLED_RETRIEVE_BUDGET_MS = _envPosInt('DECOUPLED_RETRIEVE_BUDGET_MS', 3500);
+const DECOUPLED_RETRIEVE_CEILING_MS = _envPosInt('DECOUPLED_RETRIEVE_CEILING_MS', 4000);
+// The real invariant is CEILING ≥ BUDGET + the shim client's HTTP_OVERHEAD_GRACE_MS
+// (500, in retrieve-knowledge-v2-client.js): the shim self-cancels at BUDGET, its
+// AbortController backstops at BUDGET+500, and the orchestrator must still be
+// waiting then so a typed/late response is CONSUMED, not discarded at the cliff
+// (and so we never bill a retrieve whose result we threw away). A bare BUDGET ≤
+// CEILING guard (audit M3) would wrongly accept e.g. 3900/4000. Keep this 500 in
+// sync with HTTP_OVERHEAD_GRACE_MS if that constant ever changes.
+const RETRIEVE_CLIENT_GRACE_MS = 500;
+if (DECOUPLED_RETRIEVE_CEILING_MS < DECOUPLED_RETRIEVE_BUDGET_MS + RETRIEVE_CLIENT_GRACE_MS) {
+  console.error(
+    `FATAL: DECOUPLED_RETRIEVE_CEILING_MS (${DECOUPLED_RETRIEVE_CEILING_MS}) must be ≥ ` +
+    `DECOUPLED_RETRIEVE_BUDGET_MS (${DECOUPLED_RETRIEVE_BUDGET_MS}) + ${RETRIEVE_CLIENT_GRACE_MS} ` +
+    `(shim client grace). Either LOWER the budget or RAISE the ceiling — the orchestrator ` +
+    `must outwait the shim's self-cancel+grace or it discards a result it already paid for.`,
+  );
+  process.exit(1);
+}
 const RAG_V2_PROXY_ENABLED = process.env.RAG_V2_PROXY_ENABLED === '1';
 if (RAG_V2_PROXY_ENABLED) {
   if (!process.env.RAG_V2_SHIM_URL) {
