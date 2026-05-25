@@ -345,6 +345,67 @@ test('C2: output_tokens is the LAST cumulative message_delta, input from message
   assert.equal(final.usage.outputTokens, 22);
 });
 
+// ── Re-audit C1 — Haiku finishReason parity with Gemini ─────────────────
+
+test('re-audit C1: message_delta stop_reason="max_tokens" → final.finishReason="MAX_TOKENS"', async () => {
+  const anthropic = fakeAnthropic({
+    events: [
+      { type: 'message_start', message: { usage: { input_tokens: 40, output_tokens: 0 } } },
+      { type: 'content_block_delta', delta: { type: 'text_delta', text: 'cut here' } },
+      // Anthropic carries the terminal reason on message_delta.delta.stop_reason.
+      { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 30 } },
+      { type: 'message_stop' },
+    ],
+  });
+  const { final } = await drain(streamGenerateAnthropic({
+    client: anthropic, model: 'claude-haiku-4-5-20251001',
+    systemInstruction: 'sys', contents: [{ role: 'user', parts: [{ text: 'q' }] }],
+    ErrCls: BrainBridgeError, operation: 'brain_deep_answer',
+  }));
+  assert.equal(final.finishReason, 'MAX_TOKENS', 'mirrors Gemini so the orchestrator meters it');
+});
+
+test('re-audit C1: natural stop_reason="end_turn" passes through (not mislabeled)', async () => {
+  const anthropic = fakeAnthropic({
+    events: [
+      { type: 'message_start', message: { usage: { input_tokens: 10, output_tokens: 0 } } },
+      { type: 'content_block_delta', delta: { type: 'text_delta', text: 'done' } },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 } },
+      { type: 'message_stop' },
+    ],
+  });
+  const { final } = await drain(streamGenerateAnthropic({
+    client: anthropic, model: 'claude-haiku-4-5-20251001',
+    systemInstruction: 'sys', contents: [{ role: 'user', parts: [{ text: 'q' }] }],
+    ErrCls: BrainBridgeError, operation: 'brain_deep_answer',
+  }));
+  assert.equal(final.finishReason, 'end_turn', 'natural stop is not MAX_TOKENS');
+});
+
+test('re-audit C1: finishReason survives the failoverToHaiku final yield (end-to-end)', async () => {
+  await withEnv({ ...PRICING_ENV, ...ANTHRO_ENV }, async () => {
+    const gemini = fakeGemini({ throwOnOpen: overloaded503() });
+    const anthropic = fakeAnthropic({
+      events: [
+        { type: 'message_start', message: { usage: { input_tokens: 1200, output_tokens: 1 } } },
+        { type: 'content_block_delta', delta: { type: 'text_delta', text: 'long cut answer' } },
+        { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 90 } },
+        { type: 'message_stop' },
+      ],
+    });
+    const { final } = await drain(generateDeepAnswer({
+      persona: 'p', referenceEnvelopeText: ENV_OK, question: 'q',
+      apiKey: 'k', genaiClient: gemini, anthropicClient: anthropic,
+    }));
+    assert.equal(final.service, 'anthropic');
+    assert.equal(final.failedOver, true);
+    // The fix: failoverToHaiku's final yield now carries finishReason, so the
+    // orchestrator's deepTruncated meter + B2 wasTruncated/resume gate work on
+    // the failover path (previously dropped → cut Haiku answer mislabeled done).
+    assert.equal(final.finishReason, 'MAX_TOKENS');
+  });
+});
+
 test('streamGenerateAnthropic: empty text stream → invalid_response_shape WITH billed partial', async () => {
   const anthropic = fakeAnthropic({
     events: [

@@ -7,7 +7,7 @@
 -- Coverage:
 --   try_build_tsquery:
 --     1. Well-formed query → non-empty tsquery
---     2. Quoted phrase query → websearch parses cleanly
+--     2. Multi-word query → OR-joined content lexemes, non-empty (S2: not phrase parsing)
 --     3. Empty string → empty tsquery (graceful)
 --     4. STABLE volatility (not IMMUTABLE) — auditor S
 --
@@ -95,11 +95,13 @@ BEGIN
     format('1: try_build_tsquery(''elephants'') → non-empty (got %L)', v_q_tsq::text)
   );
 
-  -- 2: Phrase query with double quotes (websearch syntax).
+  -- 2: Multi-word input → OR-joined content lexemes, non-empty. (Audit S2: the
+  -- builder no longer does websearch phrase parsing — double quotes are just
+  -- stripped to lexemes 'forest','dwell' and OR-joined. Still asserts non-empty.)
   v_q_tsq := public.try_build_tsquery('"forest dwellers"', 'english');
   RETURN NEXT ok(
     v_q_tsq IS NOT NULL AND v_q_tsq::text <> '',
-    format('2: try_build_tsquery quoted phrase → non-empty (got %L)', v_q_tsq::text)
+    format('2: try_build_tsquery multi-word → non-empty OR-query (got %L)', v_q_tsq::text)
   );
 
   -- 3: Empty string falls through to empty tsquery.

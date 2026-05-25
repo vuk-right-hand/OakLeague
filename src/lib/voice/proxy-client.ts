@@ -35,6 +35,12 @@ export type ProxyClientHandlers = {
   // server silently drops the next utterance (Phase 0 §7).
   // Simli/Tavus consumers can ignore.
   onTurnComplete?: () => void;
+  // Per-utterance "deep answer done" (2026-05-25). Fired by the proxy the moment
+  // a turn's audio finishes streaming to TTS — the EARLY, accurate boundary (the
+  // Gemini turn_complete above lands +6–20s later in decoupled mode). The
+  // consumer flushes the avatar tail-carry (the stranded last ≤187ms) on this,
+  // after a short trailing-audio grace.
+  onDeepAnswerDone?: () => void;
 };
 
 export type ProxyClientOpenArgs = {
@@ -113,6 +119,8 @@ export function createProxyClient(handlers: ProxyClientHandlers): ProxyClient {
           handlers.onTtsReconnected?.();
         } else if (type === 'turn_complete') {
           handlers.onTurnComplete?.();
+        } else if (type === 'deep_answer_done') {
+          handlers.onDeepAnswerDone?.();
         }
         return;
       }

@@ -820,3 +820,101 @@ test('Phase 3 C3: tier defaults to free when omitted (safe tighter budget)', asy
   await orch.onTurnComplete();
   assert.equal(deepArgs.tier, 'free', 'omitted tier → free (never the looser paid budget)');
 });
+
+// ── Re-audit C3 — looksLikeFollowUp deictic branch tightened ≤5 → ≤3 ─────
+
+import { looksLikeFollowUp } from './decoupled-orchestrator.js';
+
+test('re-audit C3: explicit continuation cues are follow-ups (intended B2 cases)', () => {
+  for (const t of ['please continue', 'go on', 'tell me more', 'can you elaborate', 'go deeper', 'and then what']) {
+    assert.equal(looksLikeFollowUp(t), true, `"${t}" is a follow-up`);
+  }
+});
+
+test('re-audit C3: bare deictic ≤3 words are follow-ups', () => {
+  for (const t of ['why?', 'how so?', 'and that?', 'why is that', 'what about it']) {
+    assert.equal(looksLikeFollowUp(t), true, `"${t}" (≤3 deictic) is a follow-up`);
+  }
+});
+
+test('re-audit C3: substantive ≥4-word questions are NOT follow-ups (the fixed false positives)', () => {
+  // These each merely CONTAIN a wh/pronoun token but introduce a fresh topic.
+  // Pre-fix (≤5) they wrongly threaded the prior answer + steered retrieval.
+  for (const t of ['how do I start', 'why does this work', 'is it worth it', 'how about pricing strategy', 'what should I do next']) {
+    assert.equal(looksLikeFollowUp(t), false, `"${t}" is a fresh question, not a follow-up`);
+  }
+});
+
+test('re-audit C3: empty / whitespace → false', () => {
+  for (const t of ['', '   ', null, undefined]) assert.equal(looksLikeFollowUp(t), false);
+});
+
+// ── Re-audit M3 — deep_answer_done fires ONLY on a turn that streamed audio ─
+
+test('re-audit M3: onDeepAnswerDone fires once on a normal (audio-streamed) turn', async () => {
+  let done = 0;
+  const { orch } = harness({ paraphraseEnabled: false, onDeepAnswerDone: () => { done++; } });
+  orch.onUserTranscript('what is the moat?', 1);
+  await tick();
+  await orch.onTurnComplete();
+  assert.equal(done, 1, 'streamed audio → one flush signal');
+});
+
+test('re-audit M3: a degraded turn that streamed NO audio does NOT fire onDeepAnswerDone', async () => {
+  let done = 0;
+  const { orch } = harness({
+    paraphraseEnabled: false,
+    onDeepAnswerDone: () => { done++; },
+    // throws before any delta (billed:false pre-dispatch-style) → degrade,
+    // firstChunkMs stays null → deepStreamedAudio false → no flush signal.
+    generateDeepAnswer: () => genThrow([], 'timeout', { billed: false }),
+  });
+  orch.onUserTranscript('what is the moat?', 1);
+  await tick();
+  await orch.onTurnComplete();
+  assert.equal(done, 0, 'no audio streamed → nothing to flush → no signal');
+});
+
+test('re-audit M3: a barged turn does NOT fire onDeepAnswerDone', async () => {
+  let done = 0;
+  const { orch } = harness({
+    paraphraseEnabled: false,
+    onDeepAnswerDone: () => { done++; },
+    generateDeepAnswer: (args) => genBargeable(['partial '], args.signal, { billed: false }),
+  });
+  orch.onUserTranscript('what is the moat?', 1);
+  const tc = orch.onTurnComplete();
+  await tick();
+  orch.onInterrupted(); // barge mid-stream
+  await tc;
+  assert.equal(done, 0, 'barge suppresses the tail-flush signal (browser dropped the carry)');
+});
+
+// ── Re-audit C1/B1 (orchestrator side) — MAX_TOKENS metered + resume ────────
+
+test('re-audit C1: a MAX_TOKENS deep answer increments deepTruncated + marks the turn for resume', async () => {
+  let deepArgs = [];
+  const { orch } = harness({
+    paraphraseEnabled: false,
+    generateDeepAnswer: (args) => {
+      deepArgs.push(args);
+      // turn 1 = cut at the cap; turn 2 = normal
+      const cut = deepArgs.length === 1;
+      return genStream(['a long answer'], {
+        operation: 'brain_deep_answer', text: 'a long answer', firstChunkMs: 7, latencyMs: 9, startedAt: 2,
+        finishReason: cut ? 'MAX_TOKENS' : 'STOP',
+      });
+    },
+  });
+  orch.onUserTranscript('tell me the whole boardroom story', 1);
+  await tick();
+  await orch.onTurnComplete();
+  assert.equal(orch.metricsSnapshot().deepTruncated, 1, 'MAX_TOKENS counted (now visible)');
+
+  // Follow-up turn: the prior (cut) answer must be threaded as truncated → resume.
+  orch.onUserTranscript('continue', 2);
+  await tick();
+  await orch.onTurnComplete();
+  assert.ok(deepArgs[1].priorTurn, 'follow-up threads the prior answer');
+  assert.equal(deepArgs[1].priorTurn.truncated, true, 'prior answer flagged truncated → preamble says RESUME');
+});

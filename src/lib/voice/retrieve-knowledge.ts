@@ -351,6 +351,26 @@ export const RAG_TURN_BUDGET_MS_DEFAULT = (() => {
 // network call that's guaranteed to time out anyway.
 const MIN_OP_TIMEOUT_MS = 50;
 
+// 2026-05-25 — kill switch for the semantic cache. When '1', the orchestrator
+// skips BOTH lookup and upsert: every turn retrieves + reranks FRESH. The
+// semantic cache pins (creator, corpus_version, query≈) → parent-id set for 7
+// days at 0.92 cosine, which is correct for prod but a TRAP while iterating on
+// retrieval/injection — you keep getting the pinned set and never see your
+// change. Strict === '1' (not Boolean) so a stray value can't silently disable
+// the cache in prod. Leave UNSET in prod; flip to '1' locally during RAG work.
+const CACHE_DISABLED = process.env.RAG_CACHE_DISABLED === '1';
+if (CACHE_DISABLED) {
+  // Re-audit M4 — loud boot signal. A stray RAG_CACHE_DISABLED=1 in prod is a
+  // silent ~4-paid-calls-per-turn (rewrite+embed+retrieve+rerank) cost
+  // regression with no other signal until the COGS kill-switch trips. Log it so
+  // it's greppable the moment the process starts, not after quota burns.
+  // eslint-disable-next-line no-console
+  console.warn(
+    '[retrieve-knowledge] RAG_CACHE_DISABLED=1 — semantic cache OFF (fresh '
+    + 'retrieve+rerank EVERY turn). Local-iteration flag ONLY; MUST be unset in prod.',
+  );
+}
+
 /**
  * Race a promise against a `deadlineMs` absolute timestamp. Resolves with
  * the inner promise's value if it completes in time; rejects with
@@ -567,7 +587,9 @@ async function runOrchestrator(
   // Cache is a perf optimization — DB errors here should fail-open as
   // cache miss, not propagate. Catch + warn + continue.
   let parents: RetrievedParent[] = [];
-  const canTouchCache = !rewriteResult.fallback;
+  // CACHE_DISABLED (2026-05-25) forces a fresh retrieve+rerank every turn — see
+  // the const. Gates BOTH lookup (below) and upsert (step 7) via this one flag.
+  const canTouchCache = !rewriteResult.fallback && !CACHE_DISABLED;
   if (canTouchCache) {
     let hit: Awaited<ReturnType<typeof lookupCache>> | null = null;
     try {

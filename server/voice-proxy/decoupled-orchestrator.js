@@ -85,6 +85,35 @@ export function isTrivialQuestion(text) {
   return TRIVIAL_Q_PATTERNS.some((re) => re.test(t));
 }
 
+// B2 (audit M1) — conservative follow-up detector. The prior-answer continuity
+// preamble is attached ONLY when the current utterance looks like it refers
+// back to the previous turn, so a FRESH unrelated question gets a clean,
+// stateless prompt (no answer-looping / topic-drift, no needless input tokens).
+// Two signals: explicit continuation cues, or a VERY short deictic question
+// ("why?", "and that?", "how so?"). Deliberately narrow — a false negative just
+// means a stateless answer (today's behavior), a false positive feeds one
+// bounded background paragraph.
+//
+// Re-audit C3 — the deictic branch was ≤5 words, which matched ordinary
+// substantive short questions that merely CONTAIN a wh/pronoun token: "how do I
+// start?" (4w), "why does this work?" (4w), "is it worth it?" (4w). Each wrongly
+// threaded the entire prior answer + steered retrieval → topic-drift, and (with
+// the C2 loop now closed by the preamble guard) widened the poisoning window.
+// Tightened to ≤3 words: a genuine bare-deictic follow-up ("why?", "how so?",
+// "and that?") is ≤3; the substantive 4-word questions above no longer match.
+// The explicit-cue branch (continue/more/go on/elaborate…) is unchanged and
+// already covers the intended "please continue" / "tell me more" cases.
+const FOLLOWUP_CUE_RE =
+  /\b(continue|go on|keep going|carry on|finish|more|elaborate|expand|and then|what else|go deeper)\b/i;
+const FOLLOWUP_DEICTIC_RE = /\b(that|those|this|these|it|them|why|how|again)\b/i;
+export function looksLikeFollowUp(text) {
+  const t = (text || '').trim().toLowerCase();
+  if (!t) return false;
+  if (FOLLOWUP_CUE_RE.test(t)) return true;
+  const words = t.split(/\s+/).filter(Boolean);
+  return words.length <= 3 && FOLLOWUP_DEICTIC_RE.test(t);
+}
+
 export function makeDecoupledOrchestrator({
   generateParaphrase,
   generateDeepAnswer,
@@ -132,6 +161,12 @@ export function makeDecoupledOrchestrator({
   captureException = () => {},
   now = () => Date.now(),
   makeAbort = () => new AbortController(),
+  // Per-utterance "deep answer done" signal (2026-05-25). Fired when a
+  // non-barged turn finishes streaming its audio to TTS — the EARLY, accurate
+  // boundary (the client turn_end / Gemini turn_complete lands +6–20s later in
+  // decoupled mode). index.js forwards it to the browser, which flushes the
+  // Simli tail-carry (the last ≤187ms that was stranded → "cut off mid-word").
+  onDeepAnswerDone = () => {},
 }) {
   if (!persona && typeof onPersonaNull === 'function') {
     try { onPersonaNull(); } catch {}
@@ -172,6 +207,11 @@ export function makeDecoupledOrchestrator({
     // paid sessions getting longer answers, and is anything approaching the
     // OUTPUT_CHAR_CEILING?
     maxDeepChars: null,
+    // B1 — count of deep answers the model guillotined at MAX_TOKENS (cut,
+    // potentially mid-thought). Was invisible before; a rising count means the
+    // token cap is too tight for the depth being asked → tune the cap or the
+    // word budget. Surfaced in metricsSnapshot.
+    deepTruncated: 0,
   };
 
   function freshTurn(turnNumber) {
@@ -194,6 +234,9 @@ export function makeDecoupledOrchestrator({
       spokenResolved: false,
       done: false,            // onTurnComplete entered
       superseded: false,
+      barged: false,          // set by abortTurn({barge:true}) — gates deep_answer_done
+      deepStreamedAudio: false, // M3 — true once ≥1 deep delta reached TTS this turn
+      wasTruncated: false,    // B2/M3 — set on MAX_TOKENS or char-ceiling for next-turn resume
       lastAssistantResponse: null,
       degraded: [],
     };
@@ -535,6 +578,19 @@ export function makeDecoupledOrchestrator({
         // a confident 450-word monologue answering a fragment.
         tier,
         forceBrief: t.isTrivial || t.truncationSuspected,
+        // B2 — dialogue continuity. `lastCompleted` is the PRIOR substantive
+        // turn here (t isn't assigned to it until this turn finishes). Only the
+        // prior ANSWER is threaded (audit C1/C3 — never the raw prior STT, never
+        // a model turn). Gated on looksLikeFollowUp (audit M1) so a fresh
+        // question stays stateless. Skipped when THIS question is suspected-
+        // truncated (we only half-heard it — anchoring to the prior answer would
+        // compound the mishear). `truncated` lets the preamble tell the model to
+        // resume rather than restart (audit M3).
+        priorTurn:
+          (!t.truncationSuspected && looksLikeFollowUp(t.question) && lastCompleted &&
+            typeof lastCompleted.lastAssistantResponse === 'string')
+            ? { answer: lastCompleted.lastAssistantResponse, truncated: lastCompleted.wasTruncated === true }
+            : null,
       });
       const r = await streamToTts(gen, 'brain_deep_answer', t.turnNumber, {
         gateBeforeFirstSend: t.paraphraseSpoken,
@@ -545,6 +601,15 @@ export function makeDecoupledOrchestrator({
       // firstChunkMs before degraded-side-effects so the metrics line is
       // populated for a session that ended on a single barged deep turn.
       if (r.firstChunkMs != null) session.lastDeepFirstMs = r.firstChunkMs;
+      // Re-audit M3 — did this turn actually stream audio to TTS? firstChunkMs
+      // is set iff ≥1 delta reached streamToTts ⟺ Cartesia synthesized ⟺ the
+      // Simli chunker holds a tail-carry worth flushing. Gates the
+      // deep_answer_done emit below so a degraded/empty/early-return turn never
+      // arms a flush of nothing (which trailing audio_out from a NEIGHBOURING
+      // turn could otherwise keep re-arming). (Paraphrase is off in current
+      // config; if it returns, a paraphrase-only turn's tail would need its own
+      // flag — noted, not handled, since there's no paraphrase audio today.)
+      t.deepStreamedAudio = r.firstChunkMs != null;
       if (r.final) {
         t.lastAssistantResponse = r.final.text;
         // Phase 3 — track the LONGEST deep answer this session (depth A/B +
@@ -553,12 +618,26 @@ export function makeDecoupledOrchestrator({
         if (!t.isTrivial && typeof r.final.text === 'string') {
           session.maxDeepChars = Math.max(session.maxDeepChars ?? 0, r.final.text.length);
         }
+        // B1 — surface a MAX_TOKENS guillotine (previously invisible). With the
+        // cap now above the graceful 4000-char ceiling this should be rare; a
+        // rising count means depth is outrunning the budget.
+        if (r.final.finishReason === 'MAX_TOKENS') {
+          session.deepTruncated += 1;
+          log.warn?.(`[decoupled] deep answer hit MAX_TOKENS turn=${t.turnNumber} chars=${typeof r.final.text === 'string' ? r.final.text.length : 'na'}`);
+        }
         // Step-2 — count a Haiku-carried turn (the final event flags it).
         if (r.final.failedOver === true) session.deepFailedOver += 1;
         // C4 — completed-turn snapshot. M3: a trivial Q answered by the deep
         // path (paraphrase-off mode) is still conversational filler — do NOT
         // make it the lastCompleted that feeds next-turn retrieval context.
-        if (!t.isTrivial) lastCompleted = t;
+        if (!t.isTrivial) {
+          // B2 (audit M3) — was this answer cut short? Either the server
+          // MAX_TOKENS guillotine OR the orchestrator's graceful char-ceiling
+          // abort. Threaded into next turn's continuity preamble so "please
+          // continue" resumes from the cut instead of restarting/fabricating.
+          t.wasTruncated = (r.final.finishReason === 'MAX_TOKENS') || (r.degraded === 'char_ceiling');
+          lastCompleted = t;
+        }
       }
       if (r.degraded && r.degraded !== 'misconfigured') {
         t.degraded.push(`deep:${r.degraded}`);
@@ -582,6 +661,14 @@ export function makeDecoupledOrchestrator({
       // early-return, throw) resolves `spoken` so the index.js turn_end
       // handler's bounded await never hangs.
       resolveSpoken(t);
+      // Per-utterance "deep answer done" — fire only when this turn actually
+      // streamed audio (M3) and was NOT barged. Skipped on barge: both barge
+      // paths now set t.barged (Gemini `interrupted` AND the client `cancel`
+      // handler in index.js → onInterrupted, re-audit M1), and the browser also
+      // dropped the Simli carry via cancel(); a flush signal would be a no-op at
+      // best and could nudge a stale frame at worst. The browser gates a short
+      // trailing-audio grace before flushing the carry.
+      if (!t.barged && t.deepStreamedAudio) { try { onDeepAnswerDone(); } catch {} }
     }
   }
 
@@ -632,6 +719,8 @@ export function makeDecoupledOrchestrator({
       // Phase 3 — longest deep-answer char length this session (depth A/B +
       // ceiling watch).
       maxDeepChars: session.maxDeepChars,
+      // B1 — count of MAX_TOKENS-guillotined deep answers this session.
+      deepTruncated: session.deepTruncated,
       lastTurnNumber: turn ? turn.turnNumber : null,
     };
   }

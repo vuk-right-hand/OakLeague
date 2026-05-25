@@ -111,6 +111,14 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
   // (do NOT flush partial — would leak prior turn into next).
   const SIMLI_CHUNK_BYTES = 6000;
   let chunkerBuf = new Uint8Array(0);
+  // commitUtterance (2026-05-25): the chunker carries the final <6000-byte
+  // (~≤187ms) remainder for the NEXT sendAudio call. At a turn boundary there is
+  // no next call, so the last syllable/word sat stranded in the carry → the
+  // avatar "cut off mid-word" at the end of every answer. The caller invokes
+  // commitUtterance() at the true turn-audio boundary (driven by the proxy's
+  // per-utterance "deep answer done" signal, NOT the +6–20s-late Gemini
+  // turn_complete) to flush that tail. cancel()/close() still DROP the carry
+  // (barge/teardown — flushing there would bleed a dead turn into the next).
 
   // Track cache for late subscribers + renegotiation re-fire (Plan §23.4, §25.5).
   // Updated by refreshVideoTrack / refreshAudioTrack on initial loadedmetadata
@@ -415,6 +423,31 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
   }
 
   let warnedSendAudioPostClose = false;
+  // Flush the parked carry remainder as ONE Simli frame, zero-padded to the
+  // 6000-byte cadence the SDK expects. Carry is always <6000B (sendAudio drains
+  // every full chunk), so the pad is ≤187ms of trailing PCM silence — a natural
+  // beat after the final word, not a glitch. No-op if nothing is parked or the
+  // bridge is gone. Called at the turn-audio boundary by the consumer (driven
+  // by the proxy's per-utterance "deep answer done" signal).
+  function commitUtterance(): void {
+    if (closed || !client || !ready || chunkerBuf.byteLength === 0) return;
+    const padded = new Uint8Array(SIMLI_CHUNK_BYTES);
+    padded.set(chunkerBuf, 0);
+    chunkerBuf = new Uint8Array(0);
+    try {
+      client.sendAudioData(padded);
+    } catch (e) {
+      // Audit C3 — NON-FATAL. The tail is the least-important audio in the turn;
+      // a rejected tail frame degrades to the pre-fix cut-off-last-word, which
+      // must NEVER tear down a live, working session (the main sendAudio loop's
+      // fail() is correct for a real mid-stream chunk; this is not that).
+      if (process.env.NODE_ENV !== 'production') {
+        // eslint-disable-next-line no-console
+        console.warn('[simli-bridge] commitUtterance tail-flush rejected — dropping tail (non-fatal)', e);
+      }
+    }
+  }
+
   function sendAudio(pcm16le16k: ArrayBuffer): void {
     // Audit C4 (integration): silent no-op masked a real bug surface — a
     // controller that re-uses a closed bridge ships zero lipsync latency
@@ -473,8 +506,9 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
 
   function cancel(): void {
     if (!client || closed) return;
-    // R3-C1 — drop the chunker carry so a barge-in doesn't bleed prior-
-    // turn audio into the next turn's first 6000 bytes.
+    // R3-C1 — drop the chunker carry so a barge-in doesn't bleed prior-turn
+    // audio into the next turn's first 6000 bytes (and so a commitUtterance
+    // racing a barge finds nothing to flush).
     chunkerBuf = new Uint8Array(0);
     try { client.ClearBuffer(); } catch { /* SDK tolerates repeated clears */ }
   }
@@ -538,5 +572,5 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
     applyLocalPlayback();
   }
 
-  return { provider, open, sendAudio, cancel, close, getCurrentTracks, setLocalPlayback, rebindMediaSource };
+  return { provider, open, sendAudio, commitUtterance, cancel, close, getCurrentTracks, setLocalPlayback, rebindMediaSource };
 }

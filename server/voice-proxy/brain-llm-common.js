@@ -178,7 +178,33 @@ const NO_DELTA_DEADLINE_MS = Number.parseInt(process.env.BRAIN_NO_DELTA_DEADLINE
 // `maxOutputTokens` is the server-side guard; the orchestrator adds a
 // streaming-char ceiling as the second guard.
 const PARAPHRASE_MAX_OUTPUT_TOKENS = 120;   // hedged single sentence (~80 words)
-const DEEP_ANSWER_MAX_OUTPUT_TOKENS = 800;  // ~600 words; matches OUTPUT_TRANSCRIPT_MAX_CHARS=4000 budget
+// B1 (2026-05-25): raised 800 → 1100. At 800 (~3600 chars) the SERVER's
+// MAX_TOKENS guillotine fired BELOW the orchestrator's OUTPUT_CHAR_CEILING=4000
+// — so a long boardroom story was cut mid-sentence (abrupt) before the
+// char-ceiling's GRACEFUL sentence-boundary trim could engage (live test
+// 2026-05-25). 1100 tokens (~4400 chars) sits ABOVE the 4000-char ceiling, so
+// the graceful char-trim now binds first on a runaway — the user hears a
+// complete-sounding sentence, not a mid-word cut. The load-bearing per-turn
+// budget is still the 4000-char ceiling (CLAUDE.md R4-C2), UNCHANGED; this only
+// lifts the token backstop above it. Free tier keeps its own tighter cap
+// (DEEP_ANSWER_FREE_VAR_MAX_TOKENS in brain-bridge.js) — see audit C3.
+// Kill-switch note (audit): the decoupled α' quota is metered in AUDIO seconds
+// (inputSeconds + Cartesia audioSeconds), NOT chars — ~4400 chars ≈ ~300s of
+// speech, nowhere near the 3600s/turn oob guard, so the raise is safe there.
+// COGS note: this default is ALSO the Haiku-failover cap (maxOutputTokensFor
+// below) — paid variable-depth turns may now emit ~37% more output tokens on
+// either provider, bounded by the 4000-char ceiling. Acceptable for paid.
+// Re-audit M4 — we KEEP Haiku at this shared 1100, deliberately NOT a lower
+// failover-specific cap. The auditor proposed dropping Haiku back to 800 to
+// trim outage-correlated cost; rejected, because the SAME abrupt-cut bug B1
+// fixed for Gemini would then reappear ON THE FAILOVER PATH (800 tok ≈ 3600
+// chars < the 4000-char ceiling → token guillotine fires first → mid-word cut),
+// and a Gemini outage is the worst moment to also clip the answer. The cost
+// delta is bounded (char-ceiling caps output at 4000 regardless of provider)
+// and on a rare path; and re-audit C1 now makes any Haiku MAX_TOKENS visible in
+// deepTruncated, so we'd SEE it if the cap ever proves wrong. The kill-switch
+// is audio-seconds-metered, not token-metered, so this is not a quota risk.
+const DEEP_ANSWER_MAX_OUTPUT_TOKENS = 1100;
 function maxOutputTokensFor(op) {
   if (op === 'brain_paraphrase') return PARAPHRASE_MAX_OUTPUT_TOKENS;
   return DEEP_ANSWER_MAX_OUTPUT_TOKENS;
@@ -203,6 +229,11 @@ export async function* streamGenerate({ client, model, systemInstruction, conten
   let firstChunkMs = null;
   let fullText = '';
   let lastUsage = null;
+  // B1 — the model's finishReason (last non-null wins). 'MAX_TOKENS' means the
+  // output was guillotined at the cap (potentially mid-sentence); surfaced on
+  // the terminal event so the orchestrator can meter/log it instead of it being
+  // an invisible truncation. 'STOP' = natural completion.
+  let finishReason = null;
   // Step-2 audit C5 — when the caller (the deep answer) can fail over, a
   // STALLED Gemini stream (opened, but no first token) should be detected
   // FAST and treated as failover-eligible, not left to eat the full 5s
@@ -331,6 +362,8 @@ export async function* streamGenerate({ client, model, systemInstruction, conten
       // parts exist (the common case). `chunk?.text` SDK convenience
       // accessor is bypassed when parts are present so the filter is
       // the authoritative path.
+      const fr = chunk?.candidates?.[0]?.finishReason;
+      if (fr) finishReason = fr;
       const parts = chunk?.candidates?.[0]?.content?.parts;
       let delta = '';
       if (Array.isArray(parts) && parts.length > 0) {
@@ -398,6 +431,7 @@ export async function* streamGenerate({ client, model, systemInstruction, conten
     startedAt,
     firstChunkMs,
     latencyMs: Date.now() - startedAt,
+    finishReason, // B1 — 'STOP' | 'MAX_TOKENS' | … (last non-null seen)
   };
 }
 
@@ -559,6 +593,7 @@ export async function* streamGenerateAnthropic({ client, model, systemInstructio
   let fullText = '';
   let inputTokens = null;   // from message_start
   let outputTokens = null;  // cumulative, last seen message_delta (C2)
+  let finishReason = null;  // re-audit C1 — 'MAX_TOKENS' when guillotined; mirrors Gemini
 
   // Mirror streamGenerate's pre-dispatch abort guard — a signal already
   // aborted means the request never reached the server: it did NOT bill.
@@ -646,6 +681,16 @@ export async function* streamGenerateAnthropic({ client, model, systemInstructio
         // either of which would clobber the correct number.
         const u = event.usage;
         if (u && typeof u.output_tokens === 'number') outputTokens = u.output_tokens;
+        // Re-audit C1 — Anthropic delivers the terminal reason on the
+        // message_delta `delta.stop_reason` ('max_tokens' when guillotined at
+        // the cap). Mirror Gemini's 'MAX_TOKENS' so the SAME orchestrator code
+        // (deepTruncated meter AND B2 wasTruncated/resume gate) works on the
+        // failover path — without this, a Haiku answer cut at the cap is
+        // counted as complete and next turn's "go on" restarts instead of
+        // resuming, exactly during a Gemini outage when we lean on failover.
+        const sr = event.delta?.stop_reason;
+        if (sr === 'max_tokens') finishReason = 'MAX_TOKENS';
+        else if (sr) finishReason = sr; // 'end_turn' | 'stop_sequence' | …
       } else if (type === 'content_block_delta') {
         // Audit M4 — ONLY text deltas reach TTS. `thinking_delta` /
         // `input_json_delta` are filtered so chain-of-thought never
@@ -684,5 +729,6 @@ export async function* streamGenerateAnthropic({ client, model, systemInstructio
     startedAt,
     firstChunkMs,
     latencyMs: Date.now() - startedAt,
+    finishReason, // re-audit C1 — 'MAX_TOKENS' | 'end_turn' | … (parity with Gemini)
   };
 }

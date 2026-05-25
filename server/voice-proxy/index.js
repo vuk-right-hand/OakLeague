@@ -321,6 +321,19 @@ const _envPosInt = (name, dflt) => {
 };
 const DECOUPLED_RETRIEVE_BUDGET_MS = _envPosInt('DECOUPLED_RETRIEVE_BUDGET_MS', 3500);
 const DECOUPLED_RETRIEVE_CEILING_MS = _envPosInt('DECOUPLED_RETRIEVE_CEILING_MS', 4000);
+// 2026-05-25 (fix #1) — how many reranked parent units to INJECT into the brain.
+// Was effectively 5 (the shim's DEFAULT_TOP_K, since the proxy passed no topK):
+// the brain got the #1 story PLUS 4 lower-ranked distractors, blended them into
+// generic advice, and disowned the specific story ("not my story"). The
+// reranker is decisive (lumberjack 0.7656 vs next 0.3281) — injecting ONLY the
+// top unit gives the brain ONE thing to tell in-voice. Default 1; bump via env
+// if testing shows multi-part questions need more context (audit M2 — validated
+// for single-story Qs; multi-part/comparative Qs may want 2-3, see deploy notes;
+// and audit M3 — bumping it in prod requires a corpus_version bump or
+// RAG_CACHE_DISABLED window, since the cache key does NOT include topK). NOTE
+// (audit S4): a value ≤0 / non-numeric is boot-FATAL via _envPosInt (process
+// exits), NOT floored to 1; only the upper bound is clamped to 5.
+const DECOUPLED_INJECT_TOP_K = Math.min(5, _envPosInt('DECOUPLED_INJECT_TOP_K', 1));
 // The real invariant is CEILING ≥ BUDGET + the shim client's HTTP_OVERHEAD_GRACE_MS
 // (500, in retrieve-knowledge-v2-client.js): the shim self-cancels at BUDGET, its
 // AbortController backstops at BUDGET+500, and the orchestrator must still be
@@ -358,6 +371,14 @@ if (RAG_V2_PROXY_ENABLED) {
 } else {
   console.log('[boot] RAG v2 wiring disabled (set RAG_V2_PROXY_ENABLED=1 to enable)');
 }
+// Boot-visible decoupled depth + injection config. Fly masks secret VALUES in
+// `fly secrets list` (name + digest only), so this is the only way to confirm
+// from prod that BRAIN_DEPTH_MODE actually resolved to 'variable' (anything else
+// = 'brief'). Also surfaces the inject-top-K so a stray override is visible.
+console.log(
+  `[boot] decoupled depth=${process.env.BRAIN_DEPTH_MODE === 'variable' ? 'variable' : 'brief (default — set BRAIN_DEPTH_MODE=variable for full answers)'} `
+  + `inject_top_k=${DECOUPLED_INJECT_TOP_K}`,
+);
 
 function sha256Hex(s) { return createHash('sha256').update(s).digest('hex'); }
 
@@ -1117,6 +1138,10 @@ wss.on('connection', async (ws, req) => {
           // not buried in the degraded string. A rising rate = Gemini STT
           // dropping long utterances.
           `truncated_turns=${m.truncatedTurns ?? 0} ` +
+          // B1 — deep answers guillotined at MAX_TOKENS (mid-thought cut). Should
+          // be ~0 now the token cap sits above the graceful 4000-char ceiling.
+          `deep_truncated=${m.deepTruncated ?? 0} ` +
+          `max_deep_chars=${m.maxDeepChars ?? 'na'} ` +
           `degraded=${(m.degraded || []).join(',') || 'none'} ` +
           `para_first_ms=${m.lastParaFirstMs ?? 'na'} ` +
           `deep_first_ms=${m.lastDeepFirstMs ?? 'na'} ` +
@@ -1713,6 +1738,9 @@ wss.on('connection', async (ws, req) => {
             lastAssistantResponse:
               (decoupledOrch && decoupledOrch.lastAssistantResponse()) || lastAssistantResponseClosure,
             corpusVersionAtSession, budgetMs: DECOUPLED_RETRIEVE_BUDGET_MS, signal,
+            // fix #1 — inject only the top reranked unit(s), not the default 5.
+            // Stops the 5-unit blend that made the brain disown the specific story.
+            topK: DECOUPLED_INJECT_TOP_K,
           });
         } else {
           result = await retrieveTopK({
@@ -1770,6 +1798,17 @@ wss.on('connection', async (ws, req) => {
       // — the SAFE tighter budget; a session must never accidentally get the
       // paid length budget from a stray tier string.
       tier: (sess.tier === 'premium' || sess.tier === 'boardroom') ? sess.tier : 'free',
+      // Per-utterance "deep answer done" → tell the browser this turn's audio
+      // has finished streaming so it can flush the Simli tail-carry (the last
+      // ≤187ms that was stranded → "cut off mid-word"). Fired EARLY (when the
+      // deep answer finishes), not on the +6–20s-late Gemini turn_complete.
+      // Same WS as audio_out → ordered after the last audio chunk; the browser
+      // still gates a short trailing-audio grace before flushing.
+      onDeepAnswerDone: () => {
+        try {
+          if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'deep_answer_done' }));
+        } catch { /* ws closing — nothing to flush */ }
+      },
       onFatal: () => {
         // Audit C2 — idempotent. The orchestrator's `fatal` latch
         // already blocks a second paid call, but onFatal can still be
@@ -2521,6 +2560,18 @@ wss.on('connection', async (ws, req) => {
         ttsTurnDead = true;
         bridge.cancel();
         if (useTts && ttsBridge) ttsBridge.cancel();
+        // Re-audit M1 — a CLIENT mic-tap barge sends `cancel`, but in decoupled
+        // mode Gemini isn't generating audio for the user to barge over, so its
+        // `interrupted` event (the only other onInterrupted caller) may never
+        // fire. Notify the orchestrator here so (1) the in-flight deep
+        // generate/Haiku stream is ABORTED — otherwise it runs to completion and
+        // keeps billing after the user already moved on; and (2) `t.barged` is
+        // set, which correctly SUPPRESSES the deep_answer_done tail-flush signal
+        // (a flush after a barge could nudge a stale frame). abortTurn is
+        // idempotent and null-safe, so a cancel with no live turn is a no-op.
+        if (decoupled && decoupledOrch) {
+          try { decoupledOrch.onInterrupted(); } catch {}
+        }
       }
     } catch (e) {
       console.error('[control]', msg?.type, e);
