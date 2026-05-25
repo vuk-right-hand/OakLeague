@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from 'next';
 import './globals.css';
 import { PostHogProvider } from '@/lib/posthog-client';
+import { BottomNav } from '@/components/bottom-nav';
 
 export const metadata: Metadata = {
   title: 'OakLeague',
@@ -20,6 +21,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en">
       <body>
         <PostHogProvider>{children}</PostHogProvider>
+        <BottomNav />
       </body>
     </html>
   );

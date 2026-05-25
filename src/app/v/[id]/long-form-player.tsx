@@ -113,6 +113,17 @@ export function LongFormPlayer({
         creator_id: creatorId,
         payload: { quartile: q, source: 'pill' },
       });
+      // First quartile = a real watch → record to watch_history (PROFILE_SYSTEM
+      // U4/C2). Fire-and-forget; auth-gated + published-gated server-side.
+      if (q === 25) {
+        // Mid-watch (not unload), so no keepalive needed (audit M-D5). Anon
+        // viewers no-op server-side. Best-effort; never blocks the player.
+        void fetch('/api/me/watch', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ video_id: videoId }),
+        }).catch(() => {});
+      }
     },
     [videoId, creatorId, entryHookId],
   );

@@ -2,6 +2,9 @@ import { notFound } from 'next/navigation';
 import { z } from 'zod';
 import { supabaseServer } from '@/lib/supabase/server';
 import { LongFormPlayer } from './long-form-player';
+import { LikeButton } from './like-button';
+import { CommentsPanel } from './comments-panel';
+import type { CommentRow } from '@/lib/video/comment-actions';
 
 export const dynamic = 'force-dynamic';
 
@@ -16,10 +19,13 @@ const videoRowSchema = z.object({
   long_form_mux_aspect_ratio: z.string().nullable(),
   long_form_duration_seconds: z.number().nullable(),
   long_form_published_at: z.string(),
+  like_count: z.number(),
+  comment_count: z.number(),
 });
 
 const creatorRowSchema = z.object({
   id: z.string().uuid(),
+  user_id: z.string().uuid(),
   display_name: z.string(),
   handle: z.string(),
   avatar_url: z.string().nullable(),
@@ -35,10 +41,10 @@ export default async function LongFormPage({
   searchParams,
 }: {
   params: Promise<{ id: string }>;
-  searchParams: Promise<{ from?: string }>;
+  searchParams: Promise<{ from?: string; action?: string }>;
 }) {
   const { id } = await params;
-  const { from } = await searchParams;
+  const { from, action } = await searchParams;
 
   // Validate the page :id is a UUID. supabaseServer query would tolerate
   // garbage and return null, but failing here keeps the 404 boundary clean.
@@ -56,7 +62,7 @@ export default async function LongFormPage({
     .select(
       'id, creator_id, title, description, ' +
         'long_form_mux_playback_id, long_form_mux_aspect_ratio, ' +
-        'long_form_duration_seconds, long_form_published_at',
+        'long_form_duration_seconds, long_form_published_at, like_count, comment_count',
     )
     .eq('id', idParse.data)
     .not('published_at', 'is', null)
@@ -77,7 +83,7 @@ export default async function LongFormPage({
   // already publicly viewable — display_name + handle + avatar are public.
   const { data: creatorRaw } = await sb
     .from('creators')
-    .select('id, display_name, handle, avatar_url')
+    .select('id, user_id, display_name, handle, avatar_url')
     .eq('id', video.creator_id)
     .maybeSingle();
   if (!creatorRaw) notFound();
@@ -109,19 +115,71 @@ export default async function LongFormPage({
     data: { user },
   } = await sb.auth.getUser();
 
+  // Likes + comments state (COMMENTS_LIKES_PLAN L2/C2).
+  let liked = false;
+  let isModerator = false;
+  let viewerHandle: string | null = null;
+  let viewerName: string | null = null;
+  let viewerAvatar: string | null = null;
+  if (user) {
+    const [{ data: likedData }, { data: vp }, { data: vc }] = await Promise.all([
+      sb.rpc('viewer_liked_state', { p_video_id: video.id }),
+      sb.from('profiles').select('handle, display_name, avatar_url').eq('id', user.id).maybeSingle(),
+      sb.from('creators').select('handle, display_name, avatar_url').eq('user_id', user.id).maybeSingle(),
+    ]);
+    liked = likedData === true;
+    viewerHandle = (vc?.handle ?? vp?.handle ?? null) as string | null;
+    viewerName = (vc?.display_name ?? vp?.display_name ?? null) as string | null;
+    viewerAvatar = (vc?.avatar_url ?? vp?.avatar_url ?? null) as string | null;
+    if (creator.user_id === user.id) {
+      isModerator = true;
+    } else {
+      const { data: adm } = await sb.from('admin_roles').select('user_id').eq('user_id', user.id).maybeSingle();
+      isModerator = !!adm;
+    }
+  }
+  const [{ data: pinnedRaw }, { data: topRaw }] = await Promise.all([
+    sb.rpc('list_pinned_comments', { p_video_id: video.id }),
+    sb.rpc('list_video_comments', { p_video_id: video.id, p_cursor_ts: null, p_cursor_id: null, p_limit: 30 }),
+  ]);
+  // C3: don't re-fire the login-hop like if the user already likes it.
+  const autoLike = action === 'like' && !!user && !liked;
+
   return (
-    <LongFormPlayer
-      videoId={video.id}
-      creatorId={creator.id}
-      creatorHandle={creator.handle}
-      creatorName={creator.display_name}
-      creatorAvatar={creator.avatar_url}
-      videoTitle={video.title}
-      videoDescription={video.description}
-      muxPlaybackId={video.long_form_mux_playback_id}
-      durationSeconds={video.long_form_duration_seconds}
-      entryHookId={entryHookId}
-      isAuthenticated={!!user}
-    />
+    <>
+      <LongFormPlayer
+        videoId={video.id}
+        creatorId={creator.id}
+        creatorHandle={creator.handle}
+        creatorName={creator.display_name}
+        creatorAvatar={creator.avatar_url}
+        videoTitle={video.title}
+        videoDescription={video.description}
+        muxPlaybackId={video.long_form_mux_playback_id}
+        durationSeconds={video.long_form_duration_seconds}
+        entryHookId={entryHookId}
+        isAuthenticated={!!user}
+      />
+      <div className="oak-video-engagement">
+        <LikeButton
+          videoId={video.id}
+          initialLiked={liked}
+          initialCount={video.like_count}
+          isAuthenticated={!!user}
+          autoFire={autoLike}
+        />
+        <CommentsPanel
+          videoId={video.id}
+          isAuthenticated={!!user}
+          isModerator={isModerator}
+          initialPinned={(pinnedRaw ?? []) as CommentRow[]}
+          initialComments={(topRaw ?? []) as CommentRow[]}
+          commentCount={video.comment_count}
+          viewerHandle={viewerHandle}
+          viewerName={viewerName}
+          viewerAvatar={viewerAvatar}
+        />
+      </div>
+    </>
   );
 }

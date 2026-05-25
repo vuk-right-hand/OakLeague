@@ -10,3 +10,86 @@ html, body {
   color: var(--foreground);
   font-family: system-ui, -apple-system, Segoe UI, sans-serif;
 }
+
+/* ── Profile system (PROFILE_SYSTEM_PLAN U4/U5) ───────────────────────────── */
+:root { --oak-accent: #6d5efc; --oak-card: #161616; --oak-line: #262626; }
+
+/* Keep page content clear of the fixed bottom nav. */
+body { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
+
+.oak-profile { max-width: 680px; margin: 0 auto; padding: 24px 16px; }
+.oak-profile-head { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 6px; }
+.oak-avatar { width: 96px; height: 96px; border-radius: 50%; overflow: hidden; background: var(--oak-card);
+  display: grid; place-items: center; border: 1px solid var(--oak-line); }
+.oak-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.oak-avatar-fallback { font-size: 36px; font-weight: 700; opacity: 0.7; }
+.oak-profile-name { font-size: 22px; font-weight: 700; margin-top: 8px; }
+.oak-profile-handle { opacity: 0.6; font-size: 14px; }
+.oak-profile-stats { display: flex; gap: 20px; margin: 10px 0; font-size: 14px; opacity: 0.85; }
+.oak-profile-stats strong { font-size: 16px; }
+.oak-profile-bio { max-width: 460px; opacity: 0.9; line-height: 1.5; }
+.oak-profile-actions { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; justify-content: center; }
+
+.oak-btn-primary, .oak-btn-secondary, .oak-handshake-btn {
+  border-radius: 999px; padding: 9px 18px; font-size: 14px; font-weight: 600;
+  cursor: pointer; border: 1px solid var(--oak-line); text-decoration: none; display: inline-block; }
+.oak-btn-primary { background: var(--oak-accent); color: #fff; border-color: transparent; }
+.oak-btn-secondary { background: transparent; color: var(--foreground); }
+.oak-handshake-btn { background: var(--foreground); color: var(--background); border-color: transparent; }
+.oak-handshake-btn[data-on="true"] { background: transparent; color: var(--foreground); border-color: var(--oak-line); }
+
+.oak-video-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 3px; margin-top: 20px; }
+.oak-video-cell { aspect-ratio: 9/16; background: var(--oak-card); overflow: hidden; display: grid; place-items: center; }
+.oak-video-cell img { width: 100%; height: 100%; object-fit: cover; }
+.oak-video-cell-title { font-size: 12px; opacity: 0.7; padding: 8px; text-align: center; }
+.oak-empty { text-align: center; opacity: 0.5; padding: 40px 0; }
+
+.oak-sheet { display: flex; flex-direction: column; gap: 12px; max-width: 420px; margin: 16px auto 0;
+  background: var(--oak-card); border: 1px solid var(--oak-line); border-radius: 14px; padding: 16px; text-align: left; }
+.oak-sheet label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; opacity: 0.85; }
+.oak-sheet input, .oak-sheet textarea { background: #0e0e0e; border: 1px solid var(--oak-line); border-radius: 8px;
+  padding: 8px 10px; color: var(--foreground); font-size: 14px; }
+.oak-sheet-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.oak-err { color: salmon; font-size: 13px; }
+
+/* Bottom nav */
+.oak-bottom-nav { position: fixed; bottom: 0; left: 0; right: 0; height: 64px; z-index: 50;
+  display: grid; grid-template-columns: repeat(5, 1fr); align-items: center;
+  background: rgba(10,10,10,0.92); backdrop-filter: blur(12px); border-top: 1px solid var(--oak-line);
+  padding-bottom: env(safe-area-inset-bottom); }
+.oak-bottom-nav a { display: flex; flex-direction: column; align-items: center; gap: 2px;
+  font-size: 10px; color: #9a9a9a; text-decoration: none; }
+.oak-bottom-nav a[aria-current="page"] { color: var(--foreground); }
+.oak-nav-middle { color: var(--foreground) !important; }
+.oak-nav-middle-plus { font-size: 20px; line-height: 1; color: var(--oak-accent); font-weight: 700; }
+
+/* ── Likes & comments (COMMENTS_LIKES_PLAN L2/C2) ─────────────────────────── */
+.oak-video-engagement { max-width: 680px; margin: 0 auto; padding: 12px 16px 40px; }
+.oak-section-title { font-size: 16px; font-weight: 700; margin: 8px 0; }
+
+.oak-like-btn { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px;
+  padding: 8px 16px; font-size: 15px; font-weight: 600; cursor: pointer;
+  background: transparent; color: var(--foreground); border: 1px solid var(--oak-line); text-decoration: none; }
+.oak-like-btn[data-on="true"] { color: #ff4d6d; border-color: #ff4d6d; }
+
+.oak-comments { margin-top: 20px; }
+.oak-comments-title { font-size: 15px; font-weight: 700; margin-bottom: 12px; }
+.oak-comment-list { list-style: none; padding: 0; display: flex; flex-direction: column; gap: 16px; margin-top: 16px; }
+.oak-comment[data-hidden="true"] { opacity: 0.5; }
+.oak-comment-head { display: flex; align-items: center; gap: 8px; }
+.oak-comment-av { width: 28px; height: 28px; border-radius: 50%; object-fit: cover; display: grid; place-items: center;
+  background: var(--oak-card); font-size: 12px; }
+.oak-comment-author { font-size: 13px; font-weight: 600; }
+.oak-comment-author a { color: inherit; text-decoration: none; }
+.oak-comment-tag { font-size: 11px; opacity: 0.6; border: 1px solid var(--oak-line); border-radius: 6px; padding: 1px 6px; }
+.oak-comment-body { font-size: 14px; line-height: 1.45; margin: 4px 0 0 36px; }
+.oak-comment-actions { display: flex; gap: 12px; margin: 6px 0 0 36px; }
+.oak-comment-actions button { background: none; border: none; color: #9a9a9a; font-size: 12px; cursor: pointer; padding: 0; }
+.oak-comment-actions button:hover { color: var(--foreground); }
+.oak-comment-compose { display: flex; flex-direction: column; gap: 8px; margin: 8px 0 0 36px; }
+.oak-comment-compose textarea { background: #0e0e0e; border: 1px solid var(--oak-line); border-radius: 8px;
+  padding: 8px 10px; color: var(--foreground); font-size: 14px; min-height: 56px; resize: vertical; }
+.oak-comment-compose .oak-btn-primary { align-self: flex-end; }
+.oak-replies { list-style: none; padding: 0; margin: 12px 0 0 36px; display: flex; flex-direction: column; gap: 14px;
+  border-left: 1px solid var(--oak-line); padding-left: 12px; }
+.oak-pinned { border: 1px solid var(--oak-line); border-radius: 10px; padding: 10px; margin-bottom: 12px; }
