@@ -140,3 +140,41 @@ balloons.
 - Haiku failover DISABLED locally (`ANTHROPIC_*` secrets unset) = deliberate fail-closed. Expected without Anthropic secrets.
 - `[latency]`/`[decoupled]` DIAG logs removed = intentional cleanup. (If still debugging playout, may want them back temporarily — costs observability.)
 - `SimliClient FAILED TO SEND FINAL MESSAGE` at teardown predates this work — likely red herring; only chase if it correlates with the no-audio symptom.
+
+---
+
+## DEFERRED — profile/comments/apply system (auditor 2026-05-26, Vuk OK'd skip)
+
+Surfaced by the pre-push auditor on the profile-system merge to main (`6b27bae`).
+M1 (URL scheme lock) + M2 (`/v/` nav overlap) were FIXED before push. These two
+were consciously deferred with Vuk's sign-off — neither is urgent. Pick them up
+when the trigger fires, not before.
+
+### M5 · DB-side shape guard on `submit_creator_application(p_proof)` — defense-in-depth
+- **What:** the creator-application `proof` blob (links + courses) is stored verbatim
+  as JSONB by the RPC with NO server-side shape check. The ONLY guard is the Zod
+  `ProofSchema` in the `'use server'` action (`src/app/apply/actions.ts`), which is
+  solid — and as of `6b27bae` also locks URL schemes to http(s) (M1). M5 = add a
+  redundant `IF jsonb_typeof(p_proof) IS DISTINCT FROM 'object' THEN RAISE` (and
+  optionally reject unexpected top-level keys) INSIDE the RPC so the DB doesn't
+  depend solely on one TS call site.
+- **Why deferred:** exactly one caller today, already validated. The fix means a
+  `CREATE OR REPLACE` of a function the voice/RAG workstream owns (defined in
+  `20260523000008_submit_application_with_consent.sql`), pushed to prod — small but
+  real risk of breaking live applications if the body is transcribed wrong.
+- **TRIGGER — do it when:** a SECOND caller of `submit_creator_application` is added
+  (a script, a different route, a re-used RPC), OR you're already editing that RPC
+  for another reason (fold it in then). Effort: ~1 migration, low.
+
+### M3 · Re-consent on terms/version bump — un-built P1 + policy decision
+- **What:** creators record WHICH version of ToS / voice-likeness consent they
+  accepted (`CONSENT_VERSIONS` in `src/lib/consent.ts`). If those terms are ever
+  REVISED (version bumped), existing creators are NOT re-prompted to re-agree — they
+  stay consented to the stale version. The clone/face gate checks consent EXISTENCE,
+  not VERSION (noted in `consent.ts:4-8`).
+- **Why deferred:** not a quick code fix — it's a feature (detect version mismatch →
+  force a re-consent flow) PLUS a legal/policy call on how term revisions are handled.
+  Only matters the day you actually revise the terms; today there's ~1 creator (Vuk).
+- **TRIGGER — do it when:** you are about to change ToS or voice-likeness terms (bump
+  a `CONSENT_VERSIONS` value). Build the re-consent prompt + decide the policy BEFORE
+  the bump ships, so no creator operates on stale consent.
