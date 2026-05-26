@@ -17,6 +17,14 @@ const ProofSchema = z.object({
   youtube_url: z.string().url().max(500).optional(),
   twitter_url: z.string().url().max(500).optional(),
   website: z.string().url().max(500).optional(),
+  // PROFILE_SYSTEM_PLAN U5 / audit S5: these are added to the FORM, so they MUST
+  // be in this whitelist — Zod strips unknown keys silently otherwise.
+  instagram_url: z.string().url().max(500).optional(),
+  tiktok_url: z.string().url().max(500).optional(),
+  courses: z
+    .array(z.object({ title: z.string().min(1).max(120), url: z.string().url().max(500).optional() }))
+    .max(10)
+    .optional(),
   other_links: z.array(z.string().url().max(500)).max(10).optional(),
 });
 

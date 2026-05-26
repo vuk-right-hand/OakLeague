@@ -13,6 +13,9 @@ export function ApplyForm() {
   const [youtubeUrl, setYoutubeUrl] = useState('');
   const [twitterUrl, setTwitterUrl] = useState('');
   const [website, setWebsite] = useState('');
+  const [instagramUrl, setInstagramUrl] = useState('');
+  const [tiktokUrl, setTiktokUrl] = useState('');
+  const [courses, setCourses] = useState<Array<{ title: string; url: string }>>([]);
   const [acceptTos, setAcceptTos] = useState(false);
   const [acceptVoiceLikeness, setAcceptVoiceLikeness] = useState(false);
   const [pending, startTransition] = useTransition();
@@ -27,10 +30,16 @@ export function ApplyForm() {
       onSubmit={(e) => {
         e.preventDefault();
         setErr(null);
+        const cleanCourses = courses
+          .map((c) => ({ title: c.title.trim(), url: c.url.trim() || undefined }))
+          .filter((c) => c.title.length > 0);
         const proof = {
           youtube_url: youtubeUrl || undefined,
           twitter_url: twitterUrl || undefined,
           website: website || undefined,
+          instagram_url: instagramUrl || undefined,
+          tiktok_url: tiktokUrl || undefined,
+          courses: cleanCourses.length > 0 ? cleanCourses : undefined,
         };
         startTransition(async () => {
           const res = await submitCreatorApplication({
@@ -159,6 +168,54 @@ export function ApplyForm() {
             disabled={pending}
           />
         </label>
+        <label>
+          Instagram URL
+          <input
+            type="url"
+            value={instagramUrl}
+            onChange={(e) => setInstagramUrl(e.target.value)}
+            disabled={pending}
+          />
+        </label>
+        <label>
+          TikTok URL
+          <input
+            type="url"
+            value={tiktokUrl}
+            onChange={(e) => setTiktokUrl(e.target.value)}
+            disabled={pending}
+          />
+        </label>
+      </fieldset>
+
+      <fieldset style={{ border: '1px solid #333', padding: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <legend>Courses (optional)</legend>
+        {courses.map((c, i) => (
+          <div key={i} style={{ display: 'flex', gap: 8 }}>
+            <input
+              placeholder="Course title"
+              maxLength={120}
+              value={c.title}
+              onChange={(e) => setCourses(courses.map((x, j) => (i === j ? { ...x, title: e.target.value } : x)))}
+              disabled={pending}
+            />
+            <input
+              type="url"
+              placeholder="Link (optional)"
+              value={c.url}
+              onChange={(e) => setCourses(courses.map((x, j) => (i === j ? { ...x, url: e.target.value } : x)))}
+              disabled={pending}
+            />
+            <button type="button" onClick={() => setCourses(courses.filter((_, j) => j !== i))} disabled={pending}>
+              ×
+            </button>
+          </div>
+        ))}
+        {courses.length < 10 && (
+          <button type="button" onClick={() => setCourses([...courses, { title: '', url: '' }])} disabled={pending}>
+            + Add course
+          </button>
+        )}
       </fieldset>
 
       <fieldset style={{ border: '1px solid #333', padding: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
