@@ -69,7 +69,7 @@ const FIXTURE_USER_ID    = 'aaaaaaaa-1212-4aaa-a000-000000000002';
 const FIXTURE_TOPIC_ID   = 'aaaaaaaa-1212-4aaa-a000-000000000003';
 const FIXTURE_SAMPLE_ID  = 'aaaaaaaa-1212-4aaa-a000-000000000004';
 const FIXTURE_TOPIC_SLUG = 'test-topic';
-const FIXTURE_HANDLE     = 'rag-test-fixture';
+const FIXTURE_HANDLE     = 'rag_test_fixture';  // creators_handle_check: ^[a-z0-9_]+$ (no hyphens)
 const FIXTURE_EMAIL      = 'rag-test-fixture@example.com';
 
 // Day-12 audit C4: minimal stub persona so the seeded creator passes the

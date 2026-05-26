@@ -18,12 +18,15 @@
     `scripts/diag-cogs-recent.mjs`).
   • **Apply the branch's migrations to prod ✅ DONE** (Vuk-confirmed 2026-05-25):
     `20260522000100`, `20260522000104` (rollover fix), `20260523000001/000002/000010`,
-    `20260523000004`, `20260523000005` are LIVE on prod. ⏳ NEW: `20260525000100`
-    (BM25 OR-semantics) is committed but NOT applied — proven read-only on prod
-    data, low-risk, DEFERRED (recall improvement; needs the #4 eval harness to
-    validate its RRF weight). Do NOT `supabase db push` blind (it would also
-    apply the unaudited profile migrations `20260525000001-10`); apply
-    `20260525000100` surgically or coordinate with the profile set.
+    `20260523000004`, `20260523000005` are LIVE on prod. ✅ `20260525000100`
+    (BM25 OR-semantics) is ALSO LIVE on prod (verified read-only 2026-05-26:
+    `try_build_tsquery('…lumberjack story…') => 'learn' | 'lumberjack' | 'stori'`
+    — OR-joined content lexemes, question words stripped; `websearch_to_tsquery`
+    can never emit `|`, so this is definitively the new fn). The migration FILE
+    is committed on the rag-sota branch; pushing to main lands the file (Supabase
+    won't re-run an already-applied version). Earlier "DEFERRED / NOT applied"
+    notes were STALE — disregard them. Still do NOT `supabase db push` blind: it
+    would apply the unaudited profile migrations `20260525000001-10`.
   • **Step 5 (`fly deploy`) ✅ DONE 2026-05-25** — build `48e1e1df1524e8`; boot
     log confirms Haiku failover ARMED + `decoupled depth=variable inject_top_k=1`.
     **Step 6 (`main` push) ⏳ HELD by choice:** the "exactly him" UX lives in the
