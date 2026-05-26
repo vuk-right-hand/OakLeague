@@ -13,19 +13,40 @@ const TopicSchema = z.object({
   description: z.string().max(500).optional().default(''),
 });
 
+// Zod `.url()` parses validity but ACCEPTS `javascript:`, `data:`, `vbscript:`
+// schemes. Proof URLs are stored verbatim as JSONB and may later be rendered as
+// clickable <a href> (creator links on the profile / studio), so lock the scheme
+// to http(s) at write time — a stored `javascript:` URL must never reach the DB.
+// (auditor M1, 2026-05-26.)
+const safeUrl = z
+  .string()
+  .url()
+  .max(500)
+  .refine(
+    (u) => {
+      try {
+        const p = new URL(u).protocol;
+        return p === 'https:' || p === 'http:';
+      } catch {
+        return false;
+      }
+    },
+    { message: 'unsupported_url_scheme' },
+  );
+
 const ProofSchema = z.object({
-  youtube_url: z.string().url().max(500).optional(),
-  twitter_url: z.string().url().max(500).optional(),
-  website: z.string().url().max(500).optional(),
+  youtube_url: safeUrl.optional(),
+  twitter_url: safeUrl.optional(),
+  website: safeUrl.optional(),
   // PROFILE_SYSTEM_PLAN U5 / audit S5: these are added to the FORM, so they MUST
   // be in this whitelist — Zod strips unknown keys silently otherwise.
-  instagram_url: z.string().url().max(500).optional(),
-  tiktok_url: z.string().url().max(500).optional(),
+  instagram_url: safeUrl.optional(),
+  tiktok_url: safeUrl.optional(),
   courses: z
-    .array(z.object({ title: z.string().min(1).max(120), url: z.string().url().max(500).optional() }))
+    .array(z.object({ title: z.string().min(1).max(120), url: safeUrl.optional() }))
     .max(10)
     .optional(),
-  other_links: z.array(z.string().url().max(500)).max(10).optional(),
+  other_links: z.array(safeUrl).max(10).optional(),
 });
 
 const Input = z.object({
