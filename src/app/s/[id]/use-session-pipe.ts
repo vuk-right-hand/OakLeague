@@ -226,7 +226,17 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     if (tailFlushTimerRef.current) clearTimeout(tailFlushTimerRef.current);
     tailFlushTimerRef.current = setTimeout(() => {
       tailFlushTimerRef.current = null;
-      tailPendingRef.current = false;
+      // 2026-05-26 — mid-word cutoff root cause. Do NOT clear tailPendingRef
+      // here. A final Cartesia chunk can arrive >TAIL_FLUSH_GRACE_MS after the
+      // prior one (end-of-synthesis lag, worse on longer answers) — i.e. AFTER
+      // this timer already fired. If we flip tailPending=false now, that late
+      // chunk's onAudioOut re-arm (`if (tailPendingRef.current) armTailFlush()`)
+      // is gated off, stranding its <6000B remainder in the Simli carry forever
+      // → the avatar is cut off mid-word at the very end. Keeping tailPending
+      // true means every trailing chunk re-arms and gets flushed; commitUtterance
+      // is an idempotent no-op on an empty carry, so repeated fires are harmless.
+      // tailPending is reset by clearTailFlush() at the next turn boundary
+      // (mic_started / pause / unmount), so it never leaks across turns.
       try { bridgeRef.current?.commitUtterance?.(); } catch { /* tail flush is best-effort */ }
     }, TAIL_FLUSH_GRACE_MS);
   }, []);
@@ -722,7 +732,9 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
           try { bridgeRef.current?.sendAudio(bytes); } catch { /* bridge closed */ }
           // 2026-05-25 — after 'deep_answer_done', each trailing audio_out pushes
           // the tail-flush later so we flush the Simli carry only once audio
-          // truly settles (rides out Cartesia synthesis lag).
+          // truly settles (rides out Cartesia synthesis lag). No-op until
+          // onDeepAnswerDone sets tailPending=true, so this never arms mid-answer
+          // during normal generation — only across the end-of-answer tail window.
           if (tailPendingRef.current) armTailFlush();
           // Phase-transition gate (R5-C3 audit). Only dispatch while we're
           // still waiting for the model's response — drop tail chunks that

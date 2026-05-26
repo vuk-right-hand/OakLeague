@@ -272,6 +272,49 @@ export function makeDecoupledOrchestrator({
     let firstChunkMs = null;
     let charsEmitted = 0;
     let overflowAborted = false;
+    // 2026-05-26 — word-boundary buffer. The brain LLM streams token-aligned
+    // deltas that routinely split mid-word ("under" | "standing"). Forwarding
+    // each raw delta as its own Cartesia continuation message violates
+    // Cartesia's "never split mid-word" rule (docs: stream-inputs-using-
+    // continuations) → fricative seams that surface as garbled "shh/chh"
+    // syllables on ~random words. Hold back the trailing partial word; emit
+    // only up to the last whitespace; flush the remainder at stream end. The
+    // held word is released by the very next delta (sub-ms) or by
+    // flushWordCarry() at turn end, so the latency cost is one partial word.
+    // Provider-agnostic (runs before ttsSendText → benefits Cartesia AND Hume).
+    // Audit M1 — safety valve. A space-less run longer than this (a URL, a long
+    // identifier, a run-on number) would otherwise be withheld from TTS until
+    // the next whitespace or stream end → an audible mid-sentence STALL, and on
+    // the paraphrase-off path (prod default) the first emission IS the
+    // time-to-first-audio the north star measures. Past the valve we force-emit,
+    // accepting a rare mid-word split (far better than a multi-hundred-ms gap).
+    // 48 chars is ~8 average English words of headroom — normal words never trip it.
+    const WORD_CARRY_MAX = 48;
+    let wordCarry = '';
+    const emitWordAligned = (text) => {
+      if (!text) return;
+      wordCarry += text;
+      // Last whitespace we can safely cut on (space, LF, tab, CR).
+      let cut = -1;
+      for (let i = wordCarry.length - 1; i >= 0; i--) {
+        const c = wordCarry.charCodeAt(i);
+        if (c === 32 || c === 10 || c === 9 || c === 13) { cut = i; break; }
+      }
+      if (cut < 0) {
+        // No boundary yet. Hold UNLESS we'd stall on a pathological long token.
+        if (wordCarry.length >= WORD_CARRY_MAX) { ttsSendText(wordCarry); wordCarry = ''; }
+        return;
+      }
+      const flushable = wordCarry.slice(0, cut + 1);
+      wordCarry = wordCarry.slice(cut + 1);
+      if (flushable) ttsSendText(flushable);
+    };
+    const flushWordCarry = () => {
+      // S3 — skip a whitespace-only residue (e.g. a trailing "\n"): a blank
+      // continuation buys nothing and Cartesia would just no-op it.
+      if (wordCarry.trim()) ttsSendText(wordCarry);
+      wordCarry = '';
+    };
     try {
       for await (const ev of gen) {
         if (ev.final) { final = ev; continue; }
@@ -286,6 +329,13 @@ export function makeDecoupledOrchestrator({
           // happily ride all the way to its natural end — the cap did
           // nothing. Correct semantics: hit a boundary OR hit the slack
           // window, EITHER WAY stop processing the stream.
+          //
+          // Audit M3 — `charsEmitted` counts chars HANDED TO the word buffer,
+          // not chars actually flushed to TTS; the buffer may hold a trailing
+          // partial word. So the bytes finally reaching Cartesia can exceed
+          // charsEmitted by at most one held word (≤ WORD_CARRY_MAX=48), which
+          // is well inside OUTPUT_CHAR_SLACK (200). The kill-switch derivation
+          // (R4-C2, ≤4000c/turn) therefore still holds with margin to spare.
           if (charsEmitted >= OUTPUT_CHAR_CEILING) {
             const tail = ev.delta;
             // Slack window: how many more chars are we allowed to emit?
@@ -300,14 +350,17 @@ export function makeDecoupledOrchestrator({
               }
             }
             if (endIdx < 0) endIdx = scanLen; // no boundary in window → hard cap
-            if (endIdx > 0) { ttsSendText(tail.slice(0, endIdx)); charsEmitted += endIdx; }
+            // S2 — feed the slice through the word buffer like any other delta;
+            // its trailing partial word (if any) is released by the post-loop
+            // flushWordCarry() below, not inline.
+            if (endIdx > 0) { emitWordAligned(tail.slice(0, endIdx)); charsEmitted += endIdx; }
             overflowAborted = true;
             log.warn?.(`[decoupled] ${kind} char-ceiling exceeded — aborted at ${charsEmitted}c (turn=${turnNumber})`);
             try { deepAbort?.abort?.(); } catch {}
             try { gen?.return?.(); } catch {}
             break;
           }
-          ttsSendText(ev.delta);
+          emitWordAligned(ev.delta);
           charsEmitted += ev.delta.length;
         }
       }
@@ -326,9 +379,19 @@ export function makeDecoupledOrchestrator({
       if (e && e.partial && e.partial.billed === true) {
         await safeLogLeg(e.partial, turnNumber, `${kind}.partial`);
       }
+      // Flush the held partial word so a degrade doesn't DROP the last word
+      // (which would re-introduce a mid-word cut). The held word is real text
+      // the model already produced; Cartesia's turnEnd terminates the context.
+      // Audit M4 — this flushed word's LLM cost is already in the billed
+      // `.partial` leg (the model generated it); its TTS cost is counted by the
+      // Cartesia/Hume bridge's own _charsThisTurn at ttsBridge.turnEnd(), which
+      // index.js still calls after this turn settles. No un-logged spend.
+      flushWordCarry();
       log.warn?.(`[decoupled] ${kind} degraded (${code || 'unknown'}): ${e && e.message}`);
       return { degraded: code || 'unknown', final: null, firstChunkMs };
     }
+    // Normal end (incl. char-ceiling break): release the final held word.
+    flushWordCarry();
     if (final) await safeLogLeg(final, turnNumber, kind);
     return {
       degraded: overflowAborted ? 'char_ceiling' : null,

@@ -82,12 +82,17 @@ test('paraphrase speaks first; deep answer NEVER overlaps it', async () => {
   });
   orch.onUserTranscript('q', 1);
   await tick();
-  assert.deepEqual(tts, ['Let me ', 'think...']);
+  // Word-boundary buffer (2026-05-26): the trailing partial word of a stream
+  // that is still SUSPENDED (gated before {final}) is held back until flush,
+  // so only the space-terminated 'Let me ' has reached TTS; 'think...' is held.
+  assert.deepEqual(tts, ['Let me ']);
   const tc = orch.onTurnComplete();
   await tick();
-  assert.deepEqual(tts, ['Let me ', 'think...'], 'no deep chunk while paraphrase unfinished');
+  assert.deepEqual(tts, ['Let me '], 'no deep chunk while paraphrase unfinished');
   rel.resolve();
   await tc;
+  // Once each stream completes, flushWordCarry() releases the held final word —
+  // so the full word-aligned sequence lands.
   assert.deepEqual(tts, ['Let me ', 'think...', 'The ', 'grounded ', 'answer.']);
   assert.equal(orch.lastAssistantResponse(), 'The grounded answer.');
 });
@@ -116,7 +121,9 @@ test('redundant onTurnComplete (early-trigger + Gemini fallback) does NOT resolv
   await tick();
   assert.equal(spokenResolved, false,
     'spoken must NOT resolve while the deep answer is mid-stream (else ttsBridge.turnEnd closes Cartesia → silence)');
-  assert.deepEqual(tts, ['The answer.'], 'deep answer delta already streamed to TTS');
+  // Word-boundary buffer: 'The ' streamed (space-terminated); the still-held
+  // 'answer.' proves the partial trailing word waits for flush at stream end.
+  assert.deepEqual(tts, ['The '], 'deep answer delta already streamed to TTS');
   rel.resolve();
   await tc1;
   await tick();
@@ -146,7 +153,9 @@ test('audit M2 — fallback onTurnComplete DURING retrieval (before any deep del
   await tc1;
   await tick();
   assert.equal(resolved, true, 'spoken resolves after the deep answer streams');
-  assert.deepEqual(tts, ['Grounded answer.'], 'deep answer reaches TTS once retrieval completes');
+  // Word-boundary buffer: single delta 'Grounded answer.' emits the space-
+  // terminated 'Grounded ' mid-stream, then flushWordCarry() releases 'answer.'.
+  assert.deepEqual(tts, ['Grounded ', 'answer.'], 'deep answer reaches TTS once retrieval completes');
 });
 
 // ── C1: awaitTurnSpoken gates ttsBridge.turnEnd() ───────────────────────
@@ -161,8 +170,11 @@ test('C1: awaitTurnSpoken does NOT resolve until the deep answer finished stream
   await tick();
   orch.onTurnComplete();
   await tick();
-  // Deep answer has streamed its deltas but not its terminal {final}.
-  assert.deepEqual(tts, ['Let me ', 'think...', 'The ', 'answer.']);
+  // Deep answer has streamed its deltas but not its terminal {final}. The
+  // paraphrase completed (so its held 'think...' was flushed); the deep stream
+  // is still suspended, so its trailing 'answer.' stays held in the word-buffer
+  // — only the space-terminated 'The ' has reached TTS.
+  assert.deepEqual(tts, ['Let me ', 'think...', 'The ']);
   let spokenResolved = false;
   const sp = orch.awaitTurnSpoken(10_000).then(() => { spokenResolved = true; });
   await tick();
@@ -171,6 +183,32 @@ test('C1: awaitTurnSpoken does NOT resolve until the deep answer finished stream
   deepGate.resolve();          // deep answer completes
   await sp;
   assert.equal(spokenResolved, true, 'now safe to send continue:false');
+});
+
+// ── word-boundary buffer (mid-word "shh/chh" garble fix, 2026-05-26) ────────
+
+test('word-boundary buffer: a delta that splits a word mid-grapheme never reaches TTS as a fragment', async () => {
+  // The brain LLM streams token-aligned deltas that split mid-word
+  // ('mon'|'k under'|'stands.'). Forwarding each raw delta as its own Cartesia
+  // continuation message produced fricative seams (garbled "shh/chh"). The
+  // buffer must reassemble whole words before they hit TTS.
+  const { orch, tts } = harness({
+    paraphraseEnabled: false,
+    generateDeepAnswer: () => genStream(['The mon', 'k under', 'stands.'],
+      { operation: 'brain_deep_answer', text: 'The monk understands.', firstChunkMs: 3, latencyMs: 4, startedAt: 1 }),
+  });
+  orch.onUserTranscript('q', 1);
+  orch.onTurnComplete();
+  await tick();
+  // 1. Nothing is lost or duplicated: the concatenation is the exact answer.
+  assert.equal(tts.join(''), 'The monk understands.');
+  // 2. Every emitted piece EXCEPT the final flush ends on whitespace — i.e. no
+  //    chunk ever ends in the middle of a word ('mon', 'under' never go alone).
+  tts.slice(0, -1).forEach((piece) => {
+    assert.match(piece, /\s$/, `chunk ${JSON.stringify(piece)} must end on a word boundary`);
+  });
+  // 3. Concretely, the reassembled words ride single contiguous chunks.
+  assert.deepEqual(tts, ['The ', 'monk ', 'understands.']);
 });
 
 test('C1: awaitTurnSpoken resolves on barge even though the deep answer never finished', async () => {
