@@ -13,8 +13,10 @@ type Status = {
   handle: string | null;
 };
 
-// Routes that must NOT show the app shell.
-const HIDDEN_PREFIXES = ['/login', '/onboarding', '/apply', '/auth', '/waitlist', '/admin', '/invite', '/r/', '/rate/'];
+// Routes that must NOT show the app shell. `/s/` is the immersive live voice
+// session ("ask") — it has its own End button and a fixed-bottom talk button, so
+// the nav both clutters it and overlaps the talk control. Stay full-screen there.
+const HIDDEN_PREFIXES = ['/login', '/onboarding', '/apply', '/auth', '/waitlist', '/admin', '/invite', '/r/', '/rate/', '/s/'];
 
 function Icon({ d }: { d: string }) {
   return (
