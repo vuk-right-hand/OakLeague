@@ -61,7 +61,7 @@
 // is best-effort enrichment — failing it should not crash the session,
 // just degrade to the raw query.
 
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { z } from 'zod';
 
 // Pinned model. `gemini-2.5-flash` is the current GA alias; matches
@@ -285,8 +285,14 @@ export async function rewriteQuery(input: RewriteInput): Promise<RewriteResult> 
     // timing out + 504-ing retrieval. Family-aware shape mirrors
     // brain-llm-common.js#thinkingConfigFor (2.5: thinkingBudget, 3.x: level).
     const isV3 = /^gemini-3(\.|-)/i.test(QUERY_REWRITE_MODEL);
+    // SDK-canonical enum for generateContent (serializes to "MINIMAL", uppercase).
+    // Same LOGICAL level as the JS proxy mirror brain-llm-common.js#thinkingConfigFor,
+    // but DIFFERENT WIRE CASING — the proxy sends lowercase 'minimal'. Inert today
+    // (default model is gemini-2.5-flash → isV3=false → thinkingBudget:0 path). Before
+    // any gemini-3.x model is pinned here, the v3 enable gate (P1-9) MUST verify which
+    // casing the pinned model actually honors so the two paths don't silently diverge.
     const thinkingConfig = isV3
-      ? { thinkingLevel: 'minimal' as const }
+      ? { thinkingLevel: ThinkingLevel.MINIMAL }
       : { thinkingBudget: 0 };
     const flashPromise = c.models.generateContent({
       model: QUERY_REWRITE_MODEL,

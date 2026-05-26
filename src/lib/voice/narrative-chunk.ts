@@ -25,7 +25,7 @@
 // the same creator.
 
 import 'server-only';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { z } from 'zod';
 import { sanitizeForLLMPrompt } from './preprocess';
 
@@ -286,8 +286,14 @@ async function callFlashOnce(args: {
     // don't improve schema adherence. Family-aware shape (2.5: thinkingBudget,
     // 3.x: thinkingLevel) mirrors server/voice-proxy/brain-llm-common.js#thinkingConfigFor.
     const isV3 = /^gemini-3(\.|-)/i.test(NARRATIVE_CHUNK_MODEL);
+    // SDK-canonical enum for generateContent (serializes to "MINIMAL", uppercase).
+    // Same LOGICAL level as the JS proxy mirror brain-llm-common.js#thinkingConfigFor,
+    // but DIFFERENT WIRE CASING — the proxy sends lowercase 'minimal'. Inert today
+    // (default model is gemini-2.5-flash → isV3=false → thinkingBudget:0 path). Before
+    // any gemini-3.x model is pinned here, the v3 enable gate (P1-9) MUST verify which
+    // casing the pinned model actually honors so the two paths don't silently diverge.
     const thinkingConfig = isV3
-      ? { thinkingLevel: 'minimal' as const }
+      ? { thinkingLevel: ThinkingLevel.MINIMAL }
       : { thinkingBudget: 0 };
     const flashPromise = c.models.generateContent({
       model: NARRATIVE_CHUNK_MODEL,
