@@ -93,6 +93,12 @@ const AUDIO_CONTEXT_RESUME_VERIFY_MS = 300;
 // iOS WebKit: verify AudioContext.state === 'running' 300ms after resume()
 // (R3-M4 — visibilitychange is not a user gesture).
 
+// Re-audit Small — trailing-audio settle window before flushing the Simli
+// tail-carry on 'deep_answer_done'. Each audio_out re-arms it, so the flush
+// lands GRACE_MS after the genuine last synthesis chunk. Module scope so the
+// arm/clear useCallbacks need no dependency on it.
+const TAIL_FLUSH_GRACE_MS = 200;
+
 export type PipeHandle = {
   state: SessionState;
   videoRef: React.RefObject<HTMLVideoElement | null>;
@@ -208,6 +214,26 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   // that left phase stuck at speaking after every turn). Reset on startMic /
   // endSession / visibility-hidden so a stuck flag never blocks the next turn.
   const expectingTtsRef = useRef<boolean>(false);
+  // 2026-05-25 — avatar tail-flush. On the proxy's per-utterance
+  // 'deep_answer_done', flush the Simli tail-carry (the stranded last ≤187ms
+  // that caused "cut off mid-word") ONCE — but only after trailing synthesis
+  // audio settles: each subsequent audio_out RE-ARMS the timer, so we flush
+  // TAIL_FLUSH_GRACE_MS after the genuine last chunk. Gated on the signal →
+  // never fires mid-answer (no false-positive flush during active generation).
+  const tailFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const tailPendingRef = useRef<boolean>(false);
+  const armTailFlush = useCallback(() => {
+    if (tailFlushTimerRef.current) clearTimeout(tailFlushTimerRef.current);
+    tailFlushTimerRef.current = setTimeout(() => {
+      tailFlushTimerRef.current = null;
+      tailPendingRef.current = false;
+      try { bridgeRef.current?.commitUtterance?.(); } catch { /* tail flush is best-effort */ }
+    }, TAIL_FLUSH_GRACE_MS);
+  }, []);
+  const clearTailFlush = useCallback(() => {
+    if (tailFlushTimerRef.current) { clearTimeout(tailFlushTimerRef.current); tailFlushTimerRef.current = null; }
+    tailPendingRef.current = false;
+  }, []);
   // Forward-ref for stopMic so the silence-timer callback (set up inside
   // startMic) can call stopMic without a temporal-dead-zone issue. The
   // useCallback below assigns into this ref after defining stopMic.
@@ -694,6 +720,10 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
             captureSafe('user_perceived_response_ms', { ms, session_id: sessionIdRef.current });
           }
           try { bridgeRef.current?.sendAudio(bytes); } catch { /* bridge closed */ }
+          // 2026-05-25 — after 'deep_answer_done', each trailing audio_out pushes
+          // the tail-flush later so we flush the Simli carry only once audio
+          // truly settles (rides out Cartesia synthesis lag).
+          if (tailPendingRef.current) armTailFlush();
           // Phase-transition gate (R5-C3 audit). Only dispatch while we're
           // still waiting for the model's response — drop tail chunks that
           // arrive after the server fired turn_complete so phase doesn't
@@ -724,6 +754,16 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
           expectingTtsRef.current = false;
           try { bridgeRef.current?.commitUtterance?.(); } catch { /* */ }
           dispatchRef({ kind: 'turn_complete' });
+        },
+        // 2026-05-25 — per-utterance "deep answer done" (decoupled): the EARLY,
+        // accurate end-of-audio boundary (turn_complete above is +6–20s late).
+        // Arm the gated tail-flush; trailing audio_out re-arms it, then it flushes
+        // the Simli carry once. Gated → never fires mid-answer.
+        onDeepAnswerDone: () => {
+          if (cancelled) return;
+          if (micActiveRef.current) return; // user already talking — barge owns teardown
+          tailPendingRef.current = true;
+          armTailFlush();
         },
         onError: (code, detail) => {
           if (cancelled) return;
@@ -823,6 +863,7 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
 
     return () => {
       cancelled = true;
+      clearTailFlush();
     };
     // Intentionally run once per mount — envelope is stable until rollover
     // which handles re-open internally via a dedicated effect below.
@@ -875,6 +916,12 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
             Sentry.captureException(e, { level: 'warning', extra: { op: 'sendControl_cancel_visibility', session_id: sessionIdRef.current } });
           }
         }
+        // Re-audit M2 — cancel any pending avatar tail-flush from a just-
+        // finished turn. Backgrounding pauses the session; a flush firing 200ms
+        // later (the GRACE window) would push a stale carry into Simli after the
+        // pause, and on resume it could play late over the user. commitUtterance
+        // itself also guards closed/!ready, but clearing here is the clean fix.
+        clearTailFlush();
         dispatchRef({ kind: 'visibility_hidden' });
         // Stop mic frame delivery but keep AudioContext + worklet alive to
         // avoid full re-initialization on resume.
@@ -1119,6 +1166,10 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       }
     }, 500);
     dispatchRef({ kind: 'mic_started' });
+    // 2026-05-25 — a new turn (incl. barge) is starting: cancel any pending
+    // tail-flush from the prior turn so a stale carry never plays late over the
+    // user. cancel() below also drops the Simli carry itself on a barge.
+    clearTailFlush();
     // Proxy turn boundary + barge-in. mic-tap during 'speaking' is a
     // barge-in: cancel the in-flight TTS playback locally (avatar buffer)
     // and tell proxy so Cartesia stops synthesizing.

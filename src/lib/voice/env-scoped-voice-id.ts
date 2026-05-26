@@ -1,13 +1,17 @@
-// SIMLI_WIREUP §12a.1 / R3-Missing-1 / R4-M6 — env-scoped voice_id helpers.
+// SIMLI_WIREUP §12a.1 / R3-Missing-1 / R4-M6 — env-scoped voice-id helpers.
 //
-// creators table has THREE Cartesia voice-id columns:
-//   * voice_id          — VERCEL_ENV=production
-//   * voice_id_preview  — VERCEL_ENV=preview (per-branch deploys)
-//   * voice_id_dev      — VERCEL_ENV unset OR =development (local)
+// `creators` carries env-scoped voice-id columns for BOTH providers:
+//   Cartesia:  voice_id           voice_id_preview           voice_id_dev
+//   Hume:      hume_voice_id      hume_voice_id_preview      hume_voice_id_dev
+//   Hume name: hume_voice_name    hume_voice_name_preview    hume_voice_name_dev
 //
-// VERCEL_ENV is the right gate (NOT NODE_ENV), because Vercel preview
-// deploys run with NODE_ENV=production. Reading by NODE_ENV would let a
-// preview-branch voice-clone overwrite the prod creator's voice id.
+// VERCEL_ENV is the right gate (NOT NODE_ENV), because Vercel preview deploys
+// run with NODE_ENV=production. Reading by NODE_ENV would let a preview-branch
+// clone overwrite the production voice id.
+//
+// HUME_TTS_PLAN §6.2 (2026-05-13): every resolver now takes a `provider`
+// argument so /api/sessions/open and /api/sessions/rollover can drive the same
+// helper for either Cartesia or Hume without branching at every call site.
 //
 // Server-only — no client-side resolution. The browser never knows which
 // column was read.
@@ -15,6 +19,7 @@
 import 'server-only';
 
 export type VoiceIdEnv = 'production' | 'preview' | 'development';
+export type TtsProvider = 'cartesia' | 'hume';
 
 export function currentVoiceIdEnv(): VoiceIdEnv {
   const v = process.env.VERCEL_ENV;
@@ -23,19 +28,107 @@ export function currentVoiceIdEnv(): VoiceIdEnv {
   return 'development';
 }
 
-export function voiceIdColumn(env: VoiceIdEnv = currentVoiceIdEnv()): 'voice_id' | 'voice_id_preview' | 'voice_id_dev' {
+// Cartesia voice-id column for the given env.
+type CartesiaVoiceCol = 'voice_id' | 'voice_id_preview' | 'voice_id_dev';
+// Hume voice-id column for the given env.
+type HumeVoiceCol = 'hume_voice_id' | 'hume_voice_id_preview' | 'hume_voice_id_dev';
+type HumeNameCol  = 'hume_voice_name' | 'hume_voice_name_preview' | 'hume_voice_name_dev';
+
+export function voiceIdColumn(
+  env: VoiceIdEnv = currentVoiceIdEnv(),
+  provider: TtsProvider = 'cartesia',
+): CartesiaVoiceCol | HumeVoiceCol {
+  if (provider === 'hume') {
+    if (env === 'production') return 'hume_voice_id';
+    if (env === 'preview')    return 'hume_voice_id_preview';
+    return 'hume_voice_id_dev';
+  }
   if (env === 'production') return 'voice_id';
   if (env === 'preview')    return 'voice_id_preview';
   return 'voice_id_dev';
 }
 
-// Convenience: resolve the env-appropriate value from a row that has all
-// three columns selected.
+export function humeVoiceNameColumn(env: VoiceIdEnv = currentVoiceIdEnv()): HumeNameCol {
+  if (env === 'production') return 'hume_voice_name';
+  if (env === 'preview')    return 'hume_voice_name_preview';
+  return 'hume_voice_name_dev';
+}
+
+// Shape a fully-loaded creator row carries for the resolvers below. All fields
+// nullable — callers may select only the columns they need; missing keys read
+// as undefined and the resolvers coerce to null.
+export type VoiceColumnsRow = {
+  voice_id?: string | null;
+  voice_id_preview?: string | null;
+  voice_id_dev?: string | null;
+  hume_voice_id?: string | null;
+  hume_voice_id_preview?: string | null;
+  hume_voice_id_dev?: string | null;
+  hume_voice_name?: string | null;
+  hume_voice_name_preview?: string | null;
+  hume_voice_name_dev?: string | null;
+};
+
 export function resolveVoiceId(
-  row: { voice_id: string | null; voice_id_preview: string | null; voice_id_dev: string | null },
+  row: VoiceColumnsRow,
+  env: VoiceIdEnv = currentVoiceIdEnv(),
+  provider: TtsProvider = 'cartesia',
+): string | null {
+  if (provider === 'hume') {
+    if (env === 'production') return row.hume_voice_id        ?? null;
+    if (env === 'preview')    return row.hume_voice_id_preview ?? null;
+    return row.hume_voice_id_dev ?? null;
+  }
+  if (env === 'production') return row.voice_id        ?? null;
+  if (env === 'preview')    return row.voice_id_preview ?? null;
+  return row.voice_id_dev ?? null;
+}
+
+export function resolveHumeVoiceName(
+  row: VoiceColumnsRow,
   env: VoiceIdEnv = currentVoiceIdEnv(),
 ): string | null {
-  if (env === 'production') return row.voice_id;
-  if (env === 'preview')    return row.voice_id_preview;
-  return row.voice_id_dev;
+  if (env === 'production') return row.hume_voice_name        ?? null;
+  if (env === 'preview')    return row.hume_voice_name_preview ?? null;
+  return row.hume_voice_name_dev ?? null;
+}
+
+// Audit small fix — supabase-js returns numeric columns as JS string.
+// The route-side coercion was duplicated in sessions/open and rollover.
+// Lift it here so both routes share one well-tested helper.
+export function coerceNumericOrNull(v: unknown): number | null {
+  if (v == null) return null;
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+// HUME_TTS_PLAN §6.4 — generic env-scoped column picker. The four Hume
+// prosody columns follow the same pattern (`<base>` | `<base>_preview` |
+// `<base>_dev`); rather than four named resolvers, expose one helper that
+// looks up the env-suffixed key on the row. Caller coerces (numeric arrives
+// as string from supabase-js).
+type HumeProsodyBase =
+  | 'hume_tts_speed'
+  | 'hume_trailing_silence'
+  | 'hume_voice_description'
+  | 'hume_model_version';
+
+export function pickEnvScoped(
+  row: Record<string, unknown>,
+  baseColumn: HumeProsodyBase,
+  env: VoiceIdEnv = currentVoiceIdEnv(),
+): unknown {
+  // Audit S12 (unit-wide) — runtime defense in case the SELECT call site
+  // didn't include the column (e.g., a `select('id')` minimal query that
+  // happens to pass through this helper via a future code path). Without
+  // the check the function returns null silently, hiding the bug.
+  const key = env === 'production' ? baseColumn
+           : env === 'preview'    ? `${baseColumn}_preview`
+           :                        `${baseColumn}_dev`;
+  if (!Object.prototype.hasOwnProperty.call(row, key)) {
+    // eslint-disable-next-line no-console
+    console.warn(`[pickEnvScoped] row missing key '${key}' — caller should SELECT it. Returning null.`);
+    return null;
+  }
+  return row[key] ?? null;
 }

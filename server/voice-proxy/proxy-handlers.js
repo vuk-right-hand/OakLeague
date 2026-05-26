@@ -6,6 +6,7 @@
 // trips the WS-close hook after 3 consecutive failures.
 
 import { captureException } from './sentry.js';
+import { validateHumePricingOrExit, assertHumePricing } from './hume-bridge.js';
 
 // ── Pricing constants (Pipeline α' COGS) ────────────────────────────────────
 //
@@ -42,10 +43,62 @@ export const GEMINI_TOKENS_PER_SEC_FALLBACK_SOURCE = process.env.GEMINI_TOKENS_P
 // load otherwise. A missed env var must be a hard fail at boot, never a
 // silent ship-at-$0.
 //
-// VOICE_CARTESIA_ENABLED governs whether the proxy instantiates the
-// bridge at session-open — when '0', leg-3/leg-4 stay at zero with
-// metadata.cartesia_pending=true (back-compat with pre-α' rows).
-export const VOICE_CARTESIA_ENABLED = process.env.VOICE_CARTESIA_ENABLED === '1';
+// VOICE_TTS_LAYER_ENABLED governs whether the proxy instantiates a
+// dedicated TTS bridge (Cartesia or Hume) at session-open — when '0',
+// leg-3/leg-4 stay at zero with metadata.cartesia_pending=true (back-compat
+// with pre-α' rows).
+//
+// 2026-05-14 rename: was VOICE_CARTESIA_ENABLED. Old name carries during
+// the Fly/Vercel migration window — set the new name on both, then drop
+// the old fallback in a follow-up cleanup. `VOICE_CARTESIA_ENABLED` was
+// misleading because it really means "α' TTS layer on (Cartesia OR Hume)."
+// Audit M1 — `??` only falls through on null/undefined, NOT empty string.
+// `fly secrets set VOICE_TTS_LAYER_ENABLED=` (or a templating bug) yields
+// "" — which is non-nullish, so `??` would NOT fall back to the legacy
+// VOICE_CARTESIA_ENABLED=1 Fly secret, and `"" === '1'` is false → the
+// ENTIRE α' TTS layer silently turns off mid-migration-window (every
+// session drops to legacy Gemini-audio). Treat the new var as "set" only
+// when it's an explicit '1' or '0'; otherwise fall back to legacy.
+const _newRaw = process.env.VOICE_TTS_LAYER_ENABLED;
+const _legacyCartesiaEnv = process.env.VOICE_CARTESIA_ENABLED;
+const _newExplicit = _newRaw === '1' || _newRaw === '0';
+export const VOICE_TTS_LAYER_ENABLED = (_newExplicit ? _newRaw : _legacyCartesiaEnv) === '1';
+// Alias kept so existing imports compile during the migration; new code
+// should import VOICE_TTS_LAYER_ENABLED. Both refer to the SAME value.
+export const VOICE_CARTESIA_ENABLED = VOICE_TTS_LAYER_ENABLED;
+
+// HUME_TTS_PLAN §6.10 — getHumePricing parallel to getCartesiaPricing.
+//
+// Audit C2 (unit-wide, 2026-05-13) — single source of truth. Both bridge
+// construction (index.js) AND logTurnCogs (this file) read this cached
+// value. Earlier draft had a duplicate cache in index.js; the two could
+// diverge on a test mock and during a partial pricing rotation.
+//
+// `_humePricingPrimeForBoot` is called from index.js's `provisionPricing()`
+// so the validator runs once at boot, surfacing missing env as a clean
+// FATAL before the first session. Lazy `getHumePricing()` is the fallback
+// for the C4 "probe-failed-at-boot, deferred" path.
+let _humePricing = null;
+// Audit C5 — LAZY/runtime path. Called from `logTurnCogs` (per-turn) and
+// bridge construction. THROWS on misconfig (never process.exit) so a
+// fleet missing HUME_USD_PER_CHAR fails the ONE offending session
+// (cogsPromise.catch → 1011 cogs_misconfig close) instead of hard-exiting
+// the VM and dropping every concurrent user's WebSocket on a crash-loop.
+export function getHumePricing() {
+  if (_humePricing != null) return _humePricing;
+  _humePricing = assertHumePricing();
+  return _humePricing;
+}
+// Audit C5 — BOOT path only. process.exit on misconfig so a broken fleet
+// crash-loops loudly at start. Safe here: no sessions exist yet.
+export function _humePricingPrimeForBoot() {
+  _humePricing = validateHumePricingOrExit();
+  return _humePricing;
+}
+// Test-only — reset the singleton so per-test env tweaks take effect.
+export function _humePricingResetForTests() {
+  _humePricing = null;
+}
 
 let _cartesiaUsdPerChar = null;
 let _cartesiaQuotedAt = null;
@@ -53,7 +106,7 @@ export function getCartesiaPricing() {
   if (_cartesiaUsdPerChar !== null) {
     return { usdPerChar: _cartesiaUsdPerChar, quotedAt: _cartesiaQuotedAt };
   }
-  if (!VOICE_CARTESIA_ENABLED) {
+  if (!VOICE_TTS_LAYER_ENABLED) {
     // Cartesia disabled: no need to validate the constants.
     _cartesiaUsdPerChar = 0;
     _cartesiaQuotedAt = '';
@@ -62,13 +115,13 @@ export function getCartesiaPricing() {
   const raw = Number(process.env.CARTESIA_USD_PER_CHAR);
   if (!Number.isFinite(raw) || raw <= 0) {
     throw new Error(
-      'CARTESIA_USD_PER_CHAR must be a positive finite number when VOICE_CARTESIA_ENABLED=1 (R4-S3 fail-closed)',
+      'CARTESIA_USD_PER_CHAR must be a positive finite number when VOICE_TTS_LAYER_ENABLED=1 (R4-S3 fail-closed)',
     );
   }
   const quoted = String(process.env.CARTESIA_QUOTED_AT || '').trim();
   if (!quoted || !/^\d{4}-\d{2}-\d{2}$/.test(quoted)) {
     throw new Error(
-      'CARTESIA_QUOTED_AT must be a YYYY-MM-DD date string when VOICE_CARTESIA_ENABLED=1',
+      'CARTESIA_QUOTED_AT must be a YYYY-MM-DD date string when VOICE_TTS_LAYER_ENABLED=1',
     );
   }
   _cartesiaUsdPerChar = raw;
@@ -140,18 +193,33 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
   // payload = {
   //   userId, sessionId, turnNumber,
   //   inputSeconds, outputSeconds, usageMetadata,
-  //   cartesia?: { characters, audioBytes, audioSeconds, partial }
+  //   ttsProvider?: 'cartesia' | 'hume',
+  //   tts?:      { characters, audioBytes, audioSeconds, partial },
+  //   cartesia?: { characters, audioBytes, audioSeconds, partial }   // legacy alias
   // }
-  // When `cartesia` is present, legs 3+4 are written with real values and
-  // metadata.cartesia_pending is dropped (replaced with cartesia_quoted_at +
-  // optional cartesia_partial). When absent, the legacy zeros + pending flag
-  // are written so dashboards keep the "α' not yet wired" bucket meaningful.
+  // HUME_TTS_PLAN §6.10: `ttsProvider` + `tts` are the new contract; `cartesia`
+  // is kept as a legacy alias for back-compat with pre-§6 callers. When BOTH
+  // are present, `tts` wins. When `ttsProvider` is missing, default to
+  // 'cartesia' (legacy path).
+  //
+  // When `tts` is present, legs 3+4 are written with real values + provider
+  // tag in metadata. When absent (α' off), legs 3+4 = 0 with cartesia_pending
+  // flag for back-compat dashboards.
   async function logTurnCogs(payload) {
     const {
       userId, sessionId, turnNumber,
       inputSeconds = 0, outputSeconds = 0, usageMetadata = null,
-      cartesia = null,
+      ttsProvider = 'cartesia',
+      // HUME_TTS_PLAN §6.9 / audit-C1 — when the Hume bridge's per-turn
+      // hard cap fired during this turn, the proxy sets the latch and
+      // passes it here. Tags metadata.tts_cap_exceeded so the §6.12
+      // dashboard can surface the (should-be-near-zero) frequency without
+      // a second cogs writer racing this one.
+      humeCapExceeded = false,
     } = payload;
+    // Audit S3 (unit-wide) — accept `tts` (new) or `cartesia` (legacy
+    // alias for back-compat with pre-§6 callers) in one expression.
+    const tts = payload.tts ?? payload.cartesia ?? null;
 
     // Leg 2: tokens-of-truth path vs seconds-derived fallback. The proxy-
     // supplied metadata distinguishes the two; the dashboard's headline cost
@@ -179,13 +247,29 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
       source: env,
       quoted_at: PRICING_QUOTED_AT,
     };
-    if (cartesia) {
-      const { quotedAt } = getCartesiaPricing();
-      meta.cartesia_quoted_at = quotedAt;
-      if (cartesia.partial) meta.cartesia_partial = true;
+    if (tts) {
+      // HUME_TTS_PLAN §6.5 — provider-aware metadata. tts_provider tagged
+      // on every cogs row so the aggregator can group by provider without
+      // joining sessions. tts_quoted_at carries provider-specific rate
+      // provenance; tts_partial flags hangs/timeouts for reconciliation.
+      meta.tts_provider = ttsProvider;
+      const pricing = ttsProvider === 'hume' ? getHumePricing() : getCartesiaPricing();
+      meta.tts_quoted_at = pricing.quotedAt;
+      if (tts.partial) meta.tts_partial = true;
+      // Back-compat keys retained until dashboards are re-deployed for the
+      // §6.12 aggregator rewrite. Cartesia-specific keys only get written
+      // when provider=cartesia; otherwise they'd be misleading.
+      if (ttsProvider === 'cartesia') {
+        meta.cartesia_quoted_at = pricing.quotedAt;
+        if (tts.partial) meta.cartesia_partial = true;
+      }
     } else {
       // Pre-α' rows: keep the deferral flag for dashboard bucketing.
       meta.cartesia_pending = true;
+      meta.tts_provider = ttsProvider; // still tag the env-resolved default
+    }
+    if (humeCapExceeded) {
+      meta.tts_cap_exceeded = true;
     }
     if (isFallback) {
       meta.fallback = 'seconds';
@@ -206,48 +290,147 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
 
     const inputCost = (inputSeconds || 0) * GEMINI_INPUT_USD_PER_SEC;
 
-    // Cartesia legs 3 + 4 — populated only when α' is on (caller passed
-    // `cartesia`). Cost computed at call-time so the kill-switch at
-    // module-load failure (R4-S3) can still fire.
-    let cartesiaChars = 0;
-    let cartesiaCost = 0;
-    let cartesiaAudioSeconds = 0;
-    if (cartesia) {
-      const { usdPerChar } = getCartesiaPricing();
-      cartesiaChars = Math.max(0, Math.round(cartesia.characters || 0));
-      cartesiaCost = Number((cartesiaChars * usdPerChar).toFixed(6));
-      cartesiaAudioSeconds = Number((cartesia.audioSeconds || 0).toFixed(4));
+    // TTS legs 3 + 4 — populated only when α' is on (caller passed `tts`).
+    // Cost computed at call-time so the kill-switch at module-load failure
+    // (R4-S3) can still fire. Provider-aware pricing per HUME_TTS_PLAN §6.10.
+    let ttsChars = 0;
+    let ttsCost = 0;
+    let ttsAudioSeconds = 0;
+    if (tts) {
+      const pricing = ttsProvider === 'hume' ? getHumePricing() : getCartesiaPricing();
+      ttsChars = Math.max(0, Math.round(tts.characters || 0));
+      ttsCost = Number((ttsChars * pricing.usdPerChar).toFixed(6));
+      ttsAudioSeconds = Number((tts.audioSeconds || 0).toFixed(4));
     }
 
     try {
-      const { error } = await supabase.rpc('cogs_insert_turn_voice', {
+      // HUME_TTS_PLAN §6.10 — call v2 directly with p_tts_service. The v1
+      // shim still works (it forwards with p_tts_service='cartesia') but
+      // calling v2 explicitly is the only way Hume cogs lands correctly.
+      const { error } = await supabase.rpc('cogs_insert_turn_voice_v2', {
         p_user_id: userId,
         p_session_id: sessionId,
         p_turn_number: turnNumber,
-        // Leg 1 — Gemini audio-in seconds
         p_gemini_audio_in_seconds: Number((inputSeconds || 0).toFixed(4)),
         p_gemini_audio_in_cost:    Number(inputCost.toFixed(6)),
-        // Leg 2 — Gemini audio-out tokens (or seconds-derived fallback)
         p_gemini_audio_out_tokens: audioOutTokens,
         p_gemini_audio_out_cost:   Number(audioOutCost.toFixed(6)),
-        // Legs 3 + 4 — Cartesia (zero when α' off / cartesia not passed)
-        p_cartesia_characters:     cartesiaChars,
-        p_cartesia_cost:           cartesiaCost,
-        p_cartesia_audio_seconds:  cartesiaAudioSeconds,
-        p_environment: env,
-        p_metadata: meta,
+        p_tts_service:             ttsProvider,
+        p_tts_provider:            ttsProvider,
+        p_tts_characters:          ttsChars,
+        p_tts_cost:                ttsCost,
+        p_tts_audio_seconds:       ttsAudioSeconds,
+        p_environment:             env,
+        p_metadata:                meta,
       });
       if (error) {
-        console.error('[cogs_insert_turn_voice]', error);
-        captureException(error, { op: 'cogs_insert_turn_voice', sessionId, userId, turnNumber });
+        console.error('[cogs_insert_turn_voice_v2]', error);
+        captureException(error, { op: 'cogs_insert_turn_voice_v2', sessionId, userId, turnNumber, ttsProvider });
         recordFailure(sessionId);
         return { ok: false };
       }
       recordSuccess(sessionId);
       return { ok: true, fallback: isFallback };
     } catch (e) {
-      console.error('[cogs_insert_turn_voice] exception', e);
-      captureException(e, { op: 'cogs_insert_turn_voice', sessionId, userId, turnNumber });
+      console.error('[cogs_insert_turn_voice_v2] exception', e);
+      captureException(e, { op: 'cogs_insert_turn_voice_v2', sessionId, userId, turnNumber, ttsProvider });
+      recordFailure(sessionId);
+      return { ok: false };
+    }
+  }
+
+  // DECOUPLED_BRAIN_PLAN P1-5.1b — the per-leg token COGS writer for the
+  // decoupled brain. ONE call per leg (paraphrase OR deep-answer), at the
+  // moment that leg resolves (NOT batched at turn_complete — they finish
+  // at different times and each bills-on-barge independently, P0-4a).
+  //
+  // `leg` is the bridge's terminal `{final,...}` OR its thrown `.partial`
+  // (M6). Both carry `operation` + `modelId` + `usdPer*Token` +
+  // `*Tokens` + `quotedAt`; `.partial` adds `billed:true` and may have
+  // NULL token counts (usageMetadata never arrived before the abort).
+  // A billed call MUST be cogs-visible — so on a partial we coerce null
+  // tokens → 0, write the row anyway, and flag `billed_partial` so it is
+  // a VISIBLE estimate, never a silent gap (kill-switch stays fed).
+  // Step-2 (Gemini→Haiku failover) — the valid leg operations. The
+  // failover leg ('brain_deep_answer_failover') is the Haiku call that
+  // ran when Gemini 503'd; it writes under service='anthropic' so the
+  // 150% kill-switch sees the spend AND it never collides with the
+  // primary Gemini leg's idempotency slot (migration 20260523000004).
+  const BRAIN_LEG_OPERATIONS = new Set([
+    'brain_deep_answer',
+    'brain_paraphrase',
+    'brain_deep_answer_failover',
+  ]);
+  async function logBrainLeg(payload) {
+    const { userId, sessionId, turnNumber, leg } = payload;
+    if (!leg || !BRAIN_LEG_OPERATIONS.has(leg.operation)) {
+      captureException(new Error('logBrainLeg: missing/invalid leg.operation'), {
+        op: 'cogs_insert_brain_leg', sessionId, userId, turnNumber,
+        operation: leg && leg.operation,
+      });
+      recordFailure(sessionId);
+      return { ok: false };
+    }
+    // Step-2 audit C1 — provider attribution travels on the leg. Gemini
+    // (primary) legs omit `service` → default 'gemini'; the Haiku failover
+    // bridge sets service='anthropic'. Anything outside the two-provider
+    // set is a bridge bug — coerce to 'gemini' is WRONG (mis-attributes
+    // Haiku spend), so we trust the bridge but the RPC re-guards (22023).
+    const service = leg.service === 'anthropic' ? 'anthropic' : 'gemini';
+    const isPartial = leg.billed === true;
+    const inTok  = Number.isFinite(leg.inputTokens)  ? leg.inputTokens  : 0;
+    const outTok = Number.isFinite(leg.outputTokens) ? leg.outputTokens : 0;
+    const inCost  = Number((inTok  * (leg.usdPerInputToken  || 0)).toFixed(6));
+    const outCost = Number((outTok * (leg.usdPerOutputToken || 0)).toFixed(6));
+    const meta = {
+      source: env,
+      model: leg.modelId || null,
+      quoted_at: leg.quotedAt || null,
+      // P1-9 whole-build audit C3 — `thoughts_tokens` lands in cogs_log
+      // metadata so the PROD_DEPLOY_GATE 1c manual-session checklist
+      // has a real datum to read ("thinking-off honored on the live
+      // path"). null = SDK didn't surface thoughtsTokenCount (e.g.,
+      // model family where the field is absent); 0 = surfaced and
+      // honored; >0 = thinking was emitted (M1 (A)-gate red flag).
+      thoughts_tokens: Number.isFinite(leg.thoughtsTokens) ? leg.thoughtsTokens : null,
+    };
+    // A partial with no usage = a billed call we could not size. Flag it
+    // so reconciliation can true it up; the row still exists (units/cost
+    // 0) rather than vanishing from the kill-switch's view.
+    if (isPartial && !Number.isFinite(leg.inputTokens) && !Number.isFinite(leg.outputTokens)) {
+      meta.token_estimate_unavailable = true;
+    }
+    try {
+      const { error } = await supabase.rpc('cogs_insert_brain_leg', {
+        p_user_id: userId,
+        p_session_id: sessionId,
+        p_turn_number: turnNumber,
+        p_operation: leg.operation,
+        p_input_tokens: inTok,
+        p_output_tokens: outTok,
+        p_input_cost: inCost,
+        p_output_cost: outCost,
+        p_environment: env,
+        p_billed_partial: isPartial,
+        p_metadata: meta,
+        p_service: service,
+      });
+      if (error) {
+        console.error('[cogs_insert_brain_leg]', error);
+        captureException(error, {
+          op: 'cogs_insert_brain_leg', sessionId, userId, turnNumber,
+          operation: leg.operation, billed_partial: isPartial,
+        });
+        recordFailure(sessionId);
+        return { ok: false };
+      }
+      recordSuccess(sessionId);
+      return { ok: true, billedPartial: isPartial };
+    } catch (e) {
+      console.error('[cogs_insert_brain_leg] exception', e);
+      captureException(e, {
+        op: 'cogs_insert_brain_leg', sessionId, userId, turnNumber, operation: leg.operation,
+      });
       recordFailure(sessionId);
       return { ok: false };
     }
@@ -258,7 +441,7 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
     failures.delete(sessionId);
   }
 
-  return { logTurnCogs, dropSession, _consecutiveFailures };
+  return { logTurnCogs, logBrainLeg, dropSession, _consecutiveFailures };
 }
 
 // ── makeRunReaper ───────────────────────────────────────────────────────────

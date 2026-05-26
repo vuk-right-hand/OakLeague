@@ -30,34 +30,34 @@ BEGIN
 
   -- Stale consumed (purgeable).
   INSERT INTO public.voice_tickets
-    (ticket_id, user_id, creator_id, session_id, expected_tier, purpose,
+    (ticket_id, user_id, creator_id, session_id, expected_tier, purpose, tts_provider,
      avatar_provider, expires_at, bound_ua_hash, consumed_at)
   VALUES
-    (t_stale_cons, v_user, v_creator, v_session, 'free', 'voice_session',
+    (t_stale_cons, v_user, v_creator, v_session, 'free', 'voice_session', 'cartesia',
      'simli', now() - interval '8 days', repeat('a', 64), now() - interval '8 days');
 
   -- Stale unconsumed-expired (purgeable, R3 audit M2).
   INSERT INTO public.voice_tickets
-    (ticket_id, user_id, creator_id, session_id, expected_tier, purpose,
+    (ticket_id, user_id, creator_id, session_id, expected_tier, purpose, tts_provider,
      avatar_provider, expires_at, bound_ua_hash)
   VALUES
-    (t_stale_uncon, v_user, v_creator, v_session, 'free', 'voice_session',
+    (t_stale_uncon, v_user, v_creator, v_session, 'free', 'voice_session', 'cartesia',
      'simli', now() - interval '8 days', repeat('a', 64));
 
   -- Recently consumed (preserve).
   INSERT INTO public.voice_tickets
-    (ticket_id, user_id, creator_id, session_id, expected_tier, purpose,
+    (ticket_id, user_id, creator_id, session_id, expected_tier, purpose, tts_provider,
      avatar_provider, expires_at, bound_ua_hash, consumed_at)
   VALUES
-    (t_recent_cons, v_user, v_creator, v_session, 'free', 'voice_session',
+    (t_recent_cons, v_user, v_creator, v_session, 'free', 'voice_session', 'cartesia',
      'simli', now() - interval '3 days', repeat('a', 64), now() - interval '3 days');
 
   -- Active unconsumed (preserve).
   INSERT INTO public.voice_tickets
-    (ticket_id, user_id, creator_id, session_id, expected_tier, purpose,
+    (ticket_id, user_id, creator_id, session_id, expected_tier, purpose, tts_provider,
      avatar_provider, expires_at, bound_ua_hash)
   VALUES
-    (t_active, v_user, v_creator, v_session, 'free', 'voice_session',
+    (t_active, v_user, v_creator, v_session, 'free', 'voice_session', 'cartesia',
      'simli', now() + interval '120 seconds', repeat('a', 64));
 
   v_purged := public.voice_tickets_purge_consumed();

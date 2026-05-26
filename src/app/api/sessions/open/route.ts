@@ -37,7 +37,7 @@ import type { AvatarEnvelope } from '@/lib/avatar/avatar-envelope';
 import { mintVoiceTicket, VoiceTicketMintError } from '@/lib/voice/mint-voice-ticket';
 import { buildBrainPrefix } from '@/lib/voice/brain-prefix';
 import { shouldEmitBrainNotReady } from '@/lib/voice/brain-not-ready-dedupe';
-import { resolveVoiceId } from '@/lib/voice/env-scoped-voice-id';
+import { resolveVoiceId, pickEnvScoped, coerceNumericOrNull } from '@/lib/voice/env-scoped-voice-id';
 import { createHash, randomUUID } from 'node:crypto';
 import { candidateTokenHashes, isValidTokenPlaintext } from '@/lib/recording/referral-token';
 import { captureServerSafe } from '@/lib/posthog-server';
@@ -50,6 +50,10 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 // Hard cap: Gemini Live 15-min audio-only session cap. Client advances to
 // rollover when it sees this value in the ticker.
 const GEMINI_MAX_SESSION_S = 900;
+
+// Audit S2 (unit-wide) — `coerceNumericOrNull` is the canonical helper;
+// no local alias needed. Earlier draft had a local `coerceNumOrNull`
+// shorthand; calls below now use the import directly.
 
 type Body = {
   creator_id?: unknown;
@@ -149,9 +153,23 @@ export async function POST(req: NextRequest) {
   // Brain wire-up (PR-2): SELECT system_prompt + brain_status alongside
   // existing columns so the route can hard-fail unready creators with
   // 409 brain_not_ready (R3 audit M1).
+  // HUME_TTS_PLAN §6.2 — creators carries env-scoped voice-id columns for
+  // both providers PLUS per-creator override + Hume prosody dials. SELECT
+  // them all so resolveVoiceId(row, env, provider) can route on the result.
   const { data: creatorRow, error: creatorErr } = await admin
     .from('creators')
-    .select('id, simli_face_id, heygen_avatar_id, voice_id, voice_id_preview, voice_id_dev, published_at, system_prompt, brain_status, tts_speed, brain_mode')
+    .select(`
+      id, simli_face_id, heygen_avatar_id,
+      voice_id, voice_id_preview, voice_id_dev,
+      hume_voice_id, hume_voice_id_preview, hume_voice_id_dev,
+      hume_voice_name, hume_voice_name_preview, hume_voice_name_dev,
+      hume_tts_speed, hume_tts_speed_preview, hume_tts_speed_dev,
+      hume_trailing_silence, hume_trailing_silence_preview, hume_trailing_silence_dev,
+      hume_voice_description, hume_voice_description_preview, hume_voice_description_dev,
+      hume_model_version, hume_model_version_preview, hume_model_version_dev,
+      tts_provider,
+      published_at, system_prompt, brain_status, tts_speed, brain_mode, decoupled
+    `)
     .eq('id', creatorId)
     .maybeSingle<{
       id: string;
@@ -160,6 +178,26 @@ export async function POST(req: NextRequest) {
       voice_id: string | null;
       voice_id_preview: string | null;
       voice_id_dev: string | null;
+      hume_voice_id: string | null;
+      hume_voice_id_preview: string | null;
+      hume_voice_id_dev: string | null;
+      hume_voice_name: string | null;
+      hume_voice_name_preview: string | null;
+      hume_voice_name_dev: string | null;
+      hume_tts_speed: number | string | null;
+      hume_tts_speed_preview: number | string | null;
+      hume_tts_speed_dev: number | string | null;
+      hume_trailing_silence: number | string | null;
+      hume_trailing_silence_preview: number | string | null;
+      hume_trailing_silence_dev: number | string | null;
+      hume_voice_description: string | null;
+      hume_voice_description_preview: string | null;
+      hume_voice_description_dev: string | null;
+      hume_model_version: string | null;
+      hume_model_version_preview: string | null;
+      hume_model_version_dev: string | null;
+      // Per-creator override. NULL = inherit env (proxyCfg.ttsProvider).
+      tts_provider: 'cartesia' | 'hume' | null;
       published_at: string | null;
       system_prompt: string | null;
       brain_status: 'pending' | 'queued' | 'training' | 'ready' | 'errored';
@@ -169,6 +207,12 @@ export async function POST(req: NextRequest) {
       tts_speed: number | string | null;
       // pgvector RAG plan (M2). 'drawer' | 'vector'. Default 'drawer'.
       brain_mode: 'drawer' | 'vector';
+      // DECOUPLED_BRAIN_PLAN P1-10. Snapshot of creators.decoupled at
+      // session-open. Forwarded to mintVoiceTicket (line ~930) so the
+      // voice_tickets row is in sync with the creator's current flag.
+      // Pre-P1-10 this was provably inert at the route layer (whole-
+      // build audit "route writer cannot reach decoupled today").
+      decoupled: boolean;
     }>();
   if (creatorErr) return json(500, { error: 'creator_lookup_failed' });
   if (!creatorRow) return json(404, { error: 'creator_not_found' });
@@ -200,7 +244,15 @@ export async function POST(req: NextRequest) {
   // Admin-preview escape still applies for caller with active admin role.
   const brainReady =
     creatorRow.system_prompt !== null && creatorRow.brain_status !== 'errored';
-  if (!brainReady) {
+  // C3 (FIVE_CREATOR_ONBOARDING_READINESS P0-1): an UNPUBLISHED creator must
+  // not be servable to non-admins, even when brain_status='ready'. Removing
+  // the hooks from the feed (RLS published_at gate) is not enough — a
+  // takedown / consent-withdrawal (admin_set_creator_published(…, false))
+  // must actually STOP new sessions, not just hide the entry point. The
+  // admin-preview bypass below applies to BOTH the brain-not-ready and
+  // not-published gates so admins can still open an unpublished creator.
+  const published = creatorRow.published_at !== null;
+  if (!brainReady || !published) {
     const { data: adminRow } = await admin
       .from('admin_roles')
       .select('user_id')
@@ -208,22 +260,30 @@ export async function POST(req: NextRequest) {
       .is('revoked_at', null)
       .maybeSingle();
     if (!adminRow) {
-      // PR-2 audit C4: dedupe per-creator with 5min TTL so a single
-      // misconfigured creator can't pump 1000 Sentry events/min.
-      if (shouldEmitBrainNotReady(creatorId)) {
-        Sentry.captureMessage('brain.not_ready', {
-          level: 'error',
-          extra: {
-            creator_id: creatorId,
-            brain_status: creatorRow.brain_status,
-            system_prompt_present: creatorRow.system_prompt !== null,
-          },
+      // brain_not_ready takes precedence over not_published — a creator with
+      // no persona is a harder failure than one merely awaiting publish.
+      if (!brainReady) {
+        // PR-2 audit C4: dedupe per-creator with 5min TTL so a single
+        // misconfigured creator can't pump 1000 Sentry events/min.
+        if (shouldEmitBrainNotReady(creatorId)) {
+          Sentry.captureMessage('brain.not_ready', {
+            level: 'error',
+            extra: {
+              creator_id: creatorId,
+              brain_status: creatorRow.brain_status,
+              system_prompt_present: creatorRow.system_prompt !== null,
+            },
+          });
+        }
+        return json(409, {
+          error: 'brain_not_ready',
+          creator_id: creatorId,
+          brain_status: creatorRow.brain_status,
         });
       }
       return json(409, {
-        error: 'brain_not_ready',
+        error: 'creator_not_published',
         creator_id: creatorId,
-        brain_status: creatorRow.brain_status,
       });
     }
     Sentry.addBreadcrumb({
@@ -242,16 +302,40 @@ export async function POST(req: NextRequest) {
   // a free-tier user routed through Simli needs simli_face_id; a heygen
   // user needs heygen_avatar_id. Don't block here on a missing simli id
   // when the user might be on heygen.
-  const envVoiceId = resolveVoiceId(creatorRow);
-  // U-C1 pre-WS gate: when the proxy's α' path is on, a session against a
-  // creator with no env-scoped voice_id will die at 4009 cartesia_no_voice
-  // on first WS open. Pre-empt with a user-actionable 409. The proxy is
-  // the authority for `useCartesia`; Vercel polls /voice-config (60s
-  // cache, fail-open) — flipping the Fly secret alone propagates here.
-  const { useCartesia } = await getProxyVoiceConfig();
-  if (useCartesia && !envVoiceId) {
-    return json(409, { error: 'creator_voice_not_trained' });
+  // HUME_TTS_PLAN §6.2 (Vuk-M5 fix) — freeze the proxy config ONCE per
+  // handler invocation. Without the freeze, a 60s-cache refresh OR a
+  // parallel Fly env flip between reads can race: creator.tts_provider is
+  // NULL → first read picks 'cartesia' → mint reads again → picks 'hume'.
+  // The frozen local is the single source of truth from here through
+  // mintVoiceTicket(); we never re-read the cache mid-handler.
+  const proxyCfg = await getProxyVoiceConfig();
+  // Audit M5 — proxy unreachable. We can't know whether the env defaults
+  // to cartesia or hume, so routing this session on the failOpen fallback
+  // would risk a 4009 close at WS-open for a hume-overridden creator
+  // (cartesia ticket against a creator with only hume_voice_id set).
+  // 503 instead — the client retries and the next request re-probes.
+  if (proxyCfg.failOpen) {
+    return json(503, { error: 'voice_proxy_unreachable' });
   }
+  const useTtsLayer = proxyCfg.useTtsLayer;
+  // Per-creator override wins, else inherit the frozen proxy env.
+  const sessionProvider: 'cartesia' | 'hume' =
+    creatorRow.tts_provider ?? proxyCfg.ttsProvider;
+  // Audit C4 — the proxy activates the TTS bridge when the env layer flag
+  // is on OR the session's provider is hume (per-creator override). The
+  // pre-WS voice-trained gate must use the SAME predicate, else a
+  // hume-override creator with no voice id slips past this optimization
+  // and only fails at WS-open (worse UX, wasted ticket mint). Mirror
+  // proxy index.js `useTts = useTtsLayer || ttsProvider === 'hume'`.
+  const useTts = useTtsLayer || sessionProvider === 'hume';
+
+  // §6.2 — pre-WS gate runs LATER (post-session_open, below the takeover
+  // snapshot read) so the takeover path can lock onto the original
+  // session's snapshotProvider. Premature gating here would let a
+  // diverging-env takeover slip past with the wrong provider's voice
+  // column check (audit C2). Audit S20 (unit-wide) — line ref dropped;
+  // grep `creator_voice_not_trained` to find the relocated gate.
+
 
   // RPC under the cookie-bound client so auth.uid() resolves to the caller.
   const sb = await supabaseServer();
@@ -414,6 +498,121 @@ export async function POST(req: NextRequest) {
     sessionId = openRow.session_id as string;
     tier = openRow.tier as 'free' | 'premium' | 'boardroom';
     dailyLimitRemaining = (openRow.daily_limit_remaining_s as number) ?? 0;
+  }
+
+  // HUME_TTS_PLAN §6.2 — snapshot the resolved TTS provider onto the session
+  // row. cogs_insert_turn_voice_v2 cross-checks this column against the
+  // ticket's tts_provider on every turn — a missing snapshot would fail the
+  // first turn and tear the WS down.
+  //
+  // Audit M4 — ORDERING INVARIANT (load-bearing, do not reorder):
+  // `session_open` RPC creates the row, THEN this block writes
+  // tts_provider_at_session, THEN (further below, ~line 887) the voice
+  // ticket is minted, THEN the browser opens the WS with that ticket. The
+  // cogs double-bill backstop in cogs_insert_turn_voice_v2 only enforces
+  // when the snapshot is NON-NULL, so a turn landing before this UPDATE
+  // completes would bypass it. That cannot happen ONLY because the ticket
+  // (the WS's auth) is minted strictly AFTER this awaited UPDATE — there is
+  // no path for the proxy to consume a ticket and run a turn before the
+  // snapshot exists. If you move ticket mint earlier, or make this write
+  // non-blocking, you reopen the NULL-snapshot double-bill window. The
+  // stronger hardening (fold this write INTO the session_open RPC so it's
+  // atomic with row creation, eliminating the window structurally) is a
+  // tracked follow-up — not done here because session_open is a shared
+  // core RPC and the awaited-ordering invariant already closes the gap.
+  //
+  // Takeover path: the EXISTING snapshot is the authority (CLAUDE.md "Tier
+  // routing at session-open only" — same principle for tts_provider). If a
+  // tab opens a fresh session at t=0 with provider=cartesia, and creators
+  // .tts_provider flips to hume at t=1, then a second tab joining at t=2
+  // must inherit the original cartesia (else the bridge instantiated for tab
+  // 2 wouldn't match the in-flight session 's cogs accounting). Read the
+  // snapshot and reuse it; only write if it's NULL (pre-migration row).
+  let snapshotProvider: 'cartesia' | 'hume' = sessionProvider;
+  if (isTakeover) {
+    try {
+      const { data: snap } = await admin
+        .from('sessions')
+        .select('tts_provider_at_session')
+        .eq('id', sessionId)
+        .maybeSingle<{ tts_provider_at_session: 'cartesia' | 'hume' | null }>();
+      if (snap?.tts_provider_at_session) {
+        snapshotProvider = snap.tts_provider_at_session;
+      } else {
+        // Pre-migration session with no snapshot — fix forward.
+        await admin
+          .from('sessions')
+          .update({ tts_provider_at_session: sessionProvider })
+          .eq('id', sessionId);
+      }
+    } catch (e) {
+      // Audit M6 — on takeover snapshot read failure, surface 500 rather
+      // than silently falling through to sessionProvider. The silent
+      // fallback hits the same diverging-env hazard as C2 through a
+      // different door; failing loud is the safer default.
+      Sentry.captureException(e, {
+        extra: { op: 'sessions_open_takeover_snapshot_read', session_id: sessionId },
+      });
+      return json(500, { error: 'tts_provider_snapshot_read_failed' });
+    }
+  } else {
+    // Audit C1 (unit-wide) — fail loud on snapshot UPDATE failure. A
+    // Sentry-only log left the cross-check at cogs_insert_turn_voice_v2
+    // silently disabled (NULL snapshot → permissive). Better to 500 here
+    // and force the user to retry than let the session continue without
+    // its provider-mismatch backstop.
+    try {
+      const { error: snapErr } = await admin
+        .from('sessions')
+        .update({ tts_provider_at_session: sessionProvider })
+        .eq('id', sessionId);
+      if (snapErr) throw snapErr;
+    } catch (e) {
+      Sentry.captureException(e, {
+        extra: { op: 'sessions_open_tts_provider_snapshot', session_id: sessionId, tts_provider: sessionProvider },
+      });
+      // Close the orphaned session row before returning so the user's
+      // one-active slot frees for an immediate retry.
+      try {
+        await sb.rpc('session_close', {
+          p_session_id: sessionId,
+          p_end_reason: 'snapshot_write_failed',
+        });
+      } catch {}
+      return json(500, { error: 'tts_provider_snapshot_write_failed' });
+    }
+  }
+
+  // U-C1 / HUME_TTS_PLAN §6.2 (audit C2 fix) — pre-WS voice-trained gate
+  // runs against the LOCKED snapshotProvider, not sessionProvider. On
+  // takeover, the snapshot is the source of truth — the gate must check
+  // the column for THAT provider, not the env-currently-derived one.
+  // Otherwise an env flip between the original open and the takeover
+  // could green-light a creator missing the locked provider's voice
+  // column and the proxy would close 4009/4014 immediately at WS-open.
+  //
+  // Side-effect to handle: by the time this gate runs, `session_open` RPC
+  // has already inserted a row (or takeover attached to an existing one).
+  // A fresh-open 409 leaks that row — close it. A takeover 409 must NOT
+  // close the row (it belongs to another tab).
+  const envVoiceId = resolveVoiceId(creatorRow, undefined, snapshotProvider);
+  if (useTts && !envVoiceId) {
+    if (!isTakeover) {
+      try {
+        await sb.rpc('session_close', {
+          p_session_id: sessionId,
+          p_end_reason: 'creator_voice_not_trained',
+        });
+      } catch (closeErr) {
+        Sentry.captureException(closeErr, {
+          extra: { op: 'sessions_open_voice_gate_close', session_id: sessionId },
+        });
+      }
+    }
+    return json(409, {
+      error: 'creator_voice_not_trained',
+      tts_provider: snapshotProvider,
+    });
   }
 
   // ── Resolve avatar provider for this tier (audit-r1 C1) ────────────────
@@ -752,16 +951,44 @@ export async function POST(req: NextRequest) {
       systemPrompt: resolvedSystemPrompt,
       prefixTurns:  brainPrefix?.prefixTurns ?? null,
       brainMode:    creatorRow.brain_mode,
+      // DECOUPLED_BRAIN_PLAN P1-10. Forward the creator's decoupled
+      // flag → ticket → bridge. The DB CHECK
+      // voice_tickets_decoupled_requires_vector_chk rejects
+      // decoupled=true with brain_mode != 'vector'; the admin RPC
+      // admin_set_creator_decoupled auto-aligns the two AND
+      // admin_set_creator_brain_mode (20260523000002 hardening) now
+      // refuses to drawer-flip a decoupled=true creator. So if both
+      // RPCs are the only path that mutates these columns, the pair
+      // stays in sync. Defense-in-depth retained: if a future code
+      // path desyncs them (a direct UPDATE, a buggy new RPC), the
+      // ticket INSERT fires 23514 and the mint fails loudly rather
+      // than silently mismatching.
+      decoupled:    creatorRow.decoupled ?? false,
       // Creator voice-speed (migration 20260511000006). supabase-js
       // returns `numeric` as JS string; coerce at the boundary (R2 audit
       // C3). DB DEFAULT 1.0 guarantees a value, but defensive on
       // non-finite to avoid sending bad data through to Cartesia.
-      ttsSpeed: (() => {
-        const raw = creatorRow.tts_speed;
-        if (raw == null) return null;
-        const n = typeof raw === 'number' ? raw : Number(raw);
-        return Number.isFinite(n) ? n : null;
-      })(),
+      ttsSpeed: coerceNumericOrNull(creatorRow.tts_speed),
+      // HUME_TTS_PLAN §6.3 — pass the session's snapshot provider (takeover
+      // honors the original session's lock; fresh open uses the computed
+      // sessionProvider) + env-scoped Hume prosody. Hume params are null on
+      // cartesia tickets; the bridge skips them.
+      ttsProvider: snapshotProvider,
+      humeTtsSpeed: snapshotProvider === 'hume'
+        ? coerceNumericOrNull(pickEnvScoped(creatorRow, 'hume_tts_speed'))
+        : null,
+      humeTrailingSilence: snapshotProvider === 'hume'
+        ? coerceNumericOrNull(pickEnvScoped(creatorRow, 'hume_trailing_silence'))
+        : null,
+      humeVoiceDescription: snapshotProvider === 'hume'
+        ? (pickEnvScoped(creatorRow, 'hume_voice_description') as string | null)
+        : null,
+      humeModelVersion: snapshotProvider === 'hume'
+        // Audit M3 (unit-wide) — default to '2' (Octave 2) when the env-
+        // scoped column is unset. Migration 0002 declares DEFAULT '2' but
+        // a creator inserted before that default landed could hold NULL.
+        ? ((pickEnvScoped(creatorRow, 'hume_model_version') as string | null) || '2')
+        : null,
     });
   } catch (e) {
     Sentry.captureException(e, { extra: { op: 'sessions_open_voice_ticket', session_id: sessionId } });

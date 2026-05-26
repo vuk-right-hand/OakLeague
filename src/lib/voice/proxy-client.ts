@@ -23,7 +23,7 @@
 const OVERLAP_DRAIN_MS = 2000;
 
 export type ProxyClientHandlers = {
-  onReady?: (msg: { sessionId: string; useCartesia: boolean; build: string }) => void;
+  onReady?: (msg: { sessionId: string; useTtsLayer: boolean; build: string }) => void;
   onAudioOut?: (bytes: ArrayBuffer) => void;
   onError?: (code: string, detail?: string) => void;
   onWarning?: (code: string) => void;
@@ -35,6 +35,12 @@ export type ProxyClientHandlers = {
   // server silently drops the next utterance (Phase 0 §7).
   // Simli/Tavus consumers can ignore.
   onTurnComplete?: () => void;
+  // Per-utterance "deep answer done" (2026-05-25). Fired by the proxy the moment
+  // a turn's audio finishes streaming to TTS — the EARLY, accurate boundary (the
+  // Gemini turn_complete above lands +6–20s later in decoupled mode). The
+  // consumer flushes the avatar tail-carry (the stranded last ≤187ms) on this,
+  // after a short trailing-audio grace.
+  onDeepAnswerDone?: () => void;
 };
 
 export type ProxyClientOpenArgs = {
@@ -94,7 +100,13 @@ export function createProxyClient(handlers: ProxyClientHandlers): ProxyClient {
         if (type === 'ready') {
           handlers.onReady?.({
             sessionId: String(msg.sessionId ?? ''),
-            useCartesia: Boolean(msg.useCartesia),
+            // Accept new key, fall back to legacy `useCartesia` during the
+            // Fly migration window — old proxy deploys still emit only the
+            // old key. Audit S5 — strict `=== true` (NOT Boolean()): the
+            // proxy emits a real JSON boolean; Boolean("false") === true
+            // would fail OPEN on a malformed payload. Parity with the safe
+            // form in voice-config.ts.
+            useTtsLayer: msg.useTtsLayer === true || msg.useCartesia === true,
             build: String(msg.build ?? ''),
           });
         } else if (type === 'error') {
@@ -107,6 +119,8 @@ export function createProxyClient(handlers: ProxyClientHandlers): ProxyClient {
           handlers.onTtsReconnected?.();
         } else if (type === 'turn_complete') {
           handlers.onTurnComplete?.();
+        } else if (type === 'deep_answer_done') {
+          handlers.onDeepAnswerDone?.();
         }
         return;
       }

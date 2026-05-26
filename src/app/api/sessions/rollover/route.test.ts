@@ -20,6 +20,33 @@ vi.mock('@/lib/auth-guards', () => ({
   getCallerUserId: vi.fn(async () => 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa'),
 }));
 
+// HUME_TTS_PLAN §6 audit M5 — voice-config mock with failOpen=false
+// steady-state. Tests that need the proxy-unreachable path override.
+const mockGetProxyVoiceConfig = vi.fn(async () => ({
+  useTtsLayer: true,
+  ttsProvider: 'cartesia' as 'cartesia' | 'hume',
+  failOpen: false,
+}));
+vi.mock('@/lib/voice/voice-config', () => ({
+  getProxyVoiceConfig: () => mockGetProxyVoiceConfig(),
+}));
+
+// HUME_TTS_PLAN §6 — env-scoped voice-id resolver. Tests run without
+// VERCEL_ENV set; default would be 'development' → voice_id_dev column.
+// Mock resolveVoiceId to return the stub regardless of env so the route's
+// pre-WS gate passes. pickEnvScoped + coerceNumericOrNull surfaces via
+// the actual module export.
+vi.mock('@/lib/voice/env-scoped-voice-id', () => ({
+  resolveVoiceId: vi.fn(() => 'voice-id-stub'),
+  pickEnvScoped: vi.fn(() => null),
+  coerceNumericOrNull: (v: unknown) => {
+    if (v == null) return null;
+    const n = typeof v === 'number' ? v : Number(v);
+    return Number.isFinite(n) ? n : null;
+  },
+  currentVoiceIdEnv: vi.fn(() => 'production'),
+}));
+
 vi.mock('@/lib/avatar/resolver', () => ({
   resolveAvatarProvider: vi.fn(() => 'simli'),
 }));
@@ -76,6 +103,9 @@ let rolloverResult: { data: unknown; error: unknown } = {
   data: [{ new_session_id: 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb', tier: 'free', daily_limit_remaining_s: 600 }],
   error: null,
 };
+// C3 (P0-1): the creators mock's published_at. Default published; a test
+// flips it to null to exercise the new not-published rollover gate.
+let creatorPublishedAt: string | null = '2026-01-01T00:00:00Z';
 
 function makeSb() {
   return {
@@ -105,10 +135,17 @@ function makeAdmin() {
                   // route doesn't 409 these test cases.
                   system_prompt: 'You are Test Creator. Topics: x. Answer briefly.',
                   brain_status: 'ready',
+                  // C3 (P0-1): rollover now gates on publication too.
+                  published_at: creatorPublishedAt,
                   // Creator voice-speed (migration 20260511000006). Mock
                   // as string to mirror supabase-js's numeric → string
                   // coercion.
                   tts_speed: '1.0',
+                  brain_mode: 'drawer',
+                  // HUME_TTS_PLAN §6 — env-scoped Cartesia voice id; the
+                  // route's pre-WS gate now checks the resolved column
+                  // and 409s if absent. Provide a stub so the gate passes.
+                  voice_id: 'voice-id-stub',
                 },
                 error: null,
               }),
@@ -224,6 +261,19 @@ describe('/api/sessions/rollover — voice-ticket fatal (PR-2 round-2 M2)', () =
     expect((closeCalls[0].args as { p_end_reason?: string }).p_end_reason).toBe('voice_ticket_mint_failed');
   });
 
+  it('returns 409 creator_not_published when published_at is null for a non-admin (C3)', async () => {
+    creatorPublishedAt = null;
+    try {
+      const res = await POST(makeReq());
+      expect(res.status).toBe(409);
+      expect((await res.json()).error).toBe('creator_not_published');
+      // Must NOT mint a fresh rollover session for an unpublished creator.
+      expect(rpcCalls.map((c) => c.name)).not.toContain('session_rollover');
+    } finally {
+      creatorPublishedAt = '2026-01-01T00:00:00Z';
+    }
+  });
+
   it('on bad_ua (programmer error): masks as 500 voice_ticket_mint_failed', async () => {
     mockMintVoiceTicket.mockRejectedValue(new VoiceTicketMintError('bad_ua', 400));
     const res = await POST(makeReq());
@@ -248,12 +298,23 @@ describe('/api/sessions/rollover — voice-ticket fatal (PR-2 round-2 M2)', () =
   });
 
   it('PR-2: returns 503 proxy_url_unconfigured when env unset + closes new session', async () => {
+    // Audit M5 — when VOICE_PROXY_URL is unset, getProxyVoiceConfig now
+    // surfaces failOpen=true. The route's earlier 503 check fires first
+    // (voice_proxy_unreachable) — the new behavior is strictly stricter
+    // than the old proxy_url_unconfigured (same root cause). Mock that
+    // shape for this test.
     delete process.env.NEXT_PUBLIC_VOICE_PROXY_URL;
+    mockGetProxyVoiceConfig.mockResolvedValueOnce({
+      useTtsLayer: false,
+      ttsProvider: 'cartesia',
+      failOpen: true,
+    });
     mockMintVoiceTicket.mockResolvedValue({ ticket: 'ticket-1', expiresAt: new Date(Date.now() + 120_000).toISOString() });
     const res = await POST(makeReq());
     expect(res.status).toBe(503);
-    expect((await res.json()).error).toBe('proxy_url_unconfigured');
-    expect(rpcCalls.filter((c) => c.name === 'session_close').length).toBe(1);
+    expect((await res.json()).error).toBe('voice_proxy_unreachable');
+    // The new 503 fires BEFORE session_open is called downstream, so no
+    // session_close happens (no new session row was created yet).
   });
 
   it('on success: returns 200 envelope with voice + voice_ticket + proxy_url, no gemini key', async () => {
@@ -267,5 +328,17 @@ describe('/api/sessions/rollover — voice-ticket fatal (PR-2 round-2 M2)', () =
     expect(body.proxy_url).toBe('wss://test-proxy.fly.dev/voice/spike-a');
     expect(body.session_id).toBe('bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb');
     expect(rpcCalls.filter((c) => c.name === 'session_close').length).toBe(0);
+  });
+
+  // DECOUPLED_BRAIN_PLAN P1-10 — rollover forwards creators.decoupled to
+  // mintVoiceTicket. Mirrors the open-route assertion so a rolled-over
+  // session preserves decoupled state across the resumption boundary.
+  it('P1-10: forwards decoupled flag through to mintVoiceTicket on rollover', async () => {
+    mockMintVoiceTicket.mockResolvedValue({ ticket: 'ticket-r1', expiresAt: new Date(Date.now() + 120_000).toISOString() });
+    const res = await POST(makeReq());
+    expect(res.status).toBe(200);
+    const callArgs = mockMintVoiceTicket.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    // Default fixture has no `decoupled` field → coerced to false (legacy).
+    expect(callArgs.decoupled).toBe(false);
   });
 });

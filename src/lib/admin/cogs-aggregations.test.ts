@@ -133,7 +133,58 @@ describe('aggregateLiveSessions', () => {
       cost_usd_truth: 0, cost_usd_fallback: 0, tts_seconds: 0,
       cogs_rows: 0, cartesia_pending_rows: 0,
       leg2_total: 0, leg2_fallback: 0,
+      tts_provider: null, cost_usd_cartesia: 0, cost_usd_hume: 0,
+      tts_cap_exceeded_rows: 0,
     })).toBe(0);
+  });
+
+  // HUME_TTS_PLAN §6.12 — provider-aware buckets.
+
+  it('tags provider from metadata.tts_provider; falls back to cartesia when absent', () => {
+    // Provider buckets only fold TTS-bearing services (cartesia / hume).
+    // Use the appropriate `service` value matching the row's provider.
+    const out = aggregateLiveSessions([
+      liveRow({ session_id: 'A', service: 'hume',     operation: 'voice_tts_audio_seconds', cost_usd: 0.1, metadata: { tts_provider: 'hume' } }),
+      liveRow({ session_id: 'B', service: 'cartesia', operation: 'voice_tts_audio_seconds', cost_usd: 0.2, metadata: { tts_provider: 'cartesia' } }),
+      liveRow({ session_id: 'C', service: 'cartesia', operation: 'voice_tts_audio_seconds', cost_usd: 0.3, metadata: null }),
+    ]);
+    expect(out.get('A')!.tts_provider).toBe('hume');
+    expect(out.get('A')!.cost_usd_hume).toBeCloseTo(0.1, 6);
+    expect(out.get('B')!.tts_provider).toBe('cartesia');
+    expect(out.get('B')!.cost_usd_cartesia).toBeCloseTo(0.2, 6);
+    expect(out.get('C')!.tts_provider).toBe('cartesia');
+    expect(out.get('C')!.cost_usd_cartesia).toBeCloseTo(0.3, 6);
+  });
+
+  it('surfaces mixed when a session sees both providers (defensive — should not happen by §6.6)', () => {
+    const out = aggregateLiveSessions([
+      liveRow({ session_id: 'M', service: 'cartesia', cost_usd: 0.1, metadata: { tts_provider: 'cartesia' } }),
+      liveRow({ session_id: 'M', service: 'hume',     cost_usd: 0.2, metadata: { tts_provider: 'hume' } }),
+    ]);
+    expect(out.get('M')!.tts_provider).toBe('mixed');
+    expect(out.get('M')!.cost_usd_cartesia).toBeCloseTo(0.1, 6);
+    expect(out.get('M')!.cost_usd_hume).toBeCloseTo(0.2, 6);
+  });
+
+  it('counts tts_cap_exceeded rows separately (§6.9 C2 signal)', () => {
+    const out = aggregateLiveSessions([
+      liveRow({ session_id: 'X', service: 'hume', cost_usd: 0.01, metadata: { tts_provider: 'hume', tts_cap_exceeded: true } }),
+      liveRow({ session_id: 'X', service: 'hume', cost_usd: 0.01, metadata: { tts_provider: 'hume' } }),
+    ]);
+    expect(out.get('X')!.tts_cap_exceeded_rows).toBe(1);
+  });
+
+  // Audit small fix: non-TTS rows (service='gemini') don't contribute to
+  // provider sub-totals even when carrying a tts_provider metadata tag.
+  it('does not bucket gemini-service rows into provider totals', () => {
+    const out = aggregateLiveSessions([
+      liveRow({ session_id: 'G', service: 'gemini', operation: 'voice_audio_input_seconds', cost_usd: 0.05, metadata: null }),
+      liveRow({ session_id: 'G', service: 'gemini', operation: 'voice_audio_out_tokens',    cost_usd: 0.10, metadata: null }),
+    ]);
+    const agg = out.get('G')!;
+    expect(agg.tts_provider).toBe(null);
+    expect(agg.cost_usd_cartesia).toBe(0);
+    expect(agg.cost_usd_hume).toBe(0);
   });
 });
 
@@ -219,9 +270,38 @@ describe('aggregateHistoricalSummary', () => {
   });
 
   it('empty input yields empty output', () => {
-    const { byOperation, totalUsdTruth, totalUsdFallback } = aggregateHistoricalSummary([]);
+    const { byOperation, byProviderLeg, totalUsdTruth, totalUsdFallback, totalUsdCartesia, totalUsdHume } = aggregateHistoricalSummary([]);
     expect(byOperation).toEqual([]);
+    expect(byProviderLeg).toEqual([]);
     expect(totalUsdTruth).toBe(0);
     expect(totalUsdFallback).toBe(0);
+    expect(totalUsdCartesia).toBe(0);
+    expect(totalUsdHume).toBe(0);
+  });
+
+  // HUME_TTS_PLAN §6.12 — provider × leg breakdown.
+
+  it('provider × leg fold separates cartesia and hume totals', () => {
+    const { byProviderLeg, totalUsdCartesia, totalUsdHume } = aggregateHistoricalSummary([
+      summaryRow({ service: 'cartesia', operation: 'voice_tts_characters', cost_usd: 0.50, metadata: { tts_provider: 'cartesia' } }),
+      summaryRow({ service: 'hume',     operation: 'voice_tts_characters', cost_usd: 0.10, metadata: { tts_provider: 'hume' } }),
+      summaryRow({ service: 'hume',     operation: 'voice_tts_audio_seconds', cost_usd: 0,    metadata: { tts_provider: 'hume' }, units: 3.0 }),
+    ]);
+    expect(totalUsdCartesia).toBeCloseTo(0.50, 6);
+    expect(totalUsdHume).toBeCloseTo(0.10, 6);
+    const humeChars = byProviderLeg.find((p) => p.tts_provider === 'hume' && p.operation === 'voice_tts_characters')!;
+    expect(humeChars.cost_usd_truth).toBeCloseTo(0.10, 6);
+    expect(humeChars.row_count).toBe(1);
+    const cartChars = byProviderLeg.find((p) => p.tts_provider === 'cartesia' && p.operation === 'voice_tts_characters')!;
+    expect(cartChars.cost_usd_truth).toBeCloseTo(0.50, 6);
+  });
+
+  it('byProviderLeg defaults missing tts_provider to cartesia (pre-v2 rows)', () => {
+    const { byProviderLeg, totalUsdCartesia, totalUsdHume } = aggregateHistoricalSummary([
+      summaryRow({ service: 'cartesia', operation: 'voice_tts_characters', cost_usd: 1.0, metadata: null }),
+    ]);
+    expect(totalUsdCartesia).toBe(1.0);
+    expect(totalUsdHume).toBe(0);
+    expect(byProviderLeg[0].tts_provider).toBe('cartesia');
   });
 });

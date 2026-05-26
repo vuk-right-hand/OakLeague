@@ -27,15 +27,26 @@ BEGIN
     VALUES (v_cuid, 'FCLC', 'fclc', 'ready', now())
     RETURNING id INTO v_cid;
 
-  -- 1. service-role guard. tests.set_authenticated runs as auth role.
-  PERFORM tests.set_authenticated(v_admin);
+  -- 1. service-role guard. C-1 FIX: set ONLY the jwt to a non-service role —
+  -- do NOT switch the DB role via tests.set_authenticated. Calling this
+  -- no-EXECUTE SECURITY DEFINER function as the 'authenticated' role SEGFAULTS
+  -- PostgreSQL 17.6 (the grant-level privilege check crashes the backend
+  -- instead of raising permission-denied — even an EXCEPTION handler can't
+  -- catch it). Staying on a role that HAS execute lets the call enter the body
+  -- and hit the internal service_role guard cleanly. Prod is unaffected:
+  -- authenticated can never reach finalize (REVOKED + not PostgREST-exposed),
+  -- and nothing in prod does set_config('role',...) + a privileged call.
+  PERFORM set_config('request.jwt.claims', json_build_object('role','authenticated')::text, true);
   RETURN NEXT throws_like(
     format('SELECT * FROM public.face_clone_finalize_locked(%L, %s, %L, %L)',
            v_admin, 0, v_cid, v_face),
     '%service_role only%',
     '1: anon/auth caller blocked'
   );
-  PERFORM tests.reset_role();
+  -- Establish a service_role jwt for steps 2-7. (tests.reset_role sets the
+  -- claims to '' which finalize cannot parse as jsonb → would error every
+  -- subsequent finalize call.)
+  PERFORM set_config('request.jwt.claims', json_build_object('role','service_role')::text, true);
 
   -- 2. happy path.
   INSERT INTO public.face_clone_uploads

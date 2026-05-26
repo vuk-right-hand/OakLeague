@@ -4,7 +4,7 @@
 -- would later seed creator A's sample_content under creator B's hook UI.
 -- See docs/_planning/BRAIN_WIRE_UP_PLAN.md Phase 0 (M0).
 BEGIN;
-SELECT plan(4);
+SELECT plan(6);
 
 CREATE FUNCTION pg_temp.run() RETURNS SETOF text LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -18,13 +18,22 @@ DECLARE
   v_hook_a    uuid;
   v_hook_b    uuid;
   v_new_session_id uuid;
+  v_old_session_id uuid;
   v_err_state text;
+  v_old_ended  timestamptz;
+  v_old_status text;
+  v_old_reason text;
+  v_old_active int;
+  v_csess      int;
+  v_rsess      smallint;
 BEGIN
   -- Two creators, each with one published video + hook.
   UPDATE public.profiles SET handle = 'cabnda' WHERE id = v_creat_a;
   UPDATE public.profiles SET handle = 'cabndb' WHERE id = v_creat_b;
-  INSERT INTO public.creators (user_id, display_name, handle, brain_status, published_at)
-    VALUES (v_creat_a, 'CA', 'cabnda', 'ready', now()) RETURNING id INTO v_creator_a;
+  -- creator_a at current_corpus_version=2 so the rollover snapshot assertion
+  -- (test 6) catches a DEFAULT-1 fallthrough, not just "some int landed".
+  INSERT INTO public.creators (user_id, display_name, handle, brain_status, published_at, current_corpus_version)
+    VALUES (v_creat_a, 'CA', 'cabnda', 'ready', now(), 2) RETURNING id INTO v_creator_a;
   INSERT INTO public.creators (user_id, display_name, handle, brain_status, published_at)
     VALUES (v_creat_b, 'CB', 'cabndb', 'ready', now()) RETURNING id INTO v_creator_b;
   INSERT INTO public.creator_topics (creator_id, slug, title)
@@ -85,13 +94,43 @@ BEGIN
 
   -- 4) Rollover match: same creator + matching hook → succeeds.
   --    Re-use v_hook_a; session_rollover closes the old then opens new.
+  v_old_session_id := v_new_session_id;  -- the still-open session to be rolled
   SELECT new_session_id INTO v_new_session_id
     FROM public.session_rollover(
-      v_new_session_id, v_creator_a, v_hook_a,
+      v_old_session_id, v_creator_a, v_hook_a,
       'gemini_3_1_flash_live_preview'::voice_model
     );
   RETURN NEXT ok(v_new_session_id IS NOT NULL,
                  '4: same-creator rollover returns a new session id');
+
+  -- 5) Rollover must CLOSE the old session (regression-pin, auditor Medium #3).
+  --    The 20260521000009/000100 regression dropped this UPDATE — yet test 4
+  --    above still passes (a new id came back). Assert the old row is actually
+  --    ended so a future drop-the-close cannot silently re-ship.
+  SELECT ended_at, status::text, end_reason, active_seconds
+    INTO v_old_ended, v_old_status, v_old_reason, v_old_active
+    FROM public.sessions WHERE id = v_old_session_id;
+  RETURN NEXT ok(
+    v_old_ended IS NOT NULL
+      AND v_old_status = 'ended'
+      AND v_old_reason = 'gemini_15min_cap'
+      AND v_old_active IS NOT NULL,
+    format('5: rollover closed the old session (ended=%s status=%s reason=%s active=%s)',
+           v_old_ended IS NOT NULL, v_old_status, v_old_reason, v_old_active)
+  );
+
+  -- 6) New session must carry the corpus_version/retrieval_version SNAPSHOT
+  --    (auditor Medium #4). creator_a is at current_corpus_version=2,
+  --    retrieval_version=1 (default) → assert the new row pinned both, proving
+  --    the snapshot survived the rollover rewrite and isn't a DEFAULT-1 stub.
+  SELECT corpus_version_at_session, retrieval_version_at_session
+    INTO v_csess, v_rsess
+    FROM public.sessions WHERE id = v_new_session_id;
+  RETURN NEXT ok(
+    v_csess = 2 AND v_rsess = 1,
+    format('6: rollover snapshots corpus_version=%s (want 2) + retrieval_version=%s (want 1)',
+           v_csess, v_rsess)
+  );
 
   PERFORM tests.reset_role();
 END;

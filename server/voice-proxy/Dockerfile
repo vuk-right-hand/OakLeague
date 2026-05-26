@@ -1,5 +1,6 @@
 # Voice proxy image. Minimal Node runtime.
-# Deps: @google/genai (Live client), @supabase/supabase-js (sessions/cogs),
+# Deps: @google/genai (Live client + deep-answer), @anthropic-ai/sdk (Step-2
+# Claude Haiku deep-answer failover), @supabase/supabase-js (sessions/cogs),
 # ws (WebSocket server), @sentry/node (error capture with ticket-scrub).
 #
 # IMPORTANT: every first-party source file must be COPY'd here. A previous
@@ -24,7 +25,43 @@ COPY package.json package-lock.json ./
 # of false leads. Lockfile is now load-bearing — keep it committed.
 RUN npm ci --omit=dev --no-audit --no-fund
 
-COPY index.js gemini-bridge.js cartesia-bridge.js quota-gate.js sentry.js proxy-handlers.js voice-delete-worker.js simli-face-delete-worker.js face-upload-reaper.js embed-worker.js embed-client.js build-injection-envelope.js retrieve-knowledge.js ./
+# Full first-party closure derived from `madge --json index.js` (transitive,
+# excluding *.test.js). When `index.js` reaches a NEW first-party file, add
+# it here. Transitive deps (e.g. brain-llm-common.js,
+# internal-request-signature.js) must be added by hand when a direct dep
+# is added. Verification gate (from server/voice-proxy/):
+#
+#   npx --yes madge@8 --json --extensions js index.js
+#
+# walked from index.js MUST yield exactly the set below. Full procedure +
+# the `comm`-based quick gate live in docs/_planning/PROD_DEPLOY_GATE.md
+# (search "Blocker #1 CLEARED"). If that doc is ever renamed, update this
+# pointer at the same time. If the closure differs from this COPY list,
+# the prod build is broken — add it before `fly deploy`.
+COPY index.js \
+     brain-bridge.js \
+     brain-llm-common.js \
+     build-injection-envelope.js \
+     cartesia-bridge.js \
+     decoupled-boot.js \
+     decoupled-orchestrator.js \
+     embed-client.js \
+     embed-worker.js \
+     face-upload-reaper.js \
+     gemini-bridge.js \
+     hume-bridge.js \
+     internal-request-signature.js \
+     paraphrase.js \
+     posthog-client.js \
+     proxy-handlers.js \
+     quota-gate.js \
+     retrieve-knowledge-v2-client.js \
+     retrieve-knowledge.js \
+     sentry.js \
+     simli-face-delete-worker.js \
+     voice-delete-worker.js \
+     voice-session-state-writer.js \
+     ./
 
 ENV NODE_ENV=production
 ENV PORT=8080

@@ -60,6 +60,7 @@ const sdkState = vi.hoisted(() => ({
   lastClient: null as unknown,
   audioCalls: [] as Uint8Array[],
   clearBufferCalls: 0,
+  throwOnAudio: false as boolean,
 }));
 
 vi.mock('simli-client', () => {
@@ -89,6 +90,7 @@ vi.mock('simli-client', () => {
     sendAudioData(chunk: Uint8Array): void {
       // SIMLI_WIREUP §B5 / R3-C1 — record chunks so the chunker test can
       // assert exact 6000-byte cadence + remainder carry behavior.
+      if (sdkState.throwOnAudio) throw new Error('simli rejected audio chunk');
       sdkState.audioCalls.push(new Uint8Array(chunk));
     }
     ClearBuffer(): void { sdkState.clearBufferCalls += 1; }
@@ -134,6 +136,7 @@ afterEach(() => {
   sdkState.lastClient = null;
   sdkState.audioCalls = [];
   sdkState.clearBufferCalls = 0;
+  sdkState.throwOnAudio = false;
   vi.restoreAllMocks();
 });
 
@@ -428,9 +431,51 @@ describe('sendAudio chunker (R3-C1)', () => {
   });
 });
 
-async function driveOpenWithBothTracks() {
+describe('commitUtterance — turn-boundary tail flush (mid-word cut fix, 2026-05-25)', () => {
+  it('flushes the stranded remainder, padded to 6000B with silence', async () => {
+    const { bridge } = await driveOpenWithBothTracks();
+    bridge.sendAudio(new Uint8Array(3000).fill(5).buffer); // <6000 → parked
+    expect(sdkState.audioCalls.length).toBe(0);
+    bridge.commitUtterance!();
+    expect(sdkState.audioCalls.length).toBe(1);
+    const f = sdkState.audioCalls[0];
+    expect(f.byteLength).toBe(6000);                       // one Simli frame
+    expect(f.subarray(0, 3000).every((b) => b === 5)).toBe(true);  // the real tail
+    expect(f.subarray(3000).every((b) => b === 0)).toBe(true);     // silence pad
+  });
+
+  it('is a no-op when the carry is empty (exact full-chunk boundary)', async () => {
+    const { bridge } = await driveOpenWithBothTracks();
+    bridge.sendAudio(new Uint8Array(6000).fill(8).buffer); // exact → flush, carry empty
+    expect(sdkState.audioCalls.length).toBe(1);
+    bridge.commitUtterance!();
+    expect(sdkState.audioCalls.length).toBe(1);            // nothing to flush
+  });
+
+  it('after cancel() drops the carry, commitUtterance flushes nothing (barge safety)', async () => {
+    const { bridge } = await driveOpenWithBothTracks();
+    bridge.sendAudio(new Uint8Array(3000).fill(7).buffer);
+    bridge.cancel();
+    bridge.commitUtterance!();
+    expect(sdkState.audioCalls.length).toBe(0);            // carry was dropped on barge
+  });
+
+  it('a rejected tail frame is SWALLOWED — never tears down the session (audit C3)', async () => {
+    const onError = vi.fn();
+    const { bridge } = await driveOpenWithBothTracks({ onError });
+    bridge.sendAudio(new Uint8Array(3000).fill(7).buffer);
+    sdkState.throwOnAudio = true;
+    expect(() => bridge.commitUtterance!()).not.toThrow();  // no throw out of the bridge
+    expect(onError).not.toHaveBeenCalled();                 // and NOT fatal — session lives
+    // A real mid-stream chunk still fails hard (asymmetry is intentional).
+    expect(() => bridge.sendAudio(new Uint8Array(6000).fill(1).buffer)).not.toThrow();
+    expect(onError).toHaveBeenCalled();
+  });
+});
+
+async function driveOpenWithBothTracks(handlers: Record<string, unknown> = {}) {
   const { createSimliBridge } = await import('./simli-bridge');
-  const bridge = createSimliBridge({});
+  const bridge = createSimliBridge(handlers as never);
   const openPromise = bridge.open({
     replicaId: 'r-test',
     preMintedSessionToken: 'tok-test',

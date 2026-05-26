@@ -185,10 +185,14 @@ export async function POST(req: Request) {
   const isBypassAdmin = bypassList.includes(admin.userId);
 
   const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  // HUME_TTS_PLAN audit C2 fix (2026-05-13): scope the rate-limit count to
+  // tts_provider='cartesia' so a Hume clone via the §5.2 paste-flow doesn't
+  // burn this route's cap. Hume's rate-limit lives in its own route.
   const { count: successCount, error: rateErr } = await sb
     .from('voice_clone_uploads')
     .select('*', { count: 'exact', head: true })
     .eq('admin_user_id', admin.userId)
+    .eq('tts_provider', 'cartesia')
     .gt('created_at', since)
     .not('cartesia_voice_id', 'is', null);
   if (rateErr) return jsonError(500, 'rate_lookup_failed');
@@ -199,6 +203,7 @@ export async function POST(req: Request) {
     .from('voice_clone_uploads')
     .select('*', { count: 'exact', head: true })
     .eq('admin_user_id', admin.userId)
+    .eq('tts_provider', 'cartesia')
     .gt('created_at', since);
   if (attemptErr) return jsonError(500, 'rate_lookup_failed');
   if (!isBypassAdmin && (attemptCount ?? 0) >= RATE_LIMIT_ATTEMPTS_PER_24H) {
@@ -214,22 +219,43 @@ export async function POST(req: Request) {
   const force = searchParams.get('force') === '1';
   const { data: creator, error: creatorErr } = await sb
     .from('creators')
-    .select('id, voice_id')
+    .select('id, voice_id, user_id')
     .eq('id', creatorId)
-    .maybeSingle<{ id: string; voice_id: string | null }>();
+    .maybeSingle<{ id: string; voice_id: string | null; user_id: string }>();
   if (creatorErr) return jsonError(500, 'creator_lookup_failed');
   if (!creator) return jsonError(404, 'creator_not_found');
+
+  // P0-3 consent gate: refuse to clone a voice with no recorded voice_clone
+  // consent for the creator's user. Override path: an admin records out-of-band
+  // consent via POST /api/admin/creator-consent (admin_attest_creator_consent),
+  // which inserts a row here and unblocks. Existing creators were backfilled
+  // (migration 20260523000007).
+  const { count: voiceConsentCount, error: consentErr } = await sb
+    .from('creator_consents')
+    .select('id', { head: true, count: 'exact' })
+    .eq('user_id', creator.user_id)
+    .eq('consent_type', 'voice_clone')
+    .is('revoked_at', null);
+  if (consentErr) return jsonError(500, 'consent_lookup_failed');
+  if ((voiceConsentCount ?? 0) === 0) {
+    return jsonError(403, 'consent_missing', 'no voice_clone consent on record; record it in the Consent panel before cloning');
+  }
   if (creator.voice_id && !force) {
     return jsonError(409, 'already_cloned', 'creator already has a voice; pass ?force=1 to overwrite');
   }
   const priorVoiceId = creator.voice_id;
 
   // 8. Pre-insert audit row with cartesia_voice_id=NULL.
+  // HUME_TTS_PLAN §5.5 writer discipline (2026-05-13): pass tts_provider
+  // EXPLICITLY so the follow-up migration that drops the DEFAULT can ship
+  // without 23502'ing this insert. CI grep enforces every voice_clone_uploads
+  // INSERT/UPSERT contains `tts_provider`.
   const { data: uploadRow, error: insErr } = await sb
     .from('voice_clone_uploads')
     .insert({
       admin_user_id: admin.userId,
       creator_id: creatorId,
+      tts_provider: 'cartesia',
       sha256,
       duration_seconds: Number(wav.durationSeconds.toFixed(3)),
       mime: sniffedMime,
@@ -314,10 +340,15 @@ export async function POST(req: Request) {
     // Enqueue with no defer (due_at = now) so the worker drains it on
     // the next 30s tick. Best-effort; if the queue write itself fails,
     // log it — admin can clean up via Cartesia dashboard.
+    // HUME_TTS_PLAN audit C1 fix (2026-05-13): voice_delete_queue PK is now
+    // composite (tts_provider, voice_id). onConflict must list both columns
+    // and the payload must include tts_provider explicitly (the DEFAULT
+    // 'cartesia' only fires on raw INSERT; upsert ON CONFLICT path needs
+    // the value present).
     try {
       await sb.from('voice_delete_queue').upsert(
-        { voice_id: voiceId, enqueued_by: admin.userId, due_at: new Date().toISOString() },
-        { onConflict: 'voice_id' },
+        { tts_provider: 'cartesia', voice_id: voiceId, enqueued_by: admin.userId, due_at: new Date().toISOString() },
+        { onConflict: 'tts_provider,voice_id' },
       );
     } catch (e) {
       console.error('[voice-clone] orphan-cleanup enqueue failed', e);
@@ -325,8 +356,22 @@ export async function POST(req: Request) {
 
     // Map known PG error codes to user-actionable responses.
     if (finalizeErr.code === '55006') {
-      // RPC raised "creator has N active sessions".
-      const m = /(\d+)\s+active sessions/.exec(finalizeErr.message || '');
+      // HUME_TTS_PLAN unit-wide audit C1 (2026-05-13): finalize_v2 raises
+      // 55006 in two cases now — disambiguate by message. The
+      // voice_just_deleted_retry_paste case can hit the Cartesia path
+      // too via the v1 shim if the worker happened to claim the prior
+      // cartesia voice's queue row between admin clicks.
+      const msg = finalizeErr.message || '';
+      if (/voice_just_deleted_retry_paste/.test(msg)) {
+        return NextResponse.json(
+          {
+            error: 'voice_dispatch_in_flight',
+            detail: 'the previous Cartesia voice for this creator is being deleted by the worker right now; wait ~60s and re-submit the clone',
+          },
+          { status: 409 },
+        );
+      }
+      const m = /(\d+)\s+active sessions/.exec(msg);
       const activeSessions = m ? Number(m[1]) : undefined;
       return NextResponse.json(
         {
@@ -361,9 +406,11 @@ export async function POST(req: Request) {
   // let the Fly proxy worker drain.
   if (priorVoiceId) {
     const dueAt = new Date(Date.now() + CARTESIA_DELETE_DEFER_MS).toISOString();
+    // HUME_TTS_PLAN audit C1 fix (2026-05-13): composite PK requires both
+    // columns in onConflict + payload.
     const { error: queueErr } = await sb.from('voice_delete_queue').upsert(
-      { voice_id: priorVoiceId, enqueued_by: admin.userId, due_at: dueAt },
-      { onConflict: 'voice_id' },
+      { tts_provider: 'cartesia', voice_id: priorVoiceId, enqueued_by: admin.userId, due_at: dueAt },
+      { onConflict: 'tts_provider,voice_id' },
     );
     if (queueErr) {
       // Don't fail the request — admin already swapped successfully. Log.

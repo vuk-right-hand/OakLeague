@@ -22,11 +22,25 @@ vi.mock('@/lib/auth-guards', () => ({
 }));
 
 vi.mock('@/lib/voice/voice-config', () => ({
-  getProxyVoiceConfig: vi.fn(async () => ({ useCartesia: true })),
+  // HUME_TTS_PLAN §6 audit M5 — mock includes ttsProvider + failOpen.
+  // failOpen:false is the steady-state success shape; tests that want
+  // the proxy-unreachable path override per-test.
+  getProxyVoiceConfig: vi.fn(async () => ({
+    useTtsLayer: true,
+    ttsProvider: 'cartesia',
+    failOpen: false,
+  })),
 }));
 
 vi.mock('@/lib/voice/env-scoped-voice-id', () => ({
   resolveVoiceId: vi.fn(() => 'voice-id-stub'),
+  pickEnvScoped: vi.fn(() => null),
+  coerceNumericOrNull: (v: unknown) => {
+    if (v == null) return null;
+    const n = typeof v === 'number' ? v : Number(v);
+    return Number.isFinite(n) ? n : null;
+  },
+  currentVoiceIdEnv: vi.fn(() => 'production'),
 }));
 
 vi.mock('@/lib/avatar/resolver', () => ({
@@ -216,13 +230,20 @@ function makeAdmin() {
       }
       if (table === 'sessions') {
         // Takeover-path lookup: chained .eq().is().maybeSingle().
+        // Audit C1 (unit-wide) — route now writes tts_provider_at_session
+        // post-session_open via `.update().eq()`. Test mock must return
+        // success for that UPDATE chain or the route returns 500.
         return {
           select: () => ({
             eq: () => ({
               is: () => ({
                 maybeSingle: async () => takeoverLookupResult,
               }),
+              maybeSingle: async () => takeoverLookupResult,
             }),
+          }),
+          update: () => ({
+            eq: async () => ({ data: null, error: null }),
           }),
         };
       }
@@ -553,6 +574,24 @@ describe('/api/sessions/open — brain wire-up gates (R3 audit C1 + M1)', () => 
     expect((await res.json()).error).toBe('brain_not_ready');
   });
 
+  it('returns 409 creator_not_published when published_at is null for a non-admin (C3)', async () => {
+    creatorLookupResult = {
+      data: {
+        ...((creatorLookupResult.data ?? {}) as Record<string, unknown>),
+        // Brain fully ready, but unpublished (e.g. taken down / not yet live).
+        system_prompt: 'You are Test Creator.',
+        brain_status: 'ready',
+        published_at: null,
+      },
+      error: null,
+    };
+    const res = await POST(makeReq());
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe('creator_not_published');
+    // Must NOT proceed to session_open RPC for a non-admin caller.
+    expect(rpcCalls.map((c) => c.name)).not.toContain('session_open');
+  });
+
   it('ALLOWS brain_status=training when persona populated (whole-build C1 — loosened gate)', async () => {
     // Pre-fix: this would 409. Post-fix: training+persona is the
     // post-approval steady state and should be allowed.
@@ -611,5 +650,35 @@ describe('/api/sessions/open — brain wire-up gates (R3 audit C1 + M1)', () => 
     expect(res.status).toBe(200);
     const callArgs = mockMintVoiceTicket.mock.calls[0][0] as Record<string, unknown>;
     expect(callArgs.ttsSpeed).toBeNull();
+  });
+
+  // DECOUPLED_BRAIN_PLAN P1-10 — route forwards creators.decoupled to
+  // mintVoiceTicket. Pre-P1-10 this field was provably inert at the
+  // route layer (whole-build audit: "route writer cannot reach
+  // decoupled today") — the proxy bridge always saw consumed.decoupled
+  // = false even with creators.decoupled = true. These tests lock the
+  // wiring so a future drift fails in CI.
+  it('P1-10: forwards decoupled=true through to mintVoiceTicket', async () => {
+    creatorLookupResult = {
+      data: {
+        ...((creatorLookupResult.data ?? {}) as Record<string, unknown>),
+        decoupled:  true,
+        brain_mode: 'vector', // admin RPC keeps these aligned
+      },
+      error: null,
+    };
+    const res = await POST(makeReq());
+    expect(res.status).toBe(200);
+    const callArgs = mockMintVoiceTicket.mock.calls[0][0] as Record<string, unknown>;
+    expect(callArgs.decoupled).toBe(true);
+    expect(callArgs.brainMode).toBe('vector');
+  });
+
+  it('P1-10: forwards decoupled=false on legacy creators', async () => {
+    // Default fixture has no `decoupled` field; route MUST coerce to false.
+    const res = await POST(makeReq());
+    expect(res.status).toBe(200);
+    const callArgs = mockMintVoiceTicket.mock.calls[0][0] as Record<string, unknown>;
+    expect(callArgs.decoupled).toBe(false);
   });
 });

@@ -13,6 +13,8 @@ export function ApplyForm() {
   const [youtubeUrl, setYoutubeUrl] = useState('');
   const [twitterUrl, setTwitterUrl] = useState('');
   const [website, setWebsite] = useState('');
+  const [acceptTos, setAcceptTos] = useState(false);
+  const [acceptVoiceLikeness, setAcceptVoiceLikeness] = useState(false);
   const [pending, startTransition] = useTransition();
   const [err, setErr] = useState<string | null>(null);
 
@@ -37,6 +39,8 @@ export function ApplyForm() {
             bio,
             topics,
             proof,
+            accept_tos: acceptTos,
+            accept_voice_likeness: acceptVoiceLikeness,
           });
           if (!res.ok) setErr(humanize(res.error));
           else window.location.href = '/apply/submitted';
@@ -157,8 +161,39 @@ export function ApplyForm() {
         </label>
       </fieldset>
 
+      <fieldset style={{ border: '1px solid #333', padding: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <legend>Consent</legend>
+        <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 14 }}>
+          <input
+            type="checkbox"
+            checked={acceptTos}
+            onChange={(e) => setAcceptTos(e.target.checked)}
+            disabled={pending}
+            style={{ marginTop: 3 }}
+          />
+          <span>
+            I agree to the{' '}
+            <a href="/terms" target="_blank" rel="noopener noreferrer">Terms of Service</a>{' '}and{' '}
+            <a href="/privacy" target="_blank" rel="noopener noreferrer">Privacy Policy</a>.
+          </span>
+        </label>
+        <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 14 }}>
+          <input
+            type="checkbox"
+            checked={acceptVoiceLikeness}
+            onChange={(e) => setAcceptVoiceLikeness(e.target.checked)}
+            disabled={pending}
+            style={{ marginTop: 3 }}
+          />
+          <span>
+            I authorize OakLeague to clone my voice and use my likeness to power my
+            AI mentor. I can revoke this by contacting OakLeague.
+          </span>
+        </label>
+      </fieldset>
+
       {err && <div role="alert" style={{ color: 'salmon' }}>{err}</div>}
-      <button type="submit" disabled={pending}>
+      <button type="submit" disabled={pending || !acceptTos || !acceptVoiceLikeness}>
         Submit application
       </button>
     </form>
@@ -172,6 +207,8 @@ function humanize(code: string): string {
     case 'invite_claim_invalid': return 'Your invite session expired. Open the invite email again.';
     case 'invite_unavailable': return 'This invite is no longer valid.';
     case 'needs_invite': return 'You need an active invite to apply.';
+    case 'consent_required': return 'Please accept both consent boxes to apply.';
+    case 'bad_consent': return 'Consent could not be recorded — please contact OakLeague support.';
     default: return 'Submission failed. Try again.';
   }
 }

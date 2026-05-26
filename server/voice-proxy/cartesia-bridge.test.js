@@ -67,6 +67,68 @@ test('inbound chunk emits decoded audio_out with PCM bytes', async () => {
   off();
 });
 
+// ── P1-10 spurious-barge fix — getLastChunkAt() instrumentation ──────────
+//
+// The proxy's `interrupted` event handler reads this getter to suppress
+// spurious Gemini Live interrupted events (Gemini's audio-gen timeline is
+// independent of Cartesia playback in decoupled mode). These tests lock
+// the invariants the heuristic depends on.
+
+test('P1-10: getLastChunkAt is 0 before any chunk arrives', () => {
+  const { bridge } = makeStubBridge();
+  assert.equal(bridge.getLastChunkAt(), 0,
+    'fresh bridge has no chunks yet → 0 (idleMs computed as Infinity by index.js)');
+  bridge.turnStart('sess-1:1');
+  assert.equal(bridge.getLastChunkAt(), 0,
+    'after turnStart, still no chunk arrived → 0');
+});
+
+test('P1-10: getLastChunkAt advances on each inbound audio chunk', () => {
+  const { bridge } = makeStubBridge();
+  bridge.turnStart('sess-1:1');
+  bridge.sendText('hi');
+
+  const t0 = bridge.getLastChunkAt();
+  bridge._onMessage(JSON.stringify({ type: 'chunk', data: 'AAAA', context_id: 'sess-1:1' }), false);
+  const t1 = bridge.getLastChunkAt();
+  assert.ok(t1 > 0, 'first chunk sets a timestamp');
+  assert.ok(t1 >= t0, 'timestamp is monotonic');
+
+  // Second chunk advances again.
+  bridge._onMessage(JSON.stringify({ type: 'chunk', data: 'AAAA', context_id: 'sess-1:1' }), false);
+  const t2 = bridge.getLastChunkAt();
+  assert.ok(t2 >= t1, 'second chunk does not regress timestamp');
+});
+
+test('P1-10 audit C1: turnStart resets getLastChunkAt back to 0', () => {
+  // Without this reset, turn N+1's spurious-barge heuristic mis-classifies
+  // pre-playback interrupted events against turn N's stale timestamp.
+  const { bridge } = makeStubBridge();
+  bridge.turnStart('sess-1:1');
+  bridge.sendText('hi');
+  bridge._onMessage(JSON.stringify({ type: 'chunk', data: 'AAAA', context_id: 'sess-1:1' }), false);
+  assert.ok(bridge.getLastChunkAt() > 0, 'turn 1: chunk recorded');
+
+  bridge.turnStart('sess-1:2');
+  assert.equal(bridge.getLastChunkAt(), 0,
+    'audit C1: turnStart MUST reset the timestamp to 0 (idleMs = Infinity until first chunk of new turn)');
+});
+
+test('P1-10: chunks for a non-current context_id do NOT advance getLastChunkAt', () => {
+  // Stale/cancelled-context chunks (Cartesia keeps emitting for ~50ms
+  // after cancel) shouldn't make the heuristic think audio is playing.
+  const { bridge } = makeStubBridge();
+  bridge.turnStart('sess-1:1');
+  bridge.sendText('hi');
+  bridge.cancel(); // nulls _currentContextId
+  assert.equal(bridge._currentContextId, null);
+
+  // Leaked chunk for the cancelled context.
+  bridge._onMessage(JSON.stringify({ type: 'chunk', data: 'AAAA', context_id: 'sess-1:1' }), false);
+  assert.equal(bridge.getLastChunkAt(), 0,
+    'post-cancel leaked chunks must not advance lastChunkAt');
+});
+
 test('inbound error maps voice_not_found → bad_voice_id with fatal flag', () => {
   const { bridge } = makeStubBridge();
   const events = [];

@@ -17,8 +17,8 @@
 //   4006 quota_state_inconsistent — P0002 from voice_check_quota (turn_start) or
 //                                    voice_accumulate_seconds (turn_end) — missing
 //                                    daily_quotas row OR R4-C2 22003 oob
-//   4009 cartesia_no_voice       — useCartesia=true but creators.voice_id IS NULL
-//   4010 model_not_compatible    — useCartesia=true with a non-allowlisted model
+//   4009 cartesia_no_voice       — useTtsLayer=true but creators.voice_id IS NULL
+//   4010 model_not_compatible    — useTtsLayer=true with a non-allowlisted model
 //                                    (R4-M6: only 3.1 Live verified for transcription)
 //   4011 tts_reconnecting        — turn_start during Cartesia reconnect window (R4-M2)
 //   4012 backpressure            — user WS bufferedAmount > 2 MB (R3-C2)
@@ -36,18 +36,46 @@ import { WebSocketServer } from 'ws';
 import { createClient } from '@supabase/supabase-js';
 import { GeminiBridge } from './gemini-bridge.js';
 import { CartesiaTTSBridge } from './cartesia-bridge.js';
+import { HumeTTSBridge } from './hume-bridge.js';
 import { decideQuotaGate } from './quota-gate.js';
-import { makeLogTurnCogs, installReaper, VOICE_CARTESIA_ENABLED, getCartesiaPricing } from './proxy-handlers.js';
+import { makeLogTurnCogs, installReaper, VOICE_TTS_LAYER_ENABLED, getCartesiaPricing, getHumePricing, _humePricingPrimeForBoot } from './proxy-handlers.js';
+// DECOUPLED_BRAIN_PLAN P1-5 C3 ordering gate — boot-prime decoupled
+// brain/paraphrase pricing FATAL-at-boot (same posture as Cartesia/Hume).
+import { provisionDecoupledBrainPricing } from './decoupled-boot.js';
+import { makeDecoupledOrchestrator } from './decoupled-orchestrator.js';
+import { generateParaphrase } from './paraphrase.js';
+import { generateDeepAnswer } from './brain-bridge.js';
 import { makeVoiceDeleteWorker } from './voice-delete-worker.js';
 import { makeSimliFaceDeleteWorker } from './simli-face-delete-worker.js';
 import { makeFaceUploadReaper } from './face-upload-reaper.js';
-import { makeEmbedWorker } from './embed-worker.js';
+import { makeEmbedWorker, makeCorpusReprocessWorker } from './embed-worker.js';
 // pgvector RAG — vector-mode retrieval (audit C1 fix). Mirrors of the TS libs
 // in src/lib/voice/. The TS originals stay for vitest + future Next-side
 // consumers; these JS files are the proxy's runtime source of truth (proxy is
 // pure ESM Node — cannot import .ts files at runtime).
 import { retrieveTopK } from './retrieve-knowledge.js';
 import { buildInjectionEnvelope } from './build-injection-envelope.js';
+// Day-13 — v2 retrieval HTTP shim client. Calls Next.js
+// /api/internal/retrieve-knowledge instead of running the orchestrator
+// in-proc (handoff §2a Option A). Fire-once, no retry (audit M3).
+import {
+  callRetrieveKnowledgeV2,
+  RetrieveV2ClientError,
+} from './retrieve-knowledge-v2-client.js';
+// Day-13 — proxy-side voice_session_state writer for the durable-fallback
+// path (audit C5). Closure const is the source of truth for next-turn
+// rewrite; this UPSERT survives WS replacement on Gemini Live 15-min reopen.
+import {
+  persistLastAssistantResponse,
+  VOICE_SESSION_STATE_MAX_CHARS,
+  MIN_PERSIST_CHARS,
+} from './voice-session-state-writer.js';
+// Day-13 — fire-and-forget PostHog batch emitter for v2 telemetry
+// (audit M2). Pre-mapped events arrive from the shim response.
+import {
+  captureBatch as posthogCaptureBatch,
+  drainInFlight as posthogDrainInFlight,
+} from './posthog-client.js';
 
 const PORT = Number(process.env.PORT || 8080);
 const BUILD = process.env.FLY_MACHINE_ID || 'local';
@@ -55,19 +83,117 @@ const BUILD = process.env.FLY_MACHINE_ID || 'local';
 const SUPABASE_URL          = requireEnv('SUPABASE_URL');
 const SUPABASE_SERVICE_KEY  = requireEnv('SUPABASE_SERVICE_ROLE_KEY');
 const GEMINI_API_KEY        = requireEnv('GEMINI_API_KEY');
-// CARTESIA_API_KEY is required only when VOICE_CARTESIA_ENABLED=1.
+// CARTESIA_API_KEY is required only when VOICE_TTS_LAYER_ENABLED=1.
 const CARTESIA_API_KEY      = process.env.CARTESIA_API_KEY || '';
 // SIMLI_API_KEY drives the simli-face-delete-worker (R3-Missing-3).
 // Optional — worker no-ops if absent. Set in Fly secrets when /s/[id]
 // cutover ships.
 const SIMLI_API_KEY         = process.env.SIMLI_API_KEY || '';
-if (VOICE_CARTESIA_ENABLED) {
+
+// Day-5 RAG SOTA — corpus reprocess worker POSTs to three Next 15 internal
+// routes (/api/internal/preprocess, /narrative-chunk, /contextual-gen).
+// Bearer auth via INTERNAL_API_SECRET. Base URL is the Vercel deployment.
+// Both optional at boot — reprocess worker no-ops if either is missing
+// (legacy embed-worker keeps running for v1 creators).
+const INTERNAL_API_BASE_URL = process.env.INTERNAL_API_BASE_URL || '';
+const INTERNAL_API_SECRET   = process.env.INTERNAL_API_SECRET || '';
+// HUME_TTS_PLAN §6.8 / unit-wide-audit C4 fix — dual-provider pricing.
+// VOICE_TTS_PROVIDER tells us which provider the env defaults to, but a
+// per-creator override on `creators.tts_provider` can route a session to
+// the OTHER provider mid-fleet. We probe the DB at boot for any creator
+// whose override differs from VOICE_TTS_PROVIDER; if any exist, validate
+// BOTH provider pricings so the bridge never sees a missing rate at
+// session-open. Fails closed at boot — never at first turn.
+const HUME_API_KEY = process.env.HUME_API_KEY || '';
+// Audit C2 (unit-wide) — single source of truth for Hume pricing lives in
+// proxy-handlers.js. The boot path here PRIMES that singleton; subsequent
+// callers (bridge construction in this file, logTurnCogs in proxy-handlers)
+// read the same cached value. Eliminates the "two caches diverge" hazard.
+async function provisionPricing() {
+  // DECOUPLED_BRAIN_PLAN P1-5 C3 ordering gate — runs FIRST, BEFORE the
+  // !VOICE_TTS_LAYER_ENABLED early-return. Audit C2: a decoupled creator
+  // with α' off is itself FATAL (the deep-answer must reach the cloned
+  // voice), so this gate must NOT be reachable-skippable by the two
+  // flags disagreeing. Mirrors the Hume per-creator-override probe.
+  // Inert today by construction (M3 / P1-2 safety refinement: no creator
+  // can be flagged decoupled until the D12 persona compiler +
+  // admin_set_creator_decoupled RPC exist) → probe returns zero rows →
+  // no-op. The gate is IN PLACE the moment a creator is flagged.
+  // No `fatal` override → the default (console.error + process.exit(1))
+  // IS reachable here in real boot, intentionally, exactly like Hume's
+  // FATAL at ~L153. The return value is intentionally unused: on
+  // misconfig `fatal` has already process.exit'd; otherwise there is
+  // nothing to do (primed/deferred/inert are log-only states).
+  await provisionDecoupledBrainPricing({
+    ttsLayerEnabled: VOICE_TTS_LAYER_ENABLED,
+    probeAnyDecoupledCreator: async () => {
+      const { data, error } = await supabase
+        .from('creators')
+        .select('id')
+        .eq('decoupled', true)
+        .limit(1);
+      if (error) return { error: error.message };
+      return { found: Array.isArray(data) && data.length > 0 };
+    },
+  });
+
+  if (!VOICE_TTS_LAYER_ENABLED) return; // α' off: TTS layer inert; skip both.
+  // CARTESIA always validated (it's the historical default; envs that flip
+  // VOICE_TTS_PROVIDER=hume still leave back-compat creators on cartesia
+  // unless they explicitly override).
   if (!CARTESIA_API_KEY) {
-    console.error('FATAL: CARTESIA_API_KEY missing while VOICE_CARTESIA_ENABLED=1');
+    console.error('FATAL: CARTESIA_API_KEY missing while VOICE_TTS_LAYER_ENABLED=1');
     process.exit(1);
   }
-  // Trip the pricing-env validator at boot so a missing rate is a hard fail.
   getCartesiaPricing();
+
+  // If env default is Hume, Hume pricing is required at boot.
+  // If env default is Cartesia, probe for any hume override; if found,
+  // Hume pricing is required too (C4 fix).
+  //
+  // Audit C4: on probe FAILURE (Supabase transient outage at Fly boot),
+  // do NOT force-exit on missing Hume env. A cartesia-only fleet whose
+  // operator has never set HUME_USD_PER_CHAR shouldn't crash-loop because
+  // of a 30-second Supabase blip. Log loud, assume Hume not needed, and
+  // let `getHumePricing()` lazy-validate at first session-open if a
+  // creator override turns out to be real.
+  let needHume = VOICE_TTS_PROVIDER === 'hume';
+  let probeFailed = false;
+  if (!needHume) {
+    try {
+      const { data, error } = await supabase
+        .from('creators')
+        .select('id')
+        .eq('tts_provider', 'hume')
+        .limit(1);
+      if (error) {
+        console.warn(`[boot] creator-override probe failed: ${error.message} — skipping Hume pre-validation; lazy-validate at session-open if needed`);
+        probeFailed = true;
+      } else if (Array.isArray(data) && data.length > 0) {
+        needHume = true;
+      }
+    } catch (e) {
+      console.warn(`[boot] creator-override probe threw: ${e?.message || e} — skipping Hume pre-validation; lazy-validate at session-open if needed`);
+      probeFailed = true;
+    }
+  }
+  if (needHume) {
+    if (!HUME_API_KEY) {
+      console.error('FATAL: HUME_API_KEY missing — required when VOICE_TTS_PROVIDER=hume OR any creator has tts_provider=hume override');
+      process.exit(1);
+    }
+    // Audit C2 — prime the SHARED singleton in proxy-handlers.js. After
+    // this call, both bridge construction here AND logTurnCogs over there
+    // read the same cached pricing object.
+    _humePricingPrimeForBoot();
+  } else if (probeFailed) {
+    // Best-effort: if env defaults to cartesia AND probe failed, leave
+    // the singleton uninitialized. getHumePricing() will lazy-validate
+    // at the first Hume bridge construction — hard-exit then if Hume
+    // is genuinely required. This converts a boot crash-loop into an
+    // honest "first Hume session fails" — a much narrower blast radius.
+    console.warn('[boot] Hume pricing deferred to lazy validation due to probe failure');
+  }
 }
 
 // R4-M6 — Cartesia is only safe with models we've Phase-0-verified for
@@ -96,6 +222,28 @@ const ALLOWED_MODELS = new Set([
   'gemini-3.1-flash-live-preview',
 ]);
 
+// HUME_TTS_PLAN §6.1 — env-level TTS provider default.
+// `creators.tts_provider` (per-creator override) wins at session-open. When
+// NULL, /api/sessions/open inherits this env value. Validated at boot so a
+// typo doesn't silently route every session to the wrong bridge. Older code
+// reads VOICE_TTS_LAYER_ENABLED for the "α' on/off" bit; the two flags are
+// orthogonal — α' is the TTS layer, VOICE_TTS_PROVIDER is which TTS.
+const VOICE_TTS_PROVIDER_VALID = new Set(['cartesia', 'hume']);
+const VOICE_TTS_PROVIDER = (process.env.VOICE_TTS_PROVIDER || 'cartesia').toLowerCase();
+if (!VOICE_TTS_PROVIDER_VALID.has(VOICE_TTS_PROVIDER)) {
+  console.error(`FATAL: VOICE_TTS_PROVIDER=${process.env.VOICE_TTS_PROVIDER} invalid (must be 'cartesia' or 'hume')`);
+  process.exit(1);
+}
+// Audit C5 (unit-wide, 2026-05-13) — VOICE_TTS_PROVIDER=hume implies the
+// α' TTS layer must be on (VOICE_TTS_LAYER_ENABLED=1). Without that combo,
+// `useTts` stays false at runtime, the Hume bridge never instantiates,
+// and Gemini's stock voice leaks to users — violates CLAUDE.md hard rule
+// "Gemini's stock voice is never user-facing, on any tier."
+if (VOICE_TTS_PROVIDER === 'hume' && !VOICE_TTS_LAYER_ENABLED) {
+  console.error('FATAL: VOICE_TTS_PROVIDER=hume requires VOICE_TTS_LAYER_ENABLED=1 (α\' TTS layer must be on)');
+  process.exit(1);
+}
+
 // Wire-string → sessions.model_used enum. 2.5 preview strings all map to the
 // GA enum value; the exact wire id lives in cogs_log.metadata.model.
 const MODEL_TO_ENUM = {
@@ -119,6 +267,119 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
 });
 
+// HUME_TTS_PLAN §6.8 — boot-time pricing provisioning. Async because the
+// dual-provider probe queries `creators.tts_provider`. Top-level await
+// guarantees the function completes BEFORE server.listen() is called, so
+// the first session-open never races a missing pricing constant.
+await provisionPricing();
+
+// Day-13 audit-build C4 — fail-loud at boot if v2 wiring is misconfigured.
+// `callRetrieveKnowledgeV2`'s lazy `getConfig()` would otherwise let the
+// proxy start cleanly, then silently degrade every v2 turn to persona-only
+// when the first call fires. Hard-exit here keeps the dogfood path honest.
+// Skip when v2 is intentionally not wired (default for prod until Day-15).
+// DECOUPLED_BRAIN_PLAN P1-6 (audit M6). The orchestrator abandons the
+// retrieval wait at this ceiling (persona-only degrade so the deep
+// answer starts immediately — no dead air after the hedge).
+//
+// 2026-05-21 (audit C1) — TWO distinct timers, NOT one. They were both 2500
+// and that was the bug: the v2 shim's internal deadline and the orchestrator's
+// patience expired at the SAME instant, so a ~2.5s retrieve (measured live:
+// 2462–2502ms — right on the cliff) was a coin-flip between grounded and a
+// silent persona-only miss that ALSO billed a full pipeline for nothing.
+// Once the deep answer moved onto the critical path (the early-trigger fix),
+// this cliff went live. Split + raised:
+//   • BUDGET (3000) — what the v2 pipeline races against internally
+//     (rewrite+embed+topk+rerank). Bills are capped at this.
+//   • CEILING (3500) — how long the orchestrator WAITS for retrieval before
+//     persona-only. MUST be > BUDGET + HTTP/network overhead so the budget's
+//     result is actually consumable (the old "lock to same value" reasoning
+//     was wrong — it guaranteed the result was discarded). Constraint that
+//     still holds: BUDGET ≤ CEILING, so the shim never bills past the point
+//     the orchestrator gave up.
+// P0 measured retrieve p95 ≈ 2022ms (common case clears with wide margin); the
+// budget/ceiling below are sized for the slow-but-VALID worst case, not the p95.
+// 2026-05-23 (Vuk): headroom raised 3000→3500 budget / 3500→4000 ceiling so a
+// slow-but-VALID rewrite (cap raised to 2200 in query-rewrite.ts) plus
+// embed(~350)+topk(~160)+rerank(~600) ≈ 3310ms still lands INSIDE the budget
+// instead of timing out → persona-only "I don't know". TRADEOFF: paraphrase is
+// OFF, so the ceiling is pure dead-air before the deep answer's first word;
+// 4000 = up to 4s silence + first-token. The proper cover for a longer wait is
+// enabling the paraphrase bridge (PARAPHRASE_ENABLED=1). Both env-overridable so
+// we can re-tune after the live test WITHOUT a redeploy. Invariant BUDGET ≤
+// CEILING is enforced below (the shim self-cancels at BUDGET, the orchestrator
+// waits to CEILING, so we never bill past the orchestrator's patience).
+const _envPosInt = (name, dflt) => {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || raw === '') return dflt;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    console.error(`FATAL: ${name} must be a positive finite number; got '${raw}'`);
+    process.exit(1);
+  }
+  return Math.floor(n);
+};
+const DECOUPLED_RETRIEVE_BUDGET_MS = _envPosInt('DECOUPLED_RETRIEVE_BUDGET_MS', 3500);
+const DECOUPLED_RETRIEVE_CEILING_MS = _envPosInt('DECOUPLED_RETRIEVE_CEILING_MS', 4000);
+// 2026-05-25 (fix #1) — how many reranked parent units to INJECT into the brain.
+// Was effectively 5 (the shim's DEFAULT_TOP_K, since the proxy passed no topK):
+// the brain got the #1 story PLUS 4 lower-ranked distractors, blended them into
+// generic advice, and disowned the specific story ("not my story"). The
+// reranker is decisive (lumberjack 0.7656 vs next 0.3281) — injecting ONLY the
+// top unit gives the brain ONE thing to tell in-voice. Default 1; bump via env
+// if testing shows multi-part questions need more context (audit M2 — validated
+// for single-story Qs; multi-part/comparative Qs may want 2-3, see deploy notes;
+// and audit M3 — bumping it in prod requires a corpus_version bump or
+// RAG_CACHE_DISABLED window, since the cache key does NOT include topK). NOTE
+// (audit S4): a value ≤0 / non-numeric is boot-FATAL via _envPosInt (process
+// exits), NOT floored to 1; only the upper bound is clamped to 5.
+const DECOUPLED_INJECT_TOP_K = Math.min(5, _envPosInt('DECOUPLED_INJECT_TOP_K', 1));
+// The real invariant is CEILING ≥ BUDGET + the shim client's HTTP_OVERHEAD_GRACE_MS
+// (500, in retrieve-knowledge-v2-client.js): the shim self-cancels at BUDGET, its
+// AbortController backstops at BUDGET+500, and the orchestrator must still be
+// waiting then so a typed/late response is CONSUMED, not discarded at the cliff
+// (and so we never bill a retrieve whose result we threw away). A bare BUDGET ≤
+// CEILING guard (audit M3) would wrongly accept e.g. 3900/4000. Keep this 500 in
+// sync with HTTP_OVERHEAD_GRACE_MS if that constant ever changes.
+const RETRIEVE_CLIENT_GRACE_MS = 500;
+if (DECOUPLED_RETRIEVE_CEILING_MS < DECOUPLED_RETRIEVE_BUDGET_MS + RETRIEVE_CLIENT_GRACE_MS) {
+  console.error(
+    `FATAL: DECOUPLED_RETRIEVE_CEILING_MS (${DECOUPLED_RETRIEVE_CEILING_MS}) must be ≥ ` +
+    `DECOUPLED_RETRIEVE_BUDGET_MS (${DECOUPLED_RETRIEVE_BUDGET_MS}) + ${RETRIEVE_CLIENT_GRACE_MS} ` +
+    `(shim client grace). Either LOWER the budget or RAISE the ceiling — the orchestrator ` +
+    `must outwait the shim's self-cancel+grace or it discards a result it already paid for.`,
+  );
+  process.exit(1);
+}
+const RAG_V2_PROXY_ENABLED = process.env.RAG_V2_PROXY_ENABLED === '1';
+if (RAG_V2_PROXY_ENABLED) {
+  if (!process.env.RAG_V2_SHIM_URL) {
+    console.error('FATAL: RAG_V2_PROXY_ENABLED=1 but RAG_V2_SHIM_URL not set');
+    process.exit(1);
+  }
+  if (!process.env.INTERNAL_API_SECRET || process.env.INTERNAL_API_SECRET.length < 32) {
+    console.error('FATAL: RAG_V2_PROXY_ENABLED=1 but INTERNAL_API_SECRET missing or < 32 chars');
+    process.exit(1);
+  }
+  try {
+    new URL(process.env.RAG_V2_SHIM_URL);
+  } catch {
+    console.error(`FATAL: RAG_V2_SHIM_URL is not a valid URL: ${process.env.RAG_V2_SHIM_URL}`);
+    process.exit(1);
+  }
+  console.log(`[boot] RAG v2 wiring enabled — shim=${process.env.RAG_V2_SHIM_URL}`);
+} else {
+  console.log('[boot] RAG v2 wiring disabled (set RAG_V2_PROXY_ENABLED=1 to enable)');
+}
+// Boot-visible decoupled depth + injection config. Fly masks secret VALUES in
+// `fly secrets list` (name + digest only), so this is the only way to confirm
+// from prod that BRAIN_DEPTH_MODE actually resolved to 'variable' (anything else
+// = 'brief'). Also surfaces the inject-top-K so a stray override is visible.
+console.log(
+  `[boot] decoupled depth=${process.env.BRAIN_DEPTH_MODE === 'variable' ? 'variable' : 'brief (default — set BRAIN_DEPTH_MODE=variable for full answers)'} `
+  + `inject_top_k=${DECOUPLED_INJECT_TOP_K}`,
+);
+
 function sha256Hex(s) { return createHash('sha256').update(s).digest('hex'); }
 
 // ── HTTP ─────────────────────────────────────────────────────────────────
@@ -131,9 +392,15 @@ const server = http.createServer((req, res) => {
   }
   // R3-C2 (sec) — single source of truth for the α' rollout flag.
   // Vercel polls this endpoint (60s in-process cache) instead of
-  // reading its own env, so flipping VOICE_CARTESIA_ENABLED on Fly
+  // reading its own env, so flipping VOICE_TTS_LAYER_ENABLED on Fly
   // alone propagates to the pre-WS gate at /api/sessions/open. Public
   // (no auth) but only exposes flags + version, no secrets.
+  //
+  // HUME_TTS_PLAN §6.2 — also exposes `ttsProvider` so the Vercel
+  // sessions/open route can compute `sessionProvider = creator.tts_provider
+  // ?? proxyCfg.ttsProvider` without reading its own env (single source of
+  // truth). `useCartesia` stays for back-compat with older Vercel deploys
+  // during the migration window; new code reads `useTtsLayer`.
   if (req.url === '/voice-config') {
     res.writeHead(200, {
       'content-type': 'application/json',
@@ -141,7 +408,12 @@ const server = http.createServer((req, res) => {
       'cache-control': 'public, max-age=30',
     });
     res.end(JSON.stringify({
-      useCartesia: VOICE_CARTESIA_ENABLED,
+      // Both keys returned during the migration window. New deploys read
+      // `useTtsLayer`; older Vercel deploys still read `useCartesia`. Drop
+      // the legacy field in a follow-up once Vercel is on the new name.
+      useTtsLayer: VOICE_TTS_LAYER_ENABLED,
+      useCartesia: VOICE_TTS_LAYER_ENABLED,
+      ttsProvider: VOICE_TTS_PROVIDER,
       build: BUILD,
       ts: Date.now(),
     }));
@@ -170,7 +442,11 @@ async function consumeTicket(ticketId, uaHash) {
     .is('consumed_at', null)
     .gt('expires_at', new Date().toISOString())
     .eq('bound_ua_hash', uaHash)
-    .select('user_id, creator_id, session_id, expected_tier, purpose, avatar_provider, system_prompt, prefix_turns, tts_speed, brain_mode')
+    // HUME_TTS_PLAN §6.1 — extended SELECT for tts_provider + hume_* prosody
+    // + voice_id_env. The proxy never re-derives provider OR env from its
+    // own envvars (Vuk-M5: ticket is the contract). Hume prosody is NULL on
+    // cartesia tickets and ignored by the bridge selection.
+    .select('user_id, creator_id, session_id, expected_tier, purpose, avatar_provider, system_prompt, prefix_turns, tts_speed, brain_mode, decoupled, tts_provider, hume_tts_speed, hume_trailing_silence, hume_voice_description, hume_model_version, voice_id_env')
     .maybeSingle();
   if (error || !data) return null;
   // creator_id is NOT NULL by CHECK on new rows (migration 0041). A null here
@@ -213,6 +489,39 @@ async function consumeTicket(ticketId, uaHash) {
     // 'drawer' = legacy topic-tag overlap; 'vector' = per-turn pgvector
     // retrieval injected mid-session via the audio gate below.
     brainMode:      (data.brain_mode === 'vector' ? 'vector' : 'drawer'),
+    // DECOUPLED_BRAIN_PLAN P1-2 — D7 fail-safe: STRICT === true. Any
+    // other value (false/null/undefined/'true'/1/garbage) → false →
+    // legacy path. This is THE security boundary for "absent/unparseable
+    // → legacy"; never loosen to truthy. DB CHECK guarantees a true
+    // snapshot implies brain_mode='vector'.
+    decoupled:      (data.decoupled === true),
+    // HUME_TTS_PLAN §6.1 — provider snapshot. NOT NULL by DB constraint
+    // (migration 0002), but a stray null on a pre-migration ticket would
+    // be a tts_provider mismatch trap below — coerce to a guard string.
+    ttsProvider:    (data.tts_provider === 'hume' ? 'hume' : 'cartesia'),
+    // Hume prosody dials (migration 0005). NULL on cartesia tickets — bridge
+    // selection branches on ttsProvider, so these are only read on the Hume
+    // path. Numeric coercion mirrors ttsSpeed above.
+    humeTtsSpeed: (() => {
+      if (data.hume_tts_speed == null) return null;
+      const n = typeof data.hume_tts_speed === 'number' ? data.hume_tts_speed : Number(data.hume_tts_speed);
+      return Number.isFinite(n) ? n : null;
+    })(),
+    humeTrailingSilence: (() => {
+      if (data.hume_trailing_silence == null) return null;
+      const n = typeof data.hume_trailing_silence === 'number' ? data.hume_trailing_silence : Number(data.hume_trailing_silence);
+      return Number.isFinite(n) ? n : null;
+    })(),
+    humeVoiceDescription: data.hume_voice_description || null,
+    humeModelVersion:     data.hume_model_version || null,
+    // HUME_TTS_PLAN §6 audit M1 — env-scoped voice column selector pinned
+    // on the ticket. Pre-migration tickets carry NULL → default to
+    // 'production' (the historical default).
+    voiceIdEnv: (
+      data.voice_id_env === 'preview' || data.voice_id_env === 'development'
+        ? data.voice_id_env
+        : 'production'
+    ),
   };
 }
 
@@ -240,8 +549,13 @@ async function attachToSession({ sessionId, userId, creatorId, expectedTier }) {
   if (expectedTier) q = q.eq('tier_at_session', expectedTier);
   // Read the public-safe columns. Privileged HeyGen tokens live on
   // sessions_private (RLS service-role-only) — separate query below.
+  // Day-13: corpus_version_at_session + retrieval_version_at_session
+  // become closure consts for the WS lifetime. Snapshot-at-session-open
+  // contract; never re-read live (CLAUDE.md tier-routing-at-session-open).
   const { data, error } = await q
-    .select('id, tier_at_session, avatar_provider')
+    .select(
+      'id, tier_at_session, avatar_provider, corpus_version_at_session, retrieval_version_at_session',
+    )
     .maybeSingle();
   if (error) {
     console.error('[session-attach]', error);
@@ -274,13 +588,51 @@ async function attachToSession({ sessionId, userId, creatorId, expectedTier }) {
     sessionId: data.id,
     tier: data.tier_at_session,
     avatarProvider: data.avatar_provider ?? null,
+    // Day-13 snapshot consts. Both NOT NULL DEFAULT 1 by schema. Coerce
+    // to integers defensively — supabase-js returns smallint as number
+    // already, but Number() guards against future driver shape changes.
+    corpusVersionAtSession: Number(data.corpus_version_at_session ?? 1),
+    retrievalVersionAtSession: Number(data.retrieval_version_at_session ?? 1),
     heygenSessionId,
     heygenSessionToken,
   };
 }
 
-async function openSession({ userId, creatorId, modelWire }) {
+async function openSession({ userId, creatorId, modelWire, ttsProvider }) {
   const modelEnum = MODEL_TO_ENUM[modelWire];
+  // Day-13 audit-build M4 — admin spike-a path hard-pins
+  // retrieval_version_at_session=1, but the creator may already be at
+  // v2 (Day-15+). v1 retrieveTopK queries chunker_version=1 chunks
+  // which may not exist for v2-reprocessed creators → admin sees
+  // silent zero retrieval. Probe + warn so the surface is visible
+  // (admin-only path; one extra read is cheap).
+  try {
+    const { data: cd } = await supabase
+      .from('creators')
+      .select('retrieval_version')
+      .eq('id', creatorId)
+      .maybeSingle();
+    if (cd && Number(cd.retrieval_version) === 2) {
+      console.warn(
+        `[session-open spike-a] creator=${creatorId.slice(0, 8)} is at retrieval_version=2 but spike-a path hard-pins v1; expect ZERO retrieval`,
+      );
+    }
+  } catch (e) {
+    // Non-fatal — admin-only path, never block on probe failure.
+    console.warn(`[session-open spike-a] retrieval_version probe failed: ${e?.message || e}`);
+  }
+  // Audit C3 (unit-wide) — write tts_provider_at_session snapshot on the
+  // legacy spike-a admin path too. Without this, sessions opened by the
+  // proxy (no /api/sessions/open call) had NULL snapshot, which silently
+  // bypassed cogs_insert_turn_voice_v2's provider cross-check.
+  const ttsProviderAtSession = ttsProvider === 'hume' ? 'hume' : 'cartesia';
+  // Day-13: admin spike-a path doesn't read creators.retrieval_version
+  // because it doesn't run through session_open RPC's FOR SHARE snapshot.
+  // Admin is the only caller of this path; admin will never dogfood v2 via
+  // spike-a (they go through real session-open via /api/sessions/open).
+  // Explicit DEFAULT 1 is safer than relying on the column default —
+  // future renames of the column would still produce the right value
+  // here.
   const { data, error } = await supabase
     .from('sessions')
     .insert({
@@ -289,6 +641,9 @@ async function openSession({ userId, creatorId, modelWire }) {
       model_used: modelEnum,
       tier_at_session: 'free', // overwritten by sessions_enforce_tier_and_kill_switch trigger
       status: 'starting',
+      tts_provider_at_session: ttsProviderAtSession,
+      corpus_version_at_session: 1,
+      retrieval_version_at_session: 1,
     })
     .select('id, tier_at_session')
     .single();
@@ -300,7 +655,15 @@ async function openSession({ userId, creatorId, modelWire }) {
     captureException(error, { op: 'session-insert', userId, modelWire });
     return { err: 'upstream_error' };
   }
-  return { sessionId: data.id, tier: data.tier_at_session };
+  // Day-13: spike-a path explicitly hard-pins both snapshot values to 1.
+  // Mirrors attachToSession's return shape so the caller can use the same
+  // closure consts irrespective of which path opened the session.
+  return {
+    sessionId: data.id,
+    tier: data.tier_at_session,
+    corpusVersionAtSession: 1,
+    retrievalVersionAtSession: 1,
+  };
 }
 
 async function endSession(sessionId, reason) {
@@ -479,7 +842,7 @@ function closeWs(ws, code, reason) {
 // (plan §1A.2). See SPIKE_A_DEFERRED_FIXUP_PLAN.md §1A.0 C-C fix.
 const sessionToWs = new Map();
 
-const { logTurnCogs, dropSession: dropCogsSession } = makeLogTurnCogs({
+const { logTurnCogs, logBrainLeg, dropSession: dropCogsSession } = makeLogTurnCogs({
   supabase,
   env: 'spike_a',
   onConsecutiveFailure: (sessionId) => {
@@ -520,7 +883,9 @@ wss.on('connection', async (ws, req) => {
       expectedTier: consumed.expectedTier,
     });
   } else {
-    sess = await openSession({ userId, creatorId, modelWire });
+    // Audit C3 (unit-wide) — pass ttsProvider so the spike-a admin path's
+    // sessions insert writes tts_provider_at_session.
+    sess = await openSession({ userId, creatorId, modelWire, ttsProvider: consumed.ttsProvider });
   }
   if (sess.err) { console.log(`[ws ${connId}] session err=${sess.err}`); }
   if (sess.err === 'session_already_active') return closeWs(ws, 4002, 'session_already_active');
@@ -570,12 +935,15 @@ wss.on('connection', async (ws, req) => {
   wsRegistry.set(sessionId, { ws, openedAt: Date.now() });
 
   let bridge = null;
-  let cartesia = null;
+  // HUME_TTS_PLAN §6.4 — single bridge variable for either provider. Both
+  // CartesiaTTSBridge and HumeTTSBridge expose the same interface (open /
+  // turnStart / sendText / turnEnd / cancel / close / on / getMetrics).
+  let ttsBridge = null;
   let closed = false;
   let lastHeartbeatAt = Date.now();
   let heartbeatInterval = null;
   let turnNumber = 0;
-  let cartesiaTurnDead = false; // R3-M1 / R4-S1 — relay-loop gate for barge-in
+  let ttsTurnDead = false; // R3-M1 / R4-S1 — relay-loop gate for barge-in (provider-neutral)
 
   // ── pgvector RAG plan — vector-mode state ──────────────────────────────
   //
@@ -583,8 +951,27 @@ wss.on('connection', async (ws, req) => {
   // (R3 M4 fix — application-layer trust chain). NEVER re-read from any
   // per-message field. `brainMode` selects which retrieval path runs.
   const brainMode = consumed.brainMode;          // 'drawer' | 'vector'
+  // DECOUPLED_BRAIN_PLAN P1-2 — bound ONCE from the consumed snapshot
+  // (R3-M4 trust chain), never re-read per-message. true ⇒ off-Live
+  // paraphrase→RAG→TTS path; the 1548/1572/981 decoupled branches
+  // (P1-5) gate on this. Byte-identical legacy when false.
+  const decoupled = consumed.decoupled === true; // strict; D7 fail-safe
   const ticketCreatorId = consumed.creatorId;    // used for creator_knowledge_topk
   const ticketUserId = consumed.userId;          // used for voice_retrieval_budget
+  // Day-13 — snapshot consts from sessions (attachToSession / openSession).
+  // retrievalVersionAtSession routes per-turn retrieval: 1 → legacy
+  // retrieveTopK (in-proc), 2 → HTTP shim to /api/internal/retrieve-knowledge
+  // (orchestrator runs on Vercel). corpusVersionAtSession rides every v2
+  // call as the cache key — never live-read mid-session (CLAUDE.md
+  // tier-routing-at-session-open contract).
+  const retrievalVersionAtSession = Number(sess.retrievalVersionAtSession ?? 1);
+  const corpusVersionAtSession = Number(sess.corpusVersionAtSession ?? 1);
+  // Day-13 audit C5 — last assistant response lives in-memory as the
+  // source-of-truth for the NEXT turn's rewrite call. The DB UPSERT to
+  // voice_session_state is durable-fallback only (survives WS replacement
+  // on Gemini Live 15-min reopen). Initialized null = first-turn /
+  // post-resumption signal to the rewriter.
+  let lastAssistantResponseClosure = null;
   //
   // Audio gate (R2 C1 / R3 M1). Between bridge `turn_complete` and resolution
   // of pendingInjection, we hold inbound audio frames in `audioHold` so the
@@ -668,9 +1055,21 @@ wss.on('connection', async (ws, req) => {
     console.log(`[ws ${connId}] heygen heartbeat started every=${HEYGEN_HEARTBEAT_MS}ms heygen_session=${heygenSessionId.slice(0, 8)}`);
   }
 
-  // R3-A8 / R4-S8 — snapshot the rollback flag and model gate ONCE per
-  // session. No mid-session re-read.
-  const useCartesia = VOICE_CARTESIA_ENABLED;
+  // R3-A8 / R4-S8 — snapshot the α' rollback flag ONCE per session. No
+  // mid-session re-read.
+  // `useTtsLayer` reflects "α' is on" (separate TTS bridge active, regardless
+  // of which provider). The actual provider (cartesia vs hume) lives on the
+  // ticket; we never re-derive from env. (Renamed 2026-05-14 from
+  // `useCartesia` — the old name was misleading once Hume joined the layer.)
+  const useTtsLayer = VOICE_TTS_LAYER_ENABLED;
+  const ttsProvider = consumed.ttsProvider; // 'cartesia' | 'hume', from ticket
+  // Audit C5 (unit-wide) — `useTts` activates the bridge. With α' off
+  // entirely, a ticket that requests Hume would skip bridge instantiation
+  // and leak Gemini stock audio. Activate the bridge when α' is on OR the
+  // ticket explicitly asks for Hume (a per-creator override). The boot-time
+  // assertion above guards the env=hume case; this guards the per-creator
+  // override case.
+  const useTts = useTtsLayer || ttsProvider === 'hume';
 
   const teardown = async (reason) => {
     if (closed) return;
@@ -704,7 +1103,7 @@ wss.on('connection', async (ws, req) => {
     // alongside the brain-prefix metrics so operators can grep one stream
     // for session-end signals. Skips emit entirely on drawer mode (no
     // retrieval ran).
-    if (brainMode === 'vector') {
+    if (brainMode === 'vector' && !decoupled) {
       console.log(
         `[ws ${connId}] vector.metrics injected=${injectionLandedCount} ` +
         `skipped_short=${retrievalSkippedShortUtteranceCount} ` +
@@ -715,10 +1114,45 @@ wss.on('connection', async (ws, req) => {
         `session=${sessionId.slice(0, 8)}`,
       );
     }
+    // DECOUPLED_BRAIN_PLAN P1-5.2 (§13 981) — decoupled emits its OWN
+    // metrics line (the vector counters are all-zero on this path; a
+    // misleading vector.metrics line is suppressed above via !decoupled).
+    if (decoupled && decoupledOrch) {
+      const m = decoupledOrch.metricsSnapshot();
+      if (m) {
+        // Whole-build audit C1 — field names MUST match metricsSnapshot()
+        // (`lastTurnNumber` / `lastParaFirstMs` / `lastDeepFirstMs`); the
+        // pre-fix readers `m.turnNumber` / `m.paraphrase?.firstChunkMs` /
+        // `m.deep?.firstChunkMs` resolved to `undefined` on every session,
+        // turning the (A)-gate first-audio metric — the whole reason for
+        // the decoupled re-arch — into a blind log line.
+        console.log(
+          `[ws ${connId}] decoupled.metrics turns=${m.turns} ` +
+          `last_turn=${m.lastTurnNumber ?? 'na'} ` +
+          `barged=${m.barged} ` +
+          // P1-10 audit M2 — spurious-barge + trivial-Q observability
+          `interrupted_suppressed=${m.interruptedSuppressed ?? 0} ` +
+          `trivial_turns=${m.trivialTurns ?? 0} ` +
+          // C-5 audit C1 — truncated-transcript turns (persona-only, retrieval
+          // skipped). Surfaced here so the skip is OBSERVABLE/tunable in prod,
+          // not buried in the degraded string. A rising rate = Gemini STT
+          // dropping long utterances.
+          `truncated_turns=${m.truncatedTurns ?? 0} ` +
+          // B1 — deep answers guillotined at MAX_TOKENS (mid-thought cut). Should
+          // be ~0 now the token cap sits above the graceful 4000-char ceiling.
+          `deep_truncated=${m.deepTruncated ?? 0} ` +
+          `max_deep_chars=${m.maxDeepChars ?? 'na'} ` +
+          `degraded=${(m.degraded || []).join(',') || 'none'} ` +
+          `para_first_ms=${m.lastParaFirstMs ?? 'na'} ` +
+          `deep_first_ms=${m.lastDeepFirstMs ?? 'na'} ` +
+          `session=${sessionId.slice(0, 8)}`,
+        );
+      }
+    }
     // R4-M1 — null-check INSTANCES, not booleans. Either bridge may be
     // null if the open path bailed early.
-    try { if (cartesia) await cartesia.close(); } catch {}
-    try { if (bridge)   await bridge.close();   } catch {}
+    try { if (ttsBridge) await ttsBridge.close(); } catch {}
+    try { if (bridge)    await bridge.close();    } catch {}
     // Post-build audit C3 — close the HeyGen session server-side. The
     // bridge close()s the WebSocket but doesn't call /v1/sessions/stop
     // (it has no JWT). Idempotent per Phase 0 §11.
@@ -740,49 +1174,77 @@ wss.on('connection', async (ws, req) => {
   };
 
   // R4-M6 — model gate before any bridge instantiation when α' is on.
-  if (useCartesia && !CARTESIA_COMPATIBLE_MODELS.has(modelWire)) {
+  if (useTtsLayer && !CARTESIA_COMPATIBLE_MODELS.has(modelWire)) {
     console.log(`[ws ${connId}] model_not_compatible_with_cartesia ${modelWire}`);
     await teardown('model_not_compatible_with_cartesia');
     return closeWs(ws, 4010, 'model_not_compatible');
   }
 
-  // R3-Phase3 — voice id lookup. Fail-closed when α' is on but creator
-  // hasn't been cloned yet.
+  // R3-Phase3 / HUME_TTS_PLAN §6.2 — voice id lookup. Fail-closed when α'
+  // is on but the creator's env-scoped voice column for the resolved
+  // provider is NULL. The column picked depends on ttsProvider AND
+  // voice_id_env — BOTH come from the ticket (audit M1 fix: no longer
+  // reads its own VOICE_ID_ENV env var; ticket-as-contract).
+  // For Hume we also surface the human-readable voice NAME — the DELETE
+  // worker keys by name.
+  //
+  // Punch-list (audit S14, unit-wide) — this re-queries `creators` per
+  // WS open. The Vuk-M5 ticket-as-contract pattern says pin everything
+  // we need onto the ticket. A future PR can pin `voice_id` + `hume_voice_name`
+  // onto voice_tickets and eliminate this DB read. Not urgent — the
+  // query is single-row + cheap, but it's a residual per-session DB hit
+  // that the architecture says shouldn't exist.
   let creatorVoiceId = null;
-  if (useCartesia) {
+  let creatorHumeVoiceName = null;
+  if (useTts) {
     try {
+      const env = consumed.voiceIdEnv;
+      const voiceCol = ttsProvider === 'hume'
+        ? (env === 'production' ? 'hume_voice_id'
+          : env === 'preview'    ? 'hume_voice_id_preview'
+          :                        'hume_voice_id_dev')
+        : (env === 'production' ? 'voice_id'
+          : env === 'preview'    ? 'voice_id_preview'
+          :                        'voice_id_dev');
+      const nameCol = ttsProvider === 'hume'
+        ? (env === 'production' ? 'hume_voice_name'
+          : env === 'preview'    ? 'hume_voice_name_preview'
+          :                        'hume_voice_name_dev')
+        : null;
+      const selectList = nameCol ? `${voiceCol}, ${nameCol}` : voiceCol;
       const { data, error } = await supabase
         .from('creators')
-        .select('voice_id')
+        .select(selectList)
         .eq('id', creatorId)
         .maybeSingle();
       if (error) throw error;
-      creatorVoiceId = data?.voice_id || null;
+      creatorVoiceId = data?.[voiceCol] || null;
+      if (nameCol) creatorHumeVoiceName = data?.[nameCol] || null;
     } catch (e) {
       console.error(`[ws ${connId}] voice-id-lookup`, e);
-      captureException(e, { op: 'voice-id-lookup', sessionId, creatorId });
+      captureException(e, { op: 'voice-id-lookup', sessionId, creatorId, ttsProvider });
       await teardown('voice_id_lookup_failed');
       return closeWs(ws, 4005, 'upstream_error');
     }
     if (!creatorVoiceId) {
-      console.log(`[ws ${connId}] cartesia_no_voice creator=${creatorId.slice(0,8)}`);
-      await teardown('cartesia_no_voice');
-      return closeWs(ws, 4009, 'cartesia_no_voice');
+      console.log(`[ws ${connId}] tts_no_voice provider=${ttsProvider} creator=${creatorId.slice(0,8)}`);
+      await teardown(`tts_no_voice_${ttsProvider}`);
+      // HUME_TTS_PLAN §6.3 — 4009 kept for back-compat with the harness when
+      // provider=cartesia; 4014 used for Hume (or any non-cartesia future).
+      if (ttsProvider === 'cartesia') {
+        return closeWs(ws, 4009, 'cartesia_no_voice');
+      }
+      return closeWs(ws, 4014, `tts_no_voice_${ttsProvider}`);
     }
-    // Whole-build audit M4: fail loud when useCartesia is on but the
-    // ticket carries no system_prompt. The cloned voice attached to a
-    // generic-mentor brain is the worst-of-both fallback the entire
-    // brain wire-up exists to prevent. The route's brain_not_ready 409
-    // gate normally catches this upstream, but if a future code path
-    // (admin preview, regression, RLS misconfiguration) bypasses it,
-    // refuse the WS rather than silently degrade. Close code 4013 is
-    // new — distinct from cartesia_no_voice so dashboards can tell
-    // brain-detached from voice-detached.
+    // Whole-build audit M4: fail loud when α' is on but the ticket carries
+    // no system_prompt. The cloned voice attached to a generic-mentor
+    // brain is the worst-of-both fallback. Same gate for both providers.
     if (!consumed.systemPrompt) {
-      console.log(`[ws ${connId}] brain_unset_with_cartesia creator=${creatorId.slice(0,8)} ticket=${ticket.slice(0,8)}`);
-      captureMessage('brain.unset_with_cartesia', 'warning', { connId, sessionId, creatorId });
-      await teardown('brain_unset_with_cartesia');
-      return closeWs(ws, 4013, 'brain_unset_with_cartesia');
+      console.log(`[ws ${connId}] brain_unset_with_tts provider=${ttsProvider} creator=${creatorId.slice(0,8)} ticket=${ticket.slice(0,8)}`);
+      captureMessage('brain.unset_with_tts', 'warning', { connId, sessionId, creatorId, ttsProvider });
+      await teardown('brain_unset_with_tts');
+      // Audit M1 (unit-wide) — provider-aware close reason.
+      return closeWs(ws, 4013, `brain_unset_with_${ttsProvider}`);
     }
   }
 
@@ -792,8 +1254,20 @@ wss.on('connection', async (ws, req) => {
   try {
     bridge = new GeminiBridge({
       apiKey: GEMINI_API_KEY,
-      enableOutputTranscription: useCartesia,
-      discardAudioOut: useCartesia,
+      // Audit C4 — MUST be `useTts`, NOT `useTtsLayer`. `useTts =
+      // useTtsLayer || ttsProvider === 'hume'`. If a creator has a
+      // per-creator `tts_provider='hume'` override while the fleet env
+      // layer flag is OFF (useTtsLayer=false), driving these off
+      // useTtsLayer leaves Gemini in audio-out mode (NOT discarding)
+      // WHILE the Hume bridge is also open → Gemini's stock synthesized
+      // voice can reach the user. That violates the CLAUDE.md hard rule
+      // "Gemini's stock voice is never user-facing, on any tier, any
+      // failure mode." Gating on `useTts` makes the per-creator override
+      // a correct α' session (transcript out, audio discarded). The
+      // legacy (layer off, cartesia, no override) path keeps useTts=false
+      // → audio-out preserved, no regression.
+      enableOutputTranscription: useTts,
+      discardAudioOut: useTts,
       // pgvector RAG plan (vector mode). When the ticket's brain_mode is
       // 'vector', enable inputAudioTranscription so we receive
       // serverContent.inputTranscription.text per user-turn to drive
@@ -801,9 +1275,22 @@ wss.on('connection', async (ws, req) => {
       // for staged rollout (BRAIN_ENABLE_INPUT_TRANSCRIPTION_DRAWER).
       enableInputTranscription:
         consumed.brainMode === 'vector'
+        // DECOUPLED_BRAIN_PLAN P1-2 — decoupled needs the user transcript
+        // to feed the off-Live brain. `|| false` when decoupled off ⇒
+        // byte-identical legacy (§13 proof). Audit M4: use the ONCE-bound
+        // `decoupled` const (L869), NOT a re-read of consumed.decoupled —
+        // matches the §13 guard-site spec and removes future-drift risk
+        // if the bind ever gains a staging override.
+        || decoupled
         || process.env.BRAIN_ENABLE_INPUT_TRANSCRIPTION_DRAWER === '1',
+      // DECOUPLED_BRAIN_PLAN P1-6 (audit C1) — D-GoAway proactive
+      // resumption-handle reopen is ONLY safe on the STT-only decoupled
+      // path (no persona/prefix re-seed → regression-immune). Passing the
+      // once-bound `decoupled` const (L877) hard-gates it: legacy keeps
+      // its audited reactive-only reopen, byte-identical pre-P1-6.
+      decoupled,
     });
-    console.log(`[ws ${connId}] gemini.open start (cartesia=${useCartesia} brain=${consumed.brainMode})`);
+    console.log(`[ws ${connId}] gemini.open start (tts_layer=${useTtsLayer} useTts=${useTts} provider=${ttsProvider} brain=${consumed.brainMode} decoupled=${decoupled})`);
     const t0 = Date.now();
     // Brain wire-up (PR-2 + pgvector RAG). systemInstruction + brainPrefix
     // ride the ticket; bridge.open() seeds prefix_turns post-setupComplete
@@ -824,51 +1311,78 @@ wss.on('connection', async (ws, req) => {
     return closeWs(ws, 4005, 'upstream_error');
   }
 
-  if (useCartesia) {
+  if (useTts) {
     try {
       // Per-session sample rate driven by the ticket's avatar_provider
-      // (audit-r2 C1). Cartesia ships output_format.sample_rate per WS
-      // init; mismatched cadence to the avatar pipeline = chipmunk-pitch
+      // (audit-r2 C1). The TTS bridge ships output_format.sample_rate per
+      // WS init; mismatched cadence to the avatar pipeline = chipmunk-pitch
       // or hard-reject at the avatar's audio_buffer_appended.
       //   simli   → 16 kHz (Trinity-1 SDK requires PCM16 LE @ 16k)
       //   tavus   → 16 kHz (echo-mode parity with Simli)
       //   heygen  → 24 kHz (LiveAvatar Lite, PHASE_0_HEYGEN.md §6)
       // Legacy admin spike-a path (no ticketSessionId, no avatar_provider
       // because the ticket was minted before this column existed OR is a
-      // voice_clone) defaults to 24 kHz so existing harness fixtures
-      // stay green.
-      let cartesiaSampleRate;
+      // voice_clone) defaults to 24 kHz so existing harness fixtures stay
+      // green. Hume honors the same sample-rate query param.
+      let ttsSampleRate;
       if (consumed.avatarProvider === 'heygen') {
-        cartesiaSampleRate = 24000;
+        ttsSampleRate = 24000;
       } else if (consumed.avatarProvider === 'simli' || consumed.avatarProvider === 'tavus') {
-        cartesiaSampleRate = 16000;
+        ttsSampleRate = 16000;
       } else {
-        // Fallback: legacy/admin paths. Preserve prior behavior:
-        //   attach path with no avatar_provider → 16k (Simli inferred).
-        //   spike-a (no session_id) → 24k (harness default).
-        cartesiaSampleRate = isAttachPath ? 16000 : 24000;
+        // Fallback: legacy/admin paths.
+        ttsSampleRate = isAttachPath ? 16000 : 24000;
       }
-      cartesia = new CartesiaTTSBridge({
-        apiKey: CARTESIA_API_KEY,
-        voiceId: creatorVoiceId,
-        sampleRate: cartesiaSampleRate,
-        // Creator voice-speed (migration 20260511000006). NULL when the
-        // ticket pre-dates this column OR the creator hasn't dialed in
-        // a value; bridge treats NULL/1.0 as "omit generation_config.speed"
-        // (Cartesia default) via shouldSendSpeed().
-        ttsSpeed: consumed.ttsSpeed,
-      });
+      // HUME_TTS_PLAN §6.4 — branch construction on ttsProvider. Both
+      // bridges expose the same interface; downstream relay-loop code
+      // talks to `ttsBridge` regardless of which class backs it.
+      if (ttsProvider === 'cartesia') {
+        ttsBridge = new CartesiaTTSBridge({
+          apiKey: CARTESIA_API_KEY,
+          voiceId: creatorVoiceId,
+          sampleRate: ttsSampleRate,
+          // Cartesia treats NULL/1.0 as "omit generation_config.speed" via
+          // shouldSendSpeed().
+          ttsSpeed: consumed.ttsSpeed,
+        });
+      } else if (ttsProvider === 'hume') {
+        // HUME_API_KEY validated at boot (provisionPricing). Pricing object
+        // sourced from the validated cache.
+        ttsBridge = new HumeTTSBridge({
+          apiKey: HUME_API_KEY,
+          voiceId: creatorVoiceId,
+          voiceName: creatorHumeVoiceName,
+          // Audit S2 — pass 16000 explicitly, NOT ttsSampleRate. Hume
+          // Octave 2 always emits 48k and the bridge always resamples to
+          // 16k; the constructor warns on any non-16k arg. Passing the
+          // avatar-derived ttsSampleRate (24000 for heygen/spike-a) would
+          // emit a spurious warn on every such session-open for no effect.
+          sampleRate: 16000,
+          ttsSpeed: consumed.humeTtsSpeed,
+          trailingSilence: consumed.humeTrailingSilence,
+          description: consumed.humeVoiceDescription,
+          // Audit S17 (unit-wide) — modelVersion is required-by-contract
+          // upstream (mint helper enforces; route defaults to '2' on null).
+          // The `|| '2'` here is defense-in-depth against a future code
+          // path that bypasses mint validation — never silently degrade
+          // the model selection.
+          modelVersion: consumed.humeModelVersion || '2',
+          pricing: getHumePricing(),
+        });
+      } else {
+        throw new Error(`unknown ttsProvider: ${ttsProvider}`);
+      }
       const t0 = Date.now();
-      await cartesia.open();
-      console.log(`[ws ${connId}] cartesia.open ok in ${Date.now() - t0}ms`);
+      await ttsBridge.open();
+      console.log(`[ws ${connId}] tts.open ok provider=${ttsProvider} in ${Date.now() - t0}ms`);
     } catch (e) {
-      console.error(`[ws ${connId}] cartesia-open FAIL:`, e?.message || e);
-      captureException(e, { op: 'cartesia-open', connId, sessionId });
+      console.error(`[ws ${connId}] tts-open FAIL provider=${ttsProvider}:`, e?.message || e);
+      captureException(e, { op: 'tts-open', connId, sessionId, ttsProvider });
       // R3-C3 — close Gemini before user WS so it doesn't accept audio
       // for a session that can't synthesize.
       try { await bridge?.close(); } catch {}
       bridge = null;
-      await teardown('cartesia_open_failed');
+      await teardown('tts_open_failed');
       return closeWs(ws, 4005, 'upstream_error');
     }
   }
@@ -889,7 +1403,14 @@ wss.on('connection', async (ws, req) => {
     captureException(e, { op: 'activate-session', sessionId });
   }
 
-  ws.send(JSON.stringify({ type: 'ready', sessionId, build: BUILD, useCartesia }));
+  // Audit S4 (unit-wide) — `useCartesia` was the α' on/off flag pre-Hume;
+  // with provider routing it's a misnomer when ttsProvider='hume'. We emit
+  // BOTH the new `useTts` AND the legacy `useCartesia: useTts` alias on
+  // the ready frame so older clients (pre-§6 harness, in-flight tabs at
+  // deploy time) keep parsing. `useCartesia` is retired with §8 step 6.
+  // No client should rely on it for routing decisions — it means "α' is
+  // active," not "the provider is cartesia."
+  ws.send(JSON.stringify({ type: 'ready', sessionId, build: BUILD, useTts, useCartesia: useTts, ttsProvider }));
 
   // R3-C2 / R4-C4 / S-M7 — backpressure-aware send. Applied to every
   // audio frame forwarded to the user WS (Gemini fallback or Cartesia α').
@@ -951,7 +1472,7 @@ wss.on('connection', async (ws, req) => {
     ws.send(bytes, { binary: true });
   }
 
-  // ── Vector-mode retrieval helpers (audit C1 fix) ──────────────────────
+  // ── Vector-mode retrieval helpers (audit C1 fix + Day-13 v2 branch) ───
   //
   // retrieveTopK + buildInjectionEnvelope are static-imported from the
   // proxy-side JS mirrors at the top of this file. The previous attempt
@@ -959,11 +1480,79 @@ wss.on('connection', async (ws, req) => {
   // loader rejects .ts extensions and the catch installed silent sentinels,
   // so vector mode appeared to work but never actually retrieved anything.
   //
+  // Day-13: retrievalVersionAtSession routes between two paths.
+  //   * v1 (legacy): retrieveTopK(in-proc) → passages
+  //   * v2 (Day-11 orchestrator): callRetrieveKnowledgeV2 → parents
+  // The resolveInjectionAtTurnComplete handler normalizes both shapes
+  // into the envelope builder's `{text, sourceType, title?, score?}` form.
+  //
   // Run retrieval for a user turn; the race against the 800ms ceiling
   // happens in the turn_complete handler.
   function kickoffRetrieval(transcript, turnNum) {
+    if (retrievalVersionAtSession === 2 && !RAG_V2_PROXY_ENABLED) {
+      // Safety net: session is marked v2 at DB layer but the proxy
+      // wasn't deployed with RAG_V2_PROXY_ENABLED=1 yet. Running v1
+      // retrieveTopK would query chunker_version=1 chunks that may not
+      // exist for a v2-reprocessed creator — silent zero results. Skip
+      // retrieval entirely; user gets persona-only and we emit a loud
+      // signal for ops to flip the env.
+      console.error(
+        `[ws ${connId}] v2 session detected but RAG_V2_PROXY_ENABLED=0 — skipping retrieval (sessionId=${sessionId.slice(0, 8)})`,
+      );
+      captureException(new Error('v2_session_proxy_disabled'), {
+        op: 'vector.retrieve.proxy_disabled',
+        sessionId,
+        turnNumber: turnNum,
+      });
+      pendingInjection = { skip: true, turnNumber: turnNum };
+      return;
+    }
+    if (retrievalVersionAtSession === 2) {
+      // v2 path: shim does rewrite → cache → topk_v2 → rerank → cache-upsert
+      // and returns {parents, telemetry, budgetExceeded, rewriteFallback,
+      // posthogEvents}. Budget = orchestrator's 4000ms target — clamped
+      // server-side to [1000, 8000]. We pass the relative duration, not an
+      // absolute epoch (audit C4: Fly↔Vercel clock skew).
+      //
+      // Day-13 audit-build C1: per-turn AbortController so barge-in
+      // (bridge `interrupted`) cancels the in-flight HTTP fetch. Without
+      // this, an impatient user who barges every turn burns 2-3× budget
+      // (orchestrator still runs to completion server-side, increments
+      // counter, writes cogs_log for paid legs).
+      const ac = new AbortController();
+      pendingInjection = {
+        turnNumber: turnNum,
+        version: 2,
+        skip: false,
+        abort: () => {
+          try { ac.abort(); } catch {}
+        },
+        promise: callRetrieveKnowledgeV2({
+          userId: ticketUserId,
+          creatorId: ticketCreatorId,
+          sessionId,
+          rawUtterance: transcript,
+          lastAssistantResponse: lastAssistantResponseClosure,
+          corpusVersionAtSession,
+          budgetMs: 4000,
+          signal: ac.signal,
+        }).catch((err) => {
+          // Day-13 audit M3: NEVER retry. Single-shot. Failures degrade
+          // to persona-only (empty parents) so the turn still happens.
+          captureException(err, {
+            op: 'vector.retrieve.v2',
+            sessionId,
+            turnNumber: turnNum,
+            code: err instanceof RetrieveV2ClientError ? err.code : 'unknown',
+          });
+          return { parents: [], budgetExceeded: false, rewriteFallback: false, posthogEvents: [] };
+        }),
+      };
+      return;
+    }
     pendingInjection = {
       turnNumber: turnNum,
+      version: 1,
       skip: false,
       promise: retrieveTopK({
         supabase,
@@ -1002,14 +1591,21 @@ wss.on('connection', async (ws, req) => {
 
   // Race pendingInjection against an 800ms ceiling. On result with passages,
   // call bridge.injectText. Always flush the audio gate at the end.
+  //
+  // Day-13: v1 returns `{passages: [{text, sourceType}]}`; v2 returns
+  // `{parents: [{text, sourceType, title, score, ...}], posthogEvents, ...}`.
+  // Branch on version snapshot to normalize the envelope input. Then emit
+  // PostHog events from v2 telemetry + envelope oversize.
   async function resolveInjectionAtTurnComplete() {
     if (!pendingInjection || pendingInjection.skip) {
       flushAudioHold();
       pendingInjection = null;
       return;
     }
+    const version = pendingInjection.version || 1;
     const promise = pendingInjection.promise;
     pendingInjection = null;
+
     let result = null;
     try {
       result = await Promise.race([
@@ -1025,15 +1621,56 @@ wss.on('connection', async (ws, req) => {
       flushAudioHold();
       return;
     }
-    if (!result || !Array.isArray(result.passages) || result.passages.length === 0) {
+    // Normalize v1 vs v2 result shapes into the envelope's input.
+    const envelopePassages =
+      version === 2 && Array.isArray(result?.parents)
+        ? result.parents.map((p) => ({
+            text: p.text,
+            sourceType: p.sourceType,
+            title: p.title ?? undefined,
+            score: typeof p.score === 'number' ? p.score : undefined,
+          }))
+        : Array.isArray(result?.passages)
+          ? result.passages.map((p) => ({ text: p.text, sourceType: p.sourceType }))
+          : [];
+
+    // v2 telemetry → PostHog batch — fire regardless of envelope result.
+    // Cache-hit / cache-miss / budget-exceeded / rewrite-fallback land here.
+    if (version === 2 && Array.isArray(result?.posthogEvents) && result.posthogEvents.length > 0) {
+      posthogCaptureBatch({
+        events: result.posthogEvents,
+        distinctId: ticketUserId,
+        sessionId,
+      });
+    }
+
+    if (envelopePassages.length === 0) {
       retrievalEmptyCount += 1;
       flushAudioHold();
       return;
     }
     try {
-      const envelope = buildInjectionEnvelope({
-        passages: result.passages.map((p) => ({ text: p.text, sourceType: p.sourceType })),
-      });
+      const envelope = buildInjectionEnvelope({ passages: envelopePassages });
+      // Day-13 audit M6 / cross-cutting: emit `rag_envelope_oversize` when
+      // input exceeded INJECTION_HARD_INPUT_BYTES even after lowest-score
+      // drops. Distinct from cogs_log (envelope isn't a paid API).
+      if (envelope?.oversize === true && version === 2) {
+        posthogCaptureBatch({
+          events: [
+            {
+              name: 'rag_envelope_oversize',
+              properties: {
+                user_id: ticketUserId,
+                creator_id: ticketCreatorId,
+                session_id: sessionId,
+                dropped_passages: envelope.droppedPassages,
+              },
+            },
+          ],
+          distinctId: ticketUserId,
+          sessionId,
+        });
+      }
       if (envelope && envelope.passageCount > 0) {
         bridge.injectText(envelope.text);
         injectionLandedCount += 1;
@@ -1045,6 +1682,166 @@ wss.on('connection', async (ws, req) => {
     }
   }
 
+  // ── DECOUPLED_BRAIN_PLAN P1-5.2 — off-Live orchestrator ───────────────
+  // Built ONLY for a decoupled ticket (decoupled ⇒ brain_mode 'vector'
+  // by migration invariant). Owns the paraphrase→deep-answer utterance.
+  // The legacy vector/drawer path is byte-identical when `decoupled` is
+  // false: decoupledOrch stays null and every event site below is gated
+  // on it. North star: first audio fast, seamless handoff, instant
+  // barge-in, never silence/error to the user.
+  let decoupledOrch = null;
+  let decoupledFatalFired = false; // audit C2 — onFatal idempotency latch
+  let goAwayReopenFailedFired = false; // audit NEW-M5 — fail teardown one-shot
+  if (decoupled) {
+    // Audit M5 — decoupled REQUIRES the α' TTS layer (the deep answer is
+    // spoken in the creator's cloned voice; CLAUDE.md hard rule). The
+    // boot gate FATALs this, but its probe can DEFER on a Supabase blip
+    // at Fly boot. This is the session-open backstop: without it every
+    // ttsSendText silently discards the entire paraphrase + deep answer
+    // → total silence to the user with no error (the "never silence"
+    // rule violated via a resilience seam).
+    if (!useTts) {
+      captureException(new Error('decoupled_without_tts_layer'), {
+        op: 'decoupled.no_tts', sessionId, ttsProvider,
+      });
+      // Whole-build audit C3 — must teardown() BEFORE closeWs so the
+      // sessions row records `decoupled_no_tts_layer` as the end_reason
+      // (registry-classified red-flag in fatal-end-reasons.js). The pre-
+      // fix bare-close path fell into the WS onclose handler with
+      // teardown reason `client_close_1011_decoupled_no_tts_layer`,
+      // which is NOT in the registry → burn-in monitor classified a
+      // fleet-wide misconfig as ordinary user-hangup → alert dark.
+      await teardown('decoupled_no_tts_layer');
+      return closeWs(ws, 1011, 'decoupled_no_tts_layer');
+    }
+    // retrieve(question, signal) → L2 envelope text | null. Mirrors the
+    // v1/v2 normalization of resolveInjectionAtTurnComplete but RETURNS
+    // the envelope instead of injecting it into Gemini (decoupled never
+    // injects — that is the legacy double-answer bug path).
+    const retrieveEnvelopeForDecoupled = async (question, signal) => {
+      if (retrievalVersionAtSession === 2 && !RAG_V2_PROXY_ENABLED) return null;
+      let result;
+      try {
+        if (retrievalVersionAtSession === 2) {
+          result = await callRetrieveKnowledgeV2({
+            userId: ticketUserId, creatorId: ticketCreatorId, sessionId,
+            rawUtterance: question,
+            // 2026-05-21 (audit C2) — prefer the orchestrator's EAGER
+            // lastAssistantResponse(): the early-trigger fix means the deep
+            // answer's `final` lands (and lastCompleted updates) seconds before
+            // this turn's `turn_end` handler writes lastAssistantResponseClosure
+            // (which is gated on Gemini's slow turn_complete). A quick follow-up
+            // ("tell me more about that") arriving in that window would otherwise
+            // rewrite against the turn-N-1 answer. The closure remains the
+            // durable fallback for the Gemini-Live 15-min reopen (when the
+            // orchestrator's in-memory lastCompleted is gone).
+            lastAssistantResponse:
+              (decoupledOrch && decoupledOrch.lastAssistantResponse()) || lastAssistantResponseClosure,
+            corpusVersionAtSession, budgetMs: DECOUPLED_RETRIEVE_BUDGET_MS, signal,
+            // fix #1 — inject only the top reranked unit(s), not the default 5.
+            // Stops the 5-unit blend that made the brain disown the specific story.
+            topK: DECOUPLED_INJECT_TOP_K,
+          });
+        } else {
+          result = await retrieveTopK({
+            supabase, geminiApiKey: GEMINI_API_KEY,
+            userId: ticketUserId, creatorId: ticketCreatorId,
+            queryText: question, sessionId,
+          });
+        }
+      } catch (e) {
+        captureException(e, { op: 'decoupled.retrieve', sessionId });
+        return null;
+      }
+      if (result && Array.isArray(result.posthogEvents) && result.posthogEvents.length > 0) {
+        posthogCaptureBatch({ events: result.posthogEvents, distinctId: ticketUserId, sessionId });
+      }
+      const passages = Array.isArray(result?.parents)
+        ? result.parents.map((p) => ({
+            text: p.text, sourceType: p.sourceType,
+            title: p.title ?? undefined,
+            score: typeof p.score === 'number' ? p.score : undefined,
+          }))
+        : Array.isArray(result?.passages)
+          ? result.passages.map((p) => ({ text: p.text, sourceType: p.sourceType }))
+          : [];
+      if (passages.length === 0) return null;
+      try {
+        const envelope = buildInjectionEnvelope({ passages });
+        return envelope && envelope.passageCount > 0 ? envelope.text : null;
+      } catch (e) {
+        captureException(e, { op: 'decoupled.envelope', sessionId });
+        return null;
+      }
+    };
+    decoupledOrch = makeDecoupledOrchestrator({
+      generateParaphrase,
+      generateDeepAnswer,
+      retrieve: retrieveEnvelopeForDecoupled,
+      ttsSendText: (t) => {
+        if (useTts && ttsBridge) {
+          try { ttsBridge.sendText(t); } catch (err) {
+            captureException(err, { op: 'tts.sendText', sessionId, ttsProvider });
+          }
+        }
+      },
+      logBrainLeg,
+      persona: consumed.systemPrompt || null,
+      apiKey: GEMINI_API_KEY,
+      userId: ticketUserId,
+      sessionId,
+      // Phase 3 (audit C1) — session tier snapshot. The AUTHORITATIVE source
+      // is sess.tier (sessions.tier_at_session, set by the kill-switch trigger
+      // at session-open), NOT consumed.* (the ticket-consume result carries
+      // expectedTier, never `tier`). Gates the variable-depth word budget
+      // (free tighter, paid full). Coerce any non-paid/unknown value to 'free'
+      // — the SAFE tighter budget; a session must never accidentally get the
+      // paid length budget from a stray tier string.
+      tier: (sess.tier === 'premium' || sess.tier === 'boardroom') ? sess.tier : 'free',
+      // Per-utterance "deep answer done" → tell the browser this turn's audio
+      // has finished streaming so it can flush the Simli tail-carry (the last
+      // ≤187ms that was stranded → "cut off mid-word"). Fired EARLY (when the
+      // deep answer finishes), not on the +6–20s-late Gemini turn_complete.
+      // Same WS as audio_out → ordered after the last audio chunk; the browser
+      // still gates a short trailing-audio grace before flushing.
+      onDeepAnswerDone: () => {
+        try {
+          if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'deep_answer_done' }));
+        } catch { /* ws closing — nothing to flush */ }
+      },
+      onFatal: () => {
+        // Audit C2 — idempotent. The orchestrator's `fatal` latch
+        // already blocks a second paid call, but onFatal can still be
+        // invoked once from each in-flight generator (paraphrase + deep)
+        // before the latch is observed; a second teardown + closeWs
+        // racing the first is the double-close hazard. Fire once.
+        if (decoupledFatalFired) return;
+        decoupledFatalFired = true;
+        try { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'error', code: 'cogs_misconfig', op: 'decoupled' })); } catch {}
+        teardown('decoupled_misconfigured').catch(() => {});
+        closeWs(ws, 1011, 'cogs_misconfig');
+      },
+      onPersonaNull: () => console.warn(`[ws ${connId}] brain_persona_null decoupled session=${sessionId.slice(0, 8)}`),
+      // 2026-05-21 (audit C1) — the orchestrator CEILING (3500) is
+      // deliberately LARGER than the retrieve HTTP BUDGET (3000, above), so
+      // the pipeline's result can actually be consumed instead of discarded
+      // at the cliff. BUDGET ≤ CEILING still holds (the shim self-cancels at
+      // 3000, the orchestrator waits to 3500), so the wasted-billing-tail
+      // concern the old "lock to same value" comment worried about is still
+      // covered — the shim never bills past the orchestrator's patience.
+      retrieveCeilingMs: DECOUPLED_RETRIEVE_CEILING_MS,
+      // DECOUPLED_BRAIN_PLAN — paraphrase OFF by default. Strict === '1'
+      // parse (CLAUDE.md flag convention). When 0/unset the deep answer is
+      // the sole voice (no hedge, no double-talk, no contradiction).
+      paraphraseEnabled: process.env.PARAPHRASE_ENABLED === '1',
+      log: {
+        warn: (m) => console.warn(`[ws ${connId}] ${m}`),
+        error: (m) => console.error(`[ws ${connId}] ${m}`),
+      },
+      captureException,
+    });
+  }
+
   // ── Gemini events ─────────────────────────────────────────────────────
   bridge.on((e) => {
     if (closed) return;
@@ -1052,15 +1849,24 @@ wss.on('connection', async (ws, req) => {
       // R3-S3 — when α' is on the bridge already discards audio_out at
       // emit time (discardAudioOut:true). This branch is the rollback
       // path: Gemini's audio goes straight to the user.
-      if (!useCartesia) sendBinaryWithBackpressure(e.chunk.bytes);
+      if (!useTts) sendBinaryWithBackpressure(e.chunk.bytes);
     } else if (e.kind === 'output_transcription_chunk') {
-      // R3-C4 — pipe transcript text into Cartesia. Cartesia's
-      // _turnDead flag drops the chunk if a barge-in already fired
-      // synchronously. sendText is a no-op when bridge isn't open or
-      // turn isn't started.
-      if (useCartesia && cartesia) {
-        try { cartesia.sendText(e.text); } catch (err) {
-          captureException(err, { op: 'cartesia.sendText', sessionId });
+      // R3-C4 — pipe transcript text into the active TTS bridge. The
+      // bridge's _turnDead flag drops the chunk if a barge-in already
+      // fired synchronously. sendText is a no-op when bridge isn't open
+      // or turn isn't started. Provider-neutral after HUME_TTS_PLAN §6.4
+      // rename.
+      //
+      // DECOUPLED_BRAIN_PLAN P1-5.2 (§13 — site identified during P1-5.2
+      // wiring, NOT in the original enumeration): in decoupled mode
+      // Gemini's own answer transcript MUST NOT reach TTS — the
+      // orchestrator drives TTS from the paraphrase + off-Live deep
+      // answer. Piping Gemini's discarded answer here would be a second
+      // voice over the orchestrator's. `&& !decoupled` ⇒ byte-identical
+      // when the flag is false (`&& !false` = unchanged predicate+body).
+      if (useTts && ttsBridge && !decoupled) {
+        try { ttsBridge.sendText(e.text); } catch (err) {
+          captureException(err, { op: 'tts.sendText', sessionId, ttsProvider });
         }
       }
     } else if (e.kind === 'transcript_runaway') {
@@ -1081,6 +1887,45 @@ wss.on('connection', async (ws, req) => {
       // immediately after when its clarifier finishes generating). The race
       // resolves in resolveInjectionAtTurnComplete().
       if (brainMode !== 'vector') return;
+      // DECOUPLED_BRAIN_PLAN P1-5.2 (§13 1548) — decoupled replaces the
+      // entire retrieve→inject path with the off-Live orchestrator. Fires
+      // EVERY turn (B deleted; (A) is the sole gate — the short/trunc
+      // skips below are a vector-injection optimization that does not
+      // apply: the paraphrase is the dead-air mask on every utterance).
+      // Gated on decoupledOrch ⇒ byte-identical when the flag is false.
+      if (decoupled && decoupledOrch) {
+        // C-5 — apply the SAME truncation heuristic the legacy vector path uses
+        // below. The early-trigger used to return before that check, so a >12s
+        // utterance whose transcript Gemini dropped >40% of would silently
+        // ground + answer a PARTIAL question (decoupled answers from the
+        // transcript, not the discarded audio). Pass the flag so the
+        // orchestrator skips retrieval (persona-only) and records it; count it
+        // on the same metric the legacy path reports.
+        const decoupledTruncated = truncationSuspected(e.text, e.durationSec);
+        if (decoupledTruncated) {
+          retrievalSkippedTruncationCount += 1;
+          console.warn(`[ws ${connId}] input_transcription truncated (decoupled) — persona-only deep answer (chars=${e.text.length} sec=${Number(e.durationSec).toFixed(2)})`);
+        }
+        decoupledOrch.onUserTranscript(e.text, turnNumber, { truncationSuspected: decoupledTruncated });
+        // DECOUPLED LATENCY FIX (2026-05-21) — start the REAL deep answer the
+        // INSTANT we have the final user transcript. Do NOT wait for Gemini's
+        // serverContent.turnComplete: in decoupled mode Gemini still generates
+        // a full AUDIO answer we DISCARD, and turn_complete only fires AFTER
+        // that wasted generation. PROVEN by [latency] timestamps: transcript
+        // ready at +228ms / +260ms, but turn_complete at +6693ms / +20894ms —
+        // 7-21s of dead air scaling with answer length. Triggering here
+        // collapses it to retrieval + deep_first (~3s, grounded). The
+        // serverContent.turnComplete branch below still calls onTurnComplete
+        // as a fallback (empty/garbage-transcript turns never reach here); the
+        // orchestrator's `t.done` guard makes the second call RETURN WITHOUT
+        // resolving spoken — the in-flight first call owns resolveSpoken (it
+        // resolves only after the deep answer fully streams). Resolving here
+        // would close the Cartesia context mid-answer → silent avatar.
+        decoupledOrch.onTurnComplete().catch((err) => {
+          captureException(err, { op: 'decoupled.turn_complete_early', sessionId });
+        });
+        return;
+      }
       // Audit M3: skip retrieval for conversational fillers. The clarifier
       // pattern means turn N+1 ("maintaining habits") is often <20 chars
       // and doesn't carry substantive intent — the retrieval was already
@@ -1104,7 +1949,7 @@ wss.on('connection', async (ws, req) => {
       // same-envelope input_transcription set pendingInjection FIRST (R3 M1
       // belt-and-suspenders; bridge's _onMessage already iterates input
       // before turn_complete, but we don't trust that to never refactor).
-      if (brainMode === 'vector') {
+      if (brainMode === 'vector' && !decoupled) {
         forwardAudio = false;
         setImmediate(() => {
           resolveInjectionAtTurnComplete().catch((err) => {
@@ -1112,11 +1957,121 @@ wss.on('connection', async (ws, req) => {
             flushAudioHold();
           });
         });
+      } else if (brainMode === 'vector' && decoupled && decoupledOrch) {
+        // DECOUPLED_BRAIN_PLAN P1-5.2 (§13 1572) — NO audio gate / NO
+        // Gemini injection on the decoupled path (forwardAudio stays
+        // true; nothing is injected back into Live). The orchestrator
+        // awaits retrieval and streams the deep answer to TTS, seamlessly
+        // continuing the paraphrase. `&& !decoupled` above ⇒ the legacy
+        // branch is byte-identical when the flag is false.
+        decoupledOrch.onTurnComplete().catch((err) => {
+          captureException(err, { op: 'decoupled.turn_complete', sessionId });
+        });
       }
     } else if (e.kind === 'interrupted') {
-      if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'interrupted', at: e.at }));
+      // P1-10 spurious-barge fix (2026-05-20). Gemini Live emits
+      // `serverContent.interrupted` when ITS OWN audio generation is
+      // interrupted by incoming user audio — based on Gemini's internal
+      // timeline. In decoupled mode we DISCARD that audio (Cartesia/Hume
+      // is what the user actually hears), so Gemini's audio-gen timeline
+      // is irrelevant to whether the user is barging in. A user who waits
+      // for Cartesia to finish, then asks the next question, will still
+      // trigger Gemini's interrupted (because Gemini Live is still
+      // generating its own audio response in parallel). That spurious
+      // event used to abort the orchestrator + (until this commit) NEVER
+      // call ttsBridge.cancel(), leaving the Cartesia context orphaned →
+      // "Invalid context ID" on the next turn's first sendText → silent
+      // audio for the rest of the session.
+      // NOTE (DECOUPLED_STT_OUTPUT_COST_PLAN, 2026-05-21): the maxOutputTokens
+      // cap shrinks Gemini's discarded parallel-audio window from ~5.6s to
+      // ~0.6s, so spurious interrupteds fire far less often — but the heuristic
+      // below keys off Cartesia's getLastChunkAt(), not Gemini's timeline, so
+      // its correctness is unchanged; only the spurious RATE drops.
+      //
+      // Heuristic: a REAL user barge only happens during ACTIVE TTS
+      // playback. If Cartesia/Hume hasn't emitted an audio chunk in
+      // >1000ms, no playback is being interrupted → suppress.
+      // P1-10 audit S3 — promote magic number. Cartesia chunks arrive
+      // at ~40ms intervals during synthesis; 1000ms is a 25× margin so
+      // a brief packet gap can't trip the heuristic into thinking
+      // playback ended.
+      const SPURIOUS_BARGE_IDLE_THRESHOLD_MS = 1000;
+      let suppress = false;
+      if (decoupled && useTts && ttsBridge && typeof ttsBridge.getLastChunkAt === 'function') {
+        const lastChunk = ttsBridge.getLastChunkAt() || 0;
+        const idleMs = lastChunk === 0 ? Infinity : (Date.now() - lastChunk);
+        if (idleMs > SPURIOUS_BARGE_IDLE_THRESHOLD_MS) {
+          suppress = true;
+          console.log(`[ws ${connId}] interrupted suppressed (decoupled, tts idle ${idleMs}ms — spurious Gemini interrupted)`);
+          // P1-10 audit M2 — observability: surface suppression rate in
+          // session metrics.
+          if (decoupledOrch && typeof decoupledOrch.recordInterruptedSuppressed === 'function') {
+            try { decoupledOrch.recordInterruptedSuppressed(); } catch {}
+          }
+        }
+      }
+      if (!suppress) {
+        if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'interrupted', at: e.at }));
+        // P1-10 audit C2 — ORDER MATTERS. Cancel TTS bridge FIRST
+        // (synchronous: flips _turnDead=true + nulls _currentContextId
+        // → any in-flight paraphrase delta the orchestrator hasn't yet
+        // thrown out of its for-await will hit a no-op sendText). THEN
+        // abort the orchestrator. Pre-audit ordering let a 1-3 chunk
+        // burst of audio reach Cartesia AFTER the user already barged
+        // (microtask race between AbortSignal flip and the orchestrator
+        // generator's next iteration).
+        if (useTts && ttsBridge) {
+          try { ttsBridge.cancel(); } catch {}
+        }
+        // Day-13 audit-build C1 — cancel in-flight v2 retrieval on barge-in.
+        if (pendingInjection && typeof pendingInjection.abort === 'function') {
+          try { pendingInjection.abort(); } catch {}
+        }
+        // DECOUPLED_BRAIN_PLAN P1-5.2 — barge-in: abort the in-flight
+        // paraphrase/deep generators + retrieval. Each throws with
+        // `.partial` (P0-4a server-billed) → the orchestrator still writes
+        // the cogs leg (M6).
+        if (decoupled && decoupledOrch) {
+          try { decoupledOrch.onInterrupted(); } catch {}
+        }
+      }
     } else if (e.kind === 'error') {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'error', at: e.at, message: e.message }));
+    } else if (e.kind === 'go_away') {
+      // DECOUPLED_BRAIN_PLAN P1-6 — observability only. The bridge owns
+      // the proactive resumption-handle reopen at the next VAD-silence;
+      // nothing for the proxy to do but record the advance warning.
+      console.log(`[ws ${connId}] gemini go_away timeLeftMs=${e.timeLeftMs} reopen_in_ms=${e.deadlineInMs} session=${sessionId.slice(0, 8)}`);
+    } else if (e.kind === 'go_away_reopen') {
+      // The bridge's intentional close is suppressed (no 'closed'
+      // event); we only see start/ok/fail/aborted_user_closed. ok ⇒
+      // fresh session, next turn_start is seamless. fail ⇒ the session
+      // is genuinely past the cap and unrecoverable (the reactive
+      // 1000-close fallback cannot help) → tear down cleanly instead of
+      // a server ABORTED.
+      if (e.phase === 'fail') {
+        // Audit NEW-M5 — one-shot (mirrors decoupledFatalFired). The
+        // synchronous `closed` latch + the `if (closed) return` at the
+        // top of this handler already prevent a second teardown, but a
+        // dedicated latch keeps captureException / upstream_closed /
+        // closeWs provably single-fire and matches the decoupled-fatal
+        // pattern the codebase already uses for this exact hazard.
+        if (goAwayReopenFailedFired) return;
+        goAwayReopenFailedFired = true;
+        console.error(`[ws ${connId}] gemini go_away_reopen FAILED (${e.reason}): ${e.message} — tearing down`);
+        captureException(new Error('go_away_reopen_failed'), { op: 'gemini.go_away_reopen', sessionId, reason: e.reason });
+        if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'upstream_closed', at: e.at, code: 1011, reason: 'go_away_reopen_failed' }));
+        teardown('go_away_reopen_failed').catch(() => {});
+        closeWs(ws, 1011, 'go_away_reopen_failed');
+      } else if (e.phase === 'aborted_user_closed') {
+        // Audit M5 — the user closed mid-bounce. EXPECTED outcome, not a
+        // failure: the user-close path owns its own teardown. Do NOT
+        // captureException (phantom Sentry on every hangup-during-goAway)
+        // and do NOT send upstream_closed / fire a racing teardown.
+        console.log(`[ws ${connId}] gemini go_away_reopen aborted (user closed mid-bounce, ${e.reason}) session=${sessionId.slice(0, 8)}`);
+      } else {
+        console.log(`[ws ${connId}] gemini go_away_reopen ${e.phase} (${e.reason}) session=${sessionId.slice(0, 8)}`);
+      }
     } else if (e.kind === 'closed') {
       // Phase 0.5 fix (2026-05-07). Google's js-genai#707 closes the
       // Gemini WS with code=1000 after a turn instead of holding it
@@ -1135,62 +2090,100 @@ wss.on('connection', async (ws, req) => {
     }
   });
 
-  // ── Cartesia events ───────────────────────────────────────────────────
-  if (useCartesia && cartesia) {
-    cartesia.on((e) => {
+  // HUME_TTS_PLAN §6.9 / unit-wide-audit C2 fix — Hume's per-turn cap
+  // emits `protocol_violation`. Pre-audit code wrote a second cogs row
+  // inline + closed 4006 immediately. Audit C1 caught the race: the
+  // normal `logTurnCogs` at turn_end runs concurrently and the cogs_log
+  // UNIQUE (session_id, turn_number) ON CONFLICT DO NOTHING silently
+  // drops one of the two writes.
+  //
+  // Resolution: SET A LATCH here, let turn_end run normally, the
+  // turn_end logTurnCogs picks up `humeCapExceeded:true` from metadata
+  // (single writer, no race), then closes 4006 after cogs lands.
+  let humeCapExceededLatch = false;
+
+  // Audit S13 (unit-wide) — the ttsBridge.on() handler registered below
+  // captures closures over `ws`, `sessionId`, `humeCapExceededLatch`,
+  // etc. The bridge's close() detaches all listeners (both bridges are
+  // EventEmitters; close() ultimately calls removeAllListeners or lets
+  // the EventEmitter GC), so teardown → bridge.close() frees the closure
+  // graph. If you ever swap bridge implementations, ensure close() still
+  // drops listeners or capture+invoke `off()` from the registration site.
+
+  // ── TTS bridge events (provider-neutral) ──────────────────────────────
+  // HUME_TTS_PLAN §6.4 — both CartesiaTTSBridge and HumeTTSBridge emit the
+  // same event envelope. Provider-specific error codes (cartesia: Invalid
+  // transcript et al; hume: protocol_violation, bad_voice_id) are handled
+  // by inspecting `e.code` — the handler is otherwise identical.
+  if (useTts && ttsBridge) {
+    ttsBridge.on((e) => {
       if (closed) return;
       if (e.kind === 'audio_out') {
         // R3-M1 / R4-S1 — relay-loop gate, in addition to the bridge's
         // own _turnDead check. Belt-and-suspenders against late chunks
         // from the WS receive buffer at cancel time.
-        if (cartesiaTurnDead) return;
+        if (ttsTurnDead) return;
         sendBinaryWithBackpressure(e.chunk.bytes);
       } else if (e.kind === 'reconnected') {
         if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'tts_reconnected', at: e.at }));
       } else if (e.kind === 'error') {
-        // Diagnostic 2026-05-04 — surface Cartesia error details to Fly logs
-        // (Sentry is no-op until SENTRY_DSN is wired). Without this we only
-        // see `tts_failed` at the harness with no upstream cause.
-        // Phase 0.5 (2026-05-07): include textSample so we can see what
-        // Cartesia rejected.
+        // §6.9 latch: protocol_violation (per-turn cap) is non-fatal; flip
+        // the flag and let turn_end's logTurnCogs handle the metadata +
+        // delayed 4006 close. No inline cogs write here.
+        if (e.code === 'protocol_violation' && ttsProvider === 'hume') {
+          humeCapExceededLatch = true;
+          // Send a user-visible truncation warning so the half-sentence
+          // they just heard isn't followed by silence with no signal.
+          if (ws.readyState === ws.OPEN) {
+            try { ws.send(JSON.stringify({ type: 'warning', code: 'response_truncated_cap', at: e.at })); } catch {}
+          }
+          return;
+        }
+        // Diagnostic 2026-05-04 — surface TTS error details to Fly logs.
+        // textSample exists on cartesia; humeMessage on hume (denylisted
+        // from Sentry by name in sentry.js TRANSCRIPT_KEYS).
         console.error(
-          `[cartesia.error] code=${e.code} message=${e.message} fatal=${e.fatal} sample=${JSON.stringify((e.textSample || '').slice(0, 200))}`,
+          `[tts.error provider=${ttsProvider}] code=${e.code} message=${e.message} fatal=${e.fatal} sample=${JSON.stringify((e.textSample || '').slice(0, 200))}`,
         );
         if (e.fatal) {
           if (ws.readyState === ws.OPEN) {
             ws.send(JSON.stringify({ type: 'error', code: 'tts_failed', at: e.at, detail: e.code }));
           }
-          captureException(new Error(`cartesia.${e.code}`), {
-            op: 'cartesia.error',
+          // HUME_TTS_PLAN §4.5 unit-wide M5 — humeMessage carries Hume's
+          // verbatim error body; Sentry scrub denies the key by name, but
+          // we forward it via Sentry's `extra` so a future ops view can
+          // see it. Cartesia uses textSample.
+          captureException(new Error(`${ttsProvider}.${e.code}`), {
+            op: 'tts.error',
             sessionId,
-            cartesiaCode: e.code,
+            ttsProvider,
+            ttsCode: e.code,
             detail: e.message,
             textSample: e.textSample,
+            humeMessage: e.humeMessage,
           });
           teardown('tts_failed').catch(() => {});
           closeWs(ws, 1011, 'tts_failed');
         } else {
           // Phase 0.5 (2026-05-07). Recoverable per-turn rejection
-          // ("Invalid transcript" et al). Bridge already killed the turn
-          // locally (_turnDead=true, contextId nulled). Kill the relay-loop
-          // gate so any in-flight Cartesia chunks for this dead turn are
-          // dropped, send a silent warning to the client (no UI surface —
-          // just telemetry), and continue. Next turn_start mints a fresh
-          // context. Session stays alive; HeyGen WS stays open; user sees
-          // no "avatar TTL expired" misleading message.
-          cartesiaTurnDead = true;
+          // ("Invalid transcript" et al on Cartesia; payload_parse on Hume).
+          // Bridge already killed the turn locally. Kill the relay-loop
+          // gate so any in-flight chunks for this dead turn are dropped.
+          ttsTurnDead = true;
           if (ws.readyState === ws.OPEN) {
             try {
               ws.send(JSON.stringify({ type: 'warning', code: 'tts_chunk_rejected', at: e.at, detail: e.code }));
             } catch {}
           }
-          captureException(new Error(`cartesia.${e.code}_recoverable`), {
+          captureException(new Error(`${ttsProvider}.${e.code}_recoverable`), {
             level: 'warning',
-            op: 'cartesia.error_recoverable',
+            op: 'tts.error_recoverable',
             sessionId,
-            cartesiaCode: e.code,
+            ttsProvider,
+            ttsCode: e.code,
             detail: e.message,
             textSample: e.textSample,
+            humeMessage: e.humeMessage,
           });
         }
       } else if (e.kind === 'closed') {
@@ -1199,6 +2192,7 @@ wss.on('connection', async (ws, req) => {
       }
     });
   }
+
 
   // Heartbeat: ws.ping every 20s. Client must pong (native WS behavior).
   // On pong, touch sessions.last_heartbeat_at for reaper input.
@@ -1268,7 +2262,9 @@ wss.on('connection', async (ws, req) => {
         // R3-M1 / U-C5 — clear the relay-loop barge-in flag BEFORE bridge
         // turnStart so any race with a stale chunk in the WS receive
         // buffer drops cleanly. (Was post-turnStart; moved per audit C3.)
-        cartesiaTurnDead = false;
+        ttsTurnDead = false;
+        // §6.9 latch reset per-turn — see protocol_violation handler.
+        humeCapExceededLatch = false;
         // pgvector RAG plan — barge-in / new-turn reset of the audio gate.
         // If the client signals turn_start while we're still mid-injection
         // (forwardAudio=false), the user has barge-in'd the clarifier. Drop
@@ -1291,7 +2287,6 @@ wss.on('connection', async (ws, req) => {
         if (bridge._closed) {
           try {
             await bridge.reopen();
-            console.log(`[ws ${connId}] gemini.reopen ok`);
             // Phase C B3.4: surface success-path frequency to Sentry as
             // info-level event. js-genai#707 reopen rate is invisible
             // today (only failures captured) — frequency feeds into
@@ -1312,32 +2307,25 @@ wss.on('connection', async (ws, req) => {
           // bridge.on() handler stays wired. No re-registration needed.
         }
         bridge.turnStart();
-        // R4-M2 / U-C5 — cartesia.turnStart can throw `tts_reconnecting`
-        // synchronously when the bridge is in the auto-reconnect window.
-        // Bridge auto-reconnect typically lands in 200–700ms; wait up to
-        // 1500ms for `reconnected` before giving up so a single
-        // unfortunately-timed tap doesn't kill the session.
-        // Audit R3-C1 (logic) flagged a listener-attach race here;
-        // verified false-positive. JS is single-threaded and
-        // `cartesia.on(handler)` runs synchronously inside the Promise
-        // constructor body BEFORE the await yields. The bridge needs
-        // at least one `await` cycle (setTimeout 200ms) to reach
-        // `emit('reconnected')`, which is well after the listener is
-        // attached. No race in this execution model.
-        if (useCartesia && cartesia) {
+        // R4-M2 / U-C5 — TTS bridge turnStart can throw `tts_reconnecting`
+        // synchronously when the bridge is in its auto-reconnect window
+        // (Cartesia and Hume both auto-reconnect on idle/network glitch).
+        // Wait up to 1500ms for the `reconnected` event before giving up.
+        // Audit R3-C1 — listener-attach race verified false-positive: JS is
+        // single-threaded and `ttsBridge.on(handler)` runs synchronously
+        // inside the Promise body BEFORE the await yields.
+        if (useTts && ttsBridge) {
           let attempt = 0;
           while (attempt < 2) {
             try {
-              cartesia.turnStart(`${sessionId}:${turnNumber}`);
+              ttsBridge.turnStart(`${sessionId}:${turnNumber}`);
               break; // success
             } catch (e) {
               if (e?.code === 'tts_reconnecting' && attempt === 0) {
                 attempt += 1;
-                // Wait for the bridge's `reconnected` event — single
-                // listener with a 1500ms ceiling.
                 const waited = await new Promise((resolve) => {
                   const to = setTimeout(() => { off(); resolve(false); }, 1500);
-                  const off = cartesia.on((ev) => {
+                  const off = ttsBridge.on((ev) => {
                     if (ev.kind === 'reconnected') { clearTimeout(to); off(); resolve(true); }
                     else if (ev.kind === 'error' && ev.fatal) { clearTimeout(to); off(); resolve(false); }
                   });
@@ -1347,82 +2335,178 @@ wss.on('connection', async (ws, req) => {
                   await teardown('tts_reconnecting');
                   return closeWs(ws, 4011, 'tts_reconnecting');
                 }
-                continue; // retry turnStart now that we're reconnected
+                continue;
               }
               if (e?.code === 'tts_reconnecting') {
-                // Second attempt also hit the window — give up.
                 ws.send(JSON.stringify({ type: 'error', code: 'tts_reconnecting', op: 'turn_start' }));
                 await teardown('tts_reconnecting');
                 return closeWs(ws, 4011, 'tts_reconnecting');
               }
-              // Anything else: tear down as upstream error.
-              captureException(e, { op: 'cartesia.turnStart', sessionId });
-              await teardown('cartesia_turn_start_failed');
+              captureException(e, { op: 'tts.turnStart', sessionId, ttsProvider });
+              await teardown('tts_turn_start_failed');
               return closeWs(ws, 4005, 'upstream_error');
             }
           }
         }
       } else if (msg.type === 'turn_end') {
+        // 2026-05-21 (audit M6) — capture the turn being ended BEFORE the
+        // await below. `bridge.turnEnd()` waits for Gemini's turn_complete
+        // (+7–21s in decoupled mode), and the user can start the NEXT turn in
+        // that window (turn_start increments `turnNumber`). The early-trigger
+        // fix means THIS turn's deep answer already finished speaking, so if a
+        // newer turn superseded it we must NOT run the TTS finalization here —
+        // `ttsBridge.turnEnd()` flushes the bridge's `_currentContextId`, which
+        // now belongs to the NEWER turn, and would cut its audio mid-word.
+        const endingTurn = turnNumber;
         const metrics = await bridge.turnEnd({ timeoutMs: msg.timeoutMs || 30_000 });
-        let cartesiaMetrics = null;
-        if (useCartesia && cartesia) {
+        const superseded = decoupled && turnNumber !== endingTurn;
+        // DECOUPLED_BRAIN_PLAN P1-5.2 — the off-Live deep answer streams to TTS
+        // gated behind retrieval. Wait (bounded) for the orchestrator to finish
+        // speaking THIS turn before continue:false, so the answer isn't
+        // truncated to the hedge. Skipped when superseded (M6): that turn
+        // already spoke and `turn` now points at the newer one.
+        // Decoupled-only ⇒ legacy path byte-identical.
+        if (decoupled && decoupledOrch && !superseded) {
+          // Audit Small — floor the wait so a buggy/malicious client sending a
+          // tiny timeoutMs can't let continue:false race ahead of the deep
+          // answer (the exact C1 truncation this gate prevents). Client cannot
+          // shrink it below the floor; can still extend it (e.g. 60s).
+          // Floor = 30s (audit M3): the wait covers deep-answer GENERATION
+          // streaming to TTS, whose worst case is retrieval (≤retrieveCeilingMs
+          // 3.5s) + a Haiku FAILOVER (Gemini stalls ~2s, then Haiku streams a
+          // full tier-aware ~450-word answer FROM SCRATCH) — which a hand-picked
+          // 15s could still blow through, truncating to the hedge (the exact C1
+          // failure). So we floor at the orchestrator's OWN hard cap
+          // (turnSpokenTimeoutMs = 30s): the client can EXTEND but never shrink
+          // the wait below the bound the orchestrator already enforces, so the
+          // gate can't truncate a generation the orchestrator would still allow.
+          // Today's client sends NO timeoutMs (→ 30s), so behavior is unchanged;
+          // this hardens the variable-depth + failover ramp. resolveSpoken on a
+          // finished/superseded turn returns INSTANTLY, so the floor only bites
+          // an unresolved turn — exactly the case it must not cut short.
+          const spokenWaitMs = Math.max(msg.timeoutMs || 30_000, 30_000);
+          try { await decoupledOrch.awaitTurnSpoken(spokenWaitMs); }
+          catch (e) { captureException(e, { op: 'decoupled.awaitTurnSpoken', sessionId }); }
+        }
+        if (superseded) {
+          console.warn(`[ws ${connId}] turn_end superseded — turn ${endingTurn} finalized cogs-only (turn ${turnNumber} now live, TTS finalize skipped)`);
+        }
+        let ttsMetrics = null;
+        if (useTts && ttsBridge && !superseded) {
           // R3-C1 / R4-C1 — always await; bridge resolves with partial:true
           // on timeout/error so logTurnCogs (and the Gemini legs) always
           // land. NEVER throw out of this path.
-          // 10s default: Phase 0 measured cold-connect `done` ack at ~6s,
-          // so 5s would flag partial:true on the steady state and break
-          // dashboard gating on cartesia_partial.
-          cartesiaMetrics = await cartesia.turnEnd({ timeoutMs: 10_000 });
+          // 10s default: Phase 0 measured cold-connect `done` ack at ~6s.
+          // Same default for Hume (Phase-0 verified comparable steady-state).
+          ttsMetrics = await ttsBridge.turnEnd({ timeoutMs: 10_000 });
         }
-        // U-M6 — surface a user-facing warning when Cartesia returned
-        // partial. Proxy already records cartesia_partial in metadata for
-        // dashboard reconciliation; this lets the client UI show "(this
-        // response was cut off — ask again)" instead of failing silent.
-        if (cartesiaMetrics?.partial) {
+        // U-M6 — surface a user-facing warning when the TTS bridge returned
+        // partial. The cogs row records the partial flag for dashboard
+        // reconciliation; this lets the client UI show "(this response was
+        // cut off — ask again)" instead of failing silent.
+        if (ttsMetrics?.partial) {
           try {
             ws.send(JSON.stringify({
               type: 'warning',
               code: 'response_truncated',
               at: Date.now(),
-              characters: cartesiaMetrics.characters,
+              characters: ttsMetrics.characters,
             }));
           } catch {}
         }
-        ws.send(JSON.stringify({ type: 'turn_end_ack', metrics, cartesia: cartesiaMetrics }));
-        logTurnCogs({
+        // `cartesia` envelope key kept for back-compat with the harness +
+        // existing client code; carries the active bridge's metrics either
+        // way (regardless of provider — name is legacy, not literal). New
+        // `tts` key alongside for future readers. Drop `cartesia` with the
+        // §8 step 6 retire-back-compat PR after clients migrate. Audit S8.
+        // Day-13 audit C5 / M4 / audit-build M3 — last_assistant_response
+        // handling. The closure const is the source-of-truth for the NEXT
+        // turn's rewriter; the DB UPSERT is durable-fallback for WS
+        // replacement on Gemini Live 15-min reopen. Length-gated >=
+        // MIN_PERSIST_CHARS so failed/partial turns don't poison turn
+        // N+1's context.
+        //
+        // audit-build M3: update the closure BEFORE ws.send(turn_end_ack).
+        // Gemini 3.1 Live can emit turn_complete + next-turn's
+        // input_transcription in a single synchronous parse cycle; if we
+        // updated AFTER ws.send, the next input_transcription handler
+        // (which calls kickoffRetrieval reading the closure) could
+        // observe stale turn-N-1 data.
+        if (retrievalVersionAtSession === 2) {
+          // DECOUPLED_BRAIN_PLAN P1-5.2 / R4-M4 (§13 1911-1916, the ONLY
+          // non-byte-identical site): in decoupled mode Gemini's
+          // `metrics.outputTranscript` is its DISCARDED answer — wrong
+          // source for the next turn's retrieval rewrite. Use the
+          // off-Live deep-answer text instead. When `decoupled` is false
+          // the ternary's else-branch is the EXACT original expression ⇒
+          // byte-identical legacy.
+          const transcript = decoupled
+            ? ((decoupledOrch && decoupledOrch.lastAssistantResponse()) || '')
+            : (typeof metrics?.outputTranscript === 'string'
+              ? metrics.outputTranscript
+              : '');
+          if (transcript.length >= MIN_PERSIST_CHARS) {
+            lastAssistantResponseClosure = transcript.slice(0, VOICE_SESSION_STATE_MAX_CHARS);
+            // Fire-and-forget. The writer never throws; errors land in
+            // Sentry via onError but don't block the turn lifecycle.
+            persistLastAssistantResponse(
+              supabase,
+              sessionId,
+              lastAssistantResponseClosure,
+              (err, ctx) =>
+                captureException(err, { op: ctx?.stage || 'voice_session_state', sessionId }),
+            );
+          }
+        }
+
+        ws.send(JSON.stringify({ type: 'turn_end_ack', metrics, cartesia: ttsMetrics, tts: ttsMetrics, ttsProvider }));
+        const cogsPromise = logTurnCogs({
           userId, sessionId, turnNumber,
           inputSeconds: metrics.inputSeconds,
           outputSeconds: metrics.outputSeconds,
           usageMetadata: metrics.usageMetadata,
-          cartesia: cartesiaMetrics,
-        }).catch((e) => {
-          // R4-S3 fail-closed: getCartesiaPricing() throws if env is
-          // missing/zero. The validator runs at module-load (proxy boot)
-          // so this catch is dead in steady state — but a Fly secret
-          // rotation that briefly clears the env between restarts would
-          // surface here. L-M5: kept intentionally; not dead in practice.
+          // logTurnCogs ignores `tts` if undefined (back-compat). The
+          // factory keeps the `cartesia` key as a legacy alias and the new
+          // `tts` carries the provider tag.
+          ttsProvider,
+          tts: ttsMetrics,
+          // §6.9 / audit-C1 — the per-turn cap signal lands as metadata
+          // on the normal turn_end cogs row. Single writer, no race with
+          // a separate cap-flush. 4006 close fires AFTER cogs resolve.
+          humeCapExceeded: humeCapExceededLatch,
+        });
+        cogsPromise.catch((e) => {
+          // R4-S3 fail-closed: getCartesiaPricing/getHumePricing throws if
+          // env is missing/zero. The validators run at module-load (proxy
+          // boot) so this catch is dead in steady state.
           captureException(e, { op: 'logTurnCogs', sessionId, fatal: true });
           ws.send(JSON.stringify({ type: 'error', code: 'cogs_misconfig', op: 'turn_end' }));
           teardown('cogs_misconfig').catch(() => {});
           closeWs(ws, 1011, 'cogs_misconfig');
         });
-        // R4-C1 — quota math: when α' is on, sum mic seconds + REAL
-        // Cartesia audio seconds. L-C2 fix: when Cartesia returns
-        // `partial:true` (hang/timeout/error mid-turn), fall back to
-        // Gemini's `outputSeconds` so the kill-switch still sees real
-        // assistant-talk seconds. Without this fallback a runaway turn
-        // that hung Cartesia would bill ZERO assistant seconds and
-        // never trip the latch — the user could burn the daily char
-        // cap while seconds_used ticks at 1× mic only.
+        if (humeCapExceededLatch) {
+          // §6.9 / audit-C1 — close 4006 AFTER cogs lands. await-then-close
+          // serializes the writes; the latch is a per-turn flag, reset on
+          // next turn_start. R3-C1 rule satisfied: capped cogs row landed
+          // before WS close.
+          cogsPromise.finally(() => {
+            if (ws.readyState === ws.OPEN) {
+              try { ws.send(JSON.stringify({ type: 'error', code: 'quota_state_inconsistent', at: Date.now() })); } catch {}
+            }
+            teardown('hume_per_turn_cap_exceeded').catch(() => {});
+            closeWs(ws, 4006, 'quota_state_inconsistent');
+          });
+        }
+        // R4-C1 — quota math: when α' is on, sum mic seconds + REAL TTS
+        // audio seconds. L-C2 fix: when TTS returns `partial:true` (hang/
+        // timeout/error mid-turn), fall back to Gemini's `outputSeconds`
+        // so the kill-switch still sees real assistant-talk seconds.
         let quotaSeconds;
-        if (useCartesia) {
-          if (cartesiaMetrics?.partial) {
-            // Trust Gemini's audio-out length as the assistant-talk
-            // proxy. Slightly over-bills (Cartesia would have been
-            // shorter or longer) but never under-bills.
+        if (useTts) {
+          if (ttsMetrics?.partial) {
             quotaSeconds = (metrics.inputSeconds || 0) + (metrics.outputSeconds || 0);
           } else {
-            quotaSeconds = (metrics.inputSeconds || 0) + ((cartesiaMetrics?.audioSeconds) || 0);
+            quotaSeconds = (metrics.inputSeconds || 0) + ((ttsMetrics?.audioSeconds) || 0);
           }
         } else {
           quotaSeconds = (metrics.inputSeconds || 0) + (metrics.outputSeconds || 0);
@@ -1446,34 +2530,16 @@ wss.on('connection', async (ws, req) => {
 
         // Phase C B4.5 — System B counter (voice_usage_daily/weekly).
         // Currency = "audio the user actually heard" (migration
-        // 20260428000002 §"WHY seconds as the currency"). When useCartesia,
-        // cartesiaMetrics.audioSeconds is the truth — even on partial:true
-        // it reports delivered audio bytes / sample rate, so it accurately
+        // 20260428000002 §"WHY seconds as the currency"). When α' is on,
+        // ttsMetrics.audioSeconds is the truth — even on partial:true it
+        // reports delivered audio bytes / sample rate, so it accurately
         // captures the partial-delivered seconds. We DO NOT fall back to
-        // Gemini's outputSeconds on Cartesia partial (audit C1): outputSeconds
+        // Gemini's outputSeconds on TTS partial (audit C1): outputSeconds
         // is the DISCARDED Gemini audio in Pipeline α' — billing the user
-        // for audio they never heard would create support tickets. System
-        // A's quotaSeconds above intentionally over-bills on partial as a
-        // kill-switch safety; System B is the user-facing cap contract
-        // and must under-bill on uncertainty.
-        //
-        // Without this write, voice_usage_ticket_check at /api/sessions/open
-        // reads counters always at 0 → returns full remaining → 5min/15min
-        // cap never enforces.
-        //
-        // M1: dropped the `> 0` guard so zero-second turns still write the
-        // idempotency row. voice_usage_turns is the per-turn audit ledger;
-        // a missing row would mean a duplicate turn-end retry could re-claim.
-        //
-        // M2 follow-up: on R4-C1 WS-eviction the new WS reuses sessionId
-        // but starts turnNumber=0 → PK collision with the evicted WS's
-        // entries silently drops counter increments via ON CONFLICT DO
-        // NOTHING. Rare in practice (user opens second tab during own
-        // session). Tracked as Phase C punch-list item; fix is a
-        // MAX(turn_number)+1 lookup on connection setup.
+        // for audio they never heard would create support tickets.
         let assistantSeconds;
-        if (useCartesia) {
-          assistantSeconds = cartesiaMetrics?.audioSeconds || 0;
+        if (useTts) {
+          assistantSeconds = ttsMetrics?.audioSeconds || 0;
         } else {
           assistantSeconds = metrics?.outputSeconds || 0;
         }
@@ -1488,12 +2554,24 @@ wss.on('connection', async (ws, req) => {
           captureException(e, { level: 'warning', op: 'voice_usage_record', sessionId });
         });
       } else if (msg.type === 'cancel') {
-        // R3-M1 / R4-S1 — set the relay-loop flag SYNCHRONOUSLY before
-        // any await, then ws-send cancel to Cartesia. Bridge.cancel
+        // R3-M1 / R4-S1 — set the relay-loop flag SYNCHRONOUSLY before any
+        // await, then ws-send cancel to the active TTS bridge. Bridge.cancel
         // also sets its own flag synchronously.
-        cartesiaTurnDead = true;
+        ttsTurnDead = true;
         bridge.cancel();
-        if (useCartesia && cartesia) cartesia.cancel();
+        if (useTts && ttsBridge) ttsBridge.cancel();
+        // Re-audit M1 — a CLIENT mic-tap barge sends `cancel`, but in decoupled
+        // mode Gemini isn't generating audio for the user to barge over, so its
+        // `interrupted` event (the only other onInterrupted caller) may never
+        // fire. Notify the orchestrator here so (1) the in-flight deep
+        // generate/Haiku stream is ABORTED — otherwise it runs to completion and
+        // keeps billing after the user already moved on; and (2) `t.barged` is
+        // set, which correctly SUPPRESSES the deep_answer_done tail-flush signal
+        // (a flush after a barge could nudge a stale frame). abortTurn is
+        // idempotent and null-safe, so a cancel with no live turn is a no-op.
+        if (decoupled && decoupledOrch) {
+          try { decoupledOrch.onInterrupted(); } catch {}
+        }
       }
     } catch (e) {
       console.error('[control]', msg?.type, e);
@@ -1518,6 +2596,10 @@ let voiceDeleteHandle = null;
 let simliFaceDeleteHandle = null;
 let faceUploadReaperHandle = null;
 let embedWorkerHandle = null;
+let corpusReprocessWorkerHandle = null;
+// Day-5-unit-audit C1: hold the worker OBJECT (not just .handle) so the
+// SIGTERM handler can call signalShutdown() before killing the interval.
+let corpusReprocessWorker = null;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`voice-proxy listening on :${PORT} (build=${BUILD})`);
   // Reaper: 20s cadence + 60s threshold (RPC default). Fires once at boot for
@@ -1525,7 +2607,7 @@ server.listen(PORT, '0.0.0.0', () => {
   reaperHandle = installReaper({ supabase }).handle;
   // R4-M3 — voice-delete worker (Cartesia DELETE /voices deferred queue).
   // Only when α' is enabled; otherwise no rows are ever enqueued.
-  if (VOICE_CARTESIA_ENABLED && CARTESIA_API_KEY) {
+  if (VOICE_TTS_LAYER_ENABLED && CARTESIA_API_KEY) {
     voiceDeleteHandle = makeVoiceDeleteWorker({ supabase, cartesiaApiKey: CARTESIA_API_KEY })
       .install().handle;
   }
@@ -1554,20 +2636,94 @@ server.listen(PORT, '0.0.0.0', () => {
       flyMachineId: BUILD,
     }).install().handle;
   }
+
+  // Day-5 RAG SOTA — corpus reprocess worker. Runs alongside the legacy
+  // embed worker; polls a different queue (corpus_reprocess_jobs) and runs
+  // the full v2 pipeline (sanitize → narrative-chunk → contextual-gen →
+  // embed → _insert_chunk_v2_unsafe). No-op if either INTERNAL_API_* env
+  // is missing — legacy worker still handles v1 creators.
+  if (GEMINI_API_KEY && INTERNAL_API_BASE_URL && INTERNAL_API_SECRET) {
+    if (INTERNAL_API_SECRET.length < 32) {
+      // eslint-disable-next-line no-console
+      console.error('[boot] INTERNAL_API_SECRET < 32 chars — corpus reprocess worker DISABLED');
+    } else {
+      corpusReprocessWorker = makeCorpusReprocessWorker({
+        supabase,
+        geminiApiKey: GEMINI_API_KEY,
+        internalApiBaseUrl: INTERNAL_API_BASE_URL,
+        internalApiSecret: INTERNAL_API_SECRET,
+        flyMachineId: BUILD,
+      });
+      corpusReprocessWorkerHandle = corpusReprocessWorker.install().handle;
+    }
+  } else {
+    // eslint-disable-next-line no-console
+    console.log('[boot] INTERNAL_API_BASE_URL or INTERNAL_API_SECRET missing — corpus reprocess worker disabled (legacy embed-worker still active)');
+  }
 });
 
 // Graceful shutdown — stop the reaper interval so node exits cleanly when the
 // http server's connections drain. SIGTERM is what Fly sends on deploy.
+//
+// HUME_TTS_PLAN §8 audit C3 — `http.Server#close()` stops accepting new
+// connections but does NOT close upgraded WebSockets. Without explicit WS
+// drain, every in-flight voice session at deploy time gets hung up at the
+// 30s backstop. We now send a `code=1012 (service_restart)` close to each
+// open WS so the client side can reconnect/retry gracefully and any held
+// state (cogs writes, session_close) drains via the existing teardown path.
 function shutdown(signal) {
-  console.log(`[shutdown] ${signal} — clearing reaper + delete workers`);
+  console.log(`[shutdown] ${signal} — clearing reaper + delete workers + draining ${wss.clients.size} live WS sessions`);
+  // Day-5-unit-audit C1: signal the reprocess worker BEFORE clearing
+  // intervals so an in-flight 9-min tick can drain at the next checkpoint
+  // (Flash done, unit boundary). The tick's finally block flushes cogs_log
+  // for whatever was paid so far — no silent spend loss on deploys.
+  if (corpusReprocessWorker) {
+    try { corpusReprocessWorker.signalShutdown(); }
+    catch (e) { console.error('[shutdown] signalShutdown failed', e); }
+  }
   if (reaperHandle) clearInterval(reaperHandle);
   if (voiceDeleteHandle) clearInterval(voiceDeleteHandle);
   if (simliFaceDeleteHandle) clearInterval(simliFaceDeleteHandle);
   if (faceUploadReaperHandle) clearInterval(faceUploadReaperHandle);
   if (embedWorkerHandle) clearInterval(embedWorkerHandle);
+  if (corpusReprocessWorkerHandle) clearInterval(corpusReprocessWorkerHandle);
+
+  // HUME_TTS_PLAN §8 audit C3 — graceful WS drain. Send a user-visible
+  // signal frame first so the client can show a reconnect notice, then
+  // close with 1012 (service_restart per RFC 6455 — clients SHOULD retry).
+  // The existing `ws.on('close', ...)` handler at index.js:1632-1634 fires
+  // teardown → endSession → cogs flush, so no per-session cleanup needed
+  // here. We just stop accepting new connections and drain.
+  for (const client of wss.clients) {
+    try {
+      if (client.readyState === client.OPEN) {
+        client.send(JSON.stringify({ type: 'shutdown', code: 'service_restart', at: Date.now() }));
+        client.close(1012, 'service_restart');
+      }
+    } catch (e) {
+      console.error('[shutdown] WS drain error', e?.message || e);
+    }
+  }
+
+  // Day-13 audit-build M2 — drain in-flight PostHog batches before
+  // exiting so v2 telemetry isn't silently dropped on deploys. Bounded
+  // grace = 1500ms (matches batch AbortController). Best-effort; if
+  // PostHog is wedged we still exit.
+  posthogDrainInFlight({ timeoutMs: 1500 })
+    .then((r) => {
+      if (!r.drained) {
+        console.warn(`[shutdown] posthog drain incomplete (remaining=${r.remaining})`);
+      }
+    })
+    .catch(() => {});
+
   server.close(() => process.exit(0));
-  // Hard-exit after 5s if connections won't drain.
-  setTimeout(() => process.exit(0), 5000).unref();
+  // Day-5-unit-audit C1: hard-exit backstop bumped 5s → 30s. The reprocess
+  // worker's drain checkpoint + bumpFailure + cogs_log flush is ~1-3s on a
+  // healthy network; the extended budget gives slow networks headroom
+  // without unduly delaying clean deploys (typical deploy: server.close
+  // exits within seconds, this timeout never fires).
+  setTimeout(() => process.exit(0), 30_000).unref();
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));

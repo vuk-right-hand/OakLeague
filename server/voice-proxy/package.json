@@ -5,10 +5,11 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "dev": "node --watch index.js",
+    "dev": "node --watch --env-file=../../.env.local index.js",
     "test": "node --test *.test.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.95.2",
     "@google/genai": "^1.50.1",
     "@sentry/node": "^9.47.1",
     "@supabase/supabase-js": "^2.58.0",

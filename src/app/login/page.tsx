@@ -17,6 +17,12 @@ export default async function LoginPage({
     <main style={{ maxWidth: 420, margin: '8vh auto', padding: 24 }}>
       <h1 style={{ fontSize: 28, fontWeight: 600 }}>Sign in to OakLeague</h1>
       <LoginForm next={safeNext(sp.next)} error={sp.error} sent={sp.sent === '1'} />
+      {/* P0-4: implicit ToS/Privacy acceptance recorded on auth/callback. */}
+      <p style={{ marginTop: 20, fontSize: 12, opacity: 0.65, lineHeight: 1.5 }}>
+        By continuing you agree to our{' '}
+        <a href="/terms">Terms of Service</a> and{' '}
+        <a href="/privacy">Privacy Policy</a>.
+      </p>
     </main>
   );
 }

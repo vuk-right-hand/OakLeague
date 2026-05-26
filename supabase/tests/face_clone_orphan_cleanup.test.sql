@@ -3,7 +3,7 @@
 --   2. on already-failed row: skips state UPDATE but still enqueues (idempotent).
 --   3. R3-NM5 guard — refuses when state='ready' AND creators.simli_face_id matches (live face).
 BEGIN;
-SELECT plan(5);
+SELECT plan(6);
 
 CREATE FUNCTION pg_temp.run() RETURNS SETOF text LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -21,6 +21,13 @@ BEGIN
   INSERT INTO public.creators (user_id, display_name, handle, brain_status, published_at)
     VALUES (v_cuid, 'FOCC', 'focc', 'ready', now())
     RETURNING id INTO v_cid;
+
+  -- face_clone_orphan_cleanup is a service_role-only SECURITY DEFINER fn. The
+  -- test runs as postgres with NO jwt claims, so its internal `service_role
+  -- only` guard rejects every call (raising before any RETURN NEXT → 0 tests).
+  -- Set a service_role jwt so the calls enter the body. (Role-guard coverage
+  -- lives in the dedicated finalize/reap tests; this test exercises behaviour.)
+  PERFORM set_config('request.jwt.claims', json_build_object('role','service_role')::text, true);
 
   -- 1. Happy path: pending row + vendor_face_id, orphan_cleanup marks failed.
   INSERT INTO public.face_clone_uploads
@@ -71,6 +78,20 @@ BEGIN
   SELECT count(*) INTO v_qcount FROM public.simli_face_delete_queue
    WHERE face_id = '55555555-6666-4777-9888-999999999999';
   RETURN NEXT is(v_qcount::int, 0, '3b: live face not enqueued for delete');
+
+  -- 4: ACL self-sufficiency (auditor Medium #2). The behaviour tests above run
+  -- under a service_role jwt; assert here that `authenticated` lacks EXECUTE so
+  -- this file independently pins the service_role-only guard (no cross-file
+  -- reliance on the finalize/reap tests). has_function_privilege, NOT a real
+  -- call under a switched role — that segfaults PG 17.6 (no-EXECUTE secdef +
+  -- set_config('role',...)). See memory project_pg17_secdef_role_segfault.
+  RETURN NEXT ok(
+    NOT has_function_privilege(
+      'authenticated',
+      'public.face_clone_orphan_cleanup(uuid,bigint,uuid,text,text)',
+      'EXECUTE'),
+    '4: ACL — authenticated cannot call face_clone_orphan_cleanup (no EXECUTE grant)'
+  );
 END;
 $fn$;
 

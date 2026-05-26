@@ -1,1 +1,7 @@
 *.pcm binary
+
+# Pin LF for shell-script-adjacent files so the PROD_DEPLOY_GATE verification
+# `tr` / `grep` pipeline doesn't see phantom `\r`-suffixed names on a Windows
+# checkout with core.autocrlf=true (auditor M3, 2026-05-20).
+Dockerfile text eol=lf
+*.Dockerfile text eol=lf
