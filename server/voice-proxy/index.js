@@ -944,13 +944,6 @@ wss.on('connection', async (ws, req) => {
   let heartbeatInterval = null;
   let turnNumber = 0;
   let ttsTurnDead = false; // R3-M1 / R4-S1 — relay-loop gate for barge-in (provider-neutral)
-  // ⚠️ TEMP AUDIODIAG (2026-05-27) — DELETE when the mid-word-cutoff/stutter
-  // root cause is found. Gated behind VOICE_DIAG_AUDIO=1 (Fly secret). Logs the
-  // full TTS audio path: Cartesia chunk arrival timing/gaps + forward to client.
-  const DIAG_AUDIO = process.env.VOICE_DIAG_AUDIO === '1';
-  let diagChunkSeq = 0;       // per-turn Cartesia chunk counter
-  let diagLastChunkMs = 0;    // wall-clock of prior chunk (gap detection)
-  let diagTurnBytes = 0;      // cumulative audio bytes forwarded this turn
   // 2026-05-27 (audit C3) — consecutive decoupled turn_complete_timeout recoveries.
   // ONE timeout is a recoverable Gemini hiccup (answer already played). But if
   // Gemini Live wedges into "accepts input, never emits turn_complete", every
@@ -1832,9 +1825,6 @@ wss.on('connection', async (ws, req) => {
         try {
           if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'deep_answer_done' }));
         } catch { /* ws closing — nothing to flush */ }
-        if (DIAG_AUDIO) {
-          console.log(`[AUDIODIAG ${connId}] deep_answer_done t${turnNum} fwdChunks=${diagChunkSeq} fwdBytes=${diagTurnBytes}`);
-        }
         // Mid-word-cutoff fix (2026-05-27, v2). The deep answer's full text is now
         // in Cartesia's buffer. Send a manual flush (continue:true + flush:true —
         // does NOT close the context) so Cartesia synthesizes the final buffered
@@ -2190,7 +2180,6 @@ wss.on('connection', async (ws, req) => {
         // own _turnDead check. Belt-and-suspenders against late chunks
         // from the WS receive buffer at cancel time.
         if (ttsTurnDead) return;
-        if (DIAG_AUDIO) { diagChunkSeq += 1; diagTurnBytes += e.chunk.bytes.byteLength; }
         sendBinaryWithBackpressure(e.chunk.bytes);
       } else if (e.kind === 'turn_done') {
         // Mid-word-cutoff fix (2026-05-27, v2). Cartesia's REAL end-of-audio for
@@ -2204,9 +2193,6 @@ wss.on('connection', async (ws, req) => {
         const liveCtx = `${sessionId}:${turnNumber}`;
         if (e.contextId === liveCtx && ws.readyState === ws.OPEN) {
           try { ws.send(JSON.stringify({ type: 'tts_audio_done' })); } catch {}
-          if (DIAG_AUDIO) console.log(`[AUDIODIAG ${connId}] tts_audio_done t${turnNumber} ctx=${e.contextId}`);
-        } else if (DIAG_AUDIO) {
-          console.log(`[AUDIODIAG ${connId}] turn_done IGNORED (stale ctx=${e.contextId} live=${liveCtx})`);
         }
       } else if (e.kind === 'reconnected') {
         if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'tts_reconnected', at: e.at }));
@@ -2343,11 +2329,6 @@ wss.on('connection', async (ws, req) => {
         }
         turnNumber += 1;
         turnStartedAt = Date.now(); // Phase C B4.5 — voice_usage_record day anchor
-        // ⚠️ TEMP AUDIODIAG — DELETE later. Reset per-turn chunk counters.
-        if (DIAG_AUDIO) {
-          diagChunkSeq = 0; diagLastChunkMs = 0; diagTurnBytes = 0;
-          console.log(`[AUDIODIAG ${connId}] turn_start t${turnNumber}`);
-        }
         // R3-M1 / U-C5 — clear the relay-loop barge-in flag BEFORE bridge
         // turnStart so any race with a stale chunk in the WS receive
         // buffer drops cleanly. (Was post-turnStart; moved per audit C3.)
@@ -2550,13 +2531,6 @@ wss.on('connection', async (ws, req) => {
           const ttsFinalizeTimeoutMs = (ttsProvider === 'cartesia') ? 60_000 : 10_000;
           ttsMetrics = await ttsBridge.turnEnd({ timeoutMs: ttsFinalizeTimeoutMs });
         }
-        // ⚠️ TEMP AUDIODIAG — DELETE later. Cartesia finalize result: does the
-        // continue:false produce MORE audio (partial=false + extra bytes beyond
-        // what we forwarded mid-stream)? recoveredFromTimeout = Gemini never
-        // emitted turn_complete (the 6-21s gate that strands the tail).
-        if (DIAG_AUDIO) {
-          console.log(`[AUDIODIAG ${connId}] turn_end t${endingTurn} superseded=${superseded} recoveredFromTimeout=${recoveredFromTimeout} ttsPartial=${ttsMetrics?.partial} ttsAudioBytes=${ttsMetrics?.audioBytes ?? 'na'} ttsChars=${ttsMetrics?.characters ?? 'na'} fwdBytesMidStream=${diagTurnBytes}`);
-        }
         // U-M6 — surface a user-facing warning when the TTS bridge returned
         // partial. The cogs row records the partial flag for dashboard
         // reconciliation; this lets the client UI show "(this response was
@@ -2736,10 +2710,6 @@ wss.on('connection', async (ws, req) => {
           captureException(e, { level: 'warning', op: 'voice_usage_record', sessionId });
         });
       } else if (msg.type === 'cancel') {
-        // ⚠️ TEMP AUDIODIAG — DELETE later. Definitive proof the CLIENT sent a
-        // cancel (→ ClearBuffer wipes Simli's queue → cut). Correlate the
-        // timestamp with the client [AD] CANCEL-SEND site= line.
-        if (DIAG_AUDIO) console.log(`[AUDIODIAG ${connId}] rx CANCEL t${turnNumber} fwdChunks=${diagChunkSeq}`);
         // R3-M1 / R4-S1 — set the relay-loop flag SYNCHRONOUSLY before any
         // await, then ws-send cancel to the active TTS bridge. Bridge.cancel
         // also sets its own flag synchronously.

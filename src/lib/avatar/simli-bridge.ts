@@ -347,15 +347,12 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
 
     // Wire SDK error events before start() so failures during handshake are caught.
     client.on('error', (raw: unknown) => {
-      console.log('[AD] simli EVENT=error', raw); // ⚠️ TEMP AUDIODIAG — DELETE later
       fail({ code: 'rtc_ice_failed', message: 'simli error', recoverable: true, cause: { provider, raw } });
     });
     client.on('startup_error', (raw: unknown) => {
-      console.log('[AD] simli EVENT=startup_error', raw); // ⚠️ TEMP AUDIODIAG — DELETE later
       fail({ code: 'connect_timeout', message: 'simli startup_error', recoverable: false, cause: { provider, raw } });
     });
     client.on('stop', () => {
-      console.log(`[AD] simli EVENT=stop (closed=${closed} intentionalClose=${intentionalClose})`); // ⚠️ TEMP AUDIODIAG — DELETE later
       // intentionalClose flag (audit M6): differentiates our own close() —
       // which calls client.stop() and may fire 'stop' synchronously back at
       // us — from a TTL/session-ended event we should surface as an error.
@@ -434,10 +431,6 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
   // by the proxy's per-utterance "deep answer done" signal).
   function commitUtterance(): void {
     if (closed || !client || !ready || chunkerBuf.byteLength === 0) return;
-    // ⚠️ TEMP AUDIODIAG — DELETE later. Tail actually flushed (real bytes +
-    // silence pad). carry small = a sub-word tail; this is the last audio Simli
-    // gets for the turn.
-    console.log(`[AD] simli.commitUtterance flush carryBytes=${chunkerBuf.byteLength} (padded→${SIMLI_CHUNK_BYTES})`);
     const padded = new Uint8Array(SIMLI_CHUNK_BYTES);
     padded.set(chunkerBuf, 0);
     chunkerBuf = new Uint8Array(0);

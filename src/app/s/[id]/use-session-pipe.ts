@@ -529,11 +529,6 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       const dTotal = Math.max(0, s.totalFrames - prior.total);
       if (dTotal > 0) {
         videoStatsRatiosRef.current.push(dDropped / dTotal);
-        // ⚠️ TEMP AUDIODIAG — DELETE later. Per-sample dropped-frame ratio.
-        // High ratio = Simli/LiveKit RENDER stutter (network/CPU), NOT our
-        // audio pipeline — bisects "stutter is us" vs "stutter is the pipe".
-        const ratio = dDropped / dTotal;
-        if (ratio > 0.02) console.log(`[AD] simli.videoStats DROP dropped=${dDropped}/${dTotal} ratio=${(ratio * 100).toFixed(1)}%`);
       }
     }
     if (s.sampledAtMs - videoStatsFlushAtRef.current >= 30_000) {
@@ -892,9 +887,6 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   // ── Visibility handling (pause/resume + iOS AudioContext recovery) ─────────
   useEffect(() => {
     function onVisibility() {
-      // ⚠️ TEMP AUDIODIAG — DELETE later. On PC with no screen lock this should
-      // NEVER fire during a session unless the tab loses focus.
-      console.log(`[AD] visibilitychange hidden=${document.hidden} micActive=${micActiveRef.current}`);
       if (document.hidden) {
         // 2026-05-13 (v3) — visibility hidden while mic active. Send turn_end
         // FIRST so the proxy accrues this turn's mic-seconds (R5-C1 audit:
@@ -915,11 +907,6 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
           try { proxyRef.current?.sendControl({ type: 'turn_end' }); } catch (e) {
             Sentry.captureException(e, { level: 'warning', extra: { op: 'sendControl_turn_end_visibility', session_id: sessionIdRef.current } });
           }
-          // ⚠️ TEMP AUDIODIAG — DELETE later. Visibility-hidden cancel (tab
-          // switch / screen lock). Gated on micActive — should NOT fire during
-          // hands-off playback. If this logs while just listening, the browser
-          // fired a spurious visibilitychange.
-          console.log('[AD] CANCEL-SEND site=visibility-hidden micActive=true');
           try { proxyRef.current?.sendControl({ type: 'cancel' }); } catch (e) {
             Sentry.captureException(e, { level: 'warning', extra: { op: 'sendControl_cancel_visibility', session_id: sessionIdRef.current } });
           }
@@ -1196,9 +1183,8 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     // turn_end → cartesia.turnEnd threw 'turnEnd before turnStart' →
     // bridge state poisoned (Phase 0.5 testing 2026-05-07).
     if (state.phase === 'speaking' || state.phase === 'ready') {
-      // ⚠️ TEMP AUDIODIAG — DELETE later. This is the BARGE cancel: a startMic
-      // tap while phase=speaking/ready ClearBuffers Simli (wipes queued audio).
-      console.log(`[AD] CANCEL-SEND site=startMic-barge phase=${state.phase}`);
+      // BARGE cancel: a startMic tap while phase=speaking/ready ClearBuffers
+      // Simli (wipes queued audio) so the new question starts clean.
       try { bridgeRef.current?.cancel(); } catch {}
       try { proxyRef.current?.sendControl({ type: 'cancel' }); } catch {}
     }
@@ -1283,9 +1269,6 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   const endSession = useCallback(async (reason: 'user_ended' | 'client_error') => {
     if (closedRef.current) return;
     closedRef.current = true;
-    // ⚠️ TEMP AUDIODIAG — DELETE later. If this fires mid-playback (not a user
-    // "End" tap), something dispatched a fatal/close. reason tells which.
-    console.log(`[AD] endSession reason=${reason} micActive=${micActiveRef.current}`);
     // R5-M1 audit: if the user hits End while still holding the mic, the
     // proxy never sees a turn_end for the final turn and voice_usage_record
     // never runs for it. Send turn_end FIRST so the in-flight turn closes

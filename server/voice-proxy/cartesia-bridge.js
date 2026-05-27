@@ -201,8 +201,6 @@ export class CartesiaTTSBridge extends EventEmitter {
     this._turnDead = false;
     this._charsThisTurn = 0;
     this._audioBytesThisTurn = 0;
-    this._diagDroppedChunks = 0; // ⚠️ TEMP AUDIODIAG — DELETE later
-    this._diagDroppedBytes = 0;  // ⚠️ TEMP AUDIODIAG — DELETE later
     // P1-10 audit C1 — reset on turnStart so getLastChunkAt() reflects
     // "last chunk in CURRENT turn", not turn N-1. Without this, the
     // spurious-barge heuristic mis-classifies pre-playback interrupted
@@ -538,25 +536,13 @@ export class CartesiaTTSBridge extends EventEmitter {
       // ctx was nulled on timeout — chunks for it would otherwise replay
       // out-of-order into the next turn's audio stream).
       if (this._turnDead) {
-        // ⚠️ TEMP AUDIODIAG — DELETE later. Audio Cartesia is STILL producing,
-        // dropped because the turn was killed (cancel) — quantifies the cut.
-        this._diagDroppedChunks = (this._diagDroppedChunks || 0) + 1;
-        this._diagDroppedBytes = (this._diagDroppedBytes || 0) + Buffer.from(msg.data || '', 'base64').length;
-        if (this._diagDroppedChunks <= 3 || this._diagDroppedChunks % 20 === 0) {
-          console.log(`[AUDIODIAG cartesia] DROP (turnDead) chunk#${this._diagDroppedChunks} droppedBytes=${this._diagDroppedBytes} ctx=${msg.context_id}`);
-        }
+        // Drop audio Cartesia is still producing for a turn killed by cancel.
         return;
       }
       if (msg.context_id && msg.context_id !== this._currentContextId) {
-        // ⚠️ TEMP AUDIODIAG — DELETE later. THE CUTOFF: turnEnd resolved
-        // partial (10s timeout) and nulled _currentContextId, but Cartesia is
-        // STILL synthesizing a long answer → these chunks (the tail) are
-        // dropped → avatar cuts mid-word. Quantifies the lost audio.
-        this._diagDroppedChunks = (this._diagDroppedChunks || 0) + 1;
-        this._diagDroppedBytes = (this._diagDroppedBytes || 0) + Buffer.from(msg.data || '', 'base64').length;
-        if (this._diagDroppedChunks <= 3 || this._diagDroppedChunks % 20 === 0) {
-          console.log(`[AUDIODIAG cartesia] DROP (ctx-mismatch) chunk#${this._diagDroppedChunks} droppedBytes=${this._diagDroppedBytes} (~${(this._diagDroppedBytes / 48000).toFixed(1)}s) msgCtx=${msg.context_id} liveCtx=${this._currentContextId}`);
-        }
+        // Drop chunks for a superseded/nulled context (turnEnd resolved
+        // partial and nulled _currentContextId, or a stale prior turn) so the
+        // tail does not replay out-of-order into the next turn's stream.
         return;
       }
       const b64 = msg.data || '';
