@@ -993,8 +993,23 @@ export class GeminiBridge extends EventEmitter {
     if (!this._session || this._closed) throw new Error('bridge_not_open');
     this._session.sendRealtimeInput({ activityEnd: {} });
 
+    // Audit M6 — snapshot the turn's metrics NOW, at activityEnd, before we
+    // await. The user has stopped talking, so input bytes are final; output is
+    // discarded in decoupled mode and not billed to the user. If Gemini never
+    // sends turn_complete and the proxy's decoupled recovery reads the bytes
+    // LATER, a racing next-turn `turnStart` (manual VAD lets the user start the
+    // next turn during this await) would have already zeroed the live counters
+    // → the recovered turn would log 0s and escape COGS. Carry the snapshot on
+    // the timeout error so the proxy bills the real input it observed.
+    const partialAtActivityEnd = this.getPartialTurnMetrics();
+
     await new Promise((resolve, reject) => {
-      const to = setTimeout(() => { this.off('event', h); reject(new Error('turn_complete_timeout')); }, timeoutMs);
+      const to = setTimeout(() => {
+        this.off('event', h);
+        const err = new Error('turn_complete_timeout');
+        err.partialMetrics = partialAtActivityEnd;
+        reject(err);
+      }, timeoutMs);
       const h = (e) => {
         if (e.kind === 'turn_complete') { clearTimeout(to); this.off('event', h); resolve(); }
         if (e.kind === 'error' && e.fatal) { clearTimeout(to); this.off('event', h); reject(new Error(e.message)); }
@@ -1023,6 +1038,38 @@ export class GeminiBridge extends EventEmitter {
       // enableOutputTranscription. Caller (proxy) feeds this into Cartesia.
       outputTranscript: this._currentTurnOutputTranscript,
       usageMetadata: this._currentTurnUsage, // null if none observed
+    };
+  }
+
+  /**
+   * Read-only snapshot of the IN-FLIGHT turn's accumulated metrics, in the
+   * same shape `turnEnd()` resolves. Used by the proxy's DECOUPLED turn_end
+   * path when `turn_complete_timeout` fires: Gemini Live is still open but
+   * never emitted `turn_complete` for this turn, yet the off-Live deep answer
+   * already streamed to TTS and played. Rather than tear down a session whose
+   * answer the user already heard, the proxy finalizes the turn with the bytes
+   * we DID observe. Carries `partial:true` as an honest marker that this is a
+   * snapshot, not a turn_complete-confirmed metric (R3-C1: a turn's books always
+   * close, never throw). NOTE: the proxy quota math keys off `ttsMetrics.partial`
+   * (the real audio the user heard), NOT this `metrics.partial`, so this flag is
+   * informational and does not by itself change kill-switch accounting.
+   *
+   * RACE NOTE (audit M6): the live counters reset on the next `activityStart`,
+   * and manual VAD lets the user start the next turn while turnEnd is awaiting.
+   * So turnEnd snapshots this at `activityEnd` and carries it on the timeout
+   * error (`err.partialMetrics`) — callers handling a timeout should prefer
+   * that snapshot over calling this lazily, which could read zeroed counters.
+   * At activityEnd, decoupled `outputSeconds` is ~0 (discarded audio is
+   * generated AFTER the user's turn), so the kill-switch is never fed
+   * phantom discarded-audio seconds; `inputSeconds` (the user's audio) is final.
+   */
+  getPartialTurnMetrics() {
+    return {
+      inputSeconds: this._currentTurnInputBytes / 32000,
+      outputSeconds: this._currentTurnOutputBytes / 48000,
+      outputTranscript: this._currentTurnOutputTranscript,
+      usageMetadata: this._currentTurnUsage, // null if none observed
+      partial: true,
     };
   }
 

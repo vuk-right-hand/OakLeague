@@ -944,6 +944,23 @@ wss.on('connection', async (ws, req) => {
   let heartbeatInterval = null;
   let turnNumber = 0;
   let ttsTurnDead = false; // R3-M1 / R4-S1 — relay-loop gate for barge-in (provider-neutral)
+  // 2026-05-27 (audit C3) — consecutive decoupled turn_complete_timeout recoveries.
+  // ONE timeout is a recoverable Gemini hiccup (answer already played). But if
+  // Gemini Live wedges into "accepts input, never emits turn_complete", every
+  // turn would silently recover with a per-turn timeout latency tax and an
+  // unbounded session. After MAX consecutive timeouts we stop pretending it's
+  // healthy and close LOUD so the client does a clean reconnect (fresh Gemini
+  // session). Reset to 0 on any real turn_complete (bridge event + the turnEnd
+  // resolve path).
+  let consecutiveTurnCompleteTimeouts = 0;
+  const MAX_CONSECUTIVE_TURN_COMPLETE_TIMEOUTS = 2;
+  // Audit M1 — decoupled bridge.turnEnd wait for Gemini's turn_complete. The
+  // turn finalizes on the off-Live deep answer (awaitTurnSpoken), so this only
+  // bounds RECOVERY latency on a Gemini hiccup. 15s = generous over the ~2s
+  // normal (maxOutputTokens-capped) AND conservative against a long user
+  // utterance's STT-finalize tail (avoids false-positive recovery), while well
+  // under the legacy 30s so the C3 streak-guard stays responsive.
+  const DECOUPLED_TURN_END_TIMEOUT_MS = 15_000;
 
   // ── pgvector RAG plan — vector-mode state ──────────────────────────────
   //
@@ -1944,6 +1961,7 @@ wss.on('connection', async (ws, req) => {
       }
       kickoffRetrieval(e.text, turnNumber);
     } else if (e.kind === 'turn_complete') {
+      consecutiveTurnCompleteTimeouts = 0; // audit C3 — a real turn_complete = Gemini healthy.
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'turn_complete', at: e.at }));
       // pgvector RAG plan — audio gate. Microtask-defer the race so any
       // same-envelope input_transcription set pendingInjection FIRST (R3 M1
@@ -2358,7 +2376,44 @@ wss.on('connection', async (ws, req) => {
         // `ttsBridge.turnEnd()` flushes the bridge's `_currentContextId`, which
         // now belongs to the NEWER turn, and would cut its audio mid-word.
         const endingTurn = turnNumber;
-        const metrics = await bridge.turnEnd({ timeoutMs: msg.timeoutMs || 30_000 });
+        let metrics;
+        let recoveredFromTimeout = false;
+        let turnSpokenOk = false; // audit M-2 — did the deep answer actually play this turn?
+        // Audit C-NEW-1 — when set, this turn FINALIZES NORMALLY (its answer
+        // played → its COGS/quota MUST be written) and the session closes for a
+        // clean reconnect only AFTER cogs land (see the cogsPromise tail).
+        let geminiUnresponsiveEscalate = false;
+        try {
+          const turnEndTimeoutMs = msg.timeoutMs || (decoupled ? DECOUPLED_TURN_END_TIMEOUT_MS : 30_000);
+          metrics = await bridge.turnEnd({ timeoutMs: turnEndTimeoutMs });
+        } catch (e) {
+          // 2026-05-27 — turn_complete_timeout must NOT kill a decoupled session.
+          // In decoupled mode the off-Live deep answer streams to TTS and plays
+          // INDEPENDENTLY of Gemini Live's `turn_complete` (Gemini is STT-only;
+          // its turn_complete is a turn-boundary/COGS signal, not the answer).
+          // Gemini intermittently fails to emit turn_complete (observed live
+          // 2026-05-27 session 55e67485: clean open, answer played, then the
+          // await threw → session torn down MID-ANSWER on a long reply). Recover:
+          // finalize the turn with the byte counts we DID observe and keep the
+          // session alive. The genuinely-fatal cases — Gemini WS dead
+          // (`ws_closed_mid_turn`) or a fatal bridge error — still throw through
+          // to the [control] catch. Legacy (non-decoupled) keeps strict behavior.
+          if (decoupled && e && e.message === 'turn_complete_timeout' && typeof bridge.getPartialTurnMetrics === 'function') {
+            consecutiveTurnCompleteTimeouts += 1;
+            // M6 — partialMetrics was snapshotted at activityEnd (before the
+            // await), so a racing next-turn turnStart can't have zeroed it.
+            metrics = e.partialMetrics || bridge.getPartialTurnMetrics();
+            recoveredFromTimeout = true;
+            // C3 escalation is decided AFTER the answer-delivery check below
+            // (audit M-2): a timeout whose answer still PLAYED is a healthy turn
+            // Gemini just didn't emit turn_complete for, and must not count
+            // toward the wedge streak.
+            const inS = (typeof metrics.inputSeconds === 'number') ? metrics.inputSeconds.toFixed(1) : '?';
+            console.warn(`[ws ${connId}] turn_complete_timeout (turn ${endingTurn}, streak ${consecutiveTurnCompleteTimeouts}, inputS=${inS}) — decoupled non-fatal; finalizing + keeping session`);
+          } else {
+            throw e;
+          }
+        }
         const superseded = decoupled && turnNumber !== endingTurn;
         // DECOUPLED_BRAIN_PLAN P1-5.2 — the off-Live deep answer streams to TTS
         // gated behind retrieval. Wait (bounded) for the orchestrator to finish
@@ -2385,8 +2440,23 @@ wss.on('connection', async (ws, req) => {
           // finished/superseded turn returns INSTANTLY, so the floor only bites
           // an unresolved turn — exactly the case it must not cut short.
           const spokenWaitMs = Math.max(msg.timeoutMs || 30_000, 30_000);
-          try { await decoupledOrch.awaitTurnSpoken(spokenWaitMs); }
+          try { await decoupledOrch.awaitTurnSpoken(spokenWaitMs); turnSpokenOk = true; }
           catch (e) { captureException(e, { op: 'decoupled.awaitTurnSpoken', sessionId }); }
+        }
+        // Audit M-2 — decide C3 escalation only AFTER the answer-delivery check.
+        // A recovered timeout whose deep answer GENUINELY PLAYED (awaitTurnSpoken
+        // resolved) — or that the user already moved past (superseded) — is a
+        // HEALTHY turn Gemini merely failed to emit turn_complete for; reset the
+        // streak so a slow-but-fine answer (e.g. a 16–29s Haiku failover that
+        // trips the 15s turn_complete wait) can never accumulate toward a false
+        // reconnect. Escalate ONLY when the answer ALSO failed to deliver on
+        // consecutive timeouts — the genuine "everything wedged" case.
+        if (recoveredFromTimeout) {
+          if (superseded || turnSpokenOk) {
+            consecutiveTurnCompleteTimeouts = 0;
+          } else {
+            geminiUnresponsiveEscalate = consecutiveTurnCompleteTimeouts >= MAX_CONSECUTIVE_TURN_COMPLETE_TIMEOUTS;
+          }
         }
         if (superseded) {
           console.warn(`[ws ${connId}] turn_end superseded — turn ${endingTurn} finalized cogs-only (turn ${turnNumber} now live, TTS finalize skipped)`);
@@ -2459,6 +2529,17 @@ wss.on('connection', async (ws, req) => {
           }
         }
 
+        // Audit C2 — recovered turn_complete_timeout: Gemini never emitted
+        // turn_complete, so the proxy never sent the client its `turn_complete`
+        // frame (normally sent at the bridge turn_complete event). Without it
+        // the client's reducer stays stuck at phase 'speaking' → the next mic
+        // tap is misread as a barge-in. Synthesize the boundary now (the answer
+        // is confirmed done via awaitTurnSpoken above), matching the normal
+        // late-turn_complete timing. Skip when superseded — the newer turn owns
+        // the boundary.
+        if (recoveredFromTimeout && !superseded && ws.readyState === ws.OPEN) {
+          ws.send(JSON.stringify({ type: 'turn_complete', at: Date.now() }));
+        }
         ws.send(JSON.stringify({ type: 'turn_end_ack', metrics, cartesia: ttsMetrics, tts: ttsMetrics, ttsProvider }));
         const cogsPromise = logTurnCogs({
           userId, sessionId, turnNumber,
@@ -2495,6 +2576,20 @@ wss.on('connection', async (ws, req) => {
             }
             teardown('hume_per_turn_cap_exceeded').catch(() => {});
             closeWs(ws, 4006, 'quota_state_inconsistent');
+          });
+        } else if (geminiUnresponsiveEscalate) {
+          // Audit C3 + C-NEW-1 — Gemini Live wedged (MAX consecutive
+          // turn_complete_timeouts whose answers ALSO failed to play). This
+          // turn's books closed normally above (turn_end_ack sent, cogs queued).
+          // Close for a CLEAN RECONNECT only after cogs land (mirrors the humeCap
+          // pattern), with NO error frame so the client maps the non-4002 close
+          // to 'reconnecting' (tap-to-resume) → fresh, un-wedged Gemini session,
+          // NOT a fatal redirect. `else if` (audit M-1): mutually exclusive with
+          // the Hume-cap close so a single turn can't register two finally-closes
+          // (cap-exceeded is the more specific terminal reason → wins).
+          cogsPromise.finally(() => {
+            teardown('gemini_unresponsive').catch(() => {});
+            closeWs(ws, 1011, 'gemini_unresponsive');
           });
         }
         // R4-C1 — quota math: when α' is on, sum mic seconds + REAL TTS
@@ -2575,7 +2670,20 @@ wss.on('connection', async (ws, req) => {
       }
     } catch (e) {
       console.error('[control]', msg?.type, e);
-      ws.send(JSON.stringify({ type: 'error', message: e.message, op: msg?.type }));
+      // A throw that ESCAPES to this catch means the control handler did NOT
+      // finish — that is fatal by definition (the recoverable turn_complete_
+      // timeout is absorbed locally in the turn_end handler and never reaches
+      // here). Keep the original fatal contract so a genuinely broken handler
+      // (e.g. bridge_not_open in turn_start) is surfaced, not silently swallowed.
+      // Audit Small — also capture server-side so a swallowed control throw
+      // isn't invisible beyond the Fly log line.
+      captureException(e, { op: 'control', msgType: msg?.type, sessionId });
+      // Audit M-NEW-5 — clamp: e.message can be an upstream-derived string
+      // (e.g. `ws_closed_mid_turn code=… reason=<google text>`). This is the one
+      // client-facing frame in this branch that forwards a non-taxonomy string;
+      // bound it so unexpected upstream text can't bloat/poison the payload.
+      const safeMsg = typeof e?.message === 'string' ? e.message.slice(0, 120) : 'control_error';
+      ws.send(JSON.stringify({ type: 'error', message: safeMsg, op: msg?.type }));
     }
   });
 

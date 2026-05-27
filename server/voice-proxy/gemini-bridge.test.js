@@ -110,6 +110,50 @@ test('C3: no usageMetadata in any message → _currentTurnUsage stays null', () 
   off();
 });
 
+// ── turn_complete_timeout recovery (2026-05-27) — decoupled session must NOT
+//    die when Gemini Live skips turn_complete; the answer already played. ────
+
+test('turnEnd rejects "turn_complete_timeout" carrying an activityEnd partialMetrics snapshot (string contract + M6 anti-race)', async () => {
+  // index.js's decoupled turn_end path recovers ONLY when e.message ===
+  // 'turn_complete_timeout'. If this string ever drifts, recovery silently
+  // stops and sessions get torn down mid-answer again. It also reads
+  // `e.partialMetrics` (snapshotted at activityEnd) so a racing next-turn
+  // turnStart can't zero the live counters before a lazy read. Lock both.
+  const bridge = makeDecoupledBridge();
+  bridge.turnStart();
+  bridge.sendAudio({ bytes: Buffer.alloc(64000), mimeType: 'audio/pcm;rate=16000' }); // 2.0s input
+  await assert.rejects(
+    bridge.turnEnd({ timeoutMs: 10 }),
+    (e) => {
+      assert.equal(e.message, 'turn_complete_timeout', 'exact string index.js matches on');
+      assert.ok(e.partialMetrics, 'must carry the activityEnd snapshot');
+      assert.equal(e.partialMetrics.partial, true);
+      assert.equal(e.partialMetrics.inputSeconds, 2, 'snapshot reflects observed input (64000/32000)');
+      return true;
+    },
+  );
+  // Even after the next turn starts (live counters reset to 0), the snapshot
+  // already captured on the error is unaffected — the proxy bills real input.
+  bridge.turnStart();
+  assert.equal(bridge.getPartialTurnMetrics().inputSeconds, 0, 'live counters reset on next turnStart');
+});
+
+test('getPartialTurnMetrics: snapshots the in-flight turn with partial:true (turn_complete_timeout recovery source)', () => {
+  const bridge = makeDecoupledBridge();
+  bridge.turnStart();
+  // 32000 bytes = 1.0s of 16kHz mono 16-bit PCM input.
+  bridge.sendAudio({ bytes: Buffer.alloc(32000), mimeType: 'audio/pcm;rate=16000' });
+  const m = bridge.getPartialTurnMetrics();
+  assert.equal(m.partial, true, 'must flag partial so COGS treats it like the ttsBridge partial path');
+  assert.equal(m.inputSeconds, 1, '32000 / 32000 = 1.0s of observed input');
+  assert.equal(m.outputSeconds, 0, 'no discarded output observed this turn');
+  assert.equal(m.outputTranscript, '', 'no transcript observed');
+  assert.equal(m.usageMetadata, null, 'no usageMetadata observed → null, not 0');
+  // A fresh turn must not bleed the prior turn's bytes into the snapshot.
+  bridge.turnStart();
+  assert.equal(bridge.getPartialTurnMetrics().inputSeconds, 0, 'turnStart resets the counters');
+});
+
 // ── DECOUPLED_STT_OUTPUT_COST_PLAN — discarded-output token cap ──────────
 // Spike 2026-05-21: TEXT-out dead (1011), "ok" neuter breaks turn_complete;
 // the fix is a decoupled-gated maxOutputTokens cap (~24). These lock the env

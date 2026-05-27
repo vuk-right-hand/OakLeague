@@ -180,6 +180,10 @@ export function reduce(state: SessionState, action: Action): SessionState {
       return state;
 
     case 'turn_complete':
+      // Idempotent by design (load-bearing): the proxy may send TWO turn_complete
+      // frames for one turn — a synthesized one on a recovered turn_complete_
+      // timeout, then a genuinely-late real one if Gemini finally emits it. The
+      // second is a safe no-op here. Do NOT "optimize" this into a state flip.
       if (state.phase === 'speaking') return { ...state, phase: 'ready' };
       return state;
 

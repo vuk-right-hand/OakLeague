@@ -44,6 +44,14 @@ export const FATAL_END_REASONS = Object.freeze([
   // silence" rule's last line of defense; burn-in spikes here mean a
   // fleet misconfig (admin flipped a creator without the proxy ready).
   'decoupled_no_tts_layer',
+  // 2026-05-27 (audit C3) — decoupled Gemini Live wedged: 2 consecutive
+  // (MAX_CONSECUTIVE_TURN_COMPLETE_TIMEOUTS) turn_complete_timeouts with no
+  // turn_complete in between. The USER recovers (closeWs
+  // 1011 with no error frame → client tap-to-resume → fresh Gemini session),
+  // so this is not user-terminal — but a SPIKE means Gemini is repeatedly
+  // failing to finalize turns (a real upstream regression), so the burn-in
+  // monitor must surface it. A single recovered timeout never reaches here.
+  'gemini_unresponsive',
 ]);
 
 export const FATAL_END_REASONS_SET = new Set(FATAL_END_REASONS);
