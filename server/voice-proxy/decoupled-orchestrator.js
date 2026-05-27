@@ -181,12 +181,15 @@ export function makeDecoupledOrchestrator({
     turns: 0,
     barged: 0,
     // P1-10 audit M2 — observability counter for spurious-barge events
-    // suppressed by the proxy's interrupted handler (Gemini Live's
-    // parallel audio-gen timeline emitting interrupted with no actual
-    // Cartesia/Hume playback being interrupted). Incremented by
-    // recordInterruptedSuppressed() called from index.js. A rising rate
-    // here indicates the architectural mismatch is hitting more often
-    // (e.g., model verbose mode increased, Cartesia speed slowed).
+    // suppressed by the proxy's interrupted handler (Gemini Live's parallel
+    // audio-gen timeline emitting `interrupted`). 2026-05-27: semantics WIDENED
+    // — in decoupled manual-VAD mode the proxy now suppresses EVERY Gemini
+    // `interrupted` (it is never a real barge; the real barge is the client
+    // `cancel`). So this counts ALL decoupled interrupted events, not just
+    // those during a Cartesia idle gap. Expect it to read structurally HIGHER
+    // than pre-2026-05-27 — that is the fix working, NOT a regression. Each one
+    // is a mid-word cut the OLD code would have caused. Incremented by
+    // recordInterruptedSuppressed() from index.js.
     interruptedSuppressed: 0,
     trivialTurns: 0,
     // C-5 — turns whose user transcript looked truncated (>12s audio, transcript

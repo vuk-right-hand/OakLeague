@@ -1182,9 +1182,20 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     // tail-flush from the prior turn so a stale carry never plays late over the
     // user. cancel() below also drops the Simli carry itself on a barge.
     clearTailFlush();
-    // Proxy turn boundary + barge-in. mic-tap during 'speaking' is a
-    // barge-in: cancel the in-flight TTS playback locally (avatar buffer)
-    // and tell proxy so Cartesia stops synthesizing.
+    // Proxy turn boundary + barge-in. A mic-tap while a prior turn is still
+    // in progress is a barge-in: cancel the in-flight TTS locally (avatar
+    // buffer) and tell the proxy so Cartesia stops synthesizing + the
+    // orchestrator aborts its generation.
+    //
+    // 2026-05-27 — cover BOTH 'speaking' (answer audibly playing) AND 'ready'
+    // (answer being generated / streaming to Cartesia but the client hasn't
+    // flipped to 'speaking' on first audio yet). Since we now ALWAYS suppress
+    // Gemini's spurious `interrupted` in decoupled mode (it was cutting answers
+    // mid-word), the client `cancel` is the SOLE barge signal — so it must fire
+    // across the whole in-progress window, not just once audio is playing,
+    // otherwise a barge in the pre-audio gap would talk over the user until the
+    // next transcript supersedes the abandoned turn. 'listening' (user already
+    // holding the mic) and terminal phases have no prior turn to cancel.
     //
     // Order matters: on barge-in we cancel the OLD turn FIRST, then start
     // the NEW one. The reverse order (turn_start → cancel) made
@@ -1193,7 +1204,7 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     // _currentContextId=null. The user's eventual mic-release fired
     // turn_end → cartesia.turnEnd threw 'turnEnd before turnStart' →
     // bridge state poisoned (Phase 0.5 testing 2026-05-07).
-    if (state.phase === 'speaking') {
+    if (state.phase === 'speaking' || state.phase === 'ready') {
       try { bridgeRef.current?.cancel(); } catch {}
       try { proxyRef.current?.sendControl({ type: 'cancel' }); } catch {}
     }

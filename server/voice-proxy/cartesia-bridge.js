@@ -366,10 +366,10 @@ export class CartesiaTTSBridge extends EventEmitter {
   /**
    * P1-10 spurious-barge fix (2026-05-20). Wall-clock of the last
    * audio_out chunk received from Cartesia, or 0 if no chunk arrived
-   * since open. The proxy's `interrupted` handler uses this to decide
-   * if Gemini's interrupted event reflects a real user barge during
-   * Cartesia playback (chunk recent) or a spurious event from Gemini
-   * Live's parallel audio-gen timeline (chunk stale / never arrived).
+   * since open. 2026-05-27: the proxy's `interrupted` handler no longer
+   * uses this to DECIDE suppression (decoupled now always-suppresses);
+   * it is logged only — `idleMs` small at suppression time = Cartesia was
+   * actively playing, i.e. a mid-word cut the old code would have caused.
    */
   getLastChunkAt() {
     return this._lastChunkAtMs;

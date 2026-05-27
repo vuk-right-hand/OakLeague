@@ -2006,26 +2006,46 @@ wss.on('connection', async (ws, req) => {
       // below keys off Cartesia's getLastChunkAt(), not Gemini's timeline, so
       // its correctness is unchanged; only the spurious RATE drops.
       //
-      // Heuristic: a REAL user barge only happens during ACTIVE TTS
-      // playback. If Cartesia/Hume hasn't emitted an audio chunk in
-      // >1000ms, no playback is being interrupted → suppress.
-      // P1-10 audit S3 — promote magic number. Cartesia chunks arrive
-      // at ~40ms intervals during synthesis; 1000ms is a 25× margin so
-      // a brief packet gap can't trip the heuristic into thinking
-      // playback ended.
-      const SPURIOUS_BARGE_IDLE_THRESHOLD_MS = 1000;
+      // 2026-05-27 — ROOT CAUSE of the random mid-word cutoff.
+      // We run MANUAL VAD (automaticActivityDetection.disabled=true): per the
+      // Gemini Live docs, in manual VAD the CLIENT owns turn boundaries via
+      // activityStart/activityEnd, and `interrupted` is an AUTOMATIC-VAD barge
+      // signal ("the user barged in"). In our push-to-talk UX the user CANNOT
+      // barge during playback (the mic isn't in talk-mode); a real barge is the
+      // mic-tap, which the CLIENT signals with a `cancel` control message
+      // (handled in msg.type==='cancel' below). So Gemini's `interrupted` —
+      // which fires on its OWN discarded parallel-audio timeline — is ALWAYS
+      // spurious here.
+      //
+      // The OLD heuristic suppressed it only when Cartesia was idle >1000ms,
+      // i.e. it FORWARDED it whenever Cartesia was ACTIVELY playing — sending
+      // the client a ClearBuffer + cancelling the live Cartesia context, which
+      // CUT THE ANSWER MID-WORD whenever Gemini's timeline happened to overlap
+      // playback. That overlap is non-deterministic → "2-3 turns fine, then one
+      // drops at random." Forwarding during active playback is exactly the bug,
+      // not the safe case.
+      //
+      // Fix: in decoupled mode ALWAYS suppress. Do NOT forward (no avatar cut),
+      // do NOT cancel TTS (don't kill the playing answer), do NOT abort the
+      // orchestrator (let the turn finish → ttsBridge.turnEnd finalizes the
+      // context cleanly, so no orphaned-context "Invalid context ID" either).
+      // Legacy (non-decoupled / true auto-VAD) keeps forwarding as before.
+      // LOAD-BEARING on manual VAD: this is only correct because
+      // automaticActivityDetection.disabled=true is HARDCODED in
+      // gemini-bridge.js (~L442). If that ever becomes configurable, a real
+      // auto-VAD barge could arrive via `interrupted` and this branch would
+      // wrongly ignore it — re-gate then.
       let suppress = false;
-      if (decoupled && useTts && ttsBridge && typeof ttsBridge.getLastChunkAt === 'function') {
-        const lastChunk = ttsBridge.getLastChunkAt() || 0;
-        const idleMs = lastChunk === 0 ? Infinity : (Date.now() - lastChunk);
-        if (idleMs > SPURIOUS_BARGE_IDLE_THRESHOLD_MS) {
-          suppress = true;
-          console.log(`[ws ${connId}] interrupted suppressed (decoupled, tts idle ${idleMs}ms — spurious Gemini interrupted)`);
-          // P1-10 audit M2 — observability: surface suppression rate in
-          // session metrics.
-          if (decoupledOrch && typeof decoupledOrch.recordInterruptedSuppressed === 'function') {
-            try { decoupledOrch.recordInterruptedSuppressed(); } catch {}
-          }
+      if (decoupled) {
+        suppress = true;
+        const lastChunk = (useTts && ttsBridge && typeof ttsBridge.getLastChunkAt === 'function')
+          ? (ttsBridge.getLastChunkAt() || 0) : 0;
+        const idleMs = lastChunk === 0 ? -1 : (Date.now() - lastChunk);
+        // idleMs small (≈40ms) = Cartesia was actively playing when Gemini fired
+        // interrupted ⇒ this is a cut the OLD code would have caused, now prevented.
+        console.log(`[ws ${connId}] interrupted SUPPRESSED (decoupled manual-VAD, tts idleMs=${idleMs}; real barge = client cancel)`);
+        if (decoupledOrch && typeof decoupledOrch.recordInterruptedSuppressed === 'function') {
+          try { decoupledOrch.recordInterruptedSuppressed(); } catch {}
         }
       }
       if (!suppress) {
@@ -2655,10 +2675,11 @@ wss.on('connection', async (ws, req) => {
         ttsTurnDead = true;
         bridge.cancel();
         if (useTts && ttsBridge) ttsBridge.cancel();
-        // Re-audit M1 — a CLIENT mic-tap barge sends `cancel`, but in decoupled
-        // mode Gemini isn't generating audio for the user to barge over, so its
-        // `interrupted` event (the only other onInterrupted caller) may never
-        // fire. Notify the orchestrator here so (1) the in-flight deep
+        // Re-audit M1 — a CLIENT mic-tap barge sends `cancel`. In decoupled mode
+        // (2026-05-27) the proxy now ALWAYS suppresses Gemini's `interrupted`, so
+        // this client `cancel` is the SOLE barge signal that reaches the
+        // orchestrator — making this onInterrupted() call load-bearing, not a
+        // backstop. Notify the orchestrator so (1) the in-flight deep
         // generate/Haiku stream is ABORTED — otherwise it runs to completion and
         // keeps billing after the user already moved on; and (2) `t.barged` is
         // set, which correctly SUPPRESSES the deep_answer_done tail-flush signal
