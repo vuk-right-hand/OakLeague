@@ -2726,6 +2726,10 @@ wss.on('connection', async (ws, req) => {
           captureException(e, { level: 'warning', op: 'voice_usage_record', sessionId });
         });
       } else if (msg.type === 'cancel') {
+        // ⚠️ TEMP AUDIODIAG — DELETE later. Definitive proof the CLIENT sent a
+        // cancel (→ ClearBuffer wipes Simli's queue → cut). Correlate the
+        // timestamp with the client [AD] CANCEL-SEND site= line.
+        if (DIAG_AUDIO) console.log(`[AUDIODIAG ${connId}] rx CANCEL t${turnNumber} fwdChunks=${diagChunkSeq}`);
         // R3-M1 / R4-S1 — set the relay-loop flag SYNCHRONOUSLY before any
         // await, then ws-send cancel to the active TTS bridge. Bridge.cancel
         // also sets its own flag synchronously.
