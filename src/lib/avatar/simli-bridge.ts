@@ -431,6 +431,10 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
   // by the proxy's per-utterance "deep answer done" signal).
   function commitUtterance(): void {
     if (closed || !client || !ready || chunkerBuf.byteLength === 0) return;
+    // ⚠️ TEMP AUDIODIAG — DELETE later. Tail actually flushed (real bytes +
+    // silence pad). carry small = a sub-word tail; this is the last audio Simli
+    // gets for the turn.
+    console.log(`[AD] simli.commitUtterance flush carryBytes=${chunkerBuf.byteLength} (padded→${SIMLI_CHUNK_BYTES})`);
     const padded = new Uint8Array(SIMLI_CHUNK_BYTES);
     padded.set(chunkerBuf, 0);
     chunkerBuf = new Uint8Array(0);
@@ -482,6 +486,7 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
     merged.set(chunkerBuf, 0);
     merged.set(incoming, chunkerBuf.byteLength);
     let offset = 0;
+    let emitted = 0; // ⚠️ TEMP AUDIODIAG
     while (merged.byteLength - offset >= SIMLI_CHUNK_BYTES) {
       const slice = merged.subarray(offset, offset + SIMLI_CHUNK_BYTES);
       try {
@@ -496,7 +501,11 @@ export function createSimliBridge(handlers: AvatarBridgeHandlers): AvatarBridge 
         return;
       }
       offset += SIMLI_CHUNK_BYTES;
+      emitted += 1;
     }
+    // ⚠️ TEMP AUDIODIAG — DELETE later. How the chunker batches Cartesia's
+    // arbitrary frames into Simli's 6000B cadence. carry = remainder held.
+    if (emitted > 0) console.log(`[AD] simli.sendAudio in=${incoming.byteLength} emitted=${emitted}x6000 carry=${merged.byteLength - offset}`);
     // Carry remainder for next call. Slice (not subarray) to detach from
     // `merged` so `merged` can be GC'd.
     chunkerBuf = offset < merged.byteLength

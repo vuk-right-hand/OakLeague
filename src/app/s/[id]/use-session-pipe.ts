@@ -222,6 +222,10 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   // never fires mid-answer (no false-positive flush during active generation).
   const tailFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const tailPendingRef = useRef<boolean>(false);
+  // ⚠️ TEMP AUDIODIAG (2026-05-27) — DELETE when cutoff/stutter root cause is
+  // found. Tracks the client side of the TTS audio path so the console tells
+  // the whole story (Fly log buffer is unreliable). seq=chunk #, last=prior rx.
+  const diagRef = useRef<{ seq: number; last: number; commits: number }>({ seq: 0, last: 0, commits: 0 });
   const armTailFlush = useCallback(() => {
     if (tailFlushTimerRef.current) clearTimeout(tailFlushTimerRef.current);
     tailFlushTimerRef.current = setTimeout(() => {
@@ -245,6 +249,9 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       // scripts/cartesia-flush-probe.mjs). The first fire commits an empty
       // carry; the flushed chunks land later and re-arm BECAUSE tailPending is
       // still true. Clearing it on fire re-introduces the random cutoff.
+      // ⚠️ TEMP AUDIODIAG — DELETE later.
+      diagRef.current.commits += 1;
+      console.log(`[AD] tailFlush FIRE commit#${diagRef.current.commits} (rxChunks=${diagRef.current.seq})`);
       try { bridgeRef.current?.commitUtterance?.(); } catch { /* tail flush is best-effort */ }
     }, TAIL_FLUSH_GRACE_MS);
   }, []);
@@ -555,6 +562,11 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       const dTotal = Math.max(0, s.totalFrames - prior.total);
       if (dTotal > 0) {
         videoStatsRatiosRef.current.push(dDropped / dTotal);
+        // ⚠️ TEMP AUDIODIAG — DELETE later. Per-sample dropped-frame ratio.
+        // High ratio = Simli/LiveKit RENDER stutter (network/CPU), NOT our
+        // audio pipeline — bisects "stutter is us" vs "stutter is the pipe".
+        const ratio = dDropped / dTotal;
+        if (ratio > 0.02) console.log(`[AD] simli.videoStats DROP dropped=${dDropped}/${dTotal} ratio=${(ratio * 100).toFixed(1)}%`);
       }
     }
     if (s.sampledAtMs - videoStatsFlushAtRef.current >= 30_000) {
@@ -719,6 +731,16 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
         onAudioOut: (bytes) => {
           if (cancelled) return;
           recordAudioOut(bytes.byteLength, performance.now());
+          // ⚠️ TEMP AUDIODIAG — DELETE later. Client chunk arrival timing +
+          // gating state. A big gapMs or a chunk dropped here (micActive guard)
+          // explains a stutter/cut.
+          {
+            const now = performance.now();
+            const gap = diagRef.current.last ? Math.round(now - diagRef.current.last) : -1;
+            diagRef.current.last = now;
+            diagRef.current.seq += 1;
+            console.log(`[AD] rx #${diagRef.current.seq} bytes=${bytes.byteLength} gapMs=${gap} micActive=${micActiveRef.current} tailPending=${tailPendingRef.current} expectingTts=${expectingTtsRef.current}`);
+          }
           // 2026-05-13 (v2) — mic-state firewall. With manual VAD the server
           // never starts speaking while micActive=true; ANY audio_out that
           // arrives during user listening is leftover Cartesia tail from the
@@ -765,6 +787,8 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
         // gluing silent worklet frames + a phantom barge-in onto Gemini's
         // ongoing turn until auto-VAD couldn't recover.
         onTurnComplete: () => {
+          // ⚠️ TEMP AUDIODIAG — DELETE later.
+          console.log(`[AD] turn_complete rx (rxChunks=${diagRef.current.seq} commits=${diagRef.current.commits})`);
           // Manual VAD: turn_complete from the server cannot fire while the
           // user is actively listening (server waits for our activityEnd).
           // No mic state touched here — phase-only signal.
@@ -781,6 +805,8 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
         // the Simli carry once. Gated → never fires mid-answer.
         onDeepAnswerDone: () => {
           if (cancelled) return;
+          // ⚠️ TEMP AUDIODIAG — DELETE later.
+          console.log(`[AD] deep_answer_done rx (rxChunks=${diagRef.current.seq} micActive=${micActiveRef.current})`);
           if (micActiveRef.current) return; // user already talking — barge owns teardown
           tailPendingRef.current = true;
           armTailFlush();
