@@ -21,13 +21,17 @@
 //       continue:true }
 //   Outbound continuation:
 //     { context_id, transcript, continue:true }
-//   Outbound final flush:
+//   Outbound manual flush (keeps context OPEN — forces buffered tail out now):
+//     { context_id, model_id, transcript:'', voice, output_format, continue:true, flush:true }
+//   Outbound final flush (finalizes + CLOSES context):
 //     { context_id, transcript:'', continue:false }
 //   Outbound cancel:
 //     { context_id, cancel:true }
 //
 //   Inbound chunk:
 //     { type:'chunk', data:'<base64-pcm>', context_id, done:false, status_code:206 }
+//   Inbound manual-flush ack:
+//     { type:'flush_done', done:false, flush_done:true, flush_id, context_id, status_code }
 //   Inbound done:
 //     { type:'done', done:true, context_id, status_code:206 }
 //   Inbound error:
@@ -258,6 +262,66 @@ export class CartesiaTTSBridge extends EventEmitter {
     this._sentFirstChunkOfTurn = true;
     if (this._currentTurnTextSample.length < 500) {
       this._currentTurnTextSample = (this._currentTurnTextSample + text).slice(0, 500);
+    }
+    this._wsSend(msg);
+  }
+
+  /**
+   * Manual flush — forces Cartesia to synthesize its buffered trailing text
+   * NOW, while keeping the context OPEN (continue:true). Mid-word-cutoff fix
+   * (2026-05-27). Under continue:true Cartesia holds the final synthesis unit
+   * until it has "enough context or the buffer delay elapses" (Cartesia docs),
+   * so the last word's audio only streamed when `continue:false` fired at
+   * turnEnd. In decoupled mode that terminator is gated behind Gemini Live's
+   * `turn_complete` (6-21s late, sometimes absent) → the client's 200ms
+   * tail-flush fires first and the trailing word is cut at random. Flushing at
+   * deep-answer-done (decoupled from Gemini) streams the tail immediately;
+   * turnEnd's continue:false STILL finalizes + bills (synthesizes nothing new).
+   *
+   * Wire shape (transcript:'' + continue:true + flush:true + full block)
+   * VERIFIED on the pinned cartesia_version=2026-03-01 by
+   * scripts/cartesia-flush-probe.mjs (flush accepted, flush_done returned,
+   * context survives, later continue:false still finalizes). Carries the full
+   * voice/model_id/output_format block for the SAME reason as sendText (L233 —
+   * Cartesia rejects continuation messages that drop it); do NOT "simplify" it
+   * to match Hume's bare {flush:true}.
+   *
+   * @param {string} [expectedContextId] Audit C3 — the context the CALLER
+   *   intends to flush (the turn whose deep answer just finished). onDeepAnswerDone
+   *   fires for turn N from the orchestrator; by the time it lands a fast
+   *   next-turn turnStart may have swapped _currentContextId to N+1. Flushing
+   *   then would force-synthesize the NEW turn's in-flight partial text → cut
+   *   the new turn mid-word (the exact bug, re-introduced). No-op on mismatch.
+   *
+   * No-op (does NOT throw) if the bridge is closed/dead, the WS isn't open,
+   * there's no live context, nothing was sent this turn (nothing to force out),
+   * or the live context isn't the one the caller meant. Touches neither
+   * _charsThisTurn/_currentTurnTextSample (no billable text) nor
+   * _currentContextId (context stays open for the later turnEnd).
+   */
+  flush(expectedContextId) {
+    if (this._closed || this._turnDead) return;
+    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+    if (!this._currentContextId) return;
+    if (!this._sentFirstChunkOfTurn) return;
+    if (expectedContextId != null && expectedContextId !== this._currentContextId) return;
+    const msg = {
+      context_id: this._currentContextId,
+      model_id: SONIC_MODEL,
+      transcript: '',
+      voice: { mode: 'id', id: this._voiceId },
+      output_format: {
+        container: 'raw',
+        encoding: 'pcm_s16le',
+        sample_rate: this._sampleRate,
+      },
+      continue: true,
+      flush: true,
+    };
+    // Carry speed on the flush too (matches sendText/turnEnd; Cartesia treats
+    // the per-message block as authoritative).
+    if (shouldSendSpeed(this._ttsSpeed)) {
+      msg.generation_config = { speed: this._ttsSpeed };
     }
     this._wsSend(msg);
   }

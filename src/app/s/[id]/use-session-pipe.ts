@@ -237,6 +237,14 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       // is an idempotent no-op on an empty carry, so repeated fires are harmless.
       // tailPending is reset by clearTailFlush() at the next turn boundary
       // (mic_started / pause / unmount), so it never leaks across turns.
+      //
+      // 2026-05-27 — LOAD-BEARING for the server-side Cartesia manual-flush
+      // (cartesia-bridge.js flush(), fired at onDeepAnswerDone). That flush
+      // forces the buffered tail to synthesize, but its audio_out arrives
+      // ~700ms AFTER the deep_answer_done that armed this timer (measured:
+      // scripts/cartesia-flush-probe.mjs). The first fire commits an empty
+      // carry; the flushed chunks land later and re-arm BECAUSE tailPending is
+      // still true. Clearing it on fire re-introduces the random cutoff.
       try { bridgeRef.current?.commitUtterance?.(); } catch { /* tail flush is best-effort */ }
     }, TAIL_FLUSH_GRACE_MS);
   }, []);

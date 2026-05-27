@@ -370,3 +370,111 @@ test('tts_speed=0.4 (below 0.6 floor): coerced to null fallback, generation_conf
   assert.equal(sent.length, 1);
   assert.ok(!('generation_config' in sent[0]));
 });
+
+// ── flush() — mid-word-cutoff fix (2026-05-27) ───────────────────────────────
+// Manual flush forces Cartesia's buffered tail to synthesize NOW while keeping
+// the context OPEN (continue:true). Wire shape verified on cartesia_version=
+// 2026-03-01 by scripts/cartesia-flush-probe.mjs.
+
+test('flush emits the manual-flush envelope (transcript:"" + continue:true + flush:true + full block)', () => {
+  const { bridge, sent } = makeStubBridge();
+  bridge.turnStart('sess-1:1');
+  bridge.sendText('The most important thing is your daily');
+  assert.equal(sent.length, 1);
+  bridge.flush();
+  assert.equal(sent.length, 2);
+  const f = sent[1];
+  assert.equal(f.context_id, 'sess-1:1');
+  assert.equal(f.model_id, 'sonic-3');
+  assert.deepEqual(f.voice, { mode: 'id', id: 'voice-uuid-abc' });
+  assert.equal(f.output_format.encoding, 'pcm_s16le');
+  assert.equal(f.output_format.sample_rate, 24000);
+  assert.equal(f.transcript, '');
+  assert.equal(f.continue, true);
+  assert.equal(f.flush, true);
+});
+
+test('flush does NOT touch billing counters or close the context (turnEnd still finalizes after)', async () => {
+  const { bridge } = makeStubBridge();
+  bridge.turnStart('sess-1:1');
+  bridge.sendText('hello'); // 5 chars
+  bridge._onMessage(JSON.stringify({ type: 'chunk', data: 'AAAA', context_id: 'sess-1:1' }), false);
+  bridge.flush();
+  // flush adds no billable text and keeps the context open.
+  assert.equal(bridge._charsThisTurn, 5, 'flush must not change _charsThisTurn');
+  assert.equal(bridge._currentContextId, 'sess-1:1', 'flush must keep the context open');
+  // A flush_done arriving first must NOT be mistaken for turn_done.
+  bridge._onMessage(JSON.stringify({ type: 'flush_done', flush_done: true, flush_id: 0, context_id: 'sess-1:1' }), false);
+  const endP = bridge.turnEnd({ timeoutMs: 500 });
+  setImmediate(() => {
+    bridge._onMessage(JSON.stringify({ type: 'done', context_id: 'sess-1:1', done: true }), false);
+  });
+  const result = await endP;
+  assert.equal(result.partial, false, 'turnEnd must still finalize on done after a flush');
+  assert.equal(result.characters, 5);
+});
+
+test('flush carries generation_config.speed when set (rides every message)', () => {
+  const { bridge, sent } = makeStubBridgeWithSpeed(1.15);
+  bridge.turnStart('sess-1:1');
+  bridge.sendText('Hi.');
+  bridge.flush();
+  assert.equal(sent.length, 2);
+  assert.deepEqual(sent[1].generation_config, { speed: 1.15 });
+});
+
+test('flush is a no-op when no text was sent this turn (nothing buffered to force out)', () => {
+  const { bridge, sent } = makeStubBridge();
+  bridge.turnStart('sess-1:1');
+  bridge.flush();
+  assert.equal(sent.length, 0, '_sentFirstChunkOfTurn=false → no flush frame');
+});
+
+test('flush is a no-op with no live context (post-cancel / pre-turnStart)', () => {
+  const { bridge, sent } = makeStubBridge();
+  bridge.turnStart('sess-1:1');
+  bridge.sendText('hi');
+  bridge.cancel(); // nulls _currentContextId + sets _turnDead
+  const before = sent.length;
+  bridge.flush();
+  assert.equal(sent.length, before, 'flush after cancel must send nothing');
+});
+
+test('flush audit M3 — barge interleave: _turnDead set, flush sends nothing', () => {
+  const { bridge, sent } = makeStubBridge();
+  bridge.turnStart('sess-1:1');
+  bridge.sendText('hi');
+  // Simulate the barge path setting _turnDead before the orchestrator finally
+  // fires onDeepAnswerDone (two independent code paths, no shared lock).
+  bridge._turnDead = true;
+  const before = sent.length;
+  bridge.flush('sess-1:1');
+  assert.equal(sent.length, before, 'flush on a dead turn must send nothing');
+});
+
+test('flush audit C3 — context mismatch: fast next-turn turnStart, flush of the OLD turn no-ops', () => {
+  const { bridge, sent } = makeStubBridge();
+  bridge.turnStart('sess-1:1');
+  bridge.sendText('turn one answer');
+  // Next turn started before the orchestrator's onDeepAnswerDone(1) landed.
+  bridge.turnStart('sess-1:2');
+  bridge.sendText('turn two in flight');
+  const before = sent.length;
+  // Orchestrator asks to flush turn 1; live context is now turn 2 → no-op.
+  bridge.flush('sess-1:1');
+  assert.equal(sent.length, before, 'must NOT force-synthesize turn 2 partial');
+  // Flushing the CURRENT context is allowed.
+  bridge.flush('sess-1:2');
+  assert.equal(sent.length, before + 1);
+  assert.equal(sent[sent.length - 1].context_id, 'sess-1:2');
+});
+
+test('flush is a no-op when the WS is not open', () => {
+  const { bridge, sent } = makeStubBridge();
+  bridge.turnStart('sess-1:1');
+  bridge.sendText('hi');
+  bridge._ws.readyState = 3; // CLOSED
+  const before = sent.length;
+  bridge.flush();
+  assert.equal(sent.length, before);
+});

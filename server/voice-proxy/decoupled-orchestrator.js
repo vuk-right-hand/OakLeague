@@ -734,7 +734,11 @@ export function makeDecoupledOrchestrator({
       // dropped the Simli carry via cancel(); a flush signal would be a no-op at
       // best and could nudge a stale frame at worst. The browser gates a short
       // trailing-audio grace before flushing the carry.
-      if (!t.barged && t.deepStreamedAudio) { try { onDeepAnswerDone(); } catch {} }
+      // Pass the turn number so index.js can context-guard the Cartesia
+      // manual-flush (audit C3): a fast next-turn turnStart may have swapped
+      // the live TTS context by the time this fires; flushing the wrong
+      // context would cut the NEW turn mid-word.
+      if (!t.barged && t.deepStreamedAudio) { try { onDeepAnswerDone(t.turnNumber); } catch {} }
     }
   }
 

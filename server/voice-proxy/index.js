@@ -1821,10 +1821,29 @@ wss.on('connection', async (ws, req) => {
       // deep answer finishes), not on the +6–20s-late Gemini turn_complete.
       // Same WS as audio_out → ordered after the last audio chunk; the browser
       // still gates a short trailing-audio grace before flushing.
-      onDeepAnswerDone: () => {
+      onDeepAnswerDone: (turnNum) => {
         try {
           if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'deep_answer_done' }));
         } catch { /* ws closing — nothing to flush */ }
+        // Mid-word-cutoff fix (2026-05-27). Force Cartesia's buffered tail to
+        // synthesize NOW instead of waiting for the continue:false at turn_end,
+        // which in decoupled mode is gated behind Gemini Live's `turn_complete`
+        // (6-21s late, sometimes absent) → the client's 200ms tail-flush fires
+        // first and the trailing word is cut at random. flush:true keeps the
+        // context OPEN; ttsBridge.turnEnd()'s continue:false still finalizes +
+        // bills. Cartesia-only (Hume's turnEnd already carries flush:true; its
+        // bridge has no flush() so the typeof guard skips it). Context-guarded
+        // (audit C3) with the turn the orchestrator just finished so a racing
+        // next-turn turnStart can't get its in-flight partial force-synthesized.
+        // Never throw into the orchestrator's finally.
+        if (useTts && ttsBridge && typeof ttsBridge.flush === 'function') {
+          try {
+            const expectCtx = (typeof turnNum === 'number') ? `${sessionId}:${turnNum}` : undefined;
+            ttsBridge.flush(expectCtx);
+          } catch (err) {
+            captureException(err, { op: 'tts.flush', sessionId, ttsProvider });
+          }
+        }
       },
       onFatal: () => {
         // Audit C2 — idempotent. The orchestrator's `fatal` latch
