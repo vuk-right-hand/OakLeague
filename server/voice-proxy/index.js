@@ -948,11 +948,6 @@ wss.on('connection', async (ws, req) => {
   // root cause is found. Gated behind VOICE_DIAG_AUDIO=1 (Fly secret). Logs the
   // full TTS audio path: Cartesia chunk arrival timing/gaps + forward to client.
   const DIAG_AUDIO = process.env.VOICE_DIAG_AUDIO === '1';
-  // ⚠️ Flush kill-switch (2026-05-27). The manual flush at deep_answer_done made
-  // per-word audio WORSE (stutter) — gate it OFF by default so the regression is
-  // reverted without throwing the code away; flip VOICE_TTS_FLUSH_ENABLED=1 to
-  // A/B it against the diag logs. Default OFF.
-  const FLUSH_ENABLED = process.env.VOICE_TTS_FLUSH_ENABLED === '1';
   let diagChunkSeq = 0;       // per-turn Cartesia chunk counter
   let diagLastChunkMs = 0;    // wall-clock of prior chunk (gap detection)
   let diagTurnBytes = 0;      // cumulative audio bytes forwarded this turn
@@ -1837,22 +1832,20 @@ wss.on('connection', async (ws, req) => {
         try {
           if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'deep_answer_done' }));
         } catch { /* ws closing — nothing to flush */ }
-        // ⚠️ TEMP AUDIODIAG — DELETE later. End-of-answer marker + totals.
         if (DIAG_AUDIO) {
-          console.log(`[AUDIODIAG ${connId}] deep_answer_done t${turnNum} fwdChunks=${diagChunkSeq} fwdBytes=${diagTurnBytes} flushEnabled=${FLUSH_ENABLED}`);
+          console.log(`[AUDIODIAG ${connId}] deep_answer_done t${turnNum} fwdChunks=${diagChunkSeq} fwdBytes=${diagTurnBytes}`);
         }
-        if (!FLUSH_ENABLED) return; // flush gated OFF by default (stutter regression)
-        // Mid-word-cutoff fix (2026-05-27). Force Cartesia's buffered tail to
-        // synthesize NOW instead of waiting for the continue:false at turn_end,
-        // which in decoupled mode is gated behind Gemini Live's `turn_complete`
-        // (6-21s late, sometimes absent) → the client's 200ms tail-flush fires
-        // first and the trailing word is cut at random. flush:true keeps the
-        // context OPEN; ttsBridge.turnEnd()'s continue:false still finalizes +
-        // bills. Cartesia-only (Hume's turnEnd already carries flush:true; its
-        // bridge has no flush() so the typeof guard skips it). Context-guarded
-        // (audit C3) with the turn the orchestrator just finished so a racing
-        // next-turn turnStart can't get its in-flight partial force-synthesized.
-        // Never throw into the orchestrator's finally.
+        // Mid-word-cutoff fix (2026-05-27, v2). The deep answer's full text is now
+        // in Cartesia's buffer. Send a manual flush (continue:true + flush:true —
+        // does NOT close the context) so Cartesia synthesizes the final buffered
+        // unit IMMEDIATELY instead of holding it under continue:true until the
+        // turn_end continue:false (which is gated behind Gemini's 6-21s-late
+        // turn_complete). This makes the eventual `done` land inside the (now
+        // bumped) turn_end finalize window → no timeout → no context-null → no
+        // dropped tail. Cartesia-only (Hume has no flush()). Context-guarded so a
+        // racing next-turn turnStart can't get its in-flight partial flushed.
+        // The end-of-AUDIO signal to the client is `tts_audio_done` (emitted on
+        // Cartesia's real `done`), NOT this — see the ttsBridge turn_done handler.
         if (useTts && ttsBridge && typeof ttsBridge.flush === 'function') {
           try {
             const expectCtx = (typeof turnNum === 'number') ? `${sessionId}:${turnNum}` : undefined;
@@ -2197,16 +2190,24 @@ wss.on('connection', async (ws, req) => {
         // own _turnDead check. Belt-and-suspenders against late chunks
         // from the WS receive buffer at cancel time.
         if (ttsTurnDead) return;
-        // ⚠️ TEMP AUDIODIAG — DELETE later. Cartesia chunk arrival timing.
-        if (DIAG_AUDIO) {
-          const now = Date.now();
-          const gap = diagLastChunkMs ? now - diagLastChunkMs : -1;
-          diagLastChunkMs = now;
-          diagChunkSeq += 1;
-          diagTurnBytes += e.chunk.bytes.byteLength;
-          console.log(`[AUDIODIAG ${connId}] cartesia.chunk t${turnNumber} #${diagChunkSeq} bytes=${e.chunk.bytes.byteLength} gapMs=${gap} cumBytes=${diagTurnBytes} buffered=${ws.bufferedAmount} ctx=${e.contextId}`);
-        }
+        if (DIAG_AUDIO) { diagChunkSeq += 1; diagTurnBytes += e.chunk.bytes.byteLength; }
         sendBinaryWithBackpressure(e.chunk.bytes);
+      } else if (e.kind === 'turn_done') {
+        // Mid-word-cutoff fix (2026-05-27, v2). Cartesia's REAL end-of-audio for
+        // this turn (`done` after the flush/continue:false synthesized the last
+        // chunk). Tell the client to flush the Simli tail ONCE here — this
+        // replaces the old client-side 200ms tail-flush that fired repeatedly on
+        // mid-answer synthesis gaps (the stutter). Context-gated (audit M1): a
+        // superseded/old turn's late `done` must NOT trigger a flush of the
+        // CURRENT turn's in-flight carry. turnEnd's internal handler also fires on
+        // this same event to resolve metrics — coexisting listeners.
+        const liveCtx = `${sessionId}:${turnNumber}`;
+        if (e.contextId === liveCtx && ws.readyState === ws.OPEN) {
+          try { ws.send(JSON.stringify({ type: 'tts_audio_done' })); } catch {}
+          if (DIAG_AUDIO) console.log(`[AUDIODIAG ${connId}] tts_audio_done t${turnNumber} ctx=${e.contextId}`);
+        } else if (DIAG_AUDIO) {
+          console.log(`[AUDIODIAG ${connId}] turn_done IGNORED (stale ctx=${e.contextId} live=${liveCtx})`);
+        }
       } else if (e.kind === 'reconnected') {
         if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'tts_reconnected', at: e.at }));
       } else if (e.kind === 'error') {
@@ -2536,9 +2537,18 @@ wss.on('connection', async (ws, req) => {
           // R3-C1 / R4-C1 — always await; bridge resolves with partial:true
           // on timeout/error so logTurnCogs (and the Gemini legs) always
           // land. NEVER throw out of this path.
-          // 10s default: Phase 0 measured cold-connect `done` ack at ~6s.
-          // Same default for Hume (Phase-0 verified comparable steady-state).
-          ttsMetrics = await ttsBridge.turnEnd({ timeoutMs: 10_000 });
+          // 2026-05-27 (v2) — bumped 10s → 60s. THE long-answer cutoff: a long
+          // answer is still streaming audio when continue:false is sent; the old
+          // 10s timeout resolved partial → cleanup() nulled _currentContextId →
+          // every still-arriving Cartesia chunk hit the ctx-mismatch drop
+          // (cartesia-bridge.js) → avatar cut mid-word. The early flush at
+          // deep_answer_done clears most of the backlog so `done` usually lands
+          // fast, but a genuinely long monologue needs headroom before the
+          // context is nulled. 60s covers realistic answers; null-on-timeout
+          // stays as the stuck-Cartesia safety net (now rare). Hume keeps 10s
+          // (its turnEnd already carries flush; no decoupled long-tail path).
+          const ttsFinalizeTimeoutMs = (ttsProvider === 'cartesia') ? 60_000 : 10_000;
+          ttsMetrics = await ttsBridge.turnEnd({ timeoutMs: ttsFinalizeTimeoutMs });
         }
         // ⚠️ TEMP AUDIODIAG — DELETE later. Cartesia finalize result: does the
         // continue:false produce MORE audio (partial=false + extra bytes beyond

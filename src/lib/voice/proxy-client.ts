@@ -36,11 +36,16 @@ export type ProxyClientHandlers = {
   // Simli/Tavus consumers can ignore.
   onTurnComplete?: () => void;
   // Per-utterance "deep answer done" (2026-05-25). Fired by the proxy the moment
-  // a turn's audio finishes streaming to TTS — the EARLY, accurate boundary (the
-  // Gemini turn_complete above lands +6–20s later in decoupled mode). The
-  // consumer flushes the avatar tail-carry (the stranded last ≤187ms) on this,
-  // after a short trailing-audio grace.
+  // a turn's TEXT finishes streaming to TTS. NOTE (2026-05-27 v2): this is NOT
+  // end-of-audio — Cartesia keeps synthesizing for 20-40s after on long answers.
+  // No longer used for the tail-flush (that caused mid-answer stutter); kept for
+  // observability only. The real end-of-audio flush is onTtsAudioDone.
   onDeepAnswerDone?: () => void;
+  // True end-of-audio for a turn (2026-05-27 v2). Fired by the proxy on
+  // Cartesia's real `done` (context-gated to the live turn). The consumer
+  // flushes the avatar tail-carry ONCE here — replaces the old repeated
+  // 200ms-gap tail-flush that injected silence mid-answer (the stutter).
+  onTtsAudioDone?: () => void;
 };
 
 export type ProxyClientOpenArgs = {
@@ -121,6 +126,8 @@ export function createProxyClient(handlers: ProxyClientHandlers): ProxyClient {
           handlers.onTurnComplete?.();
         } else if (type === 'deep_answer_done') {
           handlers.onDeepAnswerDone?.();
+        } else if (type === 'tts_audio_done') {
+          handlers.onTtsAudioDone?.();
         }
         return;
       }

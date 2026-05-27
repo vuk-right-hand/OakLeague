@@ -93,11 +93,6 @@ const AUDIO_CONTEXT_RESUME_VERIFY_MS = 300;
 // iOS WebKit: verify AudioContext.state === 'running' 300ms after resume()
 // (R3-M4 — visibilitychange is not a user gesture).
 
-// Re-audit Small — trailing-audio settle window before flushing the Simli
-// tail-carry on 'deep_answer_done'. Each audio_out re-arms it, so the flush
-// lands GRACE_MS after the genuine last synthesis chunk. Module scope so the
-// arm/clear useCallbacks need no dependency on it.
-const TAIL_FLUSH_GRACE_MS = 200;
 
 export type PipeHandle = {
   state: SessionState;
@@ -214,50 +209,22 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   // that left phase stuck at speaking after every turn). Reset on startMic /
   // endSession / visibility-hidden so a stuck flag never blocks the next turn.
   const expectingTtsRef = useRef<boolean>(false);
-  // 2026-05-25 — avatar tail-flush. On the proxy's per-utterance
-  // 'deep_answer_done', flush the Simli tail-carry (the stranded last ≤187ms
-  // that caused "cut off mid-word") ONCE — but only after trailing synthesis
-  // audio settles: each subsequent audio_out RE-ARMS the timer, so we flush
-  // TAIL_FLUSH_GRACE_MS after the genuine last chunk. Gated on the signal →
-  // never fires mid-answer (no false-positive flush during active generation).
-  const tailFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const tailPendingRef = useRef<boolean>(false);
-  // ⚠️ TEMP AUDIODIAG (2026-05-27) — DELETE when cutoff/stutter root cause is
-  // found. Tracks the client side of the TTS audio path so the console tells
-  // the whole story (Fly log buffer is unreliable). seq=chunk #, last=prior rx.
-  const diagRef = useRef<{ seq: number; last: number; commits: number }>({ seq: 0, last: 0, commits: 0 });
-  const armTailFlush = useCallback(() => {
-    if (tailFlushTimerRef.current) clearTimeout(tailFlushTimerRef.current);
-    tailFlushTimerRef.current = setTimeout(() => {
-      tailFlushTimerRef.current = null;
-      // 2026-05-26 — mid-word cutoff root cause. Do NOT clear tailPendingRef
-      // here. A final Cartesia chunk can arrive >TAIL_FLUSH_GRACE_MS after the
-      // prior one (end-of-synthesis lag, worse on longer answers) — i.e. AFTER
-      // this timer already fired. If we flip tailPending=false now, that late
-      // chunk's onAudioOut re-arm (`if (tailPendingRef.current) armTailFlush()`)
-      // is gated off, stranding its <6000B remainder in the Simli carry forever
-      // → the avatar is cut off mid-word at the very end. Keeping tailPending
-      // true means every trailing chunk re-arms and gets flushed; commitUtterance
-      // is an idempotent no-op on an empty carry, so repeated fires are harmless.
-      // tailPending is reset by clearTailFlush() at the next turn boundary
-      // (mic_started / pause / unmount), so it never leaks across turns.
-      //
-      // 2026-05-27 — LOAD-BEARING for the server-side Cartesia manual-flush
-      // (cartesia-bridge.js flush(), fired at onDeepAnswerDone). That flush
-      // forces the buffered tail to synthesize, but its audio_out arrives
-      // ~700ms AFTER the deep_answer_done that armed this timer (measured:
-      // scripts/cartesia-flush-probe.mjs). The first fire commits an empty
-      // carry; the flushed chunks land later and re-arm BECAUSE tailPending is
-      // still true. Clearing it on fire re-introduces the random cutoff.
-      // ⚠️ TEMP AUDIODIAG — DELETE later.
-      diagRef.current.commits += 1;
-      console.log(`[AD] tailFlush FIRE commit#${diagRef.current.commits} (rxChunks=${diagRef.current.seq})`);
-      try { bridgeRef.current?.commitUtterance?.(); } catch { /* tail flush is best-effort */ }
-    }, TAIL_FLUSH_GRACE_MS);
-  }, []);
-  const clearTailFlush = useCallback(() => {
-    if (tailFlushTimerRef.current) { clearTimeout(tailFlushTimerRef.current); tailFlushTimerRef.current = null; }
-    tailPendingRef.current = false;
+  // 2026-05-27 (v2) — avatar tail-flush. The Simli chunker carries the final
+  // <6000B remainder of a turn's audio; with no "next chunk" to complete a
+  // frame, that tail must be flushed explicitly at the TRUE end of the turn's
+  // audio. The authoritative end-of-audio signal is the proxy's 'tts_audio_done'
+  // (Cartesia's real `done`, context-gated) → flushTail() runs ONCE in
+  // onTtsAudioDone; onTurnComplete is the backstop if that signal is lost.
+  //
+  // This REPLACES the 2026-05-25/26 timer that armed on 'deep_answer_done' and
+  // re-armed on every audio_out: deep_answer_done is TEXT-done, not audio-done,
+  // so on long answers the 200ms timer fired repeatedly on Cartesia's mid-answer
+  // synthesis gaps, padding silence into the stream (the stutter — 11×/answer in
+  // the 2026-05-27 capture). No timer now; flush is edge-triggered at the end.
+  const flushTail = useCallback(() => {
+    // commitUtterance is a no-op on an empty carry (simli-bridge.ts), so a
+    // double-fire (tts_audio_done + the onTurnComplete backstop) is harmless.
+    try { bridgeRef.current?.commitUtterance?.(); } catch { /* best-effort */ }
   }, []);
   // Forward-ref for stopMic so the silence-timer callback (set up inside
   // startMic) can call stopMic without a temporal-dead-zone issue. The
@@ -731,16 +698,6 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
         onAudioOut: (bytes) => {
           if (cancelled) return;
           recordAudioOut(bytes.byteLength, performance.now());
-          // ⚠️ TEMP AUDIODIAG — DELETE later. Client chunk arrival timing +
-          // gating state. A big gapMs or a chunk dropped here (micActive guard)
-          // explains a stutter/cut.
-          {
-            const now = performance.now();
-            const gap = diagRef.current.last ? Math.round(now - diagRef.current.last) : -1;
-            diagRef.current.last = now;
-            diagRef.current.seq += 1;
-            console.log(`[AD] rx #${diagRef.current.seq} bytes=${bytes.byteLength} gapMs=${gap} micActive=${micActiveRef.current} tailPending=${tailPendingRef.current} expectingTts=${expectingTtsRef.current}`);
-          }
           // 2026-05-13 (v2) — mic-state firewall. With manual VAD the server
           // never starts speaking while micActive=true; ANY audio_out that
           // arrives during user listening is leftover Cartesia tail from the
@@ -760,12 +717,10 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
             captureSafe('user_perceived_response_ms', { ms, session_id: sessionIdRef.current });
           }
           try { bridgeRef.current?.sendAudio(bytes); } catch { /* bridge closed */ }
-          // 2026-05-25 — after 'deep_answer_done', each trailing audio_out pushes
-          // the tail-flush later so we flush the Simli carry only once audio
-          // truly settles (rides out Cartesia synthesis lag). No-op until
-          // onDeepAnswerDone sets tailPending=true, so this never arms mid-answer
-          // during normal generation — only across the end-of-answer tail window.
-          if (tailPendingRef.current) armTailFlush();
+          // 2026-05-27 (v2) — no per-chunk tail-flush re-arm here anymore. That
+          // was the stutter: it fired commitUtterance on Cartesia's mid-answer
+          // synthesis gaps. The tail is now flushed ONCE at true end-of-audio
+          // (onTtsAudioDone), with onTurnComplete as the backstop.
           // Phase-transition gate (R5-C3 audit). Only dispatch while we're
           // still waiting for the model's response — drop tail chunks that
           // arrive after the server fired turn_complete so phase doesn't
@@ -787,8 +742,6 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
         // gluing silent worklet frames + a phantom barge-in onto Gemini's
         // ongoing turn until auto-VAD couldn't recover.
         onTurnComplete: () => {
-          // ⚠️ TEMP AUDIODIAG — DELETE later.
-          console.log(`[AD] turn_complete rx (rxChunks=${diagRef.current.seq} commits=${diagRef.current.commits})`);
           // Manual VAD: turn_complete from the server cannot fire while the
           // user is actively listening (server waits for our activityEnd).
           // No mic state touched here — phase-only signal.
@@ -796,20 +749,22 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
           // arrive after this point are treated as stale and don't re-flip
           // phase ready→speaking.
           expectingTtsRef.current = false;
-          try { bridgeRef.current?.commitUtterance?.(); } catch { /* */ }
+          // Backstop tail-flush (2026-05-27 v2): if 'tts_audio_done' was lost
+          // (ws drop, Cartesia never emitted `done`), the +6-20s-late
+          // turn_complete still flushes the stranded carry. No-op on empty.
+          if (!micActiveRef.current) flushTail();
           dispatchRef({ kind: 'turn_complete' });
         },
-        // 2026-05-25 — per-utterance "deep answer done" (decoupled): the EARLY,
-        // accurate end-of-audio boundary (turn_complete above is +6–20s late).
-        // Arm the gated tail-flush; trailing audio_out re-arms it, then it flushes
-        // the Simli carry once. Gated → never fires mid-answer.
-        onDeepAnswerDone: () => {
+        // deep_answer_done = TEXT done (NOT audio done). No longer used for the
+        // tail-flush (that caused the mid-answer stutter). Kept as a no-op so the
+        // proxy message has a defined handler; the real flush is onTtsAudioDone.
+        onDeepAnswerDone: () => {},
+        // 2026-05-27 (v2) — TRUE end-of-audio (Cartesia's real `done`, proxy
+        // context-gated to the live turn). Flush the Simli tail-carry ONCE.
+        onTtsAudioDone: () => {
           if (cancelled) return;
-          // ⚠️ TEMP AUDIODIAG — DELETE later.
-          console.log(`[AD] deep_answer_done rx (rxChunks=${diagRef.current.seq} micActive=${micActiveRef.current})`);
-          if (micActiveRef.current) return; // user already talking — barge owns teardown
-          tailPendingRef.current = true;
-          armTailFlush();
+          if (micActiveRef.current) return; // user already barged/talking — owns teardown
+          flushTail();
         },
         onError: (code, detail) => {
           if (cancelled) return;
@@ -909,7 +864,6 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
 
     return () => {
       cancelled = true;
-      clearTailFlush();
     };
     // Intentionally run once per mount — envelope is stable until rollover
     // which handles re-open internally via a dedicated effect below.
@@ -970,12 +924,8 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
             Sentry.captureException(e, { level: 'warning', extra: { op: 'sendControl_cancel_visibility', session_id: sessionIdRef.current } });
           }
         }
-        // Re-audit M2 — cancel any pending avatar tail-flush from a just-
-        // finished turn. Backgrounding pauses the session; a flush firing 200ms
-        // later (the GRACE window) would push a stale carry into Simli after the
-        // pause, and on resume it could play late over the user. commitUtterance
-        // itself also guards closed/!ready, but clearing here is the clean fix.
-        clearTailFlush();
+        // 2026-05-27 (v2) — no pending tail-flush timer to cancel anymore (the
+        // flush is edge-triggered at end-of-audio, not a 200ms grace timer).
         dispatchRef({ kind: 'visibility_hidden' });
         // Stop mic frame delivery but keep AudioContext + worklet alive to
         // avoid full re-initialization on resume.
@@ -1220,10 +1170,9 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       }
     }, 500);
     dispatchRef({ kind: 'mic_started' });
-    // 2026-05-25 — a new turn (incl. barge) is starting: cancel any pending
-    // tail-flush from the prior turn so a stale carry never plays late over the
-    // user. cancel() below also drops the Simli carry itself on a barge.
-    clearTailFlush();
+    // 2026-05-27 (v2) — a new turn (incl. barge) is starting. The prior turn's
+    // tail-flush is edge-triggered (no pending timer to cancel). cancel() below
+    // drops the Simli carry itself on a barge.
     // Proxy turn boundary + barge-in. A mic-tap while a prior turn is still
     // in progress is a barge-in: cancel the in-flight TTS locally (avatar
     // buffer) and tell the proxy so Cartesia stops synthesizing + the

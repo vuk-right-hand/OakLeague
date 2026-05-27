@@ -423,7 +423,13 @@ export class CartesiaTTSBridge extends EventEmitter {
       const cleanup = () => {
         clearTimeout(to);
         this.off('event', handler);
-        this._currentContextId = null;
+        // 2026-05-27 (v2, audit Attack #3) — only null if it's STILL this turn's
+        // context. The finalize await is up to 60s (long-answer cutoff fix); if
+        // the user barges to the NEXT turn during that window, turnStart() has
+        // already set _currentContextId to N+1. Unconditionally nulling here
+        // would wipe N+1's live context → every N+1 chunk hits the ctx-mismatch
+        // drop → the new turn is cut mid-word (the exact bug, re-introduced).
+        if (this._currentContextId === ctxId) this._currentContextId = null;
       };
       this.on('event', handler);
     });
