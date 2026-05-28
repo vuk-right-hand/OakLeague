@@ -19,12 +19,17 @@ export const QUOTED_AT = '2026-04-21' as const;
 export const HEYGEN_QUOTED_AT = '2026-05-06' as const;
 
 // Best-estimate rates. Sources (verified at QUOTED_AT / HEYGEN_QUOTED_AT):
-//   Simli:  public pay-as-you-go ~$0.01/min; conservative $0.015 until
-//           written quote lands (docs/_planning/SIMLI_SUPPORT_EMAIL.md).
+//   Simli:  $0.01/min on Hobby Plan ($10 / 1000 min). Empirically confirmed
+//           2026-05-27 by cross-ref of cogs_log bridge_close rows vs Simli
+//           console session-duration table — match within 1-3% (clock drift).
+//           Estimate set to $0.011 = real rate + 10% buffer for clock-skew,
+//           plan-downgrade safety, and small silent price changes. CEILING
+//           stays at $0.05 (env-overridable) — different concern, different
+//           knob: that one is the buggy-adapter tripwire, not the bill.
 //   Tavus:  $0.32–$0.37/min Phoenix-4 echo mode on Starter tier.
 //   HeyGen: $0.10/min Lite mode (1 credit/min on the credit-pack tier).
 export const BEST_ESTIMATE_USD_PER_MIN: Record<AvatarProvider, number> = {
-  simli: 0.015,
+  simli: 0.011,
   tavus: 0.35,
   heygen: 0.10,
 };

@@ -7,6 +7,8 @@ Last revised: 2026-04-21
 Deadline: YC S26 app 2026-05-06 (14 days)
 Spike window: Apr 22–24 (Day 3–Day 5)
 
+> **2026-05-27 note** — Tavus scrapped post-Spike B (see memory `project_tavus_scrapped`). Simli rate references below (`$0.015/min conservative`, projections @ $0.015) are HISTORICAL. The live BEST_ESTIMATE is now `$0.011/min` in [src/lib/avatar/cost.ts](../src/lib/avatar/cost.ts), pinned to empirical Hobby Plan billing ($10/1000min = $0.01) + 10% buffer. CEILING ($0.05) unchanged by design.
+
 ---
 
 ## Framing (read this first — Rev 5 reframe)
