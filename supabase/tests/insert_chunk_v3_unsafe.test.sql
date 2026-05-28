@@ -10,9 +10,14 @@
 --    inserts chunk with chunker_version=3; returns uuid.
 -- 7. Duplicate (parent_unit + section + chunk_index) → 23505 from the v3
 --    partial UNIQUE (integration with migration 3's index).
+-- 8. v3 step 5 round-5 C2 — section_id MUST match parent_unit.section_id
+--    even when both belong to the same sample → 23514. Defense against
+--    spreading a parent across two sections.
+-- 9. v3 step 5 round-5 C2 — parent_unit with section_id IS NULL (v1/v2
+--    unit) is refused with 23514 'parent_unit_missing_section_id'.
 
 BEGIN;
-SELECT plan(7);
+SELECT plan(9);
 
 CREATE FUNCTION pg_temp.run() RETURNS SETOF text LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -102,12 +107,15 @@ BEGIN
   END;
 
   -- 4: cross-sample closure — section from sampleB + unit from sampleA.
+  -- Post-mig-14: the section_parent_mismatch check fires first (v_secB !=
+  -- v_unitA.section_id which is v_secA) — same SQLSTATE 23514, slightly
+  -- different message. Both protect against the same class of corruption.
   BEGIN
     PERFORM public._insert_chunk_v3_unsafe(
       v_unitA, v_secB, 0, 't', NULL, 10, ARRAY['topic-a'], v_dummy_vec);
     RETURN NEXT fail('4: cross-sample (unit in A + section in B) should raise 23514');
   EXCEPTION WHEN check_violation THEN
-    RETURN NEXT pass('4: section_sample_mismatch → 23514 (v3 cross-sample closure)');
+    RETURN NEXT pass('4: section mismatch (sample-and-section) → 23514 (v3 closures)');
   END;
 
   -- 5: unregistered topic_tag slug.
@@ -143,6 +151,44 @@ BEGIN
     RETURN NEXT fail('7: dup (parent, section, chunk_index=0) should raise unique_violation');
   EXCEPTION WHEN unique_violation THEN
     RETURN NEXT pass('7: v3 partial UNIQUE integrates with insert RPC (R2-C4 part 2)');
+  END;
+
+  -- 8: round-5 C2 — same-sample but different-section is refused.
+  -- Setup: create a SECOND section in sampleA so the cross-sample check passes
+  -- (sampleA = sampleA) but the new section_parent_mismatch check trips.
+  DECLARE
+    v_secA2 uuid;
+  BEGIN
+    INSERT INTO public.sample_content_sections
+      (sample_id, creator_id, section_index, title, summary, char_start, char_end, topic_tags)
+    VALUES
+      (v_sampleA, v_creator, 1, 'Sec A2', 'Sec A2 summary', 100, 200, ARRAY['topic-a'])
+    RETURNING id INTO v_secA2;
+    BEGIN
+      PERFORM public._insert_chunk_v3_unsafe(
+        v_unitA, v_secA2, 0, 't', NULL, 10, ARRAY['topic-a'], v_dummy_vec);
+      RETURN NEXT fail('8: parent in secA + caller passes secA2 should raise 23514');
+    EXCEPTION WHEN check_violation THEN
+      RETURN NEXT pass('8: section_parent_mismatch — same sample, wrong section → 23514');
+    END;
+  END;
+
+  -- 9: round-5 C2 — parent_unit with section_id IS NULL is refused.
+  -- Setup: insert a v1/v2-shaped parent (section_id NULL allowed for legacy).
+  DECLARE
+    v_legacy_unit uuid;
+  BEGIN
+    INSERT INTO public.sample_content_narrative_units
+      (sample_id, creator_id, unit_index, title, text, token_count, topic_tags, section_id)
+    VALUES (v_sampleA, v_creator, 99, 'Legacy', 'legacy body', 50, ARRAY['topic-a'], NULL)
+    RETURNING id INTO v_legacy_unit;
+    BEGIN
+      PERFORM public._insert_chunk_v3_unsafe(
+        v_legacy_unit, v_secA, 5, 't', NULL, 10, ARRAY['topic-a'], v_dummy_vec);
+      RETURN NEXT fail('9: parent with section_id IS NULL should raise 23514');
+    EXCEPTION WHEN check_violation THEN
+      RETURN NEXT pass('9: parent_unit_missing_section_id (v1/v2 unit) → 23514');
+    END;
   END;
 END;
 $fn$;

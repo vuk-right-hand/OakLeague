@@ -218,3 +218,47 @@ two below are consciously deferred — broader scope than Step 3, no immediate h
   EXISTS-check a section with NULL embedding and assert the function returns
   false; flip the embedding to non-NULL and assert true. Without this test, the
   silent-NULL-embedding regression has no tripwire.
+
+## DEFERRED — RAG v3 Step 5 audit round-5 (auditor 2026-05-28, applied inline + flagged)
+
+Surfaced by the post-Step-5 auditor on the route_sections_v3 + topk_v3 migrations + tests.
+Criticals C1/C2/C3/C4 ALL applied inline; mediums M1/M2/M4/M5/M6/M7 ALL applied; small
+S2/S6/S7/S8/S10 applied. Four Smalls deferred — low-impact tidiness, no production hurt.
+
+### S1 · `RAISE NOTICE` when topk_v3 clamps `p_k_child` / `p_n_parent_per_section`
+- **What:** mig 20260528000031 silently clamps `p_k_child > 100` → 100 and
+  `p_n_parent_per_section > 20` → 20. If the §7 harness passes 200 expecting
+  200, harness math gets wrong values with no log trail. Add `RAISE NOTICE
+  USING DETAIL='clamped from X to Y'` so the harness telemetry can detect.
+- **Why deferred:** the harness operator can grep COMMENT for the limits + the
+  clamps are documented. UI callers never pass > the limit. Risk is harness-only.
+- **TRIGGER — do it when:** §7 harness is built and during its first dry-run
+  someone reports "I asked for 200 candidates and got 100." Same migration can
+  fold in `p_top_s` on the route RPC.
+
+### S3 · Promote `pg_temp.unit_vec(int) → halfvec(768)` to a shared test helper
+- **What:** `pg_temp.unit_vec` (and the related `two_hot`) is now duplicated
+  across `creator_route_sections_v3.test.sql` + `creator_knowledge_topk_v3.test.sql`.
+  The next v3 read-path test (eval harness) will copy it a third time. Promote
+  to `tests.unit_vec_768(int)` + `tests.two_hot_768(int, int)` in a tests-only
+  helper migration.
+- **Why deferred:** two copies isn't a real problem. Three copies is. Defer
+  until the third test lands.
+- **TRIGGER — do it when:** step 7-9 introduces a third v3 retrieval pgTAP that
+  needs the same vector helpers.
+
+### S4 + S6 · Topic-tag string + variable-name hygiene in topk_v3 test
+- **What:** `'topic-a'` appears ~25 times across the topk_v3 test as a literal
+  (extract into `v_topic := 'topic-a'` local). Variable `v_unit_many` was
+  pre-rename used for a sec2 unit in test 6 (now `v_unit_sec2`); a few
+  comments may still refer to the old name.
+- **Why deferred:** pure tidiness, no functional impact.
+- **TRIGGER — do it when:** the next edit to topk_v3 test touches >50 lines.
+
+### S9 · `halfvec` vs `halfvec(768)` in COMMENT ON FUNCTION signatures
+- **What:** all RPCs use bare `halfvec` in `COMMENT ON FUNCTION …(uuid, halfvec, …)`
+  even though the actual param type is `halfvec(768)`. PG accepts both for
+  resolution but inconsistent. Decide a convention + pin it across all v3 RPCs.
+- **Why deferred:** zero-impact cosmetic; PG resolves both forms identically.
+- **TRIGGER — do it when:** any v3 RPC signature changes (fold the convention
+  pin into the same migration).
