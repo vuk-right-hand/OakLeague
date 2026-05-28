@@ -526,6 +526,13 @@ const FLASH_USD_PER_M_OUTPUT = Number(process.env.FLASH_USD_PER_M_OUTPUT || '2.5
 // Anthropic's published backoff window before retrying.
 const CONTEXTUAL_GEN_RETRY_AFTER_MAX_MS = 30_000;
 
+// v3 step 4d audit M2 — partial Flash cogs_log flush cadence. Every Nth
+// section the worker writes a partial-spend cogs_log row + resets the
+// accumulator, so a mid-book crash loses at most N section's worth of
+// Flash spend instead of the whole book's. 25 ≈ ~$0.10 max loss at the
+// per-section Flash rate.
+const V3_FLASH_PARTIAL_FLUSH_EVERY = Number(process.env.V3_FLASH_PARTIAL_FLUSH_EVERY || '25');
+
 /** token_count CHECK on sample_content_chunks is BETWEEN 1 AND 2048.
  *  CJK-heavy content can produce char/4 > 2048 (old audit M1). Clamp here. */
 function clampTokenCount(text) {
@@ -662,6 +669,794 @@ export function makeCorpusReprocessWorker({
     }
   }
 
+  // ── v3 per-section ingestion path (RAG v3 step 4d) ───────────────────────
+  //
+  // Parallel to the v2 path in tick(). The v3 worker:
+  //   1. Preprocess (same as v2 — pure-text sanitization)
+  //   2. SEGMENT via /api/internal/segment (NEW — fixes Wall A by bounding
+  //      Flash input to one section per call)
+  //   3. DELETE sample_content_sections (CASCADE removes units + chunks)
+  //   4. For each section:
+  //        a. /api/internal/narrative-chunk-section → {units, sectionTitle,
+  //           sectionSummary}; apply " (part k/N)" suffix when this section
+  //           is part of a sub-packed chapter (audit round-4 C4)
+  //        b. Embed (sectionTitle + ' ' + sectionSummary) → summary_embedding
+  //        c. INSERT sample_content_sections row
+  //        d. For each unit: INSERT narrative_unit (with section_id),
+  //           chunkSample → children, per-child contextual-gen passing
+  //           SECTION TEXT as `doc` (audit round-4 C3 — per-section cache key
+  //           via prompt-prefix), batch-embed, INSERT via
+  //           _insert_chunk_v3_unsafe (server-derives sample/creator/section_index)
+  //        e. After all children land: centroid = length-weighted mean of
+  //           unit-normalized child embeddings (plan §11/M1) → UPDATE section
+  //   5. corpus_reprocess_mark_done_v3 (step 7's finalize_v3 will land + this
+  //      stub will delegate to it; for now: status flip only)
+  //
+  // SCOPE GUARDS preserved from v2: deadline / shutdown checkpoints, per-creator
+  // budget cap (pre-flight + per-section accumulate), Anthropic failure-rate
+  // mid-loop short-circuit, bumpFailure on retryable error, markJobErrored on
+  // terminal. Plus step 4d's NEW per-section assertion (plan §8 step 4d /
+  // audit round-4 M7): a section that produced ZERO units bumps a Sentry
+  // breadcrumb so creator_v3_ready (step 6) doesn't stay false-with-no-cause.
+
+  async function processV3Job(claim, opts) {
+    const { jobId, sampleId, creatorId, claimedVersion, deadlineAt, timeLeft } = opts;
+
+    // V3 COGS accumulators — separate from v2's so the v2 path's flushers
+    // don't double-count. Same shape; pipeline tag is 'corpus_reprocess_v3'.
+    let v3FlashPromptTokens     = 0;
+    let v3FlashCandidatesTokens = 0;
+    let v3FlashTotalTokens      = 0;
+    let v3TotalContextualGenFailures     = 0;
+    let v3TotalChildChunks               = 0;
+    let v3TotalEmbedTokens               = 0;
+    let v3TotalSummaryEmbedTokens        = 0;   // audit M4 — split out so the
+                                                // metadata's `chunks` field
+                                                // doesn't conflate per-section
+                                                // summary embeds with per-chunk
+                                                // child embeds in analytics
+                                                // reconciliation.
+    let v3AnthropicUncachedInputTokens   = 0;
+    let v3AnthropicCacheCreation1hTokens = 0;
+    let v3AnthropicCacheReadInputTokens  = 0;
+    let v3AnthropicOutputTokens          = 0;
+    let v3SectionsProcessed              = 0;
+    let v3SectionsZeroUnits              = 0;
+    let v3FlashCogsLogged                = false;
+    let v3SpendCogsLogged                = false;
+
+    // Partial flush: write a cogs_log row for the CURRENT accumulator
+    // delta and RESET the accumulator (so the next call only emits the
+    // new spend). v3FlashCogsLogged stays unset so the final
+    // `finally`-time v3FlushFlash() still fires for the residual. Each
+    // row carries `metadata.partial = true` so analytics can union them.
+    async function v3FlushFlashPartial() {
+      if (v3FlashTotalTokens === 0) return;
+      const promptTok = v3FlashPromptTokens;
+      const candTok   = v3FlashCandidatesTokens;
+      const totTok    = v3FlashTotalTokens;
+      // Reset BEFORE the supabase INSERT so an in-flight crash during
+      // the INSERT doesn't double-count on the next partial.
+      v3FlashPromptTokens     = 0;
+      v3FlashCandidatesTokens = 0;
+      v3FlashTotalTokens      = 0;
+      try {
+        const flashCostUsd = Number(
+          (
+            (promptTok * FLASH_USD_PER_M_INPUT  / 1_000_000) +
+            (candTok   * FLASH_USD_PER_M_OUTPUT / 1_000_000)
+          ).toFixed(6),
+        );
+        await supabase.from('cogs_log').insert({
+          user_id: null,
+          session_id: null,
+          service: 'gemini',
+          operation: 'narrative_chunk',
+          units: totTok,
+          unit_label: 'tokens',
+          cost_usd: flashCostUsd,
+          metadata: {
+            model: process.env.NARRATIVE_CHUNK_MODEL || 'gemini-2.5-flash',
+            creator_id: creatorId,
+            sample_id:  sampleId,
+            prompt_tokens:      promptTok,
+            candidates_tokens:  candTok,
+            sections_processed: v3SectionsProcessed,
+            pipeline: 'corpus_reprocess_v3',
+            partial: true,
+            flush_reason: 'periodic',
+          },
+        });
+      } catch (e) {
+        captureException(e, { op: 'reprocess_worker.v3.cogs_log_flash_partial', jobId });
+      }
+    }
+
+    async function v3FlushFlash() {
+      if (v3FlashCogsLogged) return;
+      if (v3FlashTotalTokens === 0) return;
+      v3FlashCogsLogged = true;
+      try {
+        const flashCostUsd = Number(
+          (
+            (v3FlashPromptTokens     * FLASH_USD_PER_M_INPUT  / 1_000_000) +
+            (v3FlashCandidatesTokens * FLASH_USD_PER_M_OUTPUT / 1_000_000)
+          ).toFixed(6),
+        );
+        await supabase.from('cogs_log').insert({
+          user_id: null,
+          session_id: null,
+          service: 'gemini',
+          operation: 'narrative_chunk',
+          units: v3FlashTotalTokens,
+          unit_label: 'tokens',
+          cost_usd: flashCostUsd,
+          metadata: {
+            model: process.env.NARRATIVE_CHUNK_MODEL || 'gemini-2.5-flash',
+            creator_id: creatorId,
+            sample_id: sampleId,
+            prompt_tokens:      v3FlashPromptTokens,
+            candidates_tokens:  v3FlashCandidatesTokens,
+            sections_processed: v3SectionsProcessed,
+            pipeline: 'corpus_reprocess_v3',
+          },
+        });
+      } catch (e) {
+        captureException(e, { op: 'reprocess_worker.v3.cogs_log_flash', jobId });
+      }
+    }
+
+    async function v3FlushSpend(reason) {
+      if (v3SpendCogsLogged) return;
+      v3SpendCogsLogged = true;
+      // Embedding row
+      if (v3TotalEmbedTokens > 0) {
+        try {
+          const embedCostUsd = Number((v3TotalEmbedTokens * EMBEDDING_USD_PER_TOKEN).toFixed(6));
+          await supabase.from('cogs_log').insert({
+            user_id: null,
+            session_id: null,
+            service: 'gemini',
+            operation: 'embedding',
+            units: v3TotalEmbedTokens,
+            unit_label: 'tokens',
+            cost_usd: embedCostUsd,
+            metadata: {
+              model: EMBEDDING_MODEL,
+              creator_id: creatorId,
+              sample_id: sampleId,
+              sections_processed:     v3SectionsProcessed,
+              sections_zero_units:    v3SectionsZeroUnits,
+              chunks:                 v3TotalChildChunks,
+              // Audit M4 — split the per-section summary embeds out so
+              // analytics can reconcile `tokens / chunks ≈ avg chunk tokens`
+              // without the summaries inflating the denominator.
+              summary_embed_tokens:   v3TotalSummaryEmbedTokens,
+              child_embed_tokens:     v3TotalEmbedTokens - v3TotalSummaryEmbedTokens,
+              contextual_gen_failures: v3TotalContextualGenFailures,
+              pipeline: 'corpus_reprocess_v3',
+              flush_reason: reason,
+            },
+          });
+        } catch (e) {
+          captureException(e, { op: 'reprocess_worker.v3.cogs_log_embed', jobId });
+        }
+      }
+      // Anthropic row
+      const v3AnthropicTotal =
+        v3AnthropicUncachedInputTokens +
+        v3AnthropicCacheCreation1hTokens +
+        v3AnthropicCacheReadInputTokens +
+        v3AnthropicOutputTokens;
+      if (v3AnthropicTotal > 0) {
+        try {
+          const anthropicInputUsd =
+            (v3AnthropicUncachedInputTokens   * ANTHROPIC_USD_PER_M_INPUT_BASE      / 1_000_000) +
+            (v3AnthropicCacheCreation1hTokens * ANTHROPIC_USD_PER_M_INPUT_CACHE_1H  / 1_000_000) +
+            (v3AnthropicCacheReadInputTokens  * ANTHROPIC_USD_PER_M_INPUT_CACHE_RD  / 1_000_000);
+          const anthropicOutputUsd =
+            v3AnthropicOutputTokens * ANTHROPIC_USD_PER_M_OUTPUT / 1_000_000;
+          const anthropicCostUsd = Number((anthropicInputUsd + anthropicOutputUsd).toFixed(6));
+          await supabase.from('cogs_log').insert({
+            user_id: null,
+            session_id: null,
+            service: 'anthropic',
+            operation: 'contextual_gen',
+            units: v3AnthropicTotal,
+            unit_label: 'tokens',
+            cost_usd: anthropicCostUsd,
+            metadata: {
+              model: process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001',
+              creator_id: creatorId,
+              sample_id: sampleId,
+              uncached_input_tokens:    v3AnthropicUncachedInputTokens,
+              cache_creation_1h_tokens: v3AnthropicCacheCreation1hTokens,
+              cache_read_input_tokens:  v3AnthropicCacheReadInputTokens,
+              output_tokens:            v3AnthropicOutputTokens,
+              chunks_with_context:      v3TotalChildChunks - v3TotalContextualGenFailures,
+              chunks_without_context:   v3TotalContextualGenFailures,
+              pipeline: 'corpus_reprocess_v3',
+              flush_reason: reason,
+            },
+          });
+        } catch (e) {
+          captureException(e, { op: 'reprocess_worker.v3.cogs_log_anthropic', jobId });
+        }
+      }
+    }
+
+    try {
+      // Read sample. source_type added for v3 cue-mode dispatch (audit C2).
+      const { data: sample, error: sampleErr } = await supabase
+        .from('sample_content')
+        .select('raw_text, title, topic_tags, fetch_status, source_type')
+        .eq('id', sampleId)
+        .single();
+      if (sampleErr || !sample) { await markJobErrored(jobId, 'sample_not_found_or_unreadable'); return; }
+      if (sample.fetch_status === 'errored') { await markJobErrored(jobId, 'sample_fetch_status_errored'); return; }
+      if (!sample.raw_text || sample.raw_text.trim().length === 0) {
+        await markJobErrored(jobId, 'sample_raw_text_empty'); return;
+      }
+
+      const topicTags = Array.isArray(sample.topic_tags) ? sample.topic_tags : [];
+      if (topicTags.length === 0) {
+        await markJobErrored(jobId, 'sample_topic_tags_empty'); return;
+      }
+
+      // Pre-spend budget peek (same shape as v2). Section-level ingest has
+      // the SAME embed-token total as v2 (sum of all child chunks), so the
+      // estimate is identical.
+      const estTokens = Math.ceil(sample.raw_text.length / CHARS_PER_TOKEN);
+      const estUsd = estTokens * EMBEDDING_USD_PER_TOKEN;
+      const { data: peeked, error: peekErr } = await supabase.rpc(
+        'creator_embedding_budget_peek',
+        { p_creator_id: creatorId },
+      );
+      if (peekErr) { await bumpFailure(jobId, `v3_budget_peek_failed:${peekErr.message}`); return; }
+      if (Number(peeked || 0) + estUsd > CREATOR_EMBEDDING_DAILY_CAP_USD) {
+        await markJobErrored(jobId, 'creator_daily_budget_blown_preflight');
+        captureMessage('reprocess.v3.creator_daily_budget_blown_preflight', 'warning', {
+          op: 'reprocess_worker.v3.budget_preflight',
+          creator_id: creatorId,
+          current_spend_usd: Number(peeked || 0),
+          estimated_usd: estUsd,
+        });
+        return;
+      }
+
+      // Step 1: preprocess.
+      let preprocessed;
+      try {
+        preprocessed = await postInternal('/api/internal/preprocess', {
+          creator_id: creatorId,
+          raw_text:   sample.raw_text,
+        });
+      } catch (e) {
+        if (e.retryable) await bumpFailure(jobId, `v3_preprocess_retryable:${e.message}`);
+        else             await markJobErrored(jobId, `v3_preprocess_terminal:${e.message}`);
+        return;
+      }
+      const sanitizedDoc = preprocessed.sanitized_text;
+      if (timeLeft() < 0) { await bumpFailure(jobId, 'v3_claim_timeout_after_preprocess'); return; }
+      if (shuttingDown)   { await bumpFailure(jobId, 'v3_shutdown_after_preprocess');     return; }
+
+      // Step 2: SEGMENT (the Wall-A fix). Audit C2 — cue_mode MUST be wired
+      // off sample.source_type or book/textbook ingest mis-segments on
+      // prose-embedded timestamps ("at 12:45 PM he said…") and produces
+      // 200+ junk sections instead of the ~40 true chapter cuts, shredding
+      // routing precision at the moat layer. Per section-segment.ts:32-34
+      // contract (round-4 M2):
+      //   book_or_doc / mastermind_or_course → 'book'    (suppress timestamps)
+      //   youtube / transcript                → 'transcript' (timestamps fire)
+      //   anything else                       → 'auto'   (high-precision defaults)
+      const st = sample.source_type;
+      const cueMode =
+        (st === 'book_or_doc' || st === 'mastermind_or_course') ? 'book'
+        : (st === 'youtube' || st === 'transcript')              ? 'transcript'
+        : 'auto';
+      let segResp;
+      try {
+        segResp = await postInternal('/api/internal/segment', {
+          creator_id:    creatorId,
+          sample_id:     sampleId,
+          sanitized_doc: sanitizedDoc,
+          cue_mode:      cueMode,
+        });
+      } catch (e) {
+        if (e.retryable) await bumpFailure(jobId, `v3_segment_retryable:${e.message}`);
+        else             await markJobErrored(jobId, `v3_segment_terminal:${e.message}`);
+        return;
+      }
+      const segments = Array.isArray(segResp.sections) ? segResp.sections : null;
+      if (!segments || segments.length === 0) {
+        await markJobErrored(jobId, 'v3_segment_empty');
+        return;
+      }
+
+      // Audit round-4 C3 (fixed in step 4d) — sub-pack title suffix is
+      // PRE-COMPUTED per secIdx so the (k, N) label is stable across
+      // section skips (when narrative-chunk-section returns null for a
+      // middle section, the surviving siblings still get 1/N, 2/N, … with
+      // N = original group size, not "successful sibling count"). The
+      // alternative (increment inside the loop body) would shift later
+      // siblings' labels when an earlier one fails — breaks the
+      // sections-table dedup promise and confuses the routing render.
+      const cueGroupSize = new Map();          // cue → original count
+      const cueOrderInGroup = new Map();       // cue → running counter while iterating segments
+      const partLabelBySecIdx = new Array(segments.length).fill(null);
+      for (const s of segments) {
+        if (s.cue) cueGroupSize.set(s.cue, (cueGroupSize.get(s.cue) || 0) + 1);
+      }
+      for (let i = 0; i < segments.length; i++) {
+        const cue = segments[i].cue;
+        if (!cue) continue;
+        const n = cueGroupSize.get(cue) || 1;
+        if (n <= 1) continue;
+        const k = (cueOrderInGroup.get(cue) || 0) + 1;
+        cueOrderInGroup.set(cue, k);
+        partLabelBySecIdx[i] = { k, n };
+      }
+
+      // Step 3: idempotent cleanup. Two DELETEs in order:
+      //   3a (audit C1 fix). DELETE v2-shape narrative_units (section_id
+      //       NULL) for THIS sample so v3's per-section unit_index space
+      //       can claim 0..N without 23505-ing against surviving v2 units
+      //       at (sample_id, unit_index). The v2 read path on this creator
+      //       is FROZEN at retrieval_version=2; once the admin flips to v3
+      //       (build-then-flip, step 7) the sample's v2 chunks (chunker_v=2)
+      //       become dead anyway. CASCADE on parent_unit_id wipes the v2
+      //       chunks under those units too. The standalone v2 mark_done
+      //       cache-bump (step 1b) means current_corpus_version still bumps
+      //       on the v2 sample reprocess if that happens later.
+      //   3b. DELETE v3 sections → CASCADE units (section_id matches) and
+      //       chunks (parent_unit_id + section_id).
+      const { error: cleanupV2Err } = await supabase
+        .from('sample_content_narrative_units')
+        .delete()
+        .eq('sample_id', sampleId)
+        .is('section_id', null);
+      if (cleanupV2Err) {
+        await markJobErrored(jobId, `v3_pre_insert_v2_cleanup_failed:${cleanupV2Err.message}`);
+        return;
+      }
+      const { error: cleanupErr } = await supabase
+        .from('sample_content_sections')
+        .delete()
+        .eq('sample_id', sampleId);
+      if (cleanupErr) {
+        await markJobErrored(jobId, `v3_pre_insert_sections_cleanup_failed:${cleanupErr.message}`);
+        return;
+      }
+
+      // Step 4: per-section loop.
+      for (let secIdx = 0; secIdx < segments.length; secIdx++) {
+        const sec = segments[secIdx];
+
+        if (timeLeft() < 0) {
+          await bumpFailure(jobId, `v3_claim_timeout_during_section_${secIdx}`); return;
+        }
+        if (shuttingDown) {
+          await bumpFailure(jobId, `v3_shutdown_inflight_section_${secIdx}`); return;
+        }
+
+        // 4a — narrative-chunk-section.
+        let secResp;
+        try {
+          secResp = await postInternal('/api/internal/narrative-chunk-section', {
+            creator_id:        creatorId,
+            sample_id:         sampleId,
+            section_index:     secIdx,
+            sanitized_section: sec.text,
+            sample_title:      sample.title || undefined,
+            section_cue:       sec.cue ?? null,
+          });
+        } catch (e) {
+          if (e.retryable) await bumpFailure(jobId, `v3_section_${secIdx}_retryable:${e.message}`);
+          else             await markJobErrored(jobId, `v3_section_${secIdx}_terminal:${e.message}`);
+          return;
+        }
+        const sectionUnits = Array.isArray(secResp.units) ? secResp.units : null;
+        if (!sectionUnits || sectionUnits.length === 0) {
+          // Audit round-4 M7 — per-section "produced ≥1 unit OR explicit reason"
+          // assertion. Skip this section but record visibility; creator_v3_ready
+          // (step 6) will reject the creator if ANY section_id has zero chunks.
+          v3SectionsZeroUnits += 1;
+          captureMessage('reprocess.v3.section_zero_units', 'warning', {
+            op: 'reprocess_worker.v3.section_zero_units',
+            creator_id: creatorId,
+            sample_id:  sampleId,
+            section_index: secIdx,
+            reason: secResp.message || 'flash_returned_null',
+          });
+          continue;
+        }
+        // Accumulate Flash usage. Audit M2 — flush PARTIAL Flash cogs_log
+        // every PERIODIC_FLUSH_EVERY sections so a mid-book crash doesn't
+        // evaporate the entire Flash spend from cogs_log (the kill-switch
+        // under-counts; budget peek next tick can let the same creator
+        // burn through cap). The flush uses a per-row metadata.partial=true
+        // marker; the final flush in the `finally` writes the residual.
+        const fu = secResp.usage || {};
+        v3FlashPromptTokens     += Number(fu.prompt_token_count     || 0);
+        v3FlashCandidatesTokens += Number(fu.candidates_token_count || 0);
+        v3FlashTotalTokens      += Number(fu.total_token_count      || 0);
+        if ((secIdx + 1) % V3_FLASH_PARTIAL_FLUSH_EVERY === 0) {
+          await v3FlushFlashPartial();
+        }
+
+        // 4b — apply " (part k/N)" suffix from pre-computed map (audit C3 fix).
+        // partLabelBySecIdx is stable regardless of skipped sections; null
+        // for singleton-cue sections and cue-less paragraph-packed sections.
+        let finalSectionTitle = String(secResp.section_title || '').slice(0, 200);
+        const partLabel = partLabelBySecIdx[secIdx];
+        if (partLabel) {
+          const suffix = ` (part ${partLabel.k}/${partLabel.n})`;
+          // Reserve room for suffix; sample_content_sections.title CHECK ≤ 200.
+          if (finalSectionTitle.length + suffix.length > 200) {
+            finalSectionTitle = finalSectionTitle.slice(0, 200 - suffix.length);
+          }
+          finalSectionTitle = `${finalSectionTitle}${suffix}`;
+        }
+        const finalSectionSummary = String(secResp.section_summary || '').slice(0, 2000);
+
+        // 4c — embed (title + ' ' + summary) → summary_embedding.
+        let summaryVec;
+        try {
+          const resp = await ai().models.embedContent({
+            model: EMBEDDING_MODEL,
+            contents: [`${finalSectionTitle} ${finalSectionSummary}`],
+            config: {
+              outputDimensionality: EMBEDDING_DIM,
+              taskType: 'RETRIEVAL_DOCUMENT',
+            },
+          });
+          const vals = resp?.embeddings?.[0]?.values || [];
+          if (vals.length !== EMBEDDING_DIM) {
+            await bumpFailure(jobId, `v3_section_${secIdx}_summary_embed_dim_mismatch_${vals.length}`);
+            return;
+          }
+          summaryVec = vals;
+          // Audit M4 — count summary embeds separately from child chunk embeds.
+          // Both contribute to v3TotalEmbedTokens for the overall COGS row, but
+          // v3TotalSummaryEmbedTokens lets the cogs_log metadata reconcile
+          // exactly how many of those tokens were per-section summaries vs
+          // per-chunk children.
+          const summaryTokens = Number(
+            resp?.metadata?.totalTokenCount
+            ?? estimateTokens(`${finalSectionTitle} ${finalSectionSummary}`),
+          );
+          v3TotalSummaryEmbedTokens += summaryTokens;
+          v3TotalEmbedTokens        += summaryTokens;
+        } catch (e) {
+          await bumpFailure(jobId, `v3_section_${secIdx}_summary_embed_failed:${e?.message || e}`);
+          captureException(e, { op: 'reprocess_worker.v3.summary_embed', jobId });
+          return;
+        }
+
+        // 4d — INSERT section row (summary_embedding populated; centroid still
+        // NULL until children land).
+        const { data: sectionRow, error: secInsErr } = await supabase
+          .from('sample_content_sections')
+          .insert({
+            sample_id:        sampleId,
+            creator_id:       creatorId,
+            section_index:    secIdx,
+            title:            finalSectionTitle,
+            summary:          finalSectionSummary,
+            summary_embedding: `[${summaryVec.join(',')}]`,
+            // Audit S2 — nullish coalescing so legitimate charStart=0 isn't
+            // masked. (sec.charStart || 0) === 0 when the section is the
+            // first in the doc, which is the COMMON case.
+            char_start:       Number(sec.charStart ?? 0),
+            char_end:         Number(sec.charEnd   ?? sec.charStart ?? 0),
+            topic_tags:       topicTags,
+          })
+          .select('id')
+          .single();
+        if (secInsErr || !sectionRow) {
+          await bumpFailure(jobId, `v3_section_${secIdx}_insert_failed:${secInsErr?.message || 'no_row'}`);
+          return;
+        }
+        const sectionId = sectionRow.id;
+
+        // 4e — per-unit loop within this section. chunk_index is SECTION-LOCAL
+        // (C5 / R2-C4 partial UNIQUE). Reset to 0 at each new section.
+        let sectionChunkIndex = 0;
+        const childVectorsForCentroid = [];   // [{vec: number[], len: int}]
+
+        for (let unitIdx = 0; unitIdx < sectionUnits.length; unitIdx++) {
+          if (timeLeft() < 0) {
+            await bumpFailure(jobId, `v3_claim_timeout_during_section_${secIdx}_unit_${unitIdx}`); return;
+          }
+          if (shuttingDown) {
+            await bumpFailure(jobId, `v3_shutdown_inflight_section_${secIdx}_unit_${unitIdx}`); return;
+          }
+
+          const unit = sectionUnits[unitIdx];
+          const unitTokens = clampTokenCount(unit.text);
+          // narrative_units.unit_index is sample-wide unique. v3 uses a
+          // running counter that's also section-aware: secIdx*10000 + unitIdx
+          // gives a unique sample-wide value while keeping section grouping
+          // obvious in logs. 10000 cap > any realistic units/section (Flash
+          // emits ~5-30 units per section).
+          const unitIndexSampleWide = secIdx * 10000 + unitIdx;
+          const { data: unitRow, error: unitErr } = await supabase
+            .from('sample_content_narrative_units')
+            .insert({
+              sample_id:   sampleId,
+              creator_id:  creatorId,
+              unit_index:  unitIndexSampleWide,
+              title:       String(unit.title || '').slice(0, 200),
+              text:        String(unit.text  || '').slice(0, 8000),
+              token_count: unitTokens,
+              topic_tags:  topicTags,
+              section_id:  sectionId,
+            })
+            .select('id')
+            .single();
+          if (unitErr || !unitRow) {
+            await bumpFailure(jobId, `v3_unit_insert_failed_sec_${secIdx}_unit_${unitIdx}:${unitErr?.message || 'no_row'}`);
+            return;
+          }
+          const parentUnitId = unitRow.id;
+
+          // Split unit into child chunks (re-use existing chunker).
+          const children = chunkSample({ rawText: unit.text, topicTags });
+          if (children.length === 0) continue;
+
+          // Per-child contextual-gen. CRITICAL v3 change vs v2: `doc` is the
+          // SECTION TEXT, not the whole sample. This makes the 1h prompt
+          // cache key per-section (audit round-4 C3 / plan §11/M3 — without
+          // this the whole-sample-prefix exceeds cache TTL at book scale).
+          const childChunkContexts = [];
+          for (const child of children) {
+            if (timeLeft() < 0) {
+              await bumpFailure(jobId, `v3_claim_timeout_contextual_gen_sec_${secIdx}`); return;
+            }
+            try {
+              const cg = await postInternal('/api/internal/contextual-gen', {
+                creator_id:   creatorId,
+                doc:          sec.text,   // <-- SECTION (not whole sample)
+                chunk_text:   child.text,
+                sample_title: sample.title || undefined,
+              });
+              childChunkContexts.push(cg.chunk_context || null);
+              const u = cg.usage || {};
+              v3AnthropicUncachedInputTokens   += Number(u.uncached_input_tokens          || 0);
+              v3AnthropicCacheCreation1hTokens += Number(u.cache_creation_1h_input_tokens || 0);
+              v3AnthropicCacheReadInputTokens  += Number(u.cache_read_input_tokens        || 0);
+              v3AnthropicOutputTokens          += Number(u.output_tokens                  || 0);
+            } catch (e) {
+              v3TotalContextualGenFailures += 1;
+              childChunkContexts.push(null);
+              if (e?.retryAfterMs && e.retryAfterMs > 0) {
+                await new Promise((r) => setTimeout(r, Math.min(e.retryAfterMs, CONTEXTUAL_GEN_RETRY_AFTER_MAX_MS)));
+              }
+            }
+          }
+          v3TotalChildChunks += children.length;
+
+          // Mid-loop short-circuit on systemic Anthropic failure (≥10 chunks).
+          if (
+            v3TotalChildChunks >= 10 &&
+            v3TotalContextualGenFailures / v3TotalChildChunks > CONTEXTUAL_GEN_MAX_FAILURE_RATE
+          ) {
+            await markJobErrored(
+              jobId,
+              `v3_contextual_gen_failure_rate_mid_loop_${v3TotalContextualGenFailures}_of_${v3TotalChildChunks}`,
+            );
+            return;
+          }
+
+          // Batch-embed (chunk_context + chunk_text) inputs.
+          const embedInputs = children.map((c, i) => {
+            const ctx = childChunkContexts[i];
+            return ctx ? `${ctx}\n\n${c.text}` : c.text;
+          });
+
+          let vectors;
+          try {
+            const resp = await ai().models.embedContent({
+              model: EMBEDDING_MODEL,
+              contents: embedInputs,
+              config: {
+                outputDimensionality: EMBEDDING_DIM,
+                taskType: 'RETRIEVAL_DOCUMENT',
+              },
+            });
+            const embeds = Array.isArray(resp?.embeddings) ? resp.embeddings : [];
+            if (embeds.length !== embedInputs.length) {
+              await bumpFailure(jobId, `v3_embed_count_mismatch ${embeds.length}!=${embedInputs.length}`);
+              return;
+            }
+            vectors = [];
+            for (const e of embeds) {
+              const vals = e?.values || [];
+              if (vals.length !== EMBEDDING_DIM) {
+                await bumpFailure(jobId, `v3_embed_dim_mismatch ${vals.length}!=${EMBEDDING_DIM}`);
+                return;
+              }
+              vectors.push(vals);
+            }
+            // Audit S1 — match v2's `batchTokens > 0 ?` ternary so a Gemini
+            // response with `totalTokenCount === 0` correctly falls back to
+            // the estimator instead of recording a $0 spend.
+            const batchTokens = Number(resp?.metadata?.totalTokenCount ?? 0);
+            const unitEmbedTokens = batchTokens > 0
+              ? batchTokens
+              : embedInputs.reduce((s, t) => s + estimateTokens(t), 0);
+            v3TotalEmbedTokens += unitEmbedTokens;
+
+            // Per-unit budget accumulate (mid-loop kill-switch).
+            const unitEmbedUsd = Number((unitEmbedTokens * EMBEDDING_USD_PER_TOKEN).toFixed(6));
+            const { data: budgetOk, error: budgetErr } = await supabase.rpc(
+              'creator_embedding_budget_accumulate_and_check',
+              {
+                p_creator_id: creatorId,
+                p_add_usd:    unitEmbedUsd,
+                p_cap_usd:    CREATOR_EMBEDDING_DAILY_CAP_USD,
+              },
+            );
+            if (budgetErr) {
+              captureException(budgetErr, { op: 'reprocess_worker.v3.budget_accumulate', jobId });
+            } else if (budgetOk === false) {
+              captureMessage('reprocess.v3.creator_daily_budget_blown_postspend', 'warning', {
+                op: 'reprocess_worker.v3.budget_postspend',
+                creator_id: creatorId,
+                usd_this_unit: unitEmbedUsd,
+              });
+              await markJobErrored(
+                jobId,
+                `v3_creator_daily_budget_blown_postspend_sec_${secIdx}_unit_${unitIdx}`,
+              );
+              return;
+            }
+          } catch (e) {
+            await bumpFailure(jobId, `v3_embed_api_error:${e?.message || e}`);
+            captureException(e, { op: 'reprocess_worker.v3.embedContent', jobId });
+            return;
+          }
+
+          // INSERT children via _insert_chunk_v3_unsafe.
+          for (let i = 0; i < children.length; i++) {
+            const child = children[i];
+            const vec = vectors[i];
+            const tokenCount = clampTokenCount(child.text);
+            const { error: insErr } = await supabase.rpc(
+              '_insert_chunk_v3_unsafe',
+              {
+                p_parent_unit_id:  parentUnitId,
+                p_section_id:     sectionId,
+                p_chunk_index:    sectionChunkIndex,
+                p_text:           child.text,
+                p_chunk_context:  childChunkContexts[i],
+                p_token_count:    tokenCount,
+                p_topic_tags:     topicTags,
+                p_embedding:      `[${vec.join(',')}]`,
+                p_embedding_model: EMBEDDING_MODEL,
+              },
+            );
+            sectionChunkIndex++;
+            if (insErr) {
+              await bumpFailure(jobId, `v3_chunk_insert_failed:${insErr.message}`);
+              captureException(insErr, { op: 'reprocess_worker.v3.insert_chunk_v3', jobId });
+              return;
+            }
+            // Track for centroid (length-weighted unit-normalized mean).
+            childVectorsForCentroid.push({ vec, len: tokenCount });
+          }
+        }
+
+        // 4f — compute centroid + UPDATE section.centroid_embedding.
+        // Plan §11/M1: normalize each child to unit norm BEFORE the mean,
+        // then renormalize the result, then store. halfvec at 768d is
+        // ~3-4 sig digits; gemini-embedding-001 at outputDimensionality=768
+        // (Matryoshka) is not guaranteed unit-norm.
+        if (childVectorsForCentroid.length === 0) {
+          // Pathological — Flash returned units but every unit produced zero
+          // children. Section row exists with NULL centroid; creator_v3_ready
+          // will reject this creator. Captured for visibility.
+          captureMessage('reprocess.v3.section_zero_children', 'warning', {
+            op: 'reprocess_worker.v3.section_zero_children',
+            creator_id: creatorId,
+            sample_id:  sampleId,
+            section_id: sectionId,
+            section_index: secIdx,
+          });
+        } else {
+          const centroid = computeCentroidV3(childVectorsForCentroid);
+          const { error: centErr } = await supabase
+            .from('sample_content_sections')
+            .update({ centroid_embedding: `[${centroid.join(',')}]` })
+            .eq('id', sectionId);
+          if (centErr) {
+            await bumpFailure(jobId, `v3_section_${secIdx}_centroid_update_failed:${centErr.message}`);
+            return;
+          }
+        }
+
+        v3SectionsProcessed += 1;
+      }
+
+      // Plan §8.2 — sample-level abort if too many chunks lost context.
+      if (
+        v3TotalChildChunks > 0 &&
+        v3TotalContextualGenFailures / v3TotalChildChunks > CONTEXTUAL_GEN_MAX_FAILURE_RATE
+      ) {
+        await markJobErrored(
+          jobId,
+          `v3_contextual_gen_failure_rate_${v3TotalContextualGenFailures}_of_${v3TotalChildChunks}`,
+        );
+        return;
+      }
+
+      // Atomic version-checked finish.
+      const { data: doneId, error: finErr } = await supabase.rpc(
+        'corpus_reprocess_mark_done_v3',
+        { p_job_id: jobId, p_claimed_version: claimedVersion },
+      );
+      if (finErr) {
+        const code = finErr?.code || '';
+        const msg = finErr?.message || '';
+        if (code === '55P03' || /lock_not_available/i.test(msg)) return;   // reaper requeues
+        if (code === '02000' || /creator_disappeared/i.test(msg)) {
+          await markJobErrored(jobId, 'creator_deleted_during_v3_finalize');
+          return;
+        }
+        await bumpFailure(jobId, `v3_mark_done_failed:${msg}`);
+        return;
+      }
+      if (!doneId) return;   // silent abandon — admin re-enqueued
+    } catch (e) {
+      captureException(e, { op: 'reprocess_worker.v3.tick_outer', jobId });
+      await bumpFailure(jobId, `v3_unhandled:${e?.message || e}`);
+    } finally {
+      // Audit M3 — match v2's flush_reason string ('finally_drain') so prod
+      // analytics dashboards filtering on this key surface both pipelines.
+      await v3FlushFlash();
+      await v3FlushSpend('finally_drain');
+    }
+  }
+
+  // Length-weighted unit-normalized mean (plan §11/M1).
+  // Each child vec is normalized to unit norm BEFORE the weighted mean;
+  // the result is then renormalized. Zero-magnitude AND non-finite inputs
+  // are skipped (audit M5 — a single all-NaN child would otherwise poison
+  // every acc[i] to NaN, the renormalize step divides by NaN, the stored
+  // centroid becomes a NaN-vector, HNSW accepts it, retrieval cosine = NaN
+  // → section permanently invisible to routing).
+  function computeCentroidV3(weighted) {
+    const dim = EMBEDDING_DIM;
+    const acc = new Array(dim).fill(0);
+    let totalWeight = 0;
+    outer: for (const { vec, len } of weighted) {
+      let norm = 0;
+      for (let i = 0; i < dim; i++) {
+        const v = vec[i];
+        if (!Number.isFinite(v)) continue outer;   // skip non-finite child entirely
+        norm += v * v;
+      }
+      norm = Math.sqrt(norm);
+      if (!Number.isFinite(norm) || norm === 0) continue;
+      const w = Math.max(1, len);   // weight by token count (≥1)
+      for (let i = 0; i < dim; i++) acc[i] += (vec[i] / norm) * w;
+      totalWeight += w;
+    }
+    if (totalWeight === 0) {
+      // Degenerate — all inputs filtered out. Return zero vector; caller's
+      // sample_content_sections.centroid_embedding is NULLable so the
+      // step-6 creator_v3_ready reject keeps the read path off it.
+      return acc;
+    }
+    // Renormalize the weighted sum to unit norm.
+    let resNorm = 0;
+    for (let i = 0; i < dim; i++) resNorm += acc[i] * acc[i];
+    resNorm = Math.sqrt(resNorm);
+    if (!Number.isFinite(resNorm) || resNorm === 0) return acc;
+    for (let i = 0; i < dim; i++) acc[i] = acc[i] / resNorm;
+    return acc;
+  }
+
   async function tick() {
     // In-process reaper backstop (audit-5 C2 pattern from corpus_reprocess_jobs.sql).
     try {
@@ -692,9 +1487,37 @@ export function makeCorpusReprocessWorker({
     const sampleId        = claim.sample_id;
     const creatorId       = claim.creator_id;
     const claimedVersion  = claim.enqueue_version;
+    const targetVersion   = claim.target_version;   // step 4c R2-C2 added
 
     const deadlineAt = Date.now() + REPROCESS_CLAIM_TIMEOUT_MS;
     const timeLeft = () => deadlineAt - Date.now();
+
+    // ── v3 dispatch (RAG v3 step 4d / plan §11 R2-C3) ──────────────────────
+    // Per audit round-3 C5 / round-4 C5: a v3 session falling silently to
+    // a v2 code path was THE catastrophic failure mode the plan exists to
+    // prevent. Audit round-4-step-4d C4 strengthened the dispatch — STRICT
+    // allow-list, fail-loud on anything unknown:
+    //   • 3 → v3 worker branch (processV3Job)
+    //   • 2 → v2 worker (the body below)
+    //   • undefined → v2 fallback (the v2-only deploy window before
+    //     migration 20260528000020 widens claim's RETURNS TABLE)
+    //   • anything else → markJobErrored loud; the queue-infra CHECK
+    //     accepts only IN (2, 3) so this branch shouldn't be reachable
+    //     today, but a future migration that widens to 4 without updating
+    //     the worker would otherwise silently run a v4 job under v2.
+    if (targetVersion === 3) {
+      await processV3Job(claim, { jobId, sampleId, creatorId, claimedVersion, deadlineAt, timeLeft });
+      return;
+    }
+    if (targetVersion !== 2 && targetVersion !== undefined && targetVersion !== null) {
+      await markJobErrored(jobId, `unknown_target_version_${targetVersion}`);
+      captureMessage('reprocess_worker.unknown_target_version', 'error', {
+        op: 'reprocess_worker.dispatch',
+        job_id: jobId,
+        target_version: targetVersion,
+      });
+      return;
+    }
 
     // Day-5-unit-audit C2+C3: accumulators MUST live outside the try block
     // so the finally clause can flush cogs_log on EVERY exit path (success,

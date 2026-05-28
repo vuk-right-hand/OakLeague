@@ -44,9 +44,20 @@ BEGIN
     VALUES (gen_random_uuid(), v_creator, 'transcript', 'V3 Sample', 'v3 body', ARRAY['topic-a'], 'ready')
     RETURNING id INTO v_sample_v3;
 
-  -- 1: target_version=3 accepted.
-  INSERT INTO public.corpus_reprocess_jobs (id, sample_id, target_version, status, enqueue_version)
-    VALUES (gen_random_uuid(), v_sample_v3, 3, 'pending', 1)
+  -- Pre-clear ALL pending corpus_reprocess_jobs across the DB so our claim
+  -- can't pick up a leaky row from a prior test file. pgTAP BEGIN/ROLLBACK
+  -- *should* isolate, but `tests.create_auth_user` and similar fixtures
+  -- have been seen to leak via internal COMMITs, and a stray pending row
+  -- with a smaller created_at than our v_job_v3 would make tests 4/6 fail
+  -- only in the full-suite run.
+  DELETE FROM public.corpus_reprocess_jobs WHERE status = 'pending';
+
+  -- 1: target_version=3 accepted. Use explicit created_at = now()-'2s' so
+  -- v_job_v3 is strictly older than the v2 job we insert below — claim's
+  -- FIFO (ORDER BY created_at, id) picks v3 first deterministically.
+  INSERT INTO public.corpus_reprocess_jobs
+      (id, sample_id, target_version, status, enqueue_version, created_at)
+    VALUES (gen_random_uuid(), v_sample_v3, 3, 'pending', 1, now() - interval '2 seconds')
     RETURNING id INTO v_job_v3;
   RETURN NEXT ok(v_job_v3 IS NOT NULL, '1: target_version=3 INSERT accepted (widened CHECK)');
 
@@ -60,9 +71,11 @@ BEGIN
   END;
 
   -- 3 + 4: claim returns target_version.
-  -- Seed a v2 job so we have one of each.
-  INSERT INTO public.corpus_reprocess_jobs (id, sample_id, target_version, status, enqueue_version)
-    VALUES (gen_random_uuid(), v_sample_v2, 2, 'pending', 1)
+  -- Seed a v2 job at now() so it's strictly newer than v_job_v3 (created_at
+  -- = now() - 2s); claim's FIFO picks v_job_v3 first deterministically.
+  INSERT INTO public.corpus_reprocess_jobs
+      (id, sample_id, target_version, status, enqueue_version, created_at)
+    VALUES (gen_random_uuid(), v_sample_v2, 2, 'pending', 1, now())
     RETURNING id INTO v_job_v2;
 
   -- Claim FIFO — v_job_v3 was inserted FIRST (test 1) so it should be claimed first.
