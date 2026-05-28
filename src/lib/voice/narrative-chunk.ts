@@ -25,7 +25,7 @@
 // the same creator.
 
 import 'server-only';
-import { GoogleGenAI, ThinkingLevel } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type as GenaiType, type Schema as GenaiSchema } from '@google/genai';
 import { z } from 'zod';
 import { sanitizeForLLMPrompt } from './preprocess';
 
@@ -58,6 +58,11 @@ const HARD_MAX_UNIT_CHARS = 8000;
 // CHECK ≤ 200 chars).
 const HARD_MAX_TITLE_CHARS = 200;
 
+// v3 section title + summary caps (matches sample_content_sections.title
+// CHECK ≤ 200 chars + .summary CHECK ≤ 2000 chars — migration 20260528000010).
+const HARD_MAX_SECTION_TITLE_CHARS = 200;
+const HARD_MAX_SECTION_SUMMARY_CHARS = 2000;
+
 
 // ── Output schema ──────────────────────────────────────────────────────────
 
@@ -68,6 +73,14 @@ const NarrativeUnitSchema = z.object({
 
 const NarrativeChunkResponseSchema = z.object({
   units: z.array(NarrativeUnitSchema).min(1),
+});
+
+// v3 per-section response — same units array + sectionTitle + sectionSummary
+// for the new sample_content_sections row.
+const NarrativeSectionResponseSchema = z.object({
+  units: z.array(NarrativeUnitSchema).min(1),
+  sectionTitle: z.string().min(1).max(HARD_MAX_SECTION_TITLE_CHARS),
+  sectionSummary: z.string().min(1).max(HARD_MAX_SECTION_SUMMARY_CHARS),
 });
 
 export type NarrativeUnit = z.infer<typeof NarrativeUnitSchema>;
@@ -460,6 +473,393 @@ async function callFlashOnce(args: {
   }
 
   return { units: reChecked.data.units, usage };
+}
+
+
+// ── v3 per-section Flash call (RAG v3 step 4a, plan §8 step 4a) ──────────
+//
+// Replaces the v2 "whole-document Flash call" (which chokes on a book at
+// Wall A — plan §0 #1) with a per-section call. Caller (the v3 worker)
+// already has the section text via section-segment.ts; this function just
+// converts it to {units, sectionTitle, sectionSummary} via Flash and
+// returns it.
+//
+// Why a SEPARATE function (not extending narrativeChunk with a mode flag):
+//   * v2 narrativeChunk is on the live ingestion path for every existing
+//     creator. Extending it with v3 behavior risks regressing v2.
+//   * The Flash CALL is identical in shape; the schema, prompt, and parse
+//     differ. Cleanly separating makes "what changed for v3" obvious.
+//   * Both share the singleton client(), the splitOversizedUnit helper, the
+//     sanitizer post-pass, and the retry-once contract.
+//
+// Why responseSchema (resolves narrative-chunk.ts:269-272 TODO, plan §11/M6
+// + audit round-4 C2): per-section ingest multiplies the schema-drift
+// retry-tax by N (30-80 sections per book × tax per section). Without
+// schema enforcement at the SDK boundary, Flash drifts on shape and we
+// re-send a 6-8k-token section input to retry. The cost model in §3
+// implicitly assumes the schema is enforced. SDK field name verified
+// (`responseSchema: Schema` per @google/genai 1.50.1 d.ts).
+//
+// Title contract (plan §8 step 4c, audit round-4 C4): Flash ALWAYS emits a
+// sectionTitle (the SDK schema makes it required). The caller may
+// post-process: when section.cue is null (paragraph-pack mode), use
+// Flash's sectionTitle verbatim; when section.cue is non-null AND the
+// chapter sub-packed into multiple sections, the v3 worker applies the
+// "(part k/N)" suffix client-side BEFORE inserting into sample_content_
+// sections. This module does not know about cues — it only synthesizes
+// the title given the text it sees.
+
+// Gemini SchemaUnion mirror of NarrativeSectionResponseSchema. Bound
+// shapes via the SDK's OpenAPI-flavored Schema interface — `minItems`,
+// `minLength`, `maxLength` etc. are STRINGS per SDK type (sent as string
+// ints per OpenAPI 3.1).
+const FLASH_SECTION_RESPONSE_SCHEMA: GenaiSchema = {
+  type: GenaiType.OBJECT,
+  required: ['units', 'sectionTitle', 'sectionSummary'],
+  properties: {
+    sectionTitle: {
+      type: GenaiType.STRING,
+      minLength: '1',
+      maxLength: String(HARD_MAX_SECTION_TITLE_CHARS),
+    },
+    sectionSummary: {
+      type: GenaiType.STRING,
+      minLength: '1',
+      maxLength: String(HARD_MAX_SECTION_SUMMARY_CHARS),
+    },
+    units: {
+      type: GenaiType.ARRAY,
+      minItems: '1',
+      items: {
+        type: GenaiType.OBJECT,
+        required: ['title', 'text'],
+        properties: {
+          title: {
+            type: GenaiType.STRING,
+            minLength: '1',
+            maxLength: String(HARD_MAX_TITLE_CHARS),
+          },
+          text: {
+            type: GenaiType.STRING,
+            minLength: '1',
+            maxLength: String(HARD_MAX_UNIT_CHARS),
+          },
+        },
+      },
+    },
+  },
+};
+
+function buildSectionPrompt(args: {
+  sampleTitle?: string;
+  sectionCue?: string;
+  sanitizedSection: string;
+  strict: boolean;
+}): string {
+  // Cue lines are the structural marker that started the section (heading,
+  // chapter line, timestamp). Sent for orientation; Flash uses it to pick a
+  // sectionTitle that reads like the source rather than inventing one.
+  const titleLine = args.sampleTitle
+    ? `The document title is: "${args.sampleTitle}".\n\n`
+    : '';
+  const cueLine = args.sectionCue
+    ? `This section opens with: "${args.sectionCue}". Use this for context but do NOT copy it verbatim as the sectionTitle.\n\n`
+    : '';
+
+  const strictAddendum = args.strict
+    ? `\n\nCRITICAL: your previous attempt failed JSON schema validation. You MUST return EXACTLY this shape, nothing else, no markdown fence, no prose:
+{"sectionTitle":"...","sectionSummary":"...","units":[{"title":"...","text":"..."}]}\n`
+    : '';
+
+  return `You are a content editor splitting ONE SECTION of a document into self-contained narrative units for a retrieval system.
+
+${titleLine}${cueLine}Your output has THREE parts:
+
+1. sectionTitle — a short descriptive label (≤${HARD_MAX_SECTION_TITLE_CHARS} chars) for the WHOLE section. Think: chapter title in a book, topic name in a transcript. NOT the document title; specific to this section.
+
+2. sectionSummary — a 1-2 sentence summary (≤${HARD_MAX_SECTION_SUMMARY_CHARS} chars) of what this section covers. This summary is embedded and used as a routing target, so include the key concepts/proper nouns the reader would search for.
+
+3. units — an array of self-contained narrative units WITHIN this section. Each unit is a complete idea, story, or beat that makes sense on its own when surfaced to a reader. Aim for ~${TARGET_UNIT_MIN_TOKENS}-${TARGET_UNIT_MAX_TOKENS} tokens per unit. Give each unit a short descriptive title (≤${HARD_MAX_TITLE_CHARS} chars).
+
+HARD LIMIT: each unit's "text" field MUST be ≤${HARD_MAX_UNIT_CHARS} characters. If a single narrative beat would exceed ${HARD_MAX_UNIT_CHARS} chars, split it at a paragraph or sentence boundary into two or more consecutive units that together cover the same content. Never emit a "text" longer than ${HARD_MAX_UNIT_CHARS} chars under any circumstance.
+
+If the section is narrative talk, units are story beats. If it's reference content, units are logical sub-sections. Mix is fine — let the section tell you.
+
+Return JSON only. No prose, no markdown fences, no commentary.
+
+Output schema:
+{
+  "sectionTitle": "short section label",
+  "sectionSummary": "1-2 sentence summary for routing",
+  "units": [
+    { "title": "short descriptive title", "text": "the unit's text" },
+    ...
+  ]
+}${strictAddendum}
+
+<section>
+${args.sanitizedSection}
+</section>
+
+Return the JSON object:`;
+}
+
+async function callFlashSectionOnce(args: {
+  sanitizedSection: string;
+  sampleTitle?: string;
+  sectionCue?: string;
+  strict: boolean;
+  attempt: 1 | 2;
+}): Promise<{
+  units: NarrativeUnit[];
+  sectionTitle: string;
+  sectionSummary: string;
+  usage: NarrativeChunkUsage;
+}> {
+  const c = client();
+  let raw: string;
+  let usage: NarrativeChunkUsage = {
+    prompt_token_count: 0,
+    candidates_token_count: 0,
+    total_token_count: 0,
+  };
+  try {
+    const isV3 = /^gemini-3(\.|-)/i.test(NARRATIVE_CHUNK_MODEL);
+    const thinkingConfig = isV3
+      ? { thinkingLevel: ThinkingLevel.MINIMAL }
+      : { thinkingBudget: 0 };
+    const flashPromise = c.models.generateContent({
+      model: NARRATIVE_CHUNK_MODEL,
+      contents: buildSectionPrompt({
+        sampleTitle: args.sampleTitle,
+        sectionCue: args.sectionCue,
+        sanitizedSection: args.sanitizedSection,
+        strict: args.strict,
+      }),
+      config: {
+        temperature: 0.2,
+        responseMimeType: 'application/json',
+        // v3 step 4a: SDK-enforced schema. Resolves the v2-era TODO at
+        // narrative-chunk.ts:269-272 — for v3 only (v2 still un-schema'd
+        // to avoid live-path regression).
+        responseSchema: FLASH_SECTION_RESPONSE_SCHEMA,
+        thinkingConfig,
+        // Section input is bounded by section-segment.ts to ≤ 7500 tokens
+        // (DEFAULT_SAFE_MAX_TOKENS), so the JSON output is bounded too.
+        // 16384 covers worst-case re-emission of the section text across
+        // multiple unit `text` fields with comfortable headroom. Lower
+        // than v2's 65535 because per-section input is small by construction.
+        maxOutputTokens: 16384,
+      },
+    });
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(
+        () => reject(new Error(`flash_timeout_${FLASH_CALL_TIMEOUT_MS}ms`)),
+        FLASH_CALL_TIMEOUT_MS,
+      );
+    });
+    const resp = await Promise.race([flashPromise, timeoutPromise]);
+    const obj = resp as {
+      text?: string;
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+      usageMetadata?: {
+        promptTokenCount?: number;
+        candidatesTokenCount?: number;
+        totalTokenCount?: number;
+      };
+    };
+    raw = obj.text
+      ?? obj.candidates?.[0]?.content?.parts?.map((p) => p.text ?? '').join('')
+      ?? '';
+    usage = {
+      prompt_token_count:     obj.usageMetadata?.promptTokenCount     ?? 0,
+      candidates_token_count: obj.usageMetadata?.candidatesTokenCount ?? 0,
+      total_token_count:      obj.usageMetadata?.totalTokenCount      ?? 0,
+    };
+  } catch (e) {
+    throw new NarrativeChunkError(
+      'transport_error',
+      args.attempt,
+      (e as Error)?.message ?? 'flash_call_failed',
+    );
+  }
+
+  if (!raw || raw.trim().length === 0) {
+    throw new NarrativeChunkError('invalid_json', args.attempt, 'empty response');
+  }
+
+  let json = raw.trim();
+  if (json.startsWith('```')) {
+    json = json.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch (e) {
+    throw new NarrativeChunkError(
+      'invalid_json',
+      args.attempt,
+      `JSON.parse: ${(e as Error)?.message ?? 'unknown'}`,
+    );
+  }
+
+  // Defensive splitter — same as v2. Flash sometimes emits oversize unit
+  // text even when schema forbids; we split locally rather than retrying.
+  if (
+    parsed != null &&
+    typeof parsed === 'object' &&
+    'units' in (parsed as Record<string, unknown>) &&
+    Array.isArray((parsed as { units: unknown }).units)
+  ) {
+    const rawUnits = (parsed as { units: Array<{ title?: unknown; text?: unknown }> }).units;
+    const splitUnits: { title: string; text: string }[] = [];
+    let splitFiredCount = 0;
+    for (const u of rawUnits) {
+      if (u != null && typeof u.title === 'string' && typeof u.text === 'string') {
+        if (u.text.length > HARD_MAX_UNIT_CHARS) {
+          splitFiredCount++;
+          for (const piece of splitOversizedUnit({ title: u.title, text: u.text })) {
+            splitUnits.push(piece);
+          }
+        } else {
+          splitUnits.push({ title: u.title, text: u.text });
+        }
+      } else {
+        splitUnits.push(u as unknown as { title: string; text: string });
+      }
+    }
+    if (splitFiredCount > 0) {
+      console.log(
+        `[narrative-chunk-v3] split ${splitFiredCount} oversized unit(s) locally → ${splitUnits.length} total units`,
+      );
+    }
+    (parsed as { units: unknown }).units = splitUnits;
+  }
+
+  const result = NarrativeSectionResponseSchema.safeParse(parsed);
+  if (!result.success) {
+    throw new NarrativeChunkError(
+      'schema_violation',
+      args.attempt,
+      result.error.message.slice(0, 500),
+    );
+  }
+  if (result.data.units.length === 0) {
+    throw new NarrativeChunkError('no_units_returned', args.attempt);
+  }
+
+  // Sanitize Flash output (prompt-injection defense, same as v2). Clamp
+  // to char limits in case sanitizer added per-line markdown-escape chars
+  // and pushed past the cap.
+  const sanitizedUnits = result.data.units.map((u) => ({
+    title: sanitizeForLLMPrompt(u.title).slice(0, HARD_MAX_TITLE_CHARS),
+    text:  sanitizeForLLMPrompt(u.text).slice(0,  HARD_MAX_UNIT_CHARS),
+  }));
+  const sanitizedTitle = sanitizeForLLMPrompt(result.data.sectionTitle).slice(0, HARD_MAX_SECTION_TITLE_CHARS);
+  const sanitizedSummary = sanitizeForLLMPrompt(result.data.sectionSummary).slice(0, HARD_MAX_SECTION_SUMMARY_CHARS);
+  const reChecked = NarrativeSectionResponseSchema.safeParse({
+    units: sanitizedUnits,
+    sectionTitle: sanitizedTitle,
+    sectionSummary: sanitizedSummary,
+  });
+  if (!reChecked.success) {
+    throw new NarrativeChunkError(
+      'schema_violation',
+      args.attempt,
+      `post-sanitize: ${reChecked.error.message.slice(0, 400)}`,
+    );
+  }
+
+  return {
+    units: reChecked.data.units,
+    sectionTitle: reChecked.data.sectionTitle,
+    sectionSummary: reChecked.data.sectionSummary,
+    usage,
+  };
+}
+
+export type NarrativeChunkSectionArgs = {
+  /** Pre-sanitized section text (output of section-segment.ts, run through
+   *  sanitizeForLLMPrompt by the caller). */
+  sanitizedSection: string;
+  /** Optional sample title (for prompt orientation). */
+  sampleTitle?: string;
+  /** Optional structural cue that started this section (markdown heading,
+   *  "Chapter N", "[00:05:30]"). Sent for orientation; Flash uses it to
+   *  ground sectionTitle without copying verbatim. NULL/undefined for
+   *  paragraph-pack mode sections. */
+  sectionCue?: string | null;
+};
+
+export type NarrativeChunkSectionResult = {
+  units: NarrativeUnit[];
+  sectionTitle: string;
+  sectionSummary: string;
+  attempt: 1 | 2;
+  ms: number;
+  usage: NarrativeChunkUsage;
+};
+
+/**
+ * v3 per-section narrative chunker. Returns null on second-attempt failure
+ * so the caller (v3 worker) can mark the SECTION (not the whole sample)
+ * as errored and continue with the rest — per-section idempotent re-embed
+ * (audit C5) means one failed section doesn't kill the whole book.
+ *
+ * Caller responsibilities (NOT enforced here):
+ *   • Pass already-sanitized section text.
+ *   • Hold the embed-worker's per-creator advisory lock.
+ *   • For sub-packed sections (a single chapter that produced multiple
+ *     sections via section-segment.ts): apply the " (part k/N)" suffix
+ *     to sectionTitle AFTER this function returns (plan §8 step 4c).
+ *     This function doesn't know about sibling sections.
+ */
+export async function narrativeChunkSection(
+  args: NarrativeChunkSectionArgs,
+): Promise<NarrativeChunkSectionResult | null> {
+  if (!args.sanitizedSection || args.sanitizedSection.trim().length === 0) {
+    throw new NarrativeChunkError('empty_input', 1);
+  }
+  const cue = args.sectionCue ?? undefined;
+  const t0 = Date.now();
+  try {
+    const r1 = await callFlashSectionOnce({
+      sanitizedSection: args.sanitizedSection,
+      sampleTitle: args.sampleTitle,
+      sectionCue: cue,
+      strict: false,
+      attempt: 1,
+    });
+    return { ...r1, attempt: 1, ms: Date.now() - t0 };
+  } catch (e) {
+    if (e instanceof NarrativeChunkError) {
+      console.error(
+        `[narrative-chunk-v3] attempt 1 failed: code=${e.code} msg=${(e.message || '').slice(0, 500)}`,
+      );
+      if (e.code === 'api_key_missing' || e.code === 'empty_input') throw e;
+      try {
+        const r2 = await callFlashSectionOnce({
+          sanitizedSection: args.sanitizedSection,
+          sampleTitle: args.sampleTitle,
+          sectionCue: cue,
+          strict: true,
+          attempt: 2,
+        });
+        return { ...r2, attempt: 2, ms: Date.now() - t0 };
+      } catch (e2) {
+        if (e2 instanceof NarrativeChunkError) {
+          console.error(
+            `[narrative-chunk-v3] attempt 2 failed: code=${e2.code} msg=${(e2.message || '').slice(0, 500)}`,
+          );
+        } else {
+          console.error('[narrative-chunk-v3] attempt 2 failed (non-NCE):', e2);
+        }
+        return null;
+      }
+    }
+    throw e;
+  }
 }
 
 
