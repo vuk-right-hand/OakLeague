@@ -8,12 +8,12 @@
 --
 -- Three blocks:
 --
---   A. TRIPWIRE — corpus_reprocess_mark_done is NON-mutating beyond status.
---      It must NOT bump creators.current_corpus_version and must NOT delete
---      chunks. This pins the live v2 behavior so the plan's R2-C1/R3-C2
---      change (fold the version-bump into the finish RPC) shows up as an
---      INTENDED red here, not a silent drift. (Existing corpus_reprocess_jobs
---      test only checks status-flip + version-mismatch, not the no-bump.)
+--   A. POST-FIX TRIPWIRE — corpus_reprocess_mark_done now BUMPS version + DELETES v1.
+--      Migration 20260528000001 (RAG v3 step 1b, R3-C2) folded the
+--      version-bump + chunker_version=1 delete into mark_done by delegating
+--      to corpus_reprocess_finalize. The assertions LOCK the new contract so
+--      a future regression (e.g. an inadvertent revert of mark_done's body
+--      back to a pure status-flip) is caught at db:test time, not in prod.
 --
 --   B. TRIPWIRE — the 3-col UNIQUE (sample_id, chunker_version, chunk_index)
 --      rejects an exact duplicate. This pins the dedup that migration
@@ -33,7 +33,7 @@
 -- SECURITY DEFINER so no role swap needed (mirrors creator_knowledge_topk_v2.test).
 
 BEGIN;
-SELECT plan(6);
+SELECT plan(8);
 
 -- One-hot unit vector helper (mirrors creator_knowledge_topk_v2.test).
 CREATE FUNCTION pg_temp.unit_vec(p_position int) RETURNS halfvec(768)
@@ -72,8 +72,7 @@ DECLARE
   v_filler         uuid;
   v_ver_before     int;
   v_ver_after      int;
-  v_chunks_before  int;
-  v_chunks_after   int;
+  v_done_ret       uuid;
   v_idx            int;
   v_chunk_idx      int := 0;
   v_needle_in_20   int;
@@ -96,39 +95,70 @@ BEGIN
     RETURNING id INTO v_sample;
 
   -- ════════════════════════════════════════════════════════════════════════
-  -- BLOCK A — TRIPWIRE: corpus_reprocess_mark_done must NOT bump version / delete
+  -- BLOCK A — POST-FIX TRIPWIRE: mark_done bumps version + deletes v1 chunks
   -- ════════════════════════════════════════════════════════════════════════
-  -- Seed a couple of v2 chunks (so we can prove they survive mark_done) and a
-  -- claimed reprocess job, then finish it via mark_done.
-  INSERT INTO public.sample_content_chunks
-    (id, sample_id, creator_id, chunk_index, text, topic_tags, embedding, chunker_version)
-  VALUES
-    (gen_random_uuid(), v_sample, v_creator, 0, 'survivor chunk one', ARRAY['topic-a'], pg_temp.unit_vec(1), 2),
-    (gen_random_uuid(), v_sample, v_creator, 1, 'survivor chunk two', ARRAY['topic-a'], pg_temp.unit_vec(2), 2);
+  -- Migration 20260528000001 (RAG v3 step 1b) folded version-bump + v1-chunk
+  -- delete into mark_done. Seed the sample with BOTH a v1 zombie chunk
+  -- (chunker_version=1, should be deleted) AND v2 chunks (chunker_version=2,
+  -- should survive) + a claimed reprocess job, then finish it via mark_done.
+  DECLARE
+    v_v1_chunks_before  int;
+    v_v1_chunks_after   int;
+    v_v2_chunks_before  int;
+    v_v2_chunks_after   int;
+  BEGIN
+    INSERT INTO public.sample_content_chunks
+      (id, sample_id, creator_id, chunk_index, text, topic_tags, embedding, chunker_version)
+    VALUES
+      (gen_random_uuid(), v_sample, v_creator, 0, 'v2 survivor one', ARRAY['topic-a'], pg_temp.unit_vec(1), 2),
+      (gen_random_uuid(), v_sample, v_creator, 1, 'v2 survivor two', ARRAY['topic-a'], pg_temp.unit_vec(2), 2),
+      -- v1 zombie chunk (legacy windowed; should be deleted by mark_done's cutover):
+      (gen_random_uuid(), v_sample, v_creator, 2, 'v1 zombie',     ARRAY['topic-a'], pg_temp.unit_vec(3), 1);
 
-  SELECT current_corpus_version INTO v_ver_before FROM public.creators WHERE id = v_creator;
-  SELECT count(*) INTO v_chunks_before FROM public.sample_content_chunks WHERE sample_id = v_sample;
+    SELECT current_corpus_version INTO v_ver_before FROM public.creators WHERE id = v_creator;
+    SELECT count(*) INTO v_v1_chunks_before
+      FROM public.sample_content_chunks WHERE sample_id = v_sample AND chunker_version = 1;
+    SELECT count(*) INTO v_v2_chunks_before
+      FROM public.sample_content_chunks WHERE sample_id = v_sample AND chunker_version = 2;
 
-  INSERT INTO public.corpus_reprocess_jobs (id, sample_id, target_version, status, enqueue_version, claimed_by, claimed_at)
-    VALUES (gen_random_uuid(), v_sample, 2, 'processing', 1, 'ragv3-base', now())
-    RETURNING id INTO v_job;
-  PERFORM public.corpus_reprocess_mark_done(v_job, 1);
+    INSERT INTO public.corpus_reprocess_jobs (id, sample_id, target_version, status, enqueue_version, claimed_by, claimed_at)
+      VALUES (gen_random_uuid(), v_sample, 2, 'processing', 1, 'ragv3-base', now())
+      RETURNING id INTO v_job;
+    SELECT public.corpus_reprocess_mark_done(v_job, 1) INTO v_done_ret;
 
-  SELECT current_corpus_version INTO v_ver_after FROM public.creators WHERE id = v_creator;
-  SELECT count(*) INTO v_chunks_after FROM public.sample_content_chunks WHERE sample_id = v_sample;
+    SELECT current_corpus_version INTO v_ver_after FROM public.creators WHERE id = v_creator;
+    SELECT count(*) INTO v_v1_chunks_after
+      FROM public.sample_content_chunks WHERE sample_id = v_sample AND chunker_version = 1;
+    SELECT count(*) INTO v_v2_chunks_after
+      FROM public.sample_content_chunks WHERE sample_id = v_sample AND chunker_version = 2;
 
-  -- 1: version NOT bumped (this is the documented gap the plan must close;
-  --    when v3 adds the bump, THIS test goes red on purpose).
-  RETURN NEXT is(
-    v_ver_after, v_ver_before,
-    format('A1: mark_done does NOT bump current_corpus_version today (before=%s after=%s) — R2-C1 tripwire',
-           v_ver_before, v_ver_after)
-  );
-  -- 2: chunks NOT deleted by mark_done (only finalize deletes — which has no caller).
-  RETURN NEXT is(
-    v_chunks_after, v_chunks_before,
-    format('A2: mark_done does NOT delete chunks (before=%s after=%s)', v_chunks_before, v_chunks_after)
-  );
+    -- A0 (audit S5): mark_done returned the job-id, not silent-abandon. Without
+    -- this guard, a misseeded enqueue_version would silent-abandon and A1/A3
+    -- would assert against an unchanged state — passing for the wrong reason.
+    RETURN NEXT isnt(
+      v_done_ret, NULL::uuid,
+      'A0: mark_done returned the job-id (no silent-abandon under matching enqueue_version)'
+    );
+    -- A1 (POST-FIX): version IS bumped by exactly one.
+    RETURN NEXT is(
+      v_ver_after, v_ver_before + 1,
+      format('A1: mark_done bumps current_corpus_version (before=%s after=%s) — step-1b lock-in',
+             v_ver_before, v_ver_after)
+    );
+    -- A2 (POST-FIX): v2 chunks survive (mark_done only deletes v1, not v2).
+    RETURN NEXT is(
+      v_v2_chunks_after, v_v2_chunks_before,
+      format('A2: mark_done preserves chunker_version=2 chunks (before=%s after=%s)',
+             v_v2_chunks_before, v_v2_chunks_after)
+    );
+    -- A3 (NEW, POST-FIX): v1 zombie chunks ARE deleted. Use format() for a
+    -- readable failure diagnostic (audit M3) — `is(int, int, format(...))`.
+    RETURN NEXT is(
+      v_v1_chunks_after, 0,
+      format('A3: mark_done deletes chunker_version=1 zombie chunks (before=%s after=%s; expected after=0)',
+             v_v1_chunks_before, v_v1_chunks_after)
+    );
+  END;
 
   -- ════════════════════════════════════════════════════════════════════════
   -- BLOCK B — TRIPWIRE: 3-col UNIQUE (sample_id, chunker_version, chunk_index)

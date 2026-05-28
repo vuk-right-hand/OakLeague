@@ -1200,13 +1200,34 @@ export function makeCorpusReprocessWorker({
         return;
       }
 
-      // Atomic version-checked finish.
+      // Atomic version-checked finish (delegates to corpus_reprocess_finalize
+      // since migration 20260528000001 — per-creator advisory lock + 5s
+      // lock_timeout + DELETE chunker_version=1 + bump current_corpus_version).
       const { data: doneId, error: finErr } = await supabase.rpc(
         'corpus_reprocess_mark_done',
         { p_job_id: jobId, p_claimed_version: claimedVersion },
       );
       if (finErr) {
-        await bumpFailure(jobId, `mark_done_failed:${finErr.message}`);
+        // Step-1b audit M1/M2: distinguish the two errors mark_done can NOW
+        // raise (via finalize) that the prior body never could, so we don't
+        // burn 5 attempts → markJobErrored on transient/fatal-but-not-our-bug:
+        //   55P03 lock_not_available — Day-7 admin_promote_v2_chunks holds the
+        //     same advisory key beyond finalize's 5s lock_timeout. Transient;
+        //     let the reaper requeue after 600s claim TTL. NO bumpFailure.
+        //   02000 no_data_found — creator was DELETEd mid-finalize. CASCADE
+        //     will reap the work; mark errored immediately, no retries.
+        const code = finErr?.code || '';
+        const msg = finErr?.message || '';
+        if (code === '55P03' || /lock_not_available/i.test(msg)) {
+          // cogs_log still flushed by `finally` — we paid for the embed work,
+          // we attribute it; reaper picks the row back up.
+          return;
+        }
+        if (code === '02000' || /creator_disappeared_during_finalize/i.test(msg)) {
+          await markJobErrored(jobId, 'creator_deleted_during_finalize');
+          return;
+        }
+        await bumpFailure(jobId, `mark_done_failed:${msg}`);
         return;
       }
       if (!doneId) {
