@@ -125,6 +125,17 @@ export async function callRetrieveKnowledgeV2({
   budgetMs,
   topK,
   signal,
+  // v3-specific OPTIONAL fields (RAG v3 step 6c). Ignored by the v2 shim
+  // path; the shim dispatches to retrieveKnowledgeV3 when sessions.
+  // retrieval_version_at_session=3 and consumes these. Sending them on a
+  // v2 session is harmless (the Zod schema allows the extra fields but the
+  // v2 orchestrator code doesn't read them).
+  topicTags,
+  rankMode,
+  lambda,
+  topS,
+  nParentPerSection,
+  minSim,
 }) {
   const cfg = getConfig();
   const bodyObj = {
@@ -137,6 +148,13 @@ export async function callRetrieveKnowledgeV2({
     budget_ms: budgetMs,
   };
   if (typeof topK === 'number') bodyObj.top_k = topK;
+  // v3 forward-compat: include only when set. Shim ignores on v2 path.
+  if (Array.isArray(topicTags) && topicTags.length > 0) bodyObj.topic_tags = topicTags;
+  if (typeof rankMode === 'string') bodyObj.rank_mode = rankMode;
+  if (typeof lambda === 'number') bodyObj.lambda = lambda;
+  if (typeof topS === 'number') bodyObj.top_s = topS;
+  if (typeof nParentPerSection === 'number') bodyObj.n_parent_per_section = nParentPerSection;
+  if (typeof minSim === 'number') bodyObj.min_sim = minSim;
   const bodySerialized = JSON.stringify(bodyObj);
   const headers = signRequest({
     secret: cfg.secret,

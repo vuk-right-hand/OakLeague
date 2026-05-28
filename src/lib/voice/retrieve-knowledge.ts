@@ -933,3 +933,639 @@ function toNum(v: number | string | null | undefined): number | null {
 
 // (Day-11 audit S1: removed dead HALFVEC_DIM re-export — callers import
 // directly from './halfvec' when needed.)
+
+// ───────────────────────────────────────────────────────────────────────
+// v3 path — routed hierarchical retrieval (plan §4 items 5+6+7, §5)
+// ───────────────────────────────────────────────────────────────────────
+//
+// Pipeline:
+//   ┌─ budget check                         (shared with v2 — same RPC)
+//   ├─ rewrite(rawUtterance, lastAssistant) (shared with v2)
+//   ├─ embed(rewritten, RETRIEVAL_QUERY)    (shared with v2)
+//   ├─ cache lookup                         (shared with v2 — same row shape)
+//   │   └─ HIT → fetch parents → DONE
+//   ├─ try_build_tsquery(rewritten)         (shared with v2 — same helper)
+//   ├─ _creator_route_sections_v3(creator, vec, topic_tags, top_s)  -- NEW
+//   │   └─ top-S section_ids + scores
+//   ├─ _creator_knowledge_topk_v3(          -- NEW (replaces topk_v2)
+//   │     creator, section_ids, vec, tsq,
+//   │     k_child, n_parent_per_section, min_sim, rank_mode, lambda)
+//   │   └─ top-N parents per section (max S*N total)
+//   ├─ Flat-fallback (plan §2.3): if scoped pass returned 0 rows, refetch
+//   │   ALL section_ids of the creator and re-run topk_v3 over the wider
+//   │   scope. Rank-capped so it can't flood rerank. Guarantees v3 recall
+//   │   floor >= v2's. (Adaptive gap-threshold trigger is a §7 harness
+//   │   knob — start with zero-rows trigger only; widen later.)
+//   ├─ rerank(query, parents, topK)         (shared with v2)
+//   └─ cache upsert                         (shared with v2 — same row shape)
+//
+// SAME RetrievedParent[] shape returned so buildInjectionEnvelope is
+// agnostic. Telemetry gets a new `route: RouteLeg` field + v3-specific
+// retrieve-leg fields (parentScoreTop1, parentRankSource, candidatesFromScope).
+//
+// PROD-SAFETY: this is a NEW orchestrator next to v2, not a refactor.
+// v2 prod traffic is untouched. The shared helper functions (rewrite,
+// embed, cache, rerank, parent fetch) are imported, not duplicated, so a
+// future audit/improvement of those legs benefits both versions.
+
+export type RetrieveKnowledgeV3Args = {
+  supabaseAdmin: SupabaseClient;
+  userId: string;
+  creatorId: string;
+  rawUtterance: string;
+  lastAssistantResponse: string | null;
+  corpusVersionAtSession: number;
+  sessionId: string | null;
+  deadlineMs: number;
+  geminiApiKey: string;
+  voyageApiKey: string;
+  /** Final topK after rerank. Default 5, clamped to [1, 20]. */
+  topK?: number;
+  /** Cache similarity threshold for lookup. Default 0.92. */
+  cacheThreshold?: number;
+  /**
+   * v3-specific: topic tags from the hook the user tapped (soft boost to
+   * route_sections_v3). NULL/empty disables the boost.
+   */
+  topicTags?: string[] | null;
+  /**
+   * v3-specific: parent aggregation rank mode (plan §3b candidates a-d).
+   * 'max' | 'max_blend' (DEFAULT) | 'vec_max' | 'best_child'. The §7
+   * harness pins the prod value before v3 takes traffic.
+   */
+  rankMode?: 'max' | 'max_blend' | 'vec_max' | 'best_child';
+  /** v3-specific: lambda for max_blend. Default 0.10. */
+  lambda?: number;
+  /** v3-specific: p_top_s for route_sections. Default 4. Clamped server-side [1, 10]. */
+  topS?: number;
+  /** v3-specific: p_n_parent_per_section for topk. Default 5. Clamped server-side [1, 20]. */
+  nParentPerSection?: number;
+  /**
+   * v3-specific: p_min_sim for topk (PLACEHOLDER — the §7 harness will
+   * pin this before v3 takes traffic; default 0.30 from v2 is meaningless
+   * for MAX-child ranking).
+   */
+  minSim?: number;
+};
+
+export type RetrieveKnowledgeV3Result = {
+  parents: RetrievedParent[];
+  telemetry: RagTurnTelemetry;
+  budgetExceeded: boolean;
+  rewriteFallback: boolean;
+  /** Number of sections returned by route_sections_v3. */
+  sectionsRouted: number;
+  /**
+   * True when the flat (unscoped) fallback fired. Distinct from
+   * `routePhaseRan`: a cache hit returns sectionsRouted=0,
+   * flatFallbackFired=false, routePhaseRan=false (audit M7 — three
+   * distinct states must be distinguishable for dashboards).
+   */
+  flatFallbackFired: boolean;
+  /**
+   * True when the route_sections_v3 + scoped topk_v3 actually executed
+   * (i.e., the cache did NOT short-circuit). Dashboards filter
+   * `WHERE routePhaseRan = true` to compute routing-only metrics
+   * without including cache-hit turns that bypassed routing.
+   */
+  routePhaseRan: boolean;
+};
+
+export class RetrieveKnowledgeV3Error extends Error {
+  readonly code:
+    | 'budget_check_failed'
+    | 'embed_failed'
+    | 'rpc_failed'
+    | 'empty_utterance'
+    | 'invalid_corpus_version';
+  constructor(code: RetrieveKnowledgeV3Error['code'], msg?: string) {
+    super(msg ?? code);
+    this.name = 'RetrieveKnowledgeV3Error';
+    this.code = code;
+  }
+}
+
+const DEFAULT_V3_TOP_S = 4;
+const DEFAULT_V3_N_PARENT_PER_SECTION = 5;
+const DEFAULT_V3_K_CHILD = 30;
+const DEFAULT_V3_RANK_MODE = 'max_blend' as const;
+const DEFAULT_V3_LAMBDA = 0.10;
+// Per-rank-mode placeholder floors (audit M4). v2's flat 0.30 was tuned for
+// SUM-RRF and is meaningless for MAX-child ranking. These are STILL
+// placeholders — the §7 harness must pin per-mode prod values BEFORE v3
+// takes prod traffic. Per-mode defaults at least make the intent visible
+// (max-modes need a LOWER floor than vec_max).
+const DEFAULT_V3_MIN_SIM_BY_MODE: Record<
+  'max' | 'max_blend' | 'vec_max' | 'best_child',
+  number
+> = {
+  max:        0.20, // MAX(rrf) needs a low floor (rrf scale ~0.01-0.03)
+  max_blend:  0.20, // MAX(rrf) + lambda*ln boost — same scale concerns
+  vec_max:    0.40, // pure cosine — gate higher to avoid distant ranks
+  best_child: 0.20, // MAX(rrf) flavor
+};
+// Flat-fallback hard cap on sections widened to (round-5 C3). Books with
+// 200+ sections would otherwise feed an unbounded ANY filter to topk_v3.
+const FLAT_FALLBACK_MAX_SECTIONS = 50;
+// Flat-fallback budget cap (round-5 C3). The scoped pass burned some of
+// `deadlineMs` already; flat is bounded by min(remaining, this) so it
+// can't blow the §7 3500ms LIVE decoupled ceiling on long-route turns.
+const FLAT_FALLBACK_BUDGET_MS = 800;
+
+export async function retrieveKnowledgeV3(
+  args: RetrieveKnowledgeV3Args,
+): Promise<RetrieveKnowledgeV3Result> {
+  const startedAt = Date.now();
+  const admin = args.supabaseAdmin;
+  const telemetry = newTurnTelemetry({
+    userId: args.userId,
+    sessionId: args.sessionId,
+    creatorId: args.creatorId,
+    retrievalVersion: 3,
+    corpusVersionAtSession: args.corpusVersionAtSession,
+  });
+
+  if (!args.rawUtterance || args.rawUtterance.trim().length === 0) {
+    throw new RetrieveKnowledgeV3Error('empty_utterance');
+  }
+  if (
+    !Number.isInteger(args.corpusVersionAtSession) ||
+    args.corpusVersionAtSession < 1
+  ) {
+    throw new RetrieveKnowledgeV3Error(
+      'invalid_corpus_version',
+      `corpusVersionAtSession must be a positive integer; got ${args.corpusVersionAtSession}`,
+    );
+  }
+
+  try {
+    return await runOrchestratorV3(args, telemetry, startedAt);
+  } finally {
+    telemetry.totalLatencyMs = Date.now() - startedAt;
+    void flushCogsLogRows(admin, toCogsLogRows(telemetry));
+  }
+}
+
+async function runOrchestratorV3(
+  args: RetrieveKnowledgeV3Args,
+  telemetry: RagTurnTelemetry,
+  startedAt: number,
+): Promise<RetrieveKnowledgeV3Result> {
+  const admin = args.supabaseAdmin;
+  const topK = Math.max(1, Math.min(args.topK ?? DEFAULT_TOP_K, MAX_TOP_K));
+  const cacheThreshold = args.cacheThreshold ?? CACHE_DEFAULT_THRESHOLD;
+  const deadlineMs = args.deadlineMs;
+  const topS = args.topS ?? DEFAULT_V3_TOP_S;
+  const nParentPerSection = args.nParentPerSection ?? DEFAULT_V3_N_PARENT_PER_SECTION;
+  const rankMode = args.rankMode ?? DEFAULT_V3_RANK_MODE;
+  const lambda = args.lambda ?? DEFAULT_V3_LAMBDA;
+  // M4: per-mode minSim default — vec_max needs a higher floor than max-rrf modes.
+  const minSim = args.minSim ?? DEFAULT_V3_MIN_SIM_BY_MODE[rankMode];
+  const topicTags = args.topicTags && args.topicTags.length > 0 ? args.topicTags : null;
+
+  const done = (
+    parents: RetrievedParent[],
+    budgetExceeded: boolean,
+    rewriteFallback: boolean,
+    sectionsRouted: number,
+    flatFallbackFired: boolean,
+    routePhaseRan: boolean,
+  ): RetrieveKnowledgeV3Result => {
+    telemetry.totalLatencyMs = Date.now() - startedAt;
+    if (process.env.RAG_DIAG_LOGS === '1') {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[retrieve-knowledge-v3] timing: rewrite=${telemetry.rewrite?.latencyMs ?? 'na'} `
+        + `embed=${telemetry.embed?.latencyMs ?? 'na'} route=${telemetry.route?.latencyMs ?? 'na'} `
+        + `topk=${telemetry.retrieve?.latencyMs ?? 'na'} rerank=${telemetry.rerank?.latencyMs ?? 'na'} `
+        + `total=${telemetry.totalLatencyMs} sectionsRouted=${sectionsRouted} `
+        + `flat=${flatFallbackFired} routeRan=${routePhaseRan}`,
+      );
+    }
+    return {
+      parents, telemetry, budgetExceeded, rewriteFallback,
+      sectionsRouted, flatFallbackFired, routePhaseRan,
+    };
+  };
+
+  // 1. Budget check (same as v2).
+  let budgetOk: boolean | null = null;
+  try {
+    const { data, error } = await withDeadline(
+      admin.rpc('voice_retrieval_budget_check_and_increment', {
+        p_user_id: args.userId,
+        p_limit: 200,
+      }),
+      deadlineMs,
+      'budget_check',
+    );
+    if (error) throw new RetrieveKnowledgeV3Error('budget_check_failed', error.message);
+    budgetOk = data as boolean;
+  } catch (e) {
+    if (isDeadlineExceeded(e)) {
+      throw new RetrieveKnowledgeV3Error('budget_check_failed', 'deadline_exceeded');
+    }
+    throw e;
+  }
+  if (budgetOk === false) {
+    telemetry.budgetExceeded = true;
+    return done([], true, false, 0, false, false);
+  }
+
+  // 2. Rewrite (same as v2).
+  const rewriteResult = await rewriteQuery({
+    userUtterance: args.rawUtterance,
+    lastAssistantResponse: args.lastAssistantResponse,
+    geminiApiKey: args.geminiApiKey,
+    deadlineMs,
+  });
+  telemetry.rewrite = {
+    modelId: rewriteResult.modelId,
+    fallback: rewriteResult.fallback,
+    fallbackReason: rewriteResult.fallbackReason,
+    inputTokens: rewriteResult.inputTokens,
+    outputTokens: rewriteResult.outputTokens,
+    usdPerInputToken: rewriteResult.usdPerInputToken,
+    usdPerOutputToken: rewriteResult.usdPerOutputToken,
+    quotedAt: QUERY_REWRITE_QUOTED_AT,
+    latencyMs: rewriteResult.latencyMs,
+    noContextAfterResumption: rewriteResult.noContextAfterResumption,
+  };
+  const rewrittenText =
+    rewriteResult.rewritten && rewriteResult.rewritten.length > 0
+      ? rewriteResult.rewritten
+      : args.rawUtterance;
+
+  // 3. Embed (same as v2).
+  const embedStart = Date.now();
+  let queryVec: number[];
+  let embedTokens: number;
+  try {
+    const { vectors, tokens } = await withDeadline(
+      embedTexts({ texts: [rewrittenText.slice(0, 8000)], taskType: 'RETRIEVAL_QUERY' }),
+      deadlineMs,
+      'embed',
+    );
+    queryVec = vectors[0];
+    embedTokens = tokens;
+  } catch (e) {
+    const msg = (e as Error)?.message ?? 'embed_failed';
+    throw new RetrieveKnowledgeV3Error(
+      'embed_failed',
+      isDeadlineExceeded(e) ? 'deadline_exceeded' : msg,
+    );
+  }
+  telemetry.embed = {
+    modelId: EMBEDDING_MODEL,
+    inputTokens: embedTokens,
+    usdPerInputToken: EMBEDDING_USD_PER_TOKEN,
+    quotedAt: EMBEDDING_QUOTED_AT,
+    latencyMs: Date.now() - embedStart,
+  };
+
+  // 4. Cache lookup (same as v2 — semantic_query_cache is creator+corpus_version-keyed
+  // and version-agnostic; a v3 hit returns the same RetrievedParent[] shape).
+  let parents: RetrievedParent[] = [];
+  const canTouchCache = !rewriteResult.fallback && !CACHE_DISABLED;
+  if (canTouchCache) {
+    let hit: Awaited<ReturnType<typeof lookupCache>> | null = null;
+    try {
+      hit = await withDeadline(
+        lookupCache({
+          client: admin,
+          creatorId: args.creatorId,
+          corpusVersion: args.corpusVersionAtSession,
+          queryVec,
+          threshold: cacheThreshold,
+        }),
+        deadlineMs,
+        'cache_lookup',
+      );
+    } catch (e) {
+      const why = isDeadlineExceeded(e) ? 'deadline_exceeded' : (e as Error)?.message ?? 'unknown';
+      // eslint-disable-next-line no-console
+      console.warn(`[retrieve-knowledge-v3] cache lookup fail-open: ${why}`);
+    }
+    if (hit) {
+      telemetry.cacheHit = true;
+      telemetry.cacheAgeSeconds = hit.ageSeconds;
+      const fetched = await fetchParentNarrativesByIds({
+        admin, creatorId: args.creatorId, ids: hit.parentUnitIds, deadlineMs,
+      });
+      if (fetched.length < hit.parentUnitIds.length) {
+        telemetry.cacheStaleCorpus = true;
+      }
+      if (fetched.length === 0) {
+        telemetry.cacheHit = false;
+        // Fall through to fresh retrieve.
+      } else {
+        const idToScore = new Map<string, number>();
+        hit.parentUnitIds.forEach((id, i) => idToScore.set(id, hit.scores[i] ?? 0));
+        parents = fetched
+          .map((n) => ({
+            parentUnitId: n.id,
+            text: n.text,
+            title: n.title,
+            sourceType: n.sourceType,
+            score: idToScore.get(n.id) ?? null,
+            scoreSource: 'cache' as const,
+          }))
+          .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+          .slice(0, topK);
+        // Cache hit: routePhaseRan=false (the route + scoped topk never executed).
+        return done(parents, false, rewriteResult.fallback, 0, false, false);
+      }
+    }
+  }
+
+  // 5a. ROUTE — pick top-S sections.
+  const routeStart = Date.now();
+  type RouteRow = {
+    section_id: string;
+    sample_id: string;
+    title: string | null;
+    summary_sim: number | string;
+    centroid_sim: number | string;
+    topic_boost: number | string;
+    score: number | string;
+  };
+  let routeRows: RouteRow[] = [];
+  try {
+    const { data: rows, error } = await withDeadline(
+      admin.rpc('_creator_route_sections_v3', {
+        p_creator_id: args.creatorId,
+        p_query_vec: vectorToPgText(queryVec),
+        p_topic_tags: topicTags,
+        p_top_s: topS,
+        p_min_sim: 0.0, // routing uses its own internal floor; don't double-gate
+      }),
+      deadlineMs,
+      'route_sections_v3',
+    );
+    if (error) throw new RetrieveKnowledgeV3Error('rpc_failed', `route_sections_v3: ${error.message}`);
+    routeRows = Array.isArray(rows) ? (rows as RouteRow[]) : [];
+  } catch (e) {
+    if (e instanceof RetrieveKnowledgeV3Error) throw e;
+    if (isDeadlineExceeded(e)) {
+      throw new RetrieveKnowledgeV3Error('rpc_failed', 'route_sections_v3: deadline_exceeded');
+    }
+    throw e;
+  }
+  const sectionIdsScoped = routeRows.map((r) => r.section_id);
+  const routeTop1 = routeRows.length > 0 ? toNum(routeRows[0].score) : null;
+  const routeTop2 = routeRows.length > 1 ? toNum(routeRows[1].score) : null;
+  const routeGap =
+    routeTop1 !== null && routeTop2 !== null ? routeTop1 - routeTop2 : null;
+
+  // 5b. tsquery (same as v2 — shared helper). `tsqStart` is the boundary
+  // between the route leg and the topk leg for the M1 latency split.
+  const tsqStart = Date.now();
+  let tsq = '';
+  try {
+    const { data: tsqData, error: tsqErr } = await withDeadline(
+      admin.rpc('try_build_tsquery', { p_text: rewrittenText.slice(0, 4000) }),
+      deadlineMs,
+      'try_build_tsquery',
+    );
+    if (tsqErr) throw new RetrieveKnowledgeV3Error('rpc_failed', `try_build_tsquery: ${tsqErr.message}`);
+    tsq = (tsqData as string) ?? '';
+  } catch (e) {
+    if (e instanceof RetrieveKnowledgeV3Error) throw e;
+    if (isDeadlineExceeded(e)) {
+      throw new RetrieveKnowledgeV3Error('rpc_failed', 'try_build_tsquery: deadline_exceeded');
+    }
+    throw e;
+  }
+
+  // 5c. Scoped topk_v3 over routed sections.
+  type RpcRowV3 = {
+    parent_unit_id: string;
+    parent_text: string;
+    parent_title: string | null;
+    sample_id: string;
+    source_type: string;
+    section_id: string;
+    vector_score: number | string;
+    bm25_score: number | string;
+    rrf_score: number | string;
+    parent_score: number | string;
+    matched_child_chunk_ids: string[];
+  };
+  const callTopk = async (sectionIds: string[]): Promise<RpcRowV3[]> => {
+    if (sectionIds.length === 0) return [];
+    const { data: rows, error } = await withDeadline(
+      admin.rpc('_creator_knowledge_topk_v3', {
+        p_creator_id: args.creatorId,
+        p_section_ids: sectionIds,
+        p_query_vec: vectorToPgText(queryVec),
+        p_query_tsq: tsq,
+        p_k_child: DEFAULT_V3_K_CHILD,
+        p_n_parent_per_section: nParentPerSection,
+        p_min_sim: minSim,
+        p_rank_mode: rankMode,
+        p_lambda: lambda,
+      }),
+      deadlineMs,
+      'topk_v3',
+    );
+    if (error) throw new RetrieveKnowledgeV3Error('rpc_failed', `topk_v3: ${error.message}`);
+    if (!Array.isArray(rows)) {
+      // eslint-disable-next-line no-console
+      console.warn(`[retrieve-knowledge-v3] topk_v3 returned non-array: ${typeof rows}`);
+      return [];
+    }
+    return rows as RpcRowV3[];
+  };
+
+  let rows: RpcRowV3[] = [];
+  let candidatesFromScope = 0;
+  let flatFallbackFired = false;
+  let scopedTopkLatencyMs = 0;
+  let flatLatencyMs: number | null = null;
+  const scopedTopkStart = Date.now();
+  try {
+    rows = await callTopk(sectionIdsScoped);
+    candidatesFromScope = rows.length;
+  } catch (e) {
+    if (e instanceof RetrieveKnowledgeV3Error) throw e;
+    if (isDeadlineExceeded(e)) {
+      throw new RetrieveKnowledgeV3Error('rpc_failed', 'topk_v3: deadline_exceeded');
+    }
+    throw e;
+  }
+  scopedTopkLatencyMs = Date.now() - scopedTopkStart;
+
+  // 5d. Flat fallback (plan §2.3) -- fires when scoped pass returned 0 rows.
+  // Adaptive gap-threshold trigger is a §7 harness knob; ship with the
+  // zero-rows trigger so v3's recall floor >= v2's even on a routing miss.
+  //
+  // Round-5 C3: BOUNDED. (a) tighter deadline (FLAT_FALLBACK_BUDGET_MS or
+  // remaining, whichever is smaller) so flat can't blow the §7 3500ms LIVE
+  // ceiling on long-route turns; (b) hard cap on section count
+  // (FLAT_FALLBACK_MAX_SECTIONS) so a 200-section book doesn't feed a
+  // 200-uuid ANY filter to topk_v3.
+  if (rows.length === 0 && sectionIdsScoped.length > 0) {
+    const flatStart = Date.now();
+    const flatDeadlineMs = Math.min(deadlineMs, flatStart + FLAT_FALLBACK_BUDGET_MS);
+    try {
+      const { data: allSections, error: secErr } = await withDeadline(
+        admin
+          .from('sample_content_sections')
+          .select('id')
+          .eq('creator_id', args.creatorId)
+          .order('section_index', { ascending: true })
+          .limit(FLAT_FALLBACK_MAX_SECTIONS),
+        flatDeadlineMs,
+        'flat_sections_fetch',
+      );
+      if (!secErr && Array.isArray(allSections) && allSections.length > 0) {
+        const allIds = (allSections as Array<{ id: string }>).map((r) => r.id);
+        // callTopk reads `deadlineMs` from closure; the flat call needs to
+        // race against the TIGHTER `flatDeadlineMs`. Inline the call here
+        // with the tight deadline rather than restructure callTopk.
+        const { data: flatRpcRows, error: flatErr } = await withDeadline(
+          admin.rpc('_creator_knowledge_topk_v3', {
+            p_creator_id: args.creatorId,
+            p_section_ids: allIds,
+            p_query_vec: vectorToPgText(queryVec),
+            p_query_tsq: tsq,
+            p_k_child: DEFAULT_V3_K_CHILD,
+            p_n_parent_per_section: nParentPerSection,
+            p_min_sim: minSim,
+            p_rank_mode: rankMode,
+            p_lambda: lambda,
+          }),
+          flatDeadlineMs,
+          'topk_v3_flat',
+        );
+        if (!flatErr && Array.isArray(flatRpcRows) && flatRpcRows.length > 0) {
+          rows = flatRpcRows as RpcRowV3[];
+          flatFallbackFired = true;
+        }
+      }
+    } catch (e) {
+      const why = isDeadlineExceeded(e) ? 'deadline_exceeded' : (e as Error)?.message ?? 'unknown';
+      // eslint-disable-next-line no-console
+      console.warn(`[retrieve-knowledge-v3] flat fallback fail-open: ${why}`);
+    }
+    flatLatencyMs = Date.now() - flatStart;
+  }
+
+  telemetry.route = {
+    sectionsReturned: routeRows.length,
+    sectionTop1Score: routeTop1,
+    sectionTop1to2Gap: routeGap,
+    flatFallbackFired,
+    // Round-5 M1: split latencies (route alone, scoped topk alone, flat alone).
+    latencyMs: tsqStart - routeStart,
+    scopedTopkLatencyMs,
+    flatLatencyMs,
+  };
+  telemetry.retrieve = {
+    parentsReturned: rows.length,
+    vectorTop1Score: rows.length > 0 ? toNum(rows[0].vector_score) : null,
+    bm25Top1Score: rows.length > 0 ? toNum(rows[0].bm25_score) : null,
+    rrfTop1Score: rows.length > 0 ? toNum(rows[0].rrf_score) : null,
+    parentScoreTop1: rows.length > 0 ? toNum(rows[0].parent_score) : null,
+    parentRankSource: rankMode,
+    candidatesFromScope,
+    // M1: this is the scoped topk alone; flat is in route.flatLatencyMs.
+    latencyMs: scopedTopkLatencyMs,
+  };
+
+  if (rows.length === 0) {
+    return done([], false, rewriteResult.fallback, routeRows.length, flatFallbackFired, true);
+  }
+
+  // 6. Rerank (same as v2).
+  const candidates: RerankCandidate[] = rows.map((r) => ({
+    id: r.parent_unit_id, text: r.parent_text,
+  }));
+  const rowsById = new Map<string, RpcRowV3>();
+  rows.forEach((r) => rowsById.set(r.parent_unit_id, r));
+  const bridge = getRerankBridge();
+  const rerankResult = await bridge.rerank({
+    voyageApiKey: args.voyageApiKey,
+    query: rewrittenText,
+    candidates,
+    topK,
+    deadlineMs,
+  });
+  telemetry.rerank = {
+    provider: rerankResult.provider,
+    modelId: rerankResult.modelId,
+    fallback: rerankResult.fallback,
+    fallbackReason: rerankResult.fallback ? rerankResult.fallbackReason : undefined,
+    rerankTop1Score:
+      !rerankResult.fallback && rerankResult.reranked.length > 0
+        ? rerankResult.reranked[0].score
+        : null,
+    inputTokens: rerankResult.inputTokens,
+    usdPerInputToken: rerankResult.usdPerInputToken,
+    quotedAt: VOYAGE_RERANK_QUOTED_AT,
+    latencyMs: rerankResult.latencyMs,
+  };
+
+  parents = [];
+  for (const r of rerankResult.reranked) {
+    const row = rowsById.get(r.id);
+    if (!row) {
+      // eslint-disable-next-line no-console
+      console.warn(`[retrieve-knowledge-v3] rerank returned unknown id=${r.id}`);
+      continue;
+    }
+    parents.push({
+      parentUnitId: row.parent_unit_id,
+      text: row.parent_text,
+      title: row.parent_title,
+      sourceType: row.source_type,
+      score: r.score,
+      scoreSource: rerankResult.fallback ? ('rrf' as const) : ('rerank' as const),
+    });
+  }
+
+  // 7. Cache upsert.
+  // Round-5 C2: gate on `!flatFallbackFired && !topicTags`. The
+  // semantic_query_cache key is `(creator, corpus_version, query_vec)` --
+  // NOT keyed on `topic_tags` or `rank_mode`. Caching parents from:
+  //   (a) the flat fallback (parents from sections the router did NOT
+  //       route to) would poison the cache: a next-session scoped pass
+  //       on the same query would never get to run because the cache hits
+  //       FIRST and serves the wrong-scope parents.
+  //   (b) a tag-boosted route (topicTags set) would similarly poison: a
+  //       next-session caller with DIFFERENT topicTags gets the writer's
+  //       parents.
+  // Full fix is a schema change (add tags + rank_mode + flat-fired to the
+  // cache key) -- tracked in CLEANUP_BACKLOG. Until then, the safe move
+  // is to NOT write these cases at all -- a missed cache write costs one
+  // extra retrieval per next-turn; a poisoned cache costs WRONG retrieval
+  // for the cache TTL (7 days).
+  const cacheUpsertSafe = !flatFallbackFired && !topicTags;
+  if (canTouchCache && cacheUpsertSafe && parents.length > 0 && !rerankResult.fallback) {
+    let upsertResult: Awaited<ReturnType<typeof upsertCache>> | null = null;
+    try {
+      upsertResult = await withDeadline(
+        upsertCache({
+          client: admin,
+          creatorId: args.creatorId,
+          corpusVersion: args.corpusVersionAtSession,
+          queryVec,
+          rewrittenText,
+          parentUnitIds: parents.map((p) => p.parentUnitId),
+          scores: parents.map((p) => (Number.isFinite(p.score) ? (p.score as number) : 0)),
+        }),
+        deadlineMs,
+        'cache_upsert',
+      );
+    } catch (e) {
+      const why = isDeadlineExceeded(e) ? 'deadline_exceeded' : (e as Error)?.message ?? 'unknown';
+      // eslint-disable-next-line no-console
+      console.warn(`[retrieve-knowledge-v3] cache upsert fail-open: ${why}`);
+    }
+    if (upsertResult && !upsertResult.ok && upsertResult.reason === 'stale_corpus') {
+      telemetry.cacheStaleCorpus = true;
+    }
+  }
+
+  return done(parents, false, rewriteResult.fallback, routeRows.length, flatFallbackFired, true);
+}

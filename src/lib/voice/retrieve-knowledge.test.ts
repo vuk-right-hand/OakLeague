@@ -31,7 +31,9 @@ vi.mock('@google/genai', () => ({
 
 import {
   retrieveKnowledgeV2,
+  retrieveKnowledgeV3,
   RetrieveKnowledgeV2Error,
+  RetrieveKnowledgeV3Error,
   parentsToPassages,
 } from './retrieve-knowledge';
 import { _resetTokenBucketForTests } from './rerank';
@@ -736,5 +738,347 @@ describe('retrieveKnowledgeV2 — telemetry assembly', () => {
     expect(rows.some((r) => r.operation === 'rewrite')).toBe(true);
     expect(rows.some((r) => r.operation === 'embedding')).toBe(true);
     expect(rows.some((r) => r.operation === 'rerank')).toBe(true);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+// v3 fixtures + tests — routed hierarchical retrieval (plan §4 items 5+6+7)
+// ───────────────────────────────────────────────────────────────────────
+
+function makeRouteRow(i: number, score = 0.95 - i * 0.05) {
+  return {
+    section_id: `sec-${i}`,
+    sample_id: 'sample-1',
+    title: `Section ${i}`,
+    summary_sim: score,
+    centroid_sim: score - 0.02,
+    topic_boost: 0.05,
+    score,
+  };
+}
+
+function makeRpcRowV3(i: number, score = 0.9 - i * 0.1) {
+  return {
+    parent_unit_id: `pu-${i}`,
+    parent_text: `v3 parent ${i} text about workplace dynamics in depth.`,
+    parent_title: `V3 Parent ${i}`,
+    sample_id: 'sample-1',
+    source_type: 'transcript',
+    section_id: `sec-${i % 2}`,
+    vector_score: score,
+    bm25_score: score - 0.1,
+    rrf_score: score * 0.5,
+    parent_score: score,
+    matched_child_chunk_ids: [`c${i}-1`, `c${i}-2`],
+  };
+}
+
+/**
+ * v3 admin builder. Extends v2 fixture with route_sections + topk_v3 +
+ * optional flat-fallback sections fetch. Defaults preserve a happy-path
+ * scoped pass (no fallback needed).
+ */
+function buildAdminV3(opts: {
+  budget?: boolean;
+  cacheLookupHit?: {
+    parent_unit_ids: string[];
+    scores: number[];
+    age_seconds: number;
+    cached_row_id: string;
+  } | null;
+  tsq?: string;
+  routeRows?: ReturnType<typeof makeRouteRow>[];
+  topkV3Rows?: ReturnType<typeof makeRpcRowV3>[];
+  /** Rows for the SECOND topk_v3 call (flat fallback). Default empty (no fallback). */
+  topkV3FlatRows?: ReturnType<typeof makeRpcRowV3>[];
+  /** Sections returned by the all-sections fetch used by the flat fallback. */
+  allSectionsRows?: Array<{ id: string }>;
+  cacheUpsertResult?: string | null;
+  parentFetchRows?: ParentRow[];
+  parentFetchError?: { message: string } | null;
+  cogsLogError?: { message: string } | null;
+}) {
+  const rpcCalls: Array<{ name: string; args: unknown }> = [];
+  let topkV3CallCount = 0;
+  const rpc = vi.fn(async (name: string, args: unknown) => {
+    rpcCalls.push({ name, args });
+    switch (name) {
+      case 'voice_retrieval_budget_check_and_increment':
+        return { data: opts.budget ?? true, error: null };
+      case 'semantic_query_cache_lookup':
+        return { data: opts.cacheLookupHit ? [opts.cacheLookupHit] : [], error: null };
+      case '_creator_route_sections_v3':
+        return { data: opts.routeRows ?? [], error: null };
+      case 'try_build_tsquery':
+        return { data: opts.tsq ?? 'difficult & coworkers', error: null };
+      case '_creator_knowledge_topk_v3': {
+        topkV3CallCount += 1;
+        // First call = scoped pass; second = flat fallback.
+        const rows = topkV3CallCount === 1 ? (opts.topkV3Rows ?? []) : (opts.topkV3FlatRows ?? []);
+        return { data: rows, error: null };
+      }
+      case 'semantic_query_cache_upsert':
+        return { data: opts.cacheUpsertResult === undefined ? 'cache-row-uuid' : opts.cacheUpsertResult, error: null };
+      default:
+        return { data: null, error: { message: `unmocked rpc: ${name}` } };
+    }
+  });
+
+  const insertSpy = vi.fn().mockResolvedValue({ error: opts.cogsLogError ?? null });
+  const fromSpy = vi.fn((table: string) => {
+    if (table === 'sample_content_narrative_units') {
+      const inSpy = vi.fn().mockResolvedValue({
+        data: opts.parentFetchRows ?? [],
+        error: opts.parentFetchError ?? null,
+      });
+      const eqSpy = vi.fn().mockReturnValue({ in: inSpy });
+      const selectSpy = vi.fn().mockReturnValue({ eq: eqSpy });
+      return { select: selectSpy };
+    }
+    if (table === 'sample_content_sections') {
+      // Used by the flat fallback to enumerate all sections of the creator.
+      // Chain shape (post-round-5 C3): .select().eq().order().limit() returns thenable.
+      const limitResolver = vi.fn().mockResolvedValue({
+        data: opts.allSectionsRows ?? [],
+        error: null,
+      });
+      const orderSpy = vi.fn().mockReturnValue({ limit: limitResolver });
+      const eqSpy = vi.fn().mockReturnValue({ order: orderSpy });
+      const selectSpy = vi.fn().mockReturnValue({ eq: eqSpy });
+      return { select: selectSpy };
+    }
+    if (table === 'cogs_log') {
+      return { insert: insertSpy };
+    }
+    throw new Error(`unmocked table: ${table}`);
+  });
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return { admin: { rpc, from: fromSpy } as any, rpcCalls, insertSpy, fromSpy };
+}
+
+describe('retrieveKnowledgeV3 — pre-flight', () => {
+  it('throws empty_utterance on whitespace input', async () => {
+    const { admin } = buildAdminV3({});
+    await expect(
+      retrieveKnowledgeV3({ ...BASE_ARGS, supabaseAdmin: admin, rawUtterance: '  ' }),
+    ).rejects.toBeInstanceOf(RetrieveKnowledgeV3Error);
+  });
+
+  it('throws invalid_corpus_version on zero', async () => {
+    const { admin } = buildAdminV3({});
+    try {
+      await retrieveKnowledgeV3({
+        ...BASE_ARGS,
+        supabaseAdmin: admin,
+        corpusVersionAtSession: 0,
+      });
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(RetrieveKnowledgeV3Error);
+      expect((e as RetrieveKnowledgeV3Error).code).toBe('invalid_corpus_version');
+    }
+  });
+});
+
+describe('retrieveKnowledgeV3 — budget exceeded', () => {
+  it('returns empty + budgetExceeded:true on budget=false', async () => {
+    mockRewriteOk();
+    mockEmbedOk();
+    const { admin } = buildAdminV3({ budget: false });
+    const r = await retrieveKnowledgeV3({ ...BASE_ARGS, supabaseAdmin: admin });
+    expect(r.budgetExceeded).toBe(true);
+    expect(r.parents).toEqual([]);
+    expect(r.sectionsRouted).toBe(0);
+    expect(r.flatFallbackFired).toBe(false);
+  });
+});
+
+describe('retrieveKnowledgeV3 — happy path (route → scoped topk → rerank)', () => {
+  it('routes sections, runs scoped topk_v3, reranks, returns parents', async () => {
+    mockRewriteOk();
+    mockEmbedOk();
+    const { admin, rpcCalls } = buildAdminV3({
+      routeRows: [makeRouteRow(0), makeRouteRow(1), makeRouteRow(2)],
+      topkV3Rows: [makeRpcRowV3(0), makeRpcRowV3(1), makeRpcRowV3(2)],
+    });
+    const r = await retrieveKnowledgeV3({ ...BASE_ARGS, supabaseAdmin: admin });
+
+    expect(r.sectionsRouted).toBe(3);
+    expect(r.flatFallbackFired).toBe(false);
+    expect(r.parents.length).toBe(3);
+    expect(r.parents.every((p) => p.scoreSource === 'rerank')).toBe(true);
+    // Route RPC was called once.
+    const routeCalls = rpcCalls.filter((c) => c.name === '_creator_route_sections_v3');
+    expect(routeCalls.length).toBe(1);
+    // topk_v3 called once (scoped) — no fallback.
+    const topkCalls = rpcCalls.filter((c) => c.name === '_creator_knowledge_topk_v3');
+    expect(topkCalls.length).toBe(1);
+    // Verify scoped call carries the routed section ids.
+    const scopedArgs = topkCalls[0].args as Record<string, unknown>;
+    expect(scopedArgs.p_section_ids).toEqual(['sec-0', 'sec-1', 'sec-2']);
+    // Telemetry assembled.
+    expect(r.telemetry.route?.sectionsReturned).toBe(3);
+    expect(r.telemetry.route?.flatFallbackFired).toBe(false);
+    expect(r.telemetry.retrieve?.parentRankSource).toBe('max_blend');
+    expect(r.telemetry.retrieve?.candidatesFromScope).toBe(3);
+  });
+});
+
+describe('retrieveKnowledgeV3 — flat fallback fires on zero scoped rows', () => {
+  it('refetches all sections + reruns topk_v3 when scoped returned 0', async () => {
+    mockRewriteOk();
+    mockEmbedOk();
+    const { admin, rpcCalls } = buildAdminV3({
+      routeRows: [makeRouteRow(0), makeRouteRow(1)],
+      topkV3Rows: [],                                          // scoped: zero
+      allSectionsRows: [{ id: 'sec-0' }, { id: 'sec-1' }, { id: 'sec-2' }, { id: 'sec-3' }],
+      topkV3FlatRows: [makeRpcRowV3(0), makeRpcRowV3(1)],     // flat: 2 rows
+    });
+    const r = await retrieveKnowledgeV3({ ...BASE_ARGS, supabaseAdmin: admin });
+    expect(r.flatFallbackFired).toBe(true);
+    expect(r.parents.length).toBe(2);
+    expect(r.telemetry.route?.flatFallbackFired).toBe(true);
+    // topk_v3 was called TWICE (scoped + flat).
+    const topkCalls = rpcCalls.filter((c) => c.name === '_creator_knowledge_topk_v3');
+    expect(topkCalls.length).toBe(2);
+    // candidatesFromScope reflects the scoped count (0), not the flat count.
+    expect(r.telemetry.retrieve?.candidatesFromScope).toBe(0);
+  });
+
+  it('does NOT fire fallback when scoped pass had results', async () => {
+    mockRewriteOk();
+    mockEmbedOk();
+    const { admin, rpcCalls } = buildAdminV3({
+      routeRows: [makeRouteRow(0)],
+      topkV3Rows: [makeRpcRowV3(0)],
+      // allSectionsRows + topkV3FlatRows present but should NOT be consumed.
+      allSectionsRows: [{ id: 'sec-0' }, { id: 'sec-1' }],
+      topkV3FlatRows: [makeRpcRowV3(5)],
+    });
+    const r = await retrieveKnowledgeV3({ ...BASE_ARGS, supabaseAdmin: admin });
+    expect(r.flatFallbackFired).toBe(false);
+    const topkCalls = rpcCalls.filter((c) => c.name === '_creator_knowledge_topk_v3');
+    expect(topkCalls.length).toBe(1);
+  });
+
+  it('does NOT fire fallback when routing returned ZERO sections (no scoped attempt to fall back FROM)', async () => {
+    mockRewriteOk();
+    mockEmbedOk();
+    const { admin, rpcCalls } = buildAdminV3({
+      routeRows: [],         // routing returned nothing — likely empty creator
+      topkV3Rows: [],
+    });
+    const r = await retrieveKnowledgeV3({ ...BASE_ARGS, supabaseAdmin: admin });
+    expect(r.sectionsRouted).toBe(0);
+    expect(r.flatFallbackFired).toBe(false);
+    expect(r.parents).toEqual([]);
+    // callTopk short-circuits empty section_ids before the RPC fires (perf),
+    // AND the fallback only triggers when sectionIdsScoped.length > 0.
+    // So topk_v3 wasn't called at all on this path.
+    const topkCalls = rpcCalls.filter((c) => c.name === '_creator_knowledge_topk_v3');
+    expect(topkCalls.length).toBe(0);
+  });
+});
+
+describe('retrieveKnowledgeV3 — rank-mode + topic tags propagation', () => {
+  it('forwards p_rank_mode, p_lambda, p_topic_tags, p_top_s, p_n_parent_per_section, p_min_sim', async () => {
+    mockRewriteOk();
+    mockEmbedOk();
+    const { admin, rpcCalls } = buildAdminV3({
+      routeRows: [makeRouteRow(0)],
+      topkV3Rows: [makeRpcRowV3(0)],
+    });
+    await retrieveKnowledgeV3({
+      ...BASE_ARGS,
+      supabaseAdmin: admin,
+      topicTags: ['topic-a', 'topic-b'],
+      rankMode: 'vec_max',
+      lambda: 0.25,
+      topS: 7,
+      nParentPerSection: 8,
+      minSim: 0.42,
+    });
+
+    const routeCall = rpcCalls.find((c) => c.name === '_creator_route_sections_v3');
+    expect(routeCall).toBeTruthy();
+    const routeArgs = routeCall!.args as Record<string, unknown>;
+    expect(routeArgs.p_topic_tags).toEqual(['topic-a', 'topic-b']);
+    expect(routeArgs.p_top_s).toBe(7);
+
+    const topkCall = rpcCalls.find((c) => c.name === '_creator_knowledge_topk_v3');
+    const topkArgs = topkCall!.args as Record<string, unknown>;
+    expect(topkArgs.p_rank_mode).toBe('vec_max');
+    expect(topkArgs.p_lambda).toBe(0.25);
+    expect(topkArgs.p_n_parent_per_section).toBe(8);
+    expect(topkArgs.p_min_sim).toBe(0.42);
+  });
+
+  it('passes null p_topic_tags when none given (no soft boost)', async () => {
+    mockRewriteOk();
+    mockEmbedOk();
+    const { admin, rpcCalls } = buildAdminV3({
+      routeRows: [makeRouteRow(0)],
+      topkV3Rows: [makeRpcRowV3(0)],
+    });
+    await retrieveKnowledgeV3({ ...BASE_ARGS, supabaseAdmin: admin });
+    const routeCall = rpcCalls.find((c) => c.name === '_creator_route_sections_v3');
+    const routeArgs = routeCall!.args as Record<string, unknown>;
+    expect(routeArgs.p_topic_tags).toBeNull();
+  });
+});
+
+describe('retrieveKnowledgeV3 — cache HIT short-circuits before route', () => {
+  it('returns cached parents + does NOT call route_sections', async () => {
+    mockRewriteOk();
+    mockEmbedOk();
+    const { admin, rpcCalls } = buildAdminV3({
+      cacheLookupHit: {
+        parent_unit_ids: ['pu-0', 'pu-1'],
+        scores: [0.91, 0.74],
+        age_seconds: 42,
+        cached_row_id: 'crid',
+      },
+      parentFetchRows: [
+        {
+          id: 'pu-0',
+          text: 'Cached parent 0 text',
+          title: 'Cached 0',
+          sample_content: { source_type: 'transcript' },
+        },
+        {
+          id: 'pu-1',
+          text: 'Cached parent 1 text',
+          title: 'Cached 1',
+          sample_content: { source_type: 'transcript' },
+        },
+      ],
+    });
+    const r = await retrieveKnowledgeV3({ ...BASE_ARGS, supabaseAdmin: admin });
+    expect(r.parents.length).toBe(2);
+    expect(r.parents.every((p) => p.scoreSource === 'cache')).toBe(true);
+    expect(r.sectionsRouted).toBe(0);
+    expect(rpcCalls.find((c) => c.name === '_creator_route_sections_v3')).toBeUndefined();
+    expect(rpcCalls.find((c) => c.name === '_creator_knowledge_topk_v3')).toBeUndefined();
+  });
+});
+
+describe('retrieveKnowledgeV3 — telemetry shape', () => {
+  it('records route leg + retrieve leg v3-specific fields', async () => {
+    mockRewriteOk();
+    mockEmbedOk();
+    const { admin } = buildAdminV3({
+      routeRows: [makeRouteRow(0, 0.95), makeRouteRow(1, 0.80), makeRouteRow(2, 0.78)],
+      topkV3Rows: [makeRpcRowV3(0, 0.92), makeRpcRowV3(1, 0.81)],
+    });
+    const r = await retrieveKnowledgeV3({ ...BASE_ARGS, supabaseAdmin: admin });
+    expect(r.telemetry.retrievalVersion).toBe(3);
+    expect(r.telemetry.route).toBeTruthy();
+    expect(r.telemetry.route?.sectionsReturned).toBe(3);
+    expect(r.telemetry.route?.sectionTop1Score).toBeCloseTo(0.95, 5);
+    expect(r.telemetry.route?.sectionTop1to2Gap).toBeCloseTo(0.15, 5);
+    expect(r.telemetry.retrieve?.parentRankSource).toBe('max_blend');
+    expect(r.telemetry.retrieve?.parentScoreTop1).toBeCloseTo(0.92, 5);
+    expect(r.telemetry.retrieve?.candidatesFromScope).toBe(2);
   });
 });

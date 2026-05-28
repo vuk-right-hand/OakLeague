@@ -262,3 +262,72 @@ S2/S6/S7/S8/S10 applied. Four Smalls deferred — low-impact tidiness, no produc
 - **Why deferred:** zero-impact cosmetic; PG resolves both forms identically.
 - **TRIGGER — do it when:** any v3 RPC signature changes (fold the convention
   pin into the same migration).
+
+## DEFERRED — RAG v3 Step 6b+6c audit round-5 (auditor 2026-05-28, applied inline + flagged)
+
+Auditor surfaced 4 Critical + 7 Medium + 7 Small on the v3 application-layer wiring.
+C1/C2/C3 applied inline (the dropped-v3-parents bug at resolveInjectionAtTurnComplete,
+cache poisoning under flat-fallback or topic_tags, flat-fallback budget/cap).
+M1/M2/M3/M4/M5/M6/M7 applied. Smalls S2/S4/S6/S7 deferred below; C4 deferred.
+
+### C4 · AbortController doesn't propagate from proxy through HTTP to the orchestrator
+- **What:** Barge-in (proxy `ac.abort()`) cancels the HTTP fetch from proxy → Vercel
+  but not the orchestrator running on Vercel. `retrieveKnowledgeV3` runs to completion
+  server-side, incrementing budget + writing cogs_log for paid legs the user never
+  heard. A barge-happy session burns 2-3× budget. CLAUDE.md COGS kill-switch at 150%
+  trips silently after three such sessions.
+- **Why deferred:** auditor explicit: "defer until rest of v3 ships, but MUST land
+  before flipping any second creator to v3." First creator (Vuk-dogfood) is acceptable
+  acceptance loss; second creator is not.
+- **TRIGGER — do it before:** flipping a SECOND creator to retrieval_version=3. Fix
+  shape: thread `req.signal` (or derived AbortController) through `RetrieveKnowledgeV3Args`
+  and into every `withDeadline` call site via `.abortSignal()` on supabase-js builders
+  + the rewrite/embed/rerank bridges. Same fix wanted for v2.
+
+### Cache-key extension to include topic_tags + rank_mode (related to C2 partial fix)
+- **What:** C2 was applied as a CONSERVATIVE gate (don't upsert when flatFallbackFired
+  OR topicTags set). The proper fix is to extend semantic_query_cache's key from
+  `(creator, corpus_version, query_vec)` to include topic_tags_hash + rank_mode so
+  ALL v3 turns can cache safely. Today: v3 turns with topic_tags get full RAG cost
+  every time (no cache benefit).
+- **Why deferred:** schema change touching the cache table, RPC migration for the
+  lookup/upsert functions, and the harness needs to pin topic_tags presence per
+  creator. Substantial.
+- **TRIGGER — do it when:** harness §7 measures v3-with-topic-tags p50 latency
+  cost vs the v3-without-topic-tags baseline and the gap matters. Or when the
+  first creator's v3 cache-hit rate is materially worse than their v2 rate.
+
+### S2 · `lambda` Zod max=10 vs plan §3b "0..1 blend weight"
+- **What:** `route.ts` Zod schema accepts `lambda: z.number().min(0).max(10)`. Plan
+  §3b describes lambda as a small `~0.05` blend weight, but the topk_v3 migration
+  comment (round-5 M2 fix) explicitly widened the clamp to [0, 10] so the §7 harness
+  can sweep the high end. Schema upper bound and plan-text disagree at first glance.
+- **Why deferred:** intentional widening per harness sweep request. Add an explicit
+  "harness override" note in the schema's z.number() to make the intent visible.
+- **TRIGGER — do it when:** §7 harness lands and freezes the prod lambda value.
+
+### S4 · `pathTokenToVersion` helper (proxy v=3 reverse-map duplication)
+- **What:** `kickoffRetrieval` in proxy index.js manually decodes the chokepoint
+  token back to an integer: `version: pathToken === 'v3' ? 3 : 2`. Only one site
+  today; a future v4 path would need to remember this decode site.
+- **Why deferred:** one site = no duplication. Promote when a SECOND site needs it.
+- **TRIGGER — do it when:** any second site needs token→integer mapping.
+
+### S6 · `RetrieveLeg.candidatesFromScope` should default to 0 not undefined
+- **What:** type is `number | undefined`. Dashboards that `SUM(candidates_from_scope)`
+  need `COALESCE(..., 0)` to handle v1/v2 rows that don't set it. Default to 0 in
+  the type so the orchestrator can't accidentally leave it undefined.
+- **Why deferred:** v1/v2 paths never set RetrieveLeg.candidatesFromScope at all,
+  so changing the type narrowing requires updating both orchestrators. Low impact.
+- **TRIGGER — do it when:** any dashboard query trips on the COALESCE missing.
+
+### S7 · Integration test: proxy NULL retrieval_version_at_session must fail loud
+- **What:** M3 fixed the loader to throw on NULL via `resolveRetrievalPath`. There's
+  no test that inserts a `sessions` row with NULL snapshot and asserts the proxy
+  closes the WS loud (vs silent v1 degrade).
+- **Why deferred:** requires an integration test fixture that goes through the WS
+  open path with a corrupted session snapshot — not easy in vitest given the proxy
+  has no test surface yet. node:test on `loadSessionForTicket` directly is more
+  feasible.
+- **TRIGGER — do it when:** writing the next proxy node:test suite (e.g., when
+  the v3 dispatch site gets its own integration test).

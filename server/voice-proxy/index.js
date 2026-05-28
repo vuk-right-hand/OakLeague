@@ -70,6 +70,16 @@ import {
   VOICE_SESSION_STATE_MAX_CHARS,
   MIN_PERSIST_CHARS,
 } from './voice-session-state-writer.js';
+// RAG v3 step 6c — single dispatch chokepoint. resolveRetrievalPath()
+// maps v=1/2/3 → 'v1'/'v2'/'v3' tokens and THROWS on unknown so a missed
+// site in a future refactor fails LOUD at session-open instead of silently
+// degrading to v1 (the bug class plan §5 / round-3 C-3 / round-4 C5 fixes).
+// assertRetrievalPathSupportedOnSpike is the spike-a admin probe.
+import {
+  resolveRetrievalPath,
+  assertRetrievalPathSupportedOnSpike,
+  UnknownRetrievalVersionError,
+} from './retrieval-path.js';
 // Day-13 — fire-and-forget PostHog batch emitter for v2 telemetry
 // (audit M2). Pre-mapped events arrive from the shim response.
 import {
@@ -584,15 +594,36 @@ async function attachToSession({ sessionId, userId, creatorId, expectedTier }) {
     }
   }
 
+  // RAG v3 step 6c round-5 M3: pass retrieval_version_at_session through
+  // the strict chokepoint at LOAD time, not just at dispatch. The previous
+  // `Number(data.retrieval_version_at_session ?? 1)` silently coerced NULL
+  // -> 1, which would route a v=3 creator to v1 zero-retrieval if a buggy
+  // session-open RPC ever wrote a NULL snapshot. Fail loud here so the
+  // session never opens with a corrupt snapshot.
+  const rawRv = data.retrieval_version_at_session;
+  let retrievalVersionAtSession;
+  try {
+    resolveRetrievalPath(rawRv); // validates strictly; we keep the integer below
+    retrievalVersionAtSession = rawRv;
+  } catch (e) {
+    if (e instanceof UnknownRetrievalVersionError) {
+      throw new Error(
+        `session_state_corrupt: sessions.retrieval_version_at_session=${String(rawRv)} `
+        + `is not in {1,2,3} for session=${sessionId.slice(0, 8)} -- refusing to open. `
+        + 'Investigate the session_open RPC + creators.retrieval_version snapshot path.',
+      );
+    }
+    throw e;
+  }
   return {
     sessionId: data.id,
     tier: data.tier_at_session,
     avatarProvider: data.avatar_provider ?? null,
-    // Day-13 snapshot consts. Both NOT NULL DEFAULT 1 by schema. Coerce
-    // to integers defensively — supabase-js returns smallint as number
-    // already, but Number() guards against future driver shape changes.
+    // Day-13 snapshot consts. corpus_version_at_session NOT NULL DEFAULT 1
+    // by schema -- coerce defensively. retrieval_version_at_session is now
+    // validated above (round-5 M3) -- forward the raw integer through.
     corpusVersionAtSession: Number(data.corpus_version_at_session ?? 1),
-    retrievalVersionAtSession: Number(data.retrieval_version_at_session ?? 1),
+    retrievalVersionAtSession,
     heygenSessionId,
     heygenSessionToken,
   };
@@ -612,10 +643,10 @@ async function openSession({ userId, creatorId, modelWire, ttsProvider }) {
       .select('retrieval_version')
       .eq('id', creatorId)
       .maybeSingle();
-    if (cd && Number(cd.retrieval_version) === 2) {
-      console.warn(
-        `[session-open spike-a] creator=${creatorId.slice(0, 8)} is at retrieval_version=2 but spike-a path hard-pins v1; expect ZERO retrieval`,
-      );
+    if (cd) {
+      // RAG v3 step 6c: spike-a probe is now centralized in the helper so
+      // a future v4+ warning logic change happens in one place.
+      assertRetrievalPathSupportedOnSpike(Number(cd.retrieval_version));
     }
   } catch (e) {
     // Non-fatal — admin-only path, never block on probe failure.
@@ -1497,26 +1528,43 @@ wss.on('connection', async (ws, req) => {
   // loader rejects .ts extensions and the catch installed silent sentinels,
   // so vector mode appeared to work but never actually retrieved anything.
   //
-  // Day-13: retrievalVersionAtSession routes between two paths.
-  //   * v1 (legacy): retrieveTopK(in-proc) → passages
-  //   * v2 (Day-11 orchestrator): callRetrieveKnowledgeV2 → parents
-  // The resolveInjectionAtTurnComplete handler normalizes both shapes
-  // into the envelope builder's `{text, sourceType, title?, score?}` form.
+  // RAG v3 step 6c: dispatch chokepoint. resolveRetrievalPath() maps
+  // v=1/2/3 -> 'v1'/'v2'/'v3' tokens. Throws UnknownRetrievalVersionError
+  // on unknown (which the catch below maps to a hard close). v2 AND v3
+  // both go through the Vercel shim (route.ts dispatches based on the
+  // session snapshot); only v1 still runs in-proc retrieveTopK.
   //
   // Run retrieval for a user turn; the race against the 800ms ceiling
   // happens in the turn_complete handler.
   function kickoffRetrieval(transcript, turnNum) {
-    if (retrievalVersionAtSession === 2 && !RAG_V2_PROXY_ENABLED) {
-      // Safety net: session is marked v2 at DB layer but the proxy
+    let pathToken;
+    try {
+      pathToken = resolveRetrievalPath(retrievalVersionAtSession);
+    } catch (e) {
+      // Fail loud on unknown version: never silent-default to v1.
+      console.error(
+        `[ws ${connId}] kickoffRetrieval: ${e?.message || e}`,
+      );
+      captureException(e, {
+        op: 'vector.retrieve.unknown_version',
+        sessionId,
+        turnNumber: turnNum,
+        retrievalVersionAtSession,
+      });
+      pendingInjection = { skip: true, turnNumber: turnNum };
+      return;
+    }
+    if ((pathToken === 'v2' || pathToken === 'v3') && !RAG_V2_PROXY_ENABLED) {
+      // Safety net: session is marked v2/v3 at DB layer but the proxy
       // wasn't deployed with RAG_V2_PROXY_ENABLED=1 yet. Running v1
       // retrieveTopK would query chunker_version=1 chunks that may not
-      // exist for a v2-reprocessed creator — silent zero results. Skip
-      // retrieval entirely; user gets persona-only and we emit a loud
-      // signal for ops to flip the env.
+      // exist for a v2/v3-reprocessed creator -- silent zero results.
+      // Skip retrieval entirely; user gets persona-only and we emit a
+      // loud signal for ops to flip the env.
       console.error(
-        `[ws ${connId}] v2 session detected but RAG_V2_PROXY_ENABLED=0 — skipping retrieval (sessionId=${sessionId.slice(0, 8)})`,
+        `[ws ${connId}] ${pathToken} session detected but RAG_V2_PROXY_ENABLED=0 -- skipping retrieval (sessionId=${sessionId.slice(0, 8)})`,
       );
-      captureException(new Error('v2_session_proxy_disabled'), {
+      captureException(new Error(`${pathToken}_session_proxy_disabled`), {
         op: 'vector.retrieve.proxy_disabled',
         sessionId,
         turnNumber: turnNum,
@@ -1524,22 +1572,25 @@ wss.on('connection', async (ws, req) => {
       pendingInjection = { skip: true, turnNumber: turnNum };
       return;
     }
-    if (retrievalVersionAtSession === 2) {
-      // v2 path: shim does rewrite → cache → topk_v2 → rerank → cache-upsert
-      // and returns {parents, telemetry, budgetExceeded, rewriteFallback,
-      // posthogEvents}. Budget = orchestrator's 4000ms target — clamped
-      // server-side to [1000, 8000]. We pass the relative duration, not an
-      // absolute epoch (audit C4: Fly↔Vercel clock skew).
+    if (pathToken === 'v2' || pathToken === 'v3') {
+      // Shim does rewrite -> cache -> route (v3 only) -> topk -> rerank
+      // -> cache-upsert and returns {parents, telemetry, budgetExceeded,
+      // rewriteFallback, posthogEvents}. The Vercel route dispatches v2
+      // vs v3 based on sessions.retrieval_version_at_session snapshot;
+      // the client (callRetrieveKnowledgeV2) is version-agnostic.
+      // Budget = 4000ms target -- clamped server-side to [1000, 8000].
+      // We pass relative duration, not absolute epoch (audit C4: Fly<->
+      // Vercel clock skew).
       //
       // Day-13 audit-build C1: per-turn AbortController so barge-in
       // (bridge `interrupted`) cancels the in-flight HTTP fetch. Without
-      // this, an impatient user who barges every turn burns 2-3× budget
+      // this, an impatient user who barges every turn burns 2-3x budget
       // (orchestrator still runs to completion server-side, increments
       // counter, writes cogs_log for paid legs).
       const ac = new AbortController();
       pendingInjection = {
         turnNumber: turnNum,
-        version: 2,
+        version: pathToken === 'v3' ? 3 : 2,
         skip: false,
         abort: () => {
           try { ac.abort(); } catch {}
@@ -1557,7 +1608,7 @@ wss.on('connection', async (ws, req) => {
           // Day-13 audit M3: NEVER retry. Single-shot. Failures degrade
           // to persona-only (empty parents) so the turn still happens.
           captureException(err, {
-            op: 'vector.retrieve.v2',
+            op: `vector.retrieve.${pathToken}`,
             sessionId,
             turnNumber: turnNum,
             code: err instanceof RetrieveV2ClientError ? err.code : 'unknown',
@@ -1567,6 +1618,8 @@ wss.on('connection', async (ws, req) => {
       };
       return;
     }
+    // pathToken === 'v1' -- the only remaining branch (resolveRetrievalPath
+    // already filtered unknowns into the catch above).
     pendingInjection = {
       turnNumber: turnNum,
       version: 1,
@@ -1638,9 +1691,16 @@ wss.on('connection', async (ws, req) => {
       flushAudioHold();
       return;
     }
-    // Normalize v1 vs v2 result shapes into the envelope's input.
+    // Normalize v1 vs v2/v3 result shapes into the envelope's input.
+    // RAG v3 step 6c round-5 C1: v3 sessions emit pendingInjection.version=3
+    // and the shim returns parents in the SAME shape as v2 -- so the
+    // parents-shape branch must cover BOTH 2 and 3, else v3 parents get
+    // dropped on the floor and the user blanks every turn (the exact bug
+    // class the §5 chokepoint exists to prevent, replayed at a different
+    // layer). Same for the PostHog batch + envelope-oversize emission below.
+    const isShimVersion = version === 2 || version === 3;
     const envelopePassages =
-      version === 2 && Array.isArray(result?.parents)
+      isShimVersion && Array.isArray(result?.parents)
         ? result.parents.map((p) => ({
             text: p.text,
             sourceType: p.sourceType,
@@ -1651,9 +1711,9 @@ wss.on('connection', async (ws, req) => {
           ? result.passages.map((p) => ({ text: p.text, sourceType: p.sourceType }))
           : [];
 
-    // v2 telemetry → PostHog batch — fire regardless of envelope result.
+    // v2/v3 telemetry -> PostHog batch -- fire regardless of envelope result.
     // Cache-hit / cache-miss / budget-exceeded / rewrite-fallback land here.
-    if (version === 2 && Array.isArray(result?.posthogEvents) && result.posthogEvents.length > 0) {
+    if (isShimVersion && Array.isArray(result?.posthogEvents) && result.posthogEvents.length > 0) {
       posthogCaptureBatch({
         events: result.posthogEvents,
         distinctId: ticketUserId,
@@ -1671,7 +1731,7 @@ wss.on('connection', async (ws, req) => {
       // Day-13 audit M6 / cross-cutting: emit `rag_envelope_oversize` when
       // input exceeded INJECTION_HARD_INPUT_BYTES even after lowest-score
       // drops. Distinct from cogs_log (envelope isn't a paid API).
-      if (envelope?.oversize === true && version === 2) {
+      if (envelope?.oversize === true && isShimVersion) {
         posthogCaptureBatch({
           events: [
             {
@@ -1736,10 +1796,21 @@ wss.on('connection', async (ws, req) => {
     // the envelope instead of injecting it into Gemini (decoupled never
     // injects — that is the legacy double-answer bug path).
     const retrieveEnvelopeForDecoupled = async (question, signal) => {
-      if (retrievalVersionAtSession === 2 && !RAG_V2_PROXY_ENABLED) return null;
+      // RAG v3 step 6c: same chokepoint pattern as kickoffRetrieval --
+      // resolveRetrievalPath() throws on unknown so the LIVE decoupled
+      // path cannot silently fall through to v1 (the exact bug class
+      // round-3 C-3 / round-4 C5 close).
+      let pathToken;
+      try {
+        pathToken = resolveRetrievalPath(retrievalVersionAtSession);
+      } catch (e) {
+        captureException(e, { op: 'decoupled.retrieve.unknown_version', sessionId });
+        return null;
+      }
+      if ((pathToken === 'v2' || pathToken === 'v3') && !RAG_V2_PROXY_ENABLED) return null;
       let result;
       try {
-        if (retrievalVersionAtSession === 2) {
+        if (pathToken === 'v2' || pathToken === 'v3') {
           result = await callRetrieveKnowledgeV2({
             userId: ticketUserId, creatorId: ticketCreatorId, sessionId,
             rawUtterance: question,
@@ -1760,6 +1831,7 @@ wss.on('connection', async (ws, req) => {
             topK: DECOUPLED_INJECT_TOP_K,
           });
         } else {
+          // pathToken === 'v1'
           result = await retrieveTopK({
             supabase, geminiApiKey: GEMINI_API_KEY,
             userId: ticketUserId, creatorId: ticketCreatorId,
@@ -2563,7 +2635,20 @@ wss.on('connection', async (ws, req) => {
         // updated AFTER ws.send, the next input_transcription handler
         // (which calls kickoffRetrieval reading the closure) could
         // observe stale turn-N-1 data.
-        if (retrievalVersionAtSession === 2) {
+        // RAG v3 step 6c: decoupled mode is gated on v=2 OR v=3 (both
+        // use the same off-Live deep-answer architecture). v=1 sessions
+        // never decouple. Wrap in the chokepoint -- a missed v4 here would
+        // silently route to the legacy outputTranscript path.
+        let decoupledPathToken;
+        try {
+          decoupledPathToken = resolveRetrievalPath(retrievalVersionAtSession);
+        } catch {
+          // Unknown version at this late point is already alarming, but
+          // the kickoffRetrieval site has emitted a captureException.
+          // Here we just fall through to the v=1 transcript source.
+          decoupledPathToken = 'v1';
+        }
+        if (decoupledPathToken === 'v2' || decoupledPathToken === 'v3') {
           // DECOUPLED_BRAIN_PLAN P1-5.2 / R4-M4 (§13 1911-1916, the ONLY
           // non-byte-identical site): in decoupled mode Gemini's
           // `metrics.outputTranscript` is its DISCARDED answer — wrong

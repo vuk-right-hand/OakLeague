@@ -35,8 +35,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NextRequest } from 'next/server';
 
-const { mockRetrieveV2, mockSentryCapture, mockSentryCaptureMessage, mockSentrySetTag, mockSessionSelect } = vi.hoisted(() => ({
+const { mockRetrieveV2, mockRetrieveV3, mockSentryCapture, mockSentryCaptureMessage, mockSentrySetTag, mockSessionSelect } = vi.hoisted(() => ({
   mockRetrieveV2: vi.fn(),
+  mockRetrieveV3: vi.fn(),
   mockSentryCapture: vi.fn(),
   mockSentryCaptureMessage: vi.fn(),
   mockSentrySetTag: vi.fn(),
@@ -50,6 +51,7 @@ vi.mock('@/lib/voice/retrieve-knowledge', async () => {
   return {
     ...actual,
     retrieveKnowledgeV2: mockRetrieveV2,
+    retrieveKnowledgeV3: mockRetrieveV3,
   };
 });
 
@@ -84,6 +86,7 @@ const PATH = '/api/internal/retrieve-knowledge';
 
 beforeEach(() => {
   mockRetrieveV2.mockReset();
+  mockRetrieveV3.mockReset();
   mockSentryCapture.mockReset();
   mockSentryCaptureMessage.mockReset();
   mockSentrySetTag.mockReset();
@@ -407,6 +410,81 @@ describe('POST /api/internal/retrieve-knowledge — happy path', () => {
     expect(json.budget_exceeded).toBe(false);
     expect(json.rewrite_fallback).toBe(false);
     expect(typeof json.request_id).toBe('string');
+  });
+
+  // RAG v3 step 6c: dispatch v3 when session.retrieval_version_at_session=3.
+  // Verifies the route's session-snapshot-driven dispatch (NOT body-claim
+  // driven). Locks the contract that a v=3 session calls retrieveKnowledgeV3
+  // and surfaces sections_routed + flat_fallback_fired in the response.
+  it('dispatches retrieveKnowledgeV3 when session retrieval_version_at_session=3', async () => {
+    mockSessionSelect.mockResolvedValue({
+      data: {
+        user_id: USER_ID,
+        creator_id: CREATOR_ID,
+        corpus_version_at_session: 1,
+        retrieval_version_at_session: 3,
+        ended_at: null,
+      },
+      error: null,
+    });
+    mockRetrieveV3.mockResolvedValue({
+      parents: [
+        {
+          parentUnitId: 'pu-v3-1',
+          text: 'v3 parent text',
+          title: 'V3 Section A',
+          sourceType: 'transcript',
+          score: 0.83,
+          scoreSource: 'rerank',
+        },
+      ],
+      telemetry: {
+        userId: USER_ID,
+        sessionId: SESSION_ID,
+        creatorId: CREATOR_ID,
+        retrievalVersion: 3,
+        corpusVersionAtSession: 1,
+        cacheHit: false,
+        cacheStaleCorpus: false,
+        budgetExceeded: false,
+        totalLatencyMs: 800,
+      },
+      budgetExceeded: false,
+      rewriteFallback: false,
+      sectionsRouted: 4,
+      flatFallbackFired: false,
+    });
+
+    const res = await POST(mkSignedReq({
+      bodyOverrides: {
+        topic_tags: ['topic-a'],
+        rank_mode: 'max_blend',
+        lambda: 0.1,
+        top_s: 4,
+        n_parent_per_section: 5,
+        min_sim: 0.3,
+      },
+    }));
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as {
+      parents: Array<{ parent_unit_id: string }>;
+      sections_routed: number;
+      flat_fallback_fired: boolean;
+      request_id: string;
+    };
+    expect(json.parents[0].parent_unit_id).toBe('pu-v3-1');
+    expect(json.sections_routed).toBe(4);
+    expect(json.flat_fallback_fired).toBe(false);
+    expect(mockRetrieveV3).toHaveBeenCalledOnce();
+    expect(mockRetrieveV2).not.toHaveBeenCalled();
+    // Verify the orchestrator received the v3-specific args (topic_tags etc).
+    const v3Args = mockRetrieveV3.mock.calls[0][0] as Record<string, unknown>;
+    expect(v3Args.topicTags).toEqual(['topic-a']);
+    expect(v3Args.rankMode).toBe('max_blend');
+    expect(v3Args.lambda).toBe(0.1);
+    expect(v3Args.topS).toBe(4);
+    expect(v3Args.nParentPerSection).toBe(5);
+    expect(v3Args.minSim).toBe(0.3);
   });
 
   it('passes deadlineMs = Date.now() + clamped(budget_ms) to orchestrator', async () => {
