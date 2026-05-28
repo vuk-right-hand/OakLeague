@@ -83,6 +83,7 @@ A schema change is not done when YOUR new test is green. It's done when the WHOL
 ### Auth & RLS
 - Day-one `src/lib/auth-guards.ts` exporting `getCallerUserId()` and `assertAdminFromSession()`. Every server action calls them. Never inline.
 - RLS on every table. Service-role-only tables = RLS enabled, **zero** policies.
+- **Every new `CREATE TABLE public.X` migration MUST end with explicit GRANTs** — `GRANT ALL ON TABLE public.X TO service_role;` (always), plus `GRANT SELECT ON TABLE public.X TO authenticated;` if RLS policies allow client reads, plus `GRANT SELECT ... TO anon;` if unauth needs read. Supabase removed the default-grant behavior for new tables on Oct 30, 2026 — existing ~50 tables are grandfathered, but any new table without explicit `GRANT ... TO service_role` will hit `permission denied` from the admin client on `.from(X).insert/select/update/delete`. Pattern reference: [supabase/migrations/20260521000003_semantic_query_cache.sql](supabase/migrations/20260521000003_semantic_query_cache.sql).
 - Server actions: getCaller → ownership check → field whitelist → mutate → revalidate. Whitelist, never spread `patch`.
 - `window.location.href` after login/signup/role/tier change. Never `router.push()`.
 - Cookies: `httpOnly: true, secure: prod, sameSite: 'lax'`. No variations.
