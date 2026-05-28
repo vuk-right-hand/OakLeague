@@ -76,3 +76,6 @@ artifacts/spike-b/
 # Diagnostic spike logs (transient, not source)
 /spike-run.log
 /spike-*.log
+
+# Private creator content used for v3 segmentation dry-run
+scripts/aod_test_corpus/
