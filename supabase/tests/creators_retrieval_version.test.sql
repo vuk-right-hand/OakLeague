@@ -1,13 +1,19 @@
 -- RAG SOTA plan M1 — creators.retrieval_version + admin_set_creator_retrieval_version.
 --
--- 1. Column exists with DEFAULT 1 and CHECK (1, 2). New creator gets 1.
+-- POST-v3 (mig 20260528000041): CHECK widened to (1, 2, 3); RPC accepts 3
+-- BUT is gated on creator_v3_ready (the "admin literally cannot flip a
+-- half-built creator" gate from plan §6 step 3). Tests 6 + 7 are updated
+-- to reflect this contract: out-of-range is now p_version=4 (was 3); the
+-- direct UPDATE check uses 4 (was 3).
+--
+-- 1. Column exists with DEFAULT 1 and CHECK (1, 2, 3). New creator gets 1.
 -- 2. Non-admin caller → 42501 unauthorized.
 -- 3. Admin flip from 1 → 2 succeeds + system_prompt recompiles in-txn.
 -- 4. admin_audit_log row written with action='creator_retrieval_version_set'
 --    + before/after carrying previous & new version.
 -- 5. NULL p_version → 22023 version_invalid.
--- 6. Out-of-range p_version (e.g. 3) → 22023 version_invalid.
--- 7. CHECK constraint rejects UPDATE creators SET retrieval_version=3 directly.
+-- 6. Out-of-range p_version (e.g. 4) → 22023 version_invalid.
+-- 7. CHECK constraint rejects UPDATE creators SET retrieval_version=4 directly.
 
 BEGIN;
 SELECT plan(8);
@@ -96,25 +102,27 @@ BEGIN
       RETURN NEXT fail(format('5: NULL p_version → unexpected sqlstate %s', SQLSTATE));
   END;
 
-  -- 6: out-of-range (3) → 22023.
+  -- 6: out-of-range (4) → 22023. (Was 3 pre-v3; mig 41 widened CHECK to
+  -- (1,2,3) so the next out-of-range value is 4.)
   BEGIN
-    PERFORM public.admin_set_creator_retrieval_version(v_creator, 3::smallint);
-    RETURN NEXT fail('6: p_version=3 should have raised');
+    PERFORM public.admin_set_creator_retrieval_version(v_creator, 4::smallint);
+    RETURN NEXT fail('6: p_version=4 should have raised');
   EXCEPTION
     WHEN sqlstate '22023' THEN
-      RETURN NEXT pass('6: p_version=3 → 22023 version_invalid');
+      RETURN NEXT pass('6: p_version=4 → 22023 version_invalid');
     WHEN OTHERS THEN
-      RETURN NEXT fail(format('6: p_version=3 → unexpected sqlstate %s', SQLSTATE));
+      RETURN NEXT fail(format('6: p_version=4 → unexpected sqlstate %s', SQLSTATE));
   END;
   PERFORM tests.reset_role();
 
-  -- 7: CHECK constraint on the column itself rejects direct UPDATE to 3.
+  -- 7: CHECK constraint on the column itself rejects direct UPDATE to 4.
+  -- (Was 3 pre-v3.)
   BEGIN
-    UPDATE public.creators SET retrieval_version = 3 WHERE id = v_creator;
-    RETURN NEXT fail('7: direct UPDATE to 3 should have raised check_violation');
+    UPDATE public.creators SET retrieval_version = 4 WHERE id = v_creator;
+    RETURN NEXT fail('7: direct UPDATE to 4 should have raised check_violation');
   EXCEPTION
     WHEN check_violation THEN
-      RETURN NEXT pass('7: CHECK rejects direct UPDATE retrieval_version=3');
+      RETURN NEXT pass('7: CHECK rejects direct UPDATE retrieval_version=4');
   END;
 END;
 $fn$;
