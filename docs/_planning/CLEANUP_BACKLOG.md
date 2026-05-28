@@ -178,3 +178,43 @@ when the trigger fires, not before.
 - **TRIGGER — do it when:** you are about to change ToS or voice-likeness terms (bump
   a `CONSENT_VERSIONS` value). Build the re-consent prompt + decide the policy BEFORE
   the bump ships, so no creator operates on stale consent.
+
+---
+
+## DEFERRED — RAG v3 Step 3 audit round-4 (auditor 2026-05-28, applied inline + flagged)
+
+Surfaced by the post-Step-3 auditor on the v3 lockstep migration set. Criticals: 0.
+M1 (DROP CONSTRAINT IF EXISTS), M3 (HNSW partial-index forward note), M4 (NULL-
+section_index dedup test), S1/S4/S6 (comment hygiene) FIXED before commit. The
+two below are consciously deferred — broader scope than Step 3, no immediate hurt.
+
+### M2 · Slug-rename race on `verify_*_topic_slugs` triggers — 3-table coordinated fix
+- **What:** `verify_section_topic_slugs` (migration 20260528000010), `verify_narrative_unit_topic_slugs`
+  (20260514000002), and `verify_sample_topic_slugs` (20260420000013) all do an EXISTS
+  on `creator_topics` with NO `FOR SHARE` lock. Concurrent worker INSERT of a section
+  + admin rename of the slug it references can interleave at READ-COMMITTED such that
+  the verify EXISTS sees the OLD slug, the orphan-rename guard on the admin side
+  doesn't see the in-flight worker INSERT yet — both commit, leaving an orphan tag.
+- **Why deferred:** v3 inherits the v2 bug rather than introduces it. Fixing requires
+  a coordinated 3-trigger migration that touches the live v2 path (sample_content +
+  narrative_units), and a wrong edit blocks v2 ingest. Lower priority than v3 forward
+  motion.
+- **TRIGGER — do it when:** an operator first hits the orphan-tag retrieval-recall
+  hole in dashboard logs, OR you're already touching one of the verify triggers for
+  another reason (fold all three then). Effort: 1 migration adding `FOR SHARE` to
+  each EXISTS body.
+
+### M5 · `creator_v3_ready` pgTAP must reject NULL embeddings (when step 6 builds it)
+- **What:** plan §6 pins `creator_v3_ready` as a 3-condition check (done job +
+  sections + chunks). The Step-3 schema makes `sections.summary_embedding` and
+  `sections.centroid_embedding` NULLable during the worker-in-flight window. If
+  step-6's implementation forgets to assert `summary_embedding IS NOT NULL AND
+  centroid_embedding IS NOT NULL` on every section row, a creator can pass
+  `creator_v3_ready` with half-populated section embeddings → admin flips →
+  routing RPC scores against partial-NULL → blanks/lag.
+- **Why deferred:** the function doesn't exist yet. This is a forward-note for
+  step 6's pgTAP, not a Step-3 deliverable.
+- **TRIGGER — do it when:** step 6 writes `creator_v3_ready`. The pgTAP MUST
+  EXISTS-check a section with NULL embedding and assert the function returns
+  false; flip the embedding to non-NULL and assert true. Without this test, the
+  silent-NULL-embedding regression has no tripwire.
