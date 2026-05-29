@@ -1,0 +1,65 @@
+{
+  "_doc": "Needle spec for diag-eval-v3. The QUERY is always the QUESTION (never the needle text) -> guards query<->document leakage (design 2.4/6.1). 'ground_truth.value' is a VERBATIM substring that MUST exist in exactly one ingested narrative unit; pre-flight resolves it to a parent_unit_id (design C4/OQ#2). 'answerable:false' questions are calibration negatives for the inject silence-gate (design M4/5.2): pre-flight asserts NO unit substring-matches them.",
+  "corpora": {
+    "aod": {
+      "_note": "Validation fixture against the existing AoD transcript corpus (scripts/aod_test_corpus). Proves the harness machinery on real content before the book run. Substrings verified present 2026-05-29.",
+      "topic_tag": "aod",
+      "needles": [
+        {
+          "id": "dopamine-receptors",
+          "planted_in": "aod",
+          "depth": "mid",
+          "ground_truth": { "match": "substring", "value": "size of a walnut to the size of a dust grain" },
+          "questions": [
+            "what actually happens to my brain's reward chemistry when I doomscroll all day",
+            "does too much cheap stimulation physically change something in my head",
+            "why do I feel numb and need bigger and bigger hits to feel anything"
+          ]
+        },
+        {
+          "id": "lumberjack-guitar",
+          "planted_in": "aod",
+          "depth": "ch1",
+          "ground_truth": { "match": "substring", "value": "guitar player NOT play his guitar" },
+          "questions": [
+            "why do I keep failing when I try to force myself to do something I'm not built for",
+            "what's that analogy about using the wrong tool for who you are",
+            "is it pointless to grind at something that doesn't fit my nature"
+          ]
+        },
+        {
+          "id": "twin-experiment",
+          "planted_in": "aod",
+          "depth": "last",
+          "ground_truth": { "match": "substring", "value": "same genetics, same look, same habits" },
+          "questions": [
+            "tell me the thought experiment about two identical brothers raised in opposite environments",
+            "if two people had the exact same genetics but totally different surroundings, what happens",
+            "the story about one twin in comfort and one twin in struggle"
+          ]
+        },
+        {
+          "id": "outwitting-the-devil",
+          "planted_in": "aod",
+          "depth": "mid",
+          "ground_truth": { "match": "substring", "value": "outwitting the devil" },
+          "questions": [
+            "how do I stop drifting through life on autopilot",
+            "what's the idea about most people being controlled by something they can't even see",
+            "how do I take back control from the conditioning that runs me"
+          ]
+        }
+      ],
+      "off_topic": [
+        { "id": "ot-helium", "answerable": false, "forbidden_substring": "helium", "questions": ["what is the boiling point of helium in kelvin"] },
+        { "id": "ot-k8s", "answerable": false, "forbidden_substring": "kubernetes", "questions": ["how do I configure a kubernetes ingress controller with TLS termination"] }
+      ]
+    },
+    "book": {
+      "_note": "PLACEHOLDER. Filled when Vuk provides his book. >=10 needles at depths ch1/mid/last + the lumberjack story + >=1 needle planted in a synthetic distractor doc (design OQ#1). >=3 question variants each. >=5 off_topic answerable:false (Vuk-verified empty, design M4).",
+      "topic_tag": "book",
+      "needles": [],
+      "off_topic": []
+    }
+  }
+}

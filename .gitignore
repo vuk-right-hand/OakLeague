@@ -82,3 +82,7 @@ scripts/aod_test_corpus/
 
 # Throwaway scratch dir for one-off scripts / temp test fixtures
 tmp/
+
+# RAG v3 eval harness generated outputs (run artifacts, not source)
+scripts/eval-v3/out/
+scripts/eval-v3/book/
