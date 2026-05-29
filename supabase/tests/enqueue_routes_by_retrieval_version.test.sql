@@ -9,22 +9,30 @@
 -- 4. v2 creator non-raw_text UPDATE (topic_tags) → does NOT enqueue.
 -- 5. raw_text=NULL INSERT → does not enqueue either queue.
 -- 6. v1 creator behavior is unchanged (regression guard).
+-- 7. v3 creator INSERT → corpus_reprocess_jobs row with target_version=3
+--    (RAG v3 step 7 / mig 20260528000051). The pre-mig-51 trigger RAISEd
+--    feature_not_supported on v=3 — this proves the tripwire is closed.
+-- 8. v3 creator raw_text UPDATE → bumps enqueue_version on the v3 job row.
 
 BEGIN;
-SELECT plan(6);
+SELECT plan(8);
 
 CREATE FUNCTION pg_temp.run() RETURNS SETOF text LANGUAGE plpgsql AS $fn$
 DECLARE
   v_user_v1   uuid := tests.create_auth_user('erbrv-v1@test');
   v_user_v2   uuid := tests.create_auth_user('erbrv-v2@test');
+  v_user_v3   uuid := tests.create_auth_user('erbrv-v3@test');
   v_creator_v1 uuid;
   v_creator_v2 uuid;
+  v_creator_v3 uuid;
   v_app       uuid;
   v_sample1   uuid;
   v_sample2   uuid;
   v_sample3   uuid;
+  v_sample_v3 uuid;
   v_legacy_n  int;
   v_reprocess_n int;
+  v_tv        smallint;
   v_enq_v1    int;
   v_enq_v2    int;
 BEGIN
@@ -128,6 +136,45 @@ BEGIN
   RETURN NEXT ok(
     v_enq_v2 = v_enq_v1 + 1,
     '6: v1 creator raw_text edit still bumps legacy queue (regression guard)'
+  );
+
+  -- v3 creator (explicit retrieval_version=3). Requires the widened CHECK
+  -- from mig 20260528000041 (step 6a).
+  INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+    VALUES (gen_random_uuid(), v_user_v3, 'approved', 'V3 Creator', 'v3creator', '[]'::jsonb, '{}'::jsonb)
+    RETURNING id INTO v_app;
+  INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status, retrieval_version)
+    VALUES (gen_random_uuid(), v_user_v3, v_app, 'V3 Creator', 'v3creator', 'ready', 3)
+    RETURNING id INTO v_creator_v3;
+  INSERT INTO public.creator_topics (creator_id, slug, title, sort_order)
+    VALUES (v_creator_v3, 'topic-a', 'Topic A', 0);
+
+  -- 7: v3 creator INSERT → corpus_reprocess_jobs with target_version=3.
+  -- Pre-mig-51 this INSERT RAISEd feature_not_supported (the M9 tripwire).
+  INSERT INTO public.sample_content (id, creator_id, source_type, title, raw_text, topic_tags, fetch_status)
+    VALUES (gen_random_uuid(), v_creator_v3, 'transcript', 'V3 Sample', 'v3 body', ARRAY['topic-a'], 'ready')
+    RETURNING id INTO v_sample_v3;
+  SELECT count(*) INTO v_legacy_n
+    FROM public.sample_content_embedding_jobs WHERE sample_id = v_sample_v3;
+  SELECT count(*), max(target_version) INTO v_reprocess_n, v_tv
+    FROM public.corpus_reprocess_jobs WHERE sample_id = v_sample_v3;
+  RETURN NEXT ok(
+    v_legacy_n = 0 AND v_reprocess_n = 1 AND v_tv = 3,
+    format('7: v3 creator INSERT routes to corpus_reprocess_jobs target_version=3 (legacy=%s reprocess=%s tv=%s)',
+           v_legacy_n, v_reprocess_n, v_tv)
+  );
+
+  -- 8: v3 creator raw_text UPDATE bumps enqueue_version on the v3 job row.
+  SELECT enqueue_version INTO v_enq_v1
+    FROM public.corpus_reprocess_jobs WHERE sample_id = v_sample_v3 AND target_version = 3;
+  UPDATE public.sample_content
+     SET raw_text = 'v3 body EDITED'
+   WHERE id = v_sample_v3;
+  SELECT enqueue_version, count(*) OVER () INTO v_enq_v2, v_reprocess_n
+    FROM public.corpus_reprocess_jobs WHERE sample_id = v_sample_v3 AND target_version = 3;
+  RETURN NEXT ok(
+    v_enq_v2 = v_enq_v1 + 1 AND v_reprocess_n = 1,
+    '8: v3 raw_text edit bumps enqueue_version on the v3 corpus_reprocess_jobs row'
   );
 END;
 $fn$;

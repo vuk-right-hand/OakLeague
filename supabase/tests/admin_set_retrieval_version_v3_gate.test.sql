@@ -20,9 +20,15 @@
 --    cleanup migration lands, flip the assert from "alive" to "deleted".
 -- 7. Round-5 C3 partner -- v=1->v=1 same-version also no-ops cleanly
 --    (idempotency holds at every base version, not just v=3).
+-- 8. Round-5 C1 (additive-build cutover) -- flip v=2->v=3 DELETEs the
+--    creator's chunker_version IN (1,2) chunks + v2-shape narrative_units
+--    (section_id NULL), PRESERVES v3 chunks + v3 units. The one-shot v1+v2
+--    cleanup that the additive build deferred from finalize_v3 to the flip.
+-- 9. Round-5 C1 -- the v=2->v=3 flip's audit row carries cutover counts
+--    (cutover_chunks_deleted + cutover_v2_units_deleted).
 
 BEGIN;
-SELECT plan(7);
+SELECT plan(9);
 
 CREATE FUNCTION pg_temp.unit_vec(p_position int) RETURNS halfvec(768)
 LANGUAGE plpgsql IMMUTABLE AS $$
@@ -209,6 +215,100 @@ BEGIN
     v_audit_count_post, v_audit_count_pre,
     '7: same-version v=2->v=2 is a NO-OP (idempotency at every base version)'
   );
+
+  -- ── 8 + 9: Round-5 C1 — v2->v3 flip cutover cleanup ───────────────────
+  -- Fresh creator with v1 + v2 + v3 chunks coexisting (the additive-build
+  -- end-state: build complete, creator_v3_ready=true, about to flip). Flip
+  -- v2->v3 and assert v1+v2 deleted, v3 survives, v2-unit deleted, v3-unit
+  -- survives, audit carries cutover counts.
+  DECLARE
+    v_user_c     uuid := tests.create_auth_user('av3-cutover@test');
+    v_app_c      uuid;
+    v_creator_c  uuid;
+    v_sample_c   uuid;
+    v_sec_c      uuid;
+    v_unit_v3_c  uuid;
+    v_v1_after   int;
+    v_v2_after   int;
+    v_v3_after   int;
+    v_v2u_after  int;
+    v_v3u_after  int;
+    v_cut_chunks text;
+    v_cut_units  text;
+  BEGIN
+    INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+      VALUES (gen_random_uuid(), v_user_c, 'approved', 'AV3C', 'av3c', '[]'::jsonb, '{}'::jsonb)
+      RETURNING id INTO v_app_c;
+    INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status, brain_mode, retrieval_version)
+      VALUES (gen_random_uuid(), v_user_c, v_app_c, 'AV3C', 'av3c', 'ready', 'vector', 2)
+      RETURNING id INTO v_creator_c;
+    INSERT INTO public.creator_topics (creator_id, slug, title, sort_order)
+      VALUES (v_creator_c, 'topic-a', 'Topic A', 0);
+    INSERT INTO public.sample_content (id, creator_id, source_type, title, raw_text, topic_tags, fetch_status)
+      VALUES (gen_random_uuid(), v_creator_c, 'transcript', 'S', 'b', ARRAY['topic-a'], 'ready')
+      RETURNING id INTO v_sample_c;
+    INSERT INTO public.corpus_reprocess_jobs (sample_id, target_version, status, enqueue_version)
+      VALUES (v_sample_c, 3, 'done', 1);
+    -- v3 section + unit (additive-build survivors).
+    INSERT INTO public.sample_content_sections
+      (sample_id, creator_id, section_index, title, summary, char_start, char_end,
+       topic_tags, summary_embedding, centroid_embedding)
+    VALUES (v_sample_c, v_creator_c, 0, 'S', 's', 0, 100, ARRAY['topic-a'],
+            pg_temp.unit_vec(1), pg_temp.unit_vec(2))
+    RETURNING id INTO v_sec_c;
+    INSERT INTO public.sample_content_narrative_units
+      (sample_id, creator_id, unit_index, title, text, token_count, topic_tags, section_id)
+    VALUES (v_sample_c, v_creator_c, 1000, 'V3U', 'u', 10, ARRAY['topic-a'], v_sec_c)
+    RETURNING id INTO v_unit_v3_c;
+    PERFORM public._insert_chunk_v3_unsafe(
+      v_unit_v3_c, v_sec_c, 0, 'v3c', NULL, 10, ARRAY['topic-a'], pg_temp.unit_vec(1));
+    -- v2-shape unit (section_id NULL) + v1 + v2 chunks (the to-be-cut corpus).
+    INSERT INTO public.sample_content_narrative_units
+      (sample_id, creator_id, unit_index, title, text, token_count, topic_tags, section_id)
+    VALUES (v_sample_c, v_creator_c, 0, 'V2U', 'u2', 10, ARRAY['topic-a'], NULL);
+    INSERT INTO public.sample_content_chunks
+      (id, sample_id, creator_id, chunk_index, text, topic_tags, embedding, chunker_version)
+    VALUES
+      (gen_random_uuid(), v_sample_c, v_creator_c, 0, 'v1', ARRAY['topic-a'], pg_temp.unit_vec(1), 1),
+      (gen_random_uuid(), v_sample_c, v_creator_c, 1, 'v2', ARRAY['topic-a'], pg_temp.unit_vec(1), 2);
+
+    -- Flip v2->v3 (creator_v3_ready=true: the one sample has done job +
+    -- section w/ embeddings + a v3 chunk).
+    PERFORM tests.set_authenticated(v_admin);
+    PERFORM public.admin_set_creator_retrieval_version(v_creator_c, 3::smallint);
+    PERFORM tests.reset_role();
+
+    SELECT count(*) INTO v_v1_after FROM public.sample_content_chunks
+     WHERE creator_id = v_creator_c AND chunker_version = 1;
+    SELECT count(*) INTO v_v2_after FROM public.sample_content_chunks
+     WHERE creator_id = v_creator_c AND chunker_version = 2;
+    SELECT count(*) INTO v_v3_after FROM public.sample_content_chunks
+     WHERE creator_id = v_creator_c AND chunker_version = 3;
+    SELECT count(*) INTO v_v2u_after FROM public.sample_content_narrative_units
+     WHERE creator_id = v_creator_c AND section_id IS NULL;
+    SELECT count(*) INTO v_v3u_after FROM public.sample_content_narrative_units
+     WHERE creator_id = v_creator_c AND section_id IS NOT NULL;
+    RETURN NEXT ok(
+      v_v1_after = 0 AND v_v2_after = 0 AND v_v3_after = 1
+        AND v_v2u_after = 0 AND v_v3u_after = 1,
+      format('8: v2->v3 flip cutover — v1=%s v2=%s v3=%s v2u=%s v3u=%s (want 0/0/1/0/1)',
+             v_v1_after, v_v2_after, v_v3_after, v_v2u_after, v_v3u_after)
+    );
+
+    -- 9: audit carries cutover counts (1 chunk of each version + 1 v2 unit).
+    SELECT after->>'cutover_chunks_deleted', after->>'cutover_v2_units_deleted'
+      INTO v_cut_chunks, v_cut_units
+      FROM public.admin_audit_log
+     WHERE action = 'creator_retrieval_version_set'
+       AND target_id = v_creator_c
+       AND (after->>'retrieval_version') = '3'
+     ORDER BY created_at DESC, id DESC LIMIT 1;
+    RETURN NEXT is(
+      v_cut_chunks || '|' || v_cut_units, '2|1',
+      format('9: v2->v3 audit carries cutover counts (chunks=%s units=%s, want 2|1)',
+             COALESCE(v_cut_chunks, 'NULL'), COALESCE(v_cut_units, 'NULL'))
+    );
+  END;
 END;
 $fn$;
 

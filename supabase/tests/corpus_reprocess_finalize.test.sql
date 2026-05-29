@@ -26,9 +26,13 @@
 --      caller-supplied IDs — only takes p_job_id + p_claimed_version).
 --      Textual proof: signature has only those two params.
 --  11. current_corpus_version CHECK (>= 1) — cannot ALTER below 1.
+--  13. round-5 C2: v2 finalize REFUSES a target_version=3 job (silent
+--      abandon → NULL), mirroring finalize_v3's refusal of a v2 job. The
+--      mirror fence — a job is only ever finalized by the finalize matching
+--      its target_version.
 
 BEGIN;
-SELECT plan(13);
+SELECT plan(14);
 
 CREATE FUNCTION pg_temp.run() RETURNS SETOF text LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -314,6 +318,32 @@ BEGIN
           RETURN NEXT fail(format('12: unexpected sqlstate %s', SQLSTATE));
       END;
     END IF;
+  END;
+
+  -- ── 13: round-5 C2 — v2 finalize refuses a target_version=3 job ────────
+  -- Set up a processing target_version=3 job for sample1 and call the v2
+  -- finalize on it. It must silent-abandon (NULL) + not bump version.
+  DECLARE
+    v_v3job      uuid;
+    v_ver_before int;
+    v_ver_after  int;
+    v_ret        int;
+  BEGIN
+    SELECT current_corpus_version INTO v_ver_before FROM public.creators WHERE id = v_creator;
+    -- sample1's existing job is done; insert a fresh v3 job (its v2 job row
+    -- conflicts on (sample_id, target_version) only for the SAME version, so
+    -- a target_version=3 row coexists with the prior target_version=2 row).
+    INSERT INTO public.corpus_reprocess_jobs
+      (sample_id, target_version, status, attempts, enqueue_version, claimed_by, claimed_at)
+    VALUES (v_sample1, 3, 'processing', 1, 1, 'test-worker', now())
+    RETURNING id INTO v_v3job;
+    SELECT public.corpus_reprocess_finalize(v_v3job, 1) INTO v_ret;
+    SELECT current_corpus_version INTO v_ver_after FROM public.creators WHERE id = v_creator;
+    RETURN NEXT ok(
+      v_ret IS NULL AND v_ver_after = v_ver_before,
+      format('13: v2 finalize refuses target_version=3 job → NULL + no bump (ret=%s ver %s→%s)',
+             COALESCE(v_ret::text, 'NULL'), v_ver_before, v_ver_after)
+    );
   END;
 
 END;

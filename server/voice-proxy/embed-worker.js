@@ -283,10 +283,13 @@ export function makeEmbedWorker({ supabase, geminiApiKey, flyMachineId } = {}) {
       const retrievalVersion = Number(creator?.retrieval_version ?? 1);
       if (retrievalVersion !== 1) {
         // Don't run v1 work. Mark errored so admin can see + manually
-        // re-enqueue if the creator is later flipped back to v1.
+        // re-enqueue if the creator is later flipped back to v1. The `!== 1`
+        // guard skips ANY non-v1 creator (v2 AND v3 — round-5 audit M1: the
+        // event name below was renamed from the v2-specific form to a
+        // version-agnostic one so v3 skips don't mis-bucket in dashboards).
         await markJobErrored(jobId, `creator_is_v${retrievalVersion}_skip_legacy_worker`);
-        captureMessage('embedding.legacy_worker_skipped_v2_creator', 'info', {
-          op: 'embed_worker.v2_skip',
+        captureMessage('embedding.legacy_worker_skipped_non_v1_creator', 'info', {
+          op: 'embed_worker.non_v1_skip',
           creator_id: sample.creator_id,
           retrieval_version: retrievalVersion,
         });
@@ -997,34 +1000,65 @@ export function makeCorpusReprocessWorker({
         partLabelBySecIdx[i] = { k, n };
       }
 
-      // Step 3: idempotent cleanup. Two DELETEs in order:
-      //   3a (audit C1 fix). DELETE v2-shape narrative_units (section_id
-      //       NULL) for THIS sample so v3's per-section unit_index space
-      //       can claim 0..N without 23505-ing against surviving v2 units
-      //       at (sample_id, unit_index). The v2 read path on this creator
-      //       is FROZEN at retrieval_version=2; once the admin flips to v3
-      //       (build-then-flip, step 7) the sample's v2 chunks (chunker_v=2)
-      //       become dead anyway. CASCADE on parent_unit_id wipes the v2
-      //       chunks under those units too. The standalone v2 mark_done
-      //       cache-bump (step 1b) means current_corpus_version still bumps
-      //       on the v2 sample reprocess if that happens later.
-      //   3b. DELETE v3 sections → CASCADE units (section_id matches) and
-      //       chunks (parent_unit_id + section_id).
-      const { error: cleanupV2Err } = await supabase
-        .from('sample_content_narrative_units')
-        .delete()
-        .eq('sample_id', sampleId)
-        .is('section_id', null);
-      if (cleanupV2Err) {
-        await markJobErrored(jobId, `v3_pre_insert_v2_cleanup_failed:${cleanupV2Err.message}`);
-        return;
-      }
+      // Step 3: idempotent cleanup — ADDITIVE-BUILD (round-5 audit C1).
+      //
+      // We DELETE only THIS run's prior v3 artifacts (idempotent re-embed of
+      // a crashed/re-claimed v3 job), NOT the creator's live v2 corpus.
+      //
+      //   3 (was "3b"). DELETE this sample's v3 sections → CASCADE wipes the
+      //      v3 units (section_id matches) + v3 chunks (parent_unit_id +
+      //      section_id) of any PRIOR v3 attempt. v2 units/chunks are
+      //      UNTOUCHED.
+      //
+      // The OLD "3a" delete of v2-shape narrative_units (section_id NULL)
+      // was REMOVED: it CASCADE-wiped the creator's live v2 chunks mid-build,
+      // blanking the still-v2 read path for every processed sample until the
+      // flip (plan §6 promised "accumulate invisibly" — 3a broke that). The
+      // (sample_id, unit_index) UNIQUE collision that 3a existed to avoid is
+      // now handled by offsetting v3 unit_index above the surviving v2 range
+      // (v3UnitBase below). v2 + v3 rows coexist until the v2→v3 flip RPC
+      // (migration 20260528000053) does the one-shot v1+v2 cutover delete.
       const { error: cleanupErr } = await supabase
         .from('sample_content_sections')
         .delete()
         .eq('sample_id', sampleId);
       if (cleanupErr) {
         await markJobErrored(jobId, `v3_pre_insert_sections_cleanup_failed:${cleanupErr.message}`);
+        return;
+      }
+
+      // ADDITIVE-BUILD unit_index base. The (sample_id, unit_index) UNIQUE is
+      // sample-wide, so v3 units must not collide with the surviving v2 units
+      // (0..N). Read MAX(unit_index) for the sample AFTER the v3-section
+      // cleanup above (so a re-run sees only v2 units, giving a stable base)
+      // and start v3 units strictly above it. With v3UnitBase + secIdx*10000
+      // + unitIdx, v3 never overlaps v2 and the value stays well within int.
+      let v3UnitBase = 0;
+      {
+        const { data: maxRow, error: maxErr } = await supabase
+          .from('sample_content_narrative_units')
+          .select('unit_index')
+          .eq('sample_id', sampleId)
+          .order('unit_index', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (maxErr) {
+          await bumpFailure(jobId, `v3_unit_base_lookup_failed:${maxErr.message}`);
+          return;
+        }
+        v3UnitBase = maxRow ? (Number(maxRow.unit_index) + 1) : 0;
+      }
+
+      // Round-6 M2: int4 overflow guard. unit_index is int4 (max ~2.1B).
+      // The largest v3 value is v3UnitBase + (segments.length-1)*10000 +
+      // (units in last section). Bail loud rather than hit a Postgres 22003
+      // mid-insert if a pathological base + section count would overflow.
+      // 2e9 leaves headroom under 2_147_483_647.
+      if (v3UnitBase + segments.length * 10000 >= 2_000_000_000) {
+        await markJobErrored(
+          jobId,
+          `v3_unit_index_overflow_guard base=${v3UnitBase}_sections=${segments.length}`,
+        );
         return;
       }
 
@@ -1175,11 +1209,23 @@ export function makeCorpusReprocessWorker({
           const unit = sectionUnits[unitIdx];
           const unitTokens = clampTokenCount(unit.text);
           // narrative_units.unit_index is sample-wide unique. v3 uses a
-          // running counter that's also section-aware: secIdx*10000 + unitIdx
-          // gives a unique sample-wide value while keeping section grouping
-          // obvious in logs. 10000 cap > any realistic units/section (Flash
-          // emits ~5-30 units per section).
-          const unitIndexSampleWide = secIdx * 10000 + unitIdx;
+          // running counter that's section-aware AND offset above the
+          // surviving v2 range (v3UnitBase, round-5 audit C1 additive-build):
+          // v3UnitBase + secIdx*10000 + unitIdx is unique sample-wide, never
+          // collides with v2 units (0..v3UnitBase-1), and keeps section
+          // grouping obvious in logs. 10000 cap > any realistic units/section
+          // (Flash emits ~5-30 units per section).
+          //
+          // Round-6 M1 — LOAD-BEARING non-collision invariant: a v2 reprocess
+          // worker (target_version=2 job for the SAME sample) can run
+          // concurrently (claim's advisory lock is xact-scoped, released
+          // before processing). It writes v2 units counting from 0 upward.
+          // v3 never collides ONLY because v2 indices stay low (0..N) and v3
+          // starts at v3UnitBase = MAX+1 (≥ N+1). If v2 ever wrote indices
+          // ≥ v3UnitBase this would 23505. v2's counter starts at 0, so it
+          // holds — but the safety rests on that coupling. Do not change v2's
+          // unit_index scheme to start high without revisiting this.
+          const unitIndexSampleWide = v3UnitBase + secIdx * 10000 + unitIdx;
           const { data: unitRow, error: unitErr } = await supabase
             .from('sample_content_narrative_units')
             .insert({
