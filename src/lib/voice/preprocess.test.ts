@@ -14,9 +14,35 @@ import {
   neutralizeInjectionImperatives,
   sanitizeForLLMPrompt,
   stripSlideMarkers,
+  stripRecordingEscapes,
 } from './preprocess';
 
 const MIDDLE_DOT = '\u{00B7}';
+
+describe('stripRecordingEscapes (audit round-1 M6)', () => {
+  it('removes backslash before delivery-cue punctuation, keeps the punctuation', () => {
+    expect(stripRecordingEscapes('Wait for it\\! Are you ready\\?')).toBe(
+      'Wait for it! Are you ready?',
+    );
+    expect(stripRecordingEscapes('Pause\\. Then continue\\,')).toBe('Pause. Then continue,');
+  });
+
+  it('is idempotent (canonical-bytes / cache contract)', () => {
+    const once = stripRecordingEscapes("He said \\\"go\\\" and left\\.");
+    expect(stripRecordingEscapes(once)).toBe(once);
+  });
+
+  it('leaves text without recording escapes untouched', () => {
+    const natural = 'Just a normal sentence. With punctuation! And a question?';
+    expect(stripRecordingEscapes(natural)).toBe(natural);
+  });
+
+  it('preprocessRawText composes the strip (de-escaped punctuation survives)', () => {
+    expect(preprocessRawText('You drove all night\\! Then the gym\\?')).toContain(
+      'all night! Then the gym?',
+    );
+  });
+});
 
 describe('stripSlideMarkers', () => {
   it('strips line-start "42-" prefix from a transcript', () => {

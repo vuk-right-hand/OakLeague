@@ -331,3 +331,58 @@ M1/M2/M3/M4/M5/M6/M7 applied. Smalls S2/S4/S6/S7 deferred below; C4 deferred.
   feasible.
 - **TRIGGER — do it when:** writing the next proxy node:test suite (e.g., when
   the v3 dispatch site gets its own integration test).
+
+---
+
+## v3 ingest bulletproofing — round-2 audit follow-ups (2026-05-29)
+
+Deferred items from the round-2 audit of the "no silent word-loss" ingest change
+(section-coverage.ts + route never-null + worker rescue/backstop + creator_v3_ready
+count invariant). Core findings applied in the same change; these are the
+explicitly-deferred ones.
+
+- **NARRATIVE_CHUNK_MODEL pin (round-2 C1) — DECISION OWED TO VUK.** The v3 section
+  chunker defaults to the bare alias `gemini-2.5-flash` (narrative-chunk.ts:37),
+  which (a) is mutable/unversioned and (b) is slated for **deprecation ~June 2026**
+  per Google's forum (verified 2026-05-29). The coverage-gate determinism rationale
+  leans on temp-0 output stability, which a silent backend swap undercuts. NOT
+  blind-pinned in the bulletproofing commit because choosing the replacement string
+  needs its own verification pass (which dated GA tag is current + not deprecating)
+  AND the 0.85/0.90 coverage floors should be re-derived against whatever model is
+  pinned. **TRIGGER:** before the v3 prod cutover (Step 9) — pin NARRATIVE_CHUNK_MODEL
+  to a verified dated string on Fly+Vercel, re-run the AoD ingest, confirm the
+  observed per-section coverage min stays well above the floors.
+
+- **Coverage gate flip-flop persistence (round-2 M1) — ACCEPTED, not implemented.**
+  Even at temp 0, a borderline section can flip Flash-units↔verbatim across
+  re-claims, bumping current_corpus_version + re-embedding. Bounded (one section per
+  flip) and largely moot because the additive build already DELETEs+rebuilds the
+  whole sample on every re-claim regardless. If flip churn ever shows up in cost
+  telemetry, persist the decision: store fallback_reason + a section-text hash on
+  sample_content_sections and skip Flash on clean re-claim when the hash is unchanged.
+
+- **flash_failed COGS under-count (round-2 Small) — ACCEPTED.** route.ts buildFallback
+  reports usage {0,0,0} on the flash_failed path, discarding the two failed Flash
+  attempts' input-token spend (narrativeChunkSection returns null without surfacing
+  usage). Small undercount; fix would require threading failed-attempt usage out of
+  narrativeChunkSection.
+
+---
+
+## Creator-facing ingest-failure UX (raised by Vuk 2026-05-30)
+
+The v3 bulletproofing makes ingest failure **fail-closed + operator-loud** (errored
+job row + Sentry + creator_v3_ready=false blocks the flip, so a half-book never
+reaches a viewer). But the CREATOR who uploaded is NOT auto-notified "chapter XYZ
+errored, resubmit it":
+- creator brain-status API (`/creator/api/brain-status`) reads `sample_content.fetch_status`
+  (upload status), NOT the corpus_reprocess_jobs status → a v3-job error is invisible there.
+- embed-worker.js never calls the `creator_brain_mark_errored` helper (0 brain refs) →
+  `brain_status` doesn't flip on a v3 ingest failure.
+- brain page `errored` copy is generic ("our team will take a look"), not per-chapter,
+  no self-serve resubmit.
+**To close (a dedicated unit):** (1) worker calls creator_brain_mark_errored on terminal
+v3 failure; (2) brain-status route surfaces per-sample reprocess-job status; (3) brain
+page shows which chapter failed + a re-enqueue/resubmit action; (4) tests.
+**Acceptable for v1** (invite-only, hands-on admin re-enqueues) — TRIGGER: when creator
+count grows past hands-on, or before self-serve creator onboarding GA.

@@ -61,6 +61,26 @@ export function stripSlideMarkers(raw: string): string {
   return raw.replace(SLIDE_MARKER_RE, '');
 }
 
+// Recording-prep escapes (RAG v3 bulletproofing, audit round-1 M6). Some
+// creator source (e.g. teleprompter / recording scripts) contains backslash-
+// escaped punctuation — `\!`, `\?`, `\.` — used as on-camera delivery cues.
+// Left in place these break Gemini Flash's structured-JSON output (a stray
+// backslash inside a string the model echoes verbatim produces invalid JSON),
+// forcing the section into the verbatim fallback. Stripping the backslash
+// (keeping the punctuation) lets Flash succeed and improves chunk quality.
+//
+// Placed BEFORE sanitizeForLLMPrompt so the de-escaped text flows through the
+// NFKD + zero-width + L0 passes normally. IDEMPOTENT: after one pass no
+// `\<punct>` remains, so a re-call is a no-op (preserves the canonical-bytes
+// contract the contextual-gen 1h cache depends on). NOTE: this changes the
+// canonical bytes for any sample that DOES contain these escapes → a one-time
+// contextual-gen cache miss on first re-ingest. Acceptable: v3 rollout
+// re-ingests every sample anyway, so the cache is cold regardless.
+const RECORDING_ESCAPE_RE = /\\([!?.,;:'"])/g;
+export function stripRecordingEscapes(raw: string): string {
+  return raw.replace(RECORDING_ESCAPE_RE, '$1');
+}
+
 
 // ── Pass 2-6: sanitizeForLLMPrompt ──────────────────────────────────────────
 
@@ -386,7 +406,9 @@ export function neutralizeInjectionImperatives(text: string): string {
 
 export function preprocessRawText(raw: string): string {
   if (!raw) return '';
-  return neutralizeInjectionImperatives(sanitizeForLLMPrompt(stripSlideMarkers(raw)));
+  return neutralizeInjectionImperatives(
+    sanitizeForLLMPrompt(stripRecordingEscapes(stripSlideMarkers(raw))),
+  );
 }
 
 /**
@@ -398,6 +420,6 @@ export function preprocessRawText(raw: string): string {
  */
 export function preprocessRawTextWithReport(raw: string): L0Result {
   if (!raw) return { text: '', injectionNeutralized: 0, injectionCategories: [] };
-  const structural = sanitizeForLLMPrompt(stripSlideMarkers(raw));
+  const structural = sanitizeForLLMPrompt(stripRecordingEscapes(stripSlideMarkers(raw)));
   return applyL0(structural);
 }

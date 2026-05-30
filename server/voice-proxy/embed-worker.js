@@ -134,6 +134,45 @@ function chunkSample({ rawText, topicTags }) {
   }));
 }
 
+// True if the text has at least one word character (letter or number). The
+// single source of the v3 "is there anything to lose?" predicate — used by the
+// rescue below AND mirrored by the per-section pre-screen in processV3Job.
+export function hasWordContent(text) {
+  return /[\p{L}\p{N}]/u.test(String(text ?? ''));
+}
+
+// v3 unit_index stride is secIdx*10000 (processV3Job), so a section must never
+// emit ≥10000 units or it collides into the next section's range (audit round-2
+// M1). Verbatim packing (≤6000 chars/unit, ≤32K-char sections) tops out at ~6;
+// Flash emits ~5-30. This is the loud guard if either ever pathologically blows.
+export const MAX_UNITS_PER_SECTION = 9999;
+
+// AUDIT ROUND-1 C1 + ROUND-2 M3 — split a parent unit into child chunks, with a
+// rescue so a non-empty unit can NEVER be silently dropped. chunkSample returns
+// [] when its text collapses to whitespace after paragraph/sentence split (runs
+// of punctuation, formatting artifacts) — the OLD `continue` there was a silent
+// word-loss path masked by sibling units' chunks (creator_v3_ready checks chunks
+// per SECTION, not per unit). Returns { children, rescued }:
+//   • chunkSample produced ≥1 child            → { children, rescued:false }
+//   • chunkSample empty BUT unit has a word char → { [rawTextAsOneChild], rescued:true }
+//   • chunkSample empty AND no word content      → { [], rescued:false }  (nothing to lose)
+// Pure + exported so the guarantee is unit-tested without booting the worker.
+export function chunkUnitWithRescue(unitText, topicTags) {
+  const children = chunkSample({ rawText: unitText, topicTags });
+  if (children.length > 0) return { children, rescued: false };
+  if (!hasWordContent(unitText)) return { children: [], rescued: false };
+  const text = String(unitText).slice(0, HARD_MAX_CHARS);
+  return {
+    children: [{
+      chunk_index: 0,
+      text,
+      token_count: estimateTokens(text),
+      topic_tags: [...topicTags],
+    }],
+    rescued: true,
+  };
+}
+
 // Format halfvec for pgvector text wire format: '[v1,v2,...]'.
 function vecToPgText(v) {
   return '[' + v.join(',') + ']';
@@ -724,7 +763,13 @@ export function makeCorpusReprocessWorker({
     let v3AnthropicCacheReadInputTokens  = 0;
     let v3AnthropicOutputTokens          = 0;
     let v3SectionsProcessed              = 0;
-    let v3SectionsZeroUnits              = 0;
+    let v3SectionsZeroUnits              = 0;   // retained for telemetry parity
+    let v3SectionsFallback               = 0;   // sections rescued via verbatim
+                                                // fallback (Flash failed OR
+                                                // summarized) — audit round-1 M7
+    let v3SectionsSkippedEmpty           = 0;   // sections with zero word
+                                                // content (nothing to lose) —
+                                                // audit round-1 C2/C3
     let v3FlashCogsLogged                = false;
     let v3SpendCogsLogged                = false;
 
@@ -830,6 +875,8 @@ export function makeCorpusReprocessWorker({
               sample_id: sampleId,
               sections_processed:     v3SectionsProcessed,
               sections_zero_units:    v3SectionsZeroUnits,
+              sections_fallback:      v3SectionsFallback,      // audit round-1 M7
+              sections_skipped_empty: v3SectionsSkippedEmpty,  // audit round-1 M7
               chunks:                 v3TotalChildChunks,
               // Audit M4 — split the per-section summary embeds out so
               // analytics can reconcile `tokens / chunks ≈ avg chunk tokens`
@@ -1073,7 +1120,24 @@ export function makeCorpusReprocessWorker({
           await bumpFailure(jobId, `v3_shutdown_inflight_section_${secIdx}`); return;
         }
 
-        // 4a — narrative-chunk-section.
+        // Pre-screen empty sections (audit round-1 C2/C3). The segmenter emits
+        // heading-only / whitespace sections HONESTLY (section-segment.ts:36-39
+        // does not filter them). A section with ZERO word characters has
+        // nothing to lose — skip it WITHOUT inserting a row and exclude it from
+        // the backstop denominator. Predicate is "no letter or number" (NOT a
+        // word-count threshold — a 4-word aphorism is real content and must be
+        // ingested). This is the ONLY legitimate skip; every section with word
+        // content is guaranteed a row below.
+        if (!hasWordContent(sec.text)) {
+          v3SectionsSkippedEmpty += 1;
+          continue;
+        }
+
+        // 4a — narrative-chunk-section. The route NEVER returns units:null
+        // (audit round-1): on Flash failure OR low coverage it substitutes
+        // deterministic VERBATIM units built from sec.text, so no section's
+        // words are ever silently dropped. `fallback`/`fallback_reason` are
+        // telemetry only.
         let secResp;
         try {
           secResp = await postInternal('/api/internal/narrative-chunk-section', {
@@ -1091,19 +1155,47 @@ export function makeCorpusReprocessWorker({
         }
         const sectionUnits = Array.isArray(secResp.units) ? secResp.units : null;
         if (!sectionUnits || sectionUnits.length === 0) {
-          // Audit round-4 M7 — per-section "produced ≥1 unit OR explicit reason"
-          // assertion. Skip this section but record visibility; creator_v3_ready
-          // (step 6) will reject the creator if ANY section_id has zero chunks.
-          v3SectionsZeroUnits += 1;
-          captureMessage('reprocess.v3.section_zero_units', 'warning', {
-            op: 'reprocess_worker.v3.section_zero_units',
+          // The route returns an empty array ONLY when verbatimUnitsFromSection
+          // also found no word content — i.e. this section is genuinely empty.
+          // Our pre-screen above should have caught it; reaching here means the
+          // route and worker disagreed on emptiness. Treat as empty (no words
+          // to lose), record it, and skip. NOT the old silent-loss `continue`:
+          // a section WITH content can no longer reach this branch.
+          v3SectionsSkippedEmpty += 1;
+          captureMessage('reprocess.v3.section_empty_after_route', 'warning', {
+            op: 'reprocess_worker.v3.section_empty_after_route',
             creator_id: creatorId,
             sample_id:  sampleId,
             section_index: secIdx,
-            reason: secResp.message || 'flash_returned_null',
           });
           continue;
         }
+        // Track verbatim-fallback rate (audit round-1 M7 + Sentry brownout
+        // alert). A spike means Flash is degrading — visible, not silent.
+        if (secResp.fallback === true) {
+          v3SectionsFallback += 1;
+          captureMessage('reprocess.v3.section_verbatim_fallback', 'info', {
+            op: 'reprocess_worker.v3.section_verbatim_fallback',
+            creator_id: creatorId,
+            sample_id:  sampleId,
+            section_index: secIdx,
+            reason: secResp.fallback_reason || 'unknown',
+            coverage: secResp.coverage || null,
+          });
+        }
+        // Audit round-2 M1 — unit_index stride is secIdx*10000; a section with
+        // ≥10000 units would collide into the next section's index range and hit
+        // the (sample_id, unit_index) UNIQUE. Can't happen via verbatim packing
+        // or normal Flash output, but fail LOUD if it ever does rather than
+        // 23505-loop on every re-claim.
+        if (sectionUnits.length > MAX_UNITS_PER_SECTION) {
+          await markJobErrored(
+            jobId,
+            `v3_section_${secIdx}_too_many_units_${sectionUnits.length}`,
+          );
+          return;
+        }
+
         // Accumulate Flash usage. Audit M2 — flush PARTIAL Flash cogs_log
         // every PERIODIC_FLUSH_EVERY sections so a mid-book crash doesn't
         // evaporate the entire Flash spend from cogs_log (the kill-switch
@@ -1246,9 +1338,21 @@ export function makeCorpusReprocessWorker({
           }
           const parentUnitId = unitRow.id;
 
-          // Split unit into child chunks (re-use existing chunker).
-          const children = chunkSample({ rawText: unit.text, topicTags });
-          if (children.length === 0) continue;
+          // Split unit into child chunks, with the C1 rescue (chunkUnitWithRescue
+          // — pure, unit-tested). A non-empty unit can NEVER be silently dropped:
+          // if the chunker collapses it to [], we embed its raw text as one child.
+          // Only a unit with ZERO word content (nothing to lose) yields [].
+          const { children, rescued } = chunkUnitWithRescue(unit.text, topicTags);
+          if (children.length === 0) continue;   // truly nothing to lose
+          if (rescued) {
+            captureMessage('reprocess.v3.unit_chunker_empty_rescued', 'warning', {
+              op: 'reprocess_worker.v3.unit_chunker_empty_rescued',
+              creator_id: creatorId,
+              sample_id:  sampleId,
+              section_index: secIdx,
+              unit_index: unitIdx,
+            });
+          }
 
           // Per-child contextual-gen. CRITICAL v3 change vs v2: `doc` is the
           // SECTION TEXT, not the whole sample. This makes the 1h prompt
@@ -1434,6 +1538,65 @@ export function makeCorpusReprocessWorker({
           `v3_contextual_gen_failure_rate_${v3TotalContextualGenFailures}_of_${v3TotalChildChunks}`,
         );
         return;
+      }
+
+      // AUDIT ROUND-1 C2/C3/M3 — sample-level "no section silently dropped"
+      // backstop. Every segment must have been EITHER ingested as a section
+      // row OR skipped as genuinely-empty. The route's never-null contract +
+      // the loud per-section error returns above make this assertion
+      // belt-and-suspenders (it should never fire), but if it ever does we
+      // fail LOUD instead of finalizing a partial book. This runs on the
+      // single success path (after the contextual-gen abort, before finalize)
+      // and `return`s rather than throws, so the `finally` still flushes COGS
+      // honestly. Denominator math uses the SAME skip the loop applied
+      // (v3SectionsSkippedEmpty), never a recomputed predicate.
+      if (v3SectionsProcessed + v3SectionsSkippedEmpty !== segments.length) {
+        await markJobErrored(
+          jobId,
+          `v3_section_count_mismatch processed=${v3SectionsProcessed} skipped_empty=${v3SectionsSkippedEmpty} expected=${segments.length}`,
+        );
+        captureMessage('reprocess.v3.section_count_mismatch', 'error', {
+          op: 'reprocess_worker.v3.section_count_mismatch',
+          creator_id: creatorId,
+          sample_id:  sampleId,
+          processed: v3SectionsProcessed,
+          skipped_empty: v3SectionsSkippedEmpty,
+          fallback: v3SectionsFallback,
+          expected: segments.length,
+        });
+        return;
+      }
+
+      // AUDIT ROUND-1 M4 — persist the expected/skipped section counts on the
+      // sample so creator_v3_ready (the DB-side flip gate) can assert the
+      // actual section-row count matches, independent of any worker-side
+      // reasoning. Written BEFORE finalize: if this UPDATE fails we requeue
+      // (do NOT finalize a sample whose gate-invariant columns are stale).
+      {
+        const { error: countErr } = await supabase
+          .from('sample_content')
+          .update({
+            v3_expected_section_count: segments.length,
+            v3_skipped_empty_count:    v3SectionsSkippedEmpty,
+          })
+          .eq('id', sampleId);
+        if (countErr) {
+          await bumpFailure(jobId, `v3_section_count_write_failed:${countErr.message}`);
+          return;
+        }
+      }
+
+      // Brownout alert (audit round-1 Small) — a high verbatim-fallback rate
+      // for one sample means Flash is degrading broadly; surface it so a
+      // demo-day model hiccup is visible, not a silently-churning queue.
+      if (segments.length > 0 && v3SectionsFallback / segments.length > 0.25) {
+        captureMessage('reprocess.v3.high_fallback_rate', 'warning', {
+          op: 'reprocess_worker.v3.high_fallback_rate',
+          creator_id: creatorId,
+          sample_id:  sampleId,
+          fallback: v3SectionsFallback,
+          sections: segments.length,
+        });
       }
 
       // Atomic version-checked finish.

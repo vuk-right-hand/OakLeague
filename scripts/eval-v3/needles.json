@@ -2,51 +2,115 @@
   "_doc": "Needle spec for diag-eval-v3. The QUERY is always the QUESTION (never the needle text) -> guards query<->document leakage (design 2.4/6.1). 'ground_truth.value' is a VERBATIM substring that MUST exist in exactly one ingested narrative unit; pre-flight resolves it to a parent_unit_id (design C4/OQ#2). 'answerable:false' questions are calibration negatives for the inject silence-gate (design M4/5.2): pre-flight asserts NO unit substring-matches them.",
   "corpora": {
     "aod": {
-      "_note": "Validation fixture against the existing AoD transcript corpus (scripts/aod_test_corpus). Proves the harness machinery on real content before the book run. Substrings verified present 2026-05-29.",
+      "_note": "Vuk's book 'Acres Of Personal Diamonds' (8 modules, ~92k words, scripts/aod_test_corpus). 12 needles drafted from real passages 2026-05-29, AWAITING Vuk verification. Each ground_truth.value is a verbatim phrase seen in the source; preflight confirms it survived Flash ingest into exactly one unit (some may need swapping — Flash ingest is ~58% lossy).",
       "topic_tag": "aod",
       "needles": [
         {
-          "id": "dopamine-receptors",
-          "planted_in": "aod",
-          "depth": "mid",
+          "id": "chess-be-the-hand", "planted_in": "aod", "depth": "ch1",
+          "ground_truth": { "match": "substring", "value": "to be the hand" },
+          "questions": [
+            "you have that metaphor about life being like a chess game — what should our goal be if we think about life that way?",
+            "thinking of life as a chess game, what should we actually be aiming for?",
+            "you said most people climb from pawn to king — what's the real goal instead?"
+          ]
+        },
+        {
+          "id": "discipline-fallacy", "planted_in": "aod", "depth": "ch1",
+          "ground_truth": { "match": "substring", "values": ["drives all night to his vacation", "getting a lumberjack to play a guitar"] },
+          "questions": [
+            "you talk about the fallacy of discipline — that discipline is NOT actually required for success. what do you mean?",
+            "you say willpower and discipline aren't the real thing — like your friend who drove all night then went straight to the gym?",
+            "if it's not discipline that makes people consistent, then what is it?"
+          ]
+        },
+        {
+          "id": "dopamine-receptors", "planted_in": "aod", "depth": "mid",
           "ground_truth": { "match": "substring", "value": "size of a walnut to the size of a dust grain" },
           "questions": [
-            "what actually happens to my brain's reward chemistry when I doomscroll all day",
-            "does too much cheap stimulation physically change something in my head",
-            "why do I feel numb and need bigger and bigger hits to feel anything"
+            "what physically happens to my brain's reward system from too much cheap stimulation?",
+            "does scrolling and constant dopamine actually shrink something in my brain?",
+            "why do I feel numb and need bigger hits to feel anything?"
           ]
         },
         {
-          "id": "lumberjack-guitar",
-          "planted_in": "aod",
-          "depth": "ch1",
-          "ground_truth": { "match": "substring", "value": "guitar player NOT play his guitar" },
+          "id": "shower-ideas", "planted_in": "aod", "depth": "mid",
+          "ground_truth": { "match": "substring", "value": "most ideas happen in the shower" },
           "questions": [
-            "why do I keep failing when I try to force myself to do something I'm not built for",
-            "what's that analogy about using the wrong tool for who you are",
-            "is it pointless to grind at something that doesn't fit my nature"
+            "why do my best ideas always seem to come when I'm in the shower?",
+            "what's the brain reason good ideas pop up in the shower?",
+            "how come I get my clearest thoughts in the shower and not at my desk?"
           ]
         },
         {
-          "id": "twin-experiment",
-          "planted_in": "aod",
-          "depth": "last",
+          "id": "paradigm-lens", "planted_in": "aod", "depth": "mid",
+          "ground_truth": { "match": "substring", "values": ["the lens you're wearing", "same genetics, same look, same habits"] },
+          "questions": [
+            "how can two people see the exact same situation completely differently?",
+            "why does the same situation look totally different to two different people?",
+            "what makes my view of a situation so different from someone else's?"
+          ]
+        },
+        {
+          "id": "play-to-strengths-trap", "planted_in": "aod", "depth": "mid",
+          "ground_truth": { "match": "substring", "value": "Forget about your weaknesses" },
+          "questions": [
+            "is the advice to just focus on my strengths and forget my weaknesses actually good?",
+            "everyone says play to your strengths — is that wrong?",
+            "should I ignore my weaknesses and double down on what I'm good at?"
+          ]
+        },
+        {
+          "id": "retention-only-goal", "planted_in": "aod", "depth": "mid",
+          "ground_truth": { "match": "substring", "value": "Retention IS THE ONLY GOAL" },
+          "questions": [
+            "why is so much advice from online creators contradictory?",
+            "why does self-help advice keep flip-flopping with whatever's trending?",
+            "what's the real goal behind most of the advice creators push?"
+          ]
+        },
+        {
+          "id": "insurance-salesperson-story", "planted_in": "aod", "depth": "mid",
+          "ground_truth": { "match": "substring", "value": "2 insurance policies in 14 months" },
+          "questions": [
+            "weren't you really bad at a sales job once — what happened?",
+            "tell me about your time trying to sell insurance",
+            "how did you actually do when you worked in sales?"
+          ]
+        },
+        {
+          "id": "input-vs-outcome-goals", "planted_in": "aod", "depth": "mid",
+          "ground_truth": { "match": "substring", "value": "the ones you can actually control" },
+          "questions": [
+            "what's the difference between goals I can actually control and ones I can't — and which should I set?",
+            "you split goals into the ones I control and the ones I don't — what are they?",
+            "what are input goals versus outcome goals?"
+          ]
+        },
+        {
+          "id": "reality-screen", "planted_in": "aod", "depth": "mid",
+          "ground_truth": { "match": "substring", "value": "tentacles from the screen got attached" },
+          "questions": [
+            "what's the 'reality screen' idea — how my brain projects what I see?",
+            "how would the same screen show a different reality for two different people?",
+            "how is what I perceive just a reflection of who I am?"
+          ]
+        },
+        {
+          "id": "the-devil-old-self", "planted_in": "aod", "depth": "last",
+          "ground_truth": { "match": "substring", "value": "The devil is your old character living inside of you" },
+          "questions": [
+            "when you talk about 'the devil,' what do you actually mean?",
+            "who is the devil you keep referring to?",
+            "is the devil an external thing or something inside me?"
+          ]
+        },
+        {
+          "id": "twin-experiment", "planted_in": "aod", "depth": "last",
           "ground_truth": { "match": "substring", "value": "same genetics, same look, same habits" },
           "questions": [
-            "tell me the thought experiment about two identical brothers raised in opposite environments",
-            "if two people had the exact same genetics but totally different surroundings, what happens",
+            "tell me the thought experiment about two identical twins raised in opposite environments",
+            "if two people had the exact same genetics but totally different surroundings, what happens?",
             "the story about one twin in comfort and one twin in struggle"
-          ]
-        },
-        {
-          "id": "outwitting-the-devil",
-          "planted_in": "aod",
-          "depth": "mid",
-          "ground_truth": { "match": "substring", "value": "outwitting the devil" },
-          "questions": [
-            "how do I stop drifting through life on autopilot",
-            "what's the idea about most people being controlled by something they can't even see",
-            "how do I take back control from the conditioning that runs me"
           ]
         }
       ],

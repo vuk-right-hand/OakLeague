@@ -31,29 +31,25 @@
 //     section_cue?:      string | null,
 //   }
 //
-// Response (200 happy):
+// Response (200) — `units` is ALWAYS a non-empty array. This route NEVER
+// returns units:null (v3 bulletproofing, audit round 1). When Flash fails
+// OR summarizes (coverage below floor), the route substitutes deterministic
+// VERBATIM units built from the raw section text, so every word of the
+// section is ingested + retrievable. The worker therefore can never silently
+// `continue` past a dropped section.
 //   {
-//     units:           [{title, text}, ...],
+//     units:           [{title, text}, ...],   // never null, never empty
 //     section_title:   string,
 //     section_summary: string,
 //     attempt:         1 | 2,
 //     ms:              number,
 //     usage:           { prompt_token_count, candidates_token_count, total_token_count },
+//     fallback:        boolean,                 // true = verbatim substitution
+//     fallback_reason: 'flash_failed' | 'low_coverage' | null,
+//     coverage:        { lengthRatio, trigramContainment } | null,
 //     request_id:      string,
 //     retryable:       false
 //   }
-//
-// Response (200 fallback — both Flash attempts failed schema/transport):
-//   {
-//     units:    null,
-//     attempt:  2,
-//     ms:       0,
-//     message:  'fallback_to_skip_section',
-//     request_id: string,
-//     retryable:  false
-//   }
-//   Worker contract on `units: null`: skip THIS section, continue with
-//   the rest (per-section idempotent re-embed = audit C5).
 
 import { NextResponse, type NextRequest } from 'next/server';
 import { randomUUID } from 'node:crypto';
@@ -63,6 +59,14 @@ import {
   narrativeChunkSection,
   NarrativeChunkError,
 } from '@/lib/voice/narrative-chunk';
+import {
+  sectionCoverage,
+  coveragePasses,
+  isCoverageMeasurable,
+  verbatimUnitsFromSection,
+  extractiveTitleAndSummary,
+  type Coverage,
+} from '@/lib/voice/section-coverage';
 import { checkInternalAuth } from '@/lib/internal-api-auth';
 
 export const runtime = 'nodejs';
@@ -112,27 +116,108 @@ export async function POST(req: NextRequest) {
   Sentry.setTag('sample_id', parsed.data.sample_id);
   Sentry.setTag('section_index', String(parsed.data.section_index));
 
-  try {
-    const result = await narrativeChunkSection({
-      sanitizedSection: parsed.data.sanitized_section,
-      sampleTitle:      parsed.data.sample_title,
-      sectionCue:       parsed.data.section_cue,
-    });
+  const sanitizedSection = parsed.data.sanitized_section;
+  const sectionCue = parsed.data.section_cue ?? null;
+  const sectionIndex = parsed.data.section_index;
 
-    if (result === null) {
-      // Both attempts failed. Worker contract per plan §8 step 4d: skip
-      // THIS section + write a per-section error row so creator_v3_ready
-      // (step 6) stays false until admin re-enqueue.
+  // Build the verbatim-fallback response from the raw section text. Used when
+  // Flash fails OR when its output doesn't cover the source (audit round 1).
+  // Guarantees every word of the section is ingested. `reason` is for worker
+  // telemetry + the Sentry fallback-rate alert.
+  const buildFallback = (
+    reason: 'flash_failed' | 'low_coverage',
+    coverage: Coverage | null,
+    flash: { sectionTitle: string; sectionSummary: string } | null,
+    usage: { prompt_token_count: number; candidates_token_count: number; total_token_count: number },
+    attempt: 1 | 2,
+    ms: number,
+  ): NextResponse => {
+    const units = verbatimUnitsFromSection(sanitizedSection);
+    if (units.length === 0) {
+      // Section had no word content after all (e.g. heading-only). The worker
+      // also pre-screens for this and skips such sections; returning an empty
+      // array here is the secondary guard. Worker treats empty as "skip".
       return NextResponse.json(
         {
-          units: null,
-          attempt: 2,
-          ms: 0,
-          message: 'fallback_to_skip_section',
+          units: [],
+          section_title: '',
+          section_summary: '',
+          attempt,
+          ms,
+          usage,
+          fallback: true,
+          fallback_reason: reason,
+          coverage,
           request_id: requestId,
           retryable: false,
         },
         { status: 200, headers: { 'cache-control': 'no-store' } },
+      );
+    }
+    // Keep Flash's title/summary when we have them (low-coverage case — Flash
+    // succeeded, only its units were lossy); otherwise extract a routing-
+    // viable title/summary from the source (M5 — never a "first N chars" stub).
+    const { title, summary } = flash
+      ? { title: flash.sectionTitle, summary: flash.sectionSummary }
+      : extractiveTitleAndSummary(sanitizedSection, sectionCue, sectionIndex);
+    return NextResponse.json(
+      {
+        units,
+        section_title: title,
+        section_summary: summary,
+        attempt,
+        ms,
+        usage,
+        fallback: true,
+        fallback_reason: reason,
+        coverage,
+        request_id: requestId,
+        retryable: false,
+      },
+      { status: 200, headers: { 'cache-control': 'no-store' } },
+    );
+  };
+
+  try {
+    const result = await narrativeChunkSection({
+      sanitizedSection,
+      sampleTitle: parsed.data.sample_title,
+      sectionCue,
+    });
+
+    if (result === null) {
+      // Both Flash attempts failed → verbatim fallback (never drop the section).
+      Sentry.setTag('section_fallback', 'flash_failed');
+      return buildFallback(
+        'flash_failed',
+        null,
+        null,
+        { prompt_token_count: 0, candidates_token_count: 0, total_token_count: 0 },
+        2,
+        0,
+      );
+    }
+
+    // Flash succeeded — but did it KEEP the words, or summarize them away?
+    // Measure coverage on the exact unit.text strings the chunker will see
+    // (audit C5: pre-truncation, pre-contextual-gen-prefix).
+    const coverage = sectionCoverage(
+      sanitizedSection,
+      result.units.map((u) => u.text),
+    );
+    // Audit round-2 M5 — for sections too short for the metric to be reliable,
+    // trust Flash's units rather than force a needless verbatim fallback (the
+    // trigram set degenerates on tiny inputs; a single dropped char would false-
+    // fail). Lossless either way; this avoids fallback churn + false brownout.
+    if (isCoverageMeasurable(sanitizedSection) && !coveragePasses(coverage)) {
+      Sentry.setTag('section_fallback', 'low_coverage');
+      return buildFallback(
+        'low_coverage',
+        coverage,
+        { sectionTitle: result.sectionTitle, sectionSummary: result.sectionSummary },
+        result.usage,
+        result.attempt,
+        result.ms,
       );
     }
 
@@ -144,6 +229,9 @@ export async function POST(req: NextRequest) {
         attempt:         result.attempt,
         ms:              result.ms,
         usage:           result.usage,
+        fallback:        false,
+        fallback_reason: null,
+        coverage,
         request_id:      requestId,
         retryable:       false,
       },

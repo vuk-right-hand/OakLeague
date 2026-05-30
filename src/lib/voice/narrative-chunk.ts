@@ -229,13 +229,11 @@ function buildPrompt(args: {
 {"units":[{"title":"...","text":"..."},{"title":"...","text":"..."}]}\n`
     : '';
 
-  return `You are a content editor splitting a document into self-contained narrative units for a retrieval system.
+  return `You are a precise transcript SEGMENTER. You are NOT an editor: you never rewrite, summarize, paraphrase, condense, or "improve" the text. Your ONLY job is to decide WHERE to cut the document into consecutive units; the words inside each unit are copied from the source unchanged.
 
-${titleLine}Each unit should be a complete idea, story, or section that makes sense on its own when surfaced to a reader. Aim for ~${TARGET_UNIT_MIN_TOKENS}-${TARGET_UNIT_MAX_TOKENS} tokens per unit. Give each unit a short descriptive title (≤${HARD_MAX_TITLE_CHARS} chars).
+${titleLine}Each unit's "text" MUST be the EXACT, VERBATIM words copied from the document, character for character. Do NOT summarize, paraphrase, rewrite, or describe. Do NOT switch to third person or write "the author/speaker", "this unit explains/describes...". Keep the original first-person voice and exact wording (the stories, specific words, numbers, and names). Cut at natural topic shifts, story beats, or paragraph boundaries; the text between two cuts is copied unchanged. Concatenating every unit's "text" in order MUST reproduce the document's wording (you may drop only pure filler like standalone bookmark numbers). Aim for ~${TARGET_UNIT_MIN_TOKENS}-${TARGET_UNIT_MAX_TOKENS} tokens per unit. Give each unit a short descriptive title (≤${HARD_MAX_TITLE_CHARS} chars) — the title may be your own words, the "text" may NOT.
 
-HARD LIMIT: each unit's "text" field MUST be ≤${HARD_MAX_UNIT_CHARS} characters. If a single narrative beat would exceed ${HARD_MAX_UNIT_CHARS} chars, split it at a paragraph or sentence boundary into two or more consecutive units that together cover the same content. Never emit a "text" longer than ${HARD_MAX_UNIT_CHARS} chars under any circumstance.
-
-If the document is a narrative talk, units are story beats. If it's a reference doc, units are logical sections. Mix is fine — let the document tell you.
+HARD LIMIT: each unit's "text" field MUST be ≤${HARD_MAX_UNIT_CHARS} characters. If a verbatim beat would exceed ${HARD_MAX_UNIT_CHARS} chars, cut it at a paragraph or sentence boundary into two or more consecutive units (still copied verbatim). Never emit a "text" longer than ${HARD_MAX_UNIT_CHARS} chars under any circumstance.
 
 Return JSON only. No prose, no markdown fences, no commentary.
 
@@ -571,19 +569,22 @@ function buildSectionPrompt(args: {
 {"sectionTitle":"...","sectionSummary":"...","units":[{"title":"...","text":"..."}]}\n`
     : '';
 
-  return `You are a content editor splitting ONE SECTION of a document into self-contained narrative units for a retrieval system.
+  return `You are a precise transcript SEGMENTER for ONE SECTION of a document. You are NOT an editor: you never rewrite, summarize, paraphrase, condense, or "improve" the text. Your ONLY job is to decide WHERE to cut the section into consecutive units. The words inside each unit are copied from the source unchanged.
 
 ${titleLine}${cueLine}Your output has THREE parts:
 
 1. sectionTitle — a short descriptive label (≤${HARD_MAX_SECTION_TITLE_CHARS} chars) for the WHOLE section. Think: chapter title in a book, topic name in a transcript. NOT the document title; specific to this section.
 
-2. sectionSummary — a 1-2 sentence summary (≤${HARD_MAX_SECTION_SUMMARY_CHARS} chars) of what this section covers. This summary is embedded and used as a routing target, so include the key concepts/proper nouns the reader would search for.
+2. sectionSummary — a 1-2 sentence summary (≤${HARD_MAX_SECTION_SUMMARY_CHARS} chars) of what this section covers. This is embedded as a routing target, so include the key concepts/proper nouns the reader would search for. This is the ONLY field you may write in your own words.
 
-3. units — an array of self-contained narrative units WITHIN this section. Each unit is a complete idea, story, or beat that makes sense on its own when surfaced to a reader. Aim for ~${TARGET_UNIT_MIN_TOKENS}-${TARGET_UNIT_MAX_TOKENS} tokens per unit. Give each unit a short descriptive title (≤${HARD_MAX_TITLE_CHARS} chars).
+3. units — an array of CONSECUTIVE units that together cover this section in order. CRITICAL — each unit's "text" MUST be the EXACT, VERBATIM words copied from the section, character for character:
+   - Do NOT summarize, paraphrase, rewrite, condense, reorder, or describe the content.
+   - Do NOT switch to third person. NEVER write "the author", "the speaker", "this section/unit explains/describes/notes...". Keep the original first-person voice and exact wording (the "I", "you", the stories, the specific words, numbers, and names).
+   - Your only decision is where one unit ends and the next begins — cut at natural topic shifts, story beats, or paragraph boundaries. The text between two cuts is copied unchanged.
+   - Concatenating every unit's "text" in order MUST reproduce the section's wording (you may drop only pure filler like standalone bookmark numbers).
+   Aim for ~${TARGET_UNIT_MIN_TOKENS}-${TARGET_UNIT_MAX_TOKENS} tokens per unit. Give each unit a short descriptive "title" (≤${HARD_MAX_TITLE_CHARS} chars) — the title may be your own words, but the "text" may NOT.
 
-HARD LIMIT: each unit's "text" field MUST be ≤${HARD_MAX_UNIT_CHARS} characters. If a single narrative beat would exceed ${HARD_MAX_UNIT_CHARS} chars, split it at a paragraph or sentence boundary into two or more consecutive units that together cover the same content. Never emit a "text" longer than ${HARD_MAX_UNIT_CHARS} chars under any circumstance.
-
-If the section is narrative talk, units are story beats. If it's reference content, units are logical sub-sections. Mix is fine — let the section tell you.
+HARD LIMIT: each unit's "text" field MUST be ≤${HARD_MAX_UNIT_CHARS} characters. If a verbatim beat would exceed ${HARD_MAX_UNIT_CHARS} chars, cut it at a paragraph or sentence boundary into two or more consecutive units (still copied verbatim). Never emit a "text" longer than ${HARD_MAX_UNIT_CHARS} chars under any circumstance.
 
 Return JSON only. No prose, no markdown fences, no commentary.
 
@@ -637,7 +638,17 @@ async function callFlashSectionOnce(args: {
         strict: args.strict,
       }),
       config: {
-        temperature: 0.2,
+        // temperature 0 (was 0.2) — v3 bulletproofing audit C4. The section
+        // call is EXTRACTIVE (copy verbatim, decide cut points), not creative,
+        // so 0 is correct and it makes the output far MORE stable run-to-run
+        // (NOT bit-exact — Google contracts no determinism for Flash). Stability
+        // matters because the route gates Flash output on a coverage threshold
+        // (section-coverage.ts); a section hovering exactly at the floor could
+        // flip between Flash-units and verbatim across re-embeds. Residual flip
+        // risk is accepted (bounded: one section, one re-embed; the additive
+        // build already re-embeds the whole sample on any re-claim regardless).
+        // See CLEANUP_BACKLOG "Coverage gate flip-flop persistence".
+        temperature: 0,
         responseMimeType: 'application/json',
         // v3 step 4a: SDK-enforced schema. Resolves the v2-era TODO at
         // narrative-chunk.ts:269-272 — for v3 only (v2 still un-schema'd
@@ -649,7 +660,11 @@ async function callFlashSectionOnce(args: {
         // 16384 covers worst-case re-emission of the section text across
         // multiple unit `text` fields with comfortable headroom. Lower
         // than v2's 65535 because per-section input is small by construction.
-        maxOutputTokens: 16384,
+        // 32768 (was 16384): verbatim extraction emits ~as many output tokens as
+        // the input section (vs summarization which compressed). A ~7.5k-token
+        // section + JSON-escaping overhead must not truncate -> invalid JSON ->
+        // dropped section. Headroom for the verbatim prompt (2026-05-29).
+        maxOutputTokens: 32768,
       },
     });
     const timeoutPromise = new Promise<never>((_, reject) => {
@@ -802,10 +817,14 @@ export type NarrativeChunkSectionResult = {
 };
 
 /**
- * v3 per-section narrative chunker. Returns null on second-attempt failure
- * so the caller (v3 worker) can mark the SECTION (not the whole sample)
- * as errored and continue with the rest — per-section idempotent re-embed
- * (audit C5) means one failed section doesn't kill the whole book.
+ * v3 per-section narrative chunker. Returns null on second-attempt failure.
+ * The CALLER is the narrative-chunk-section route, which NEVER propagates
+ * null to the worker: on null (or on low coverage of a successful result) it
+ * substitutes deterministic VERBATIM units from the raw section text
+ * (section-coverage.ts), so a failed Flash call degrades section QUALITY but
+ * never drops the section's words (v3 bulletproofing, audit round 1). The
+ * old contract ("worker skips the section on null") was a silent word-loss
+ * path and has been removed.
  *
  * Caller responsibilities (NOT enforced here):
  *   • Pass already-sanitized section text.

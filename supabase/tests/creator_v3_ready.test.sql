@@ -20,8 +20,14 @@
 --     before the admin clicks Flip cannot retroactively block the gate.
 -- 13. Round-5 M2 -- NULL p_creator_id returns FALSE (caller-friendly).
 
+-- 14. Round-1 M4 — count invariant satisfied: v3_expected_section_count=1,
+--     skipped=0, one section present → TRUE.
+-- 15. Round-1 M4 — count MISMATCH: expected=2 but only 1 section row → FALSE
+--     (a silently dropped section the per-section checks couldn't see).
+-- 16. Round-1 M4 — skipped-empty math: expected=2, skipped=1, 1 section → TRUE.
+
 BEGIN;
-SELECT plan(13);
+SELECT plan(16);
 
 -- Local halfvec helper (same pattern as the v3 route/topk tests).
 CREATE FUNCTION pg_temp.unit_vec(p_position int) RETURNS halfvec(768)
@@ -233,6 +239,37 @@ BEGIN
   RETURN NEXT is(
     public.creator_v3_ready(NULL::uuid), false,
     '13: NULL p_creator_id returns FALSE (no NULL leak to clients)'
+  );
+
+  -- Reset to a clean single-ready-sample state for the count-invariant tests:
+  -- drop the pending sibling so only v_sample_ok (1 fully-wired section) gates.
+  DELETE FROM public.sample_content WHERE id = v_sample_bad;
+
+  -- 14: count invariant satisfied — expected=1, skipped=0, 1 section → TRUE.
+  UPDATE public.sample_content
+     SET v3_expected_section_count = 1, v3_skipped_empty_count = 0
+   WHERE id = v_sample_ok;
+  RETURN NEXT is(
+    public.creator_v3_ready(v_creator), true,
+    '14: section-count invariant satisfied (1 = 1-0) → TRUE (round-1 M4)'
+  );
+
+  -- 15: count mismatch — expected=2 but only 1 section row → FALSE.
+  UPDATE public.sample_content
+     SET v3_expected_section_count = 2, v3_skipped_empty_count = 0
+   WHERE id = v_sample_ok;
+  RETURN NEXT is(
+    public.creator_v3_ready(v_creator), false,
+    '15: section-count mismatch (1 <> 2-0) → FALSE — catches a dropped section (round-1 M4)'
+  );
+
+  -- 16: skipped-empty math — expected=2, skipped=1, 1 section → TRUE.
+  UPDATE public.sample_content
+     SET v3_expected_section_count = 2, v3_skipped_empty_count = 1
+   WHERE id = v_sample_ok;
+  RETURN NEXT is(
+    public.creator_v3_ready(v_creator), true,
+    '16: skipped-empty subtracted (1 = 2-1) → TRUE (round-1 M4)'
   );
 END;
 $fn$;

@@ -62,19 +62,28 @@ function authed(body: unknown) {
   return mkReq({ body, bearer: `Bearer ${VALID_SECRET}` });
 }
 
+// sanitized_section + goodResult.units are kept CONSISTENT so the coverage
+// gate (route now measures Flash output against the source) passes — the
+// units verbatim-cover the section text.
+// Long enough to clear the M5 coverage-measurability floor (≥60 word chars)
+// so the low-coverage fallback path is exercised.
+const SECTION_TEXT =
+  'The first beat introduces the core idea with real detail and concrete examples. ' +
+  'The second beat expands on that idea and lands the point with a short story.';
+
 const goodBody = {
   creator_id:        TEST_CREATOR_ID,
   sample_id:         TEST_SAMPLE_ID,
   section_index:     0,
-  sanitized_section: 'Section body content for the test.',
+  sanitized_section: SECTION_TEXT,
   sample_title:      'My Talk',
   section_cue:       '# Chapter 1',
 };
 
 const goodResult = {
   units: [
-    { title: 'Beat One', text: 'First beat in the section.' },
-    { title: 'Beat Two', text: 'Second beat in the section.' },
+    { title: 'Beat One', text: 'The first beat introduces the core idea with real detail and concrete examples.' },
+    { title: 'Beat Two', text: 'The second beat expands on that idea and lands the point with a short story.' },
   ],
   sectionTitle: 'Section Zero',
   sectionSummary: 'A short summary of the first section.',
@@ -99,7 +108,7 @@ describe('POST /api/internal/narrative-chunk-section', () => {
     expect(r.status).toBe(400);
   });
 
-  it('happy path returns units + section_title + section_summary + usage', async () => {
+  it('happy path (Flash covers source) returns Flash units, fallback:false', async () => {
     mockNarrativeChunkSection.mockResolvedValueOnce(goodResult);
     const r = await POST(authed(goodBody));
     expect(r.status).toBe(200);
@@ -109,18 +118,47 @@ describe('POST /api/internal/narrative-chunk-section', () => {
     expect(json.section_summary).toContain('summary');
     expect(json.attempt).toBe(1);
     expect(json.usage.total_token_count).toBe(690);
+    expect(json.fallback).toBe(false);
+    expect(json.fallback_reason).toBeNull();
+    expect(json.coverage.lengthRatio).toBeGreaterThanOrEqual(0.85);
     expect(json.request_id).toMatch(/^[0-9a-f-]{36}$/);
   });
 
-  it('fallback path: null result → 200 with units:null + message', async () => {
+  it('Flash failed (null) → 200 with VERBATIM units (never null), fallback:flash_failed', async () => {
     mockNarrativeChunkSection.mockResolvedValueOnce(null);
     const r = await POST(authed(goodBody));
     expect(r.status).toBe(200);
     const json = await r.json();
-    expect(json.units).toBeNull();
-    expect(json.attempt).toBe(2);
-    expect(json.message).toBe('fallback_to_skip_section');
+    // never null — words preserved from the raw section:
+    expect(Array.isArray(json.units)).toBe(true);
+    expect(json.units.length).toBeGreaterThanOrEqual(1);
+    const joined = json.units.map((u: { text: string }) => u.text).join('');
+    expect(joined.replace(/\s+/g, '')).toBe(SECTION_TEXT.replace(/\s+/g, ''));
+    expect(json.fallback).toBe(true);
+    expect(json.fallback_reason).toBe('flash_failed');
+    // extractive title from the cue (M5 — routing-viable, not a stub):
+    expect(json.section_title.toLowerCase()).toContain('chapter 1');
+    expect(json.section_summary.length).toBeGreaterThan(0);
     expect(json.retryable).toBe(false);
+  });
+
+  it('Flash summarized (low coverage) → VERBATIM units, fallback:low_coverage, keeps Flash title/summary', async () => {
+    // Flash returns a one-line paraphrase that drops most of the section.
+    mockNarrativeChunkSection.mockResolvedValueOnce({
+      ...goodResult,
+      units: [{ title: 'Gist', text: 'A beat.' }],
+    });
+    const r = await POST(authed(goodBody));
+    expect(r.status).toBe(200);
+    const json = await r.json();
+    expect(json.fallback).toBe(true);
+    expect(json.fallback_reason).toBe('low_coverage');
+    // words rescued verbatim from the source, not Flash's lossy paraphrase:
+    const joined = json.units.map((u: { text: string }) => u.text).join('');
+    expect(joined.replace(/\s+/g, '')).toBe(SECTION_TEXT.replace(/\s+/g, ''));
+    // Flash succeeded on title/summary, so we keep those (they're fine):
+    expect(json.section_title).toBe('Section Zero');
+    expect(json.coverage.lengthRatio).toBeLessThan(0.85);
   });
 
   it('empty_input throw → 400', async () => {
