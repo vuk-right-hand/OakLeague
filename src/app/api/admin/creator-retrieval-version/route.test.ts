@@ -108,8 +108,17 @@ describe('POST /api/admin/creator-retrieval-version — body validation', () => 
     const res = await POST(mkReq({ body: { creator_id: CREATOR_ID, version: '2' } }));
     expect(res.status).toBe(400);
   });
-  it('400 bad_version for 3', async () => {
+  // Step-9 C4: version 3 is now VALID (v3 flip). Inverted from the old
+  // '400 bad_version for 3' — the RPC owns the creator_v3_ready gate.
+  it('200 for version 3 (v3 flip now allowed)', async () => {
+    mockUserRpc.mockResolvedValueOnce({ data: null, error: null });
     const res = await POST(mkReq({ body: { creator_id: CREATOR_ID, version: 3 } }));
+    expect(res.status).toBe(200);
+    expect(mockUserRpc).toHaveBeenCalledWith('admin_set_creator_retrieval_version',
+      expect.objectContaining({ p_version: 3 }));
+  });
+  it('400 bad_version for 4 (only 1, 2, 3 allowed)', async () => {
+    const res = await POST(mkReq({ body: { creator_id: CREATOR_ID, version: 4 } }));
     expect(res.status).toBe(400);
   });
   it('400 bad_version for true', async () => {
@@ -164,5 +173,26 @@ describe('POST /api/admin/creator-retrieval-version — rpc error mapping', () =
     const res = await POST(mkReq({ body: { creator_id: CREATOR_ID, version: 2 } }));
     expect(res.status).toBe(500);
     expect(mockSentryCapture).toHaveBeenCalled();
+  });
+  // Step-9 C4: both check_violation (23514) raises mapped to 409 by leading
+  // token. Token strings pinned to the EXACT migration message so an edit to
+  // the migration breaks this test, not prod (audit M-C).
+  it('409 rollback_refused_legacy_purged on 23514 rollback message', async () => {
+    mockUserRpc.mockResolvedValueOnce({ data: null, error: {
+      code: '23514',
+      message: 'rollback_refused_legacy_purged -- legacy v1/v2 chunks were purged (admin_purge_legacy_chunks) at 2026-05-31; rolling back to v2 would read an empty corpus. Re-ingest the legacy corpus before downgrading.',
+    } });
+    const res = await POST(mkReq({ body: { creator_id: CREATOR_ID, version: 2 } }));
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe('rollback_refused_legacy_purged');
+  });
+  it('409 creator_v3_not_ready on 23514 not-ready message', async () => {
+    mockUserRpc.mockResolvedValueOnce({ data: null, error: {
+      code: '23514',
+      message: 'creator_v3_not_ready -- at least one ready sample is missing v3 sections / chunks / done job. Run creator_v3_ready(creator_id) for diagnostics.',
+    } });
+    const res = await POST(mkReq({ body: { creator_id: CREATOR_ID, version: 3 } }));
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe('creator_v3_not_ready');
   });
 });

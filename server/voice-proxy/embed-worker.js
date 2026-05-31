@@ -590,6 +590,37 @@ function clampTokenCount(text) {
   return Math.min(2048, Math.max(1, est));
 }
 
+// ── M1 zombie-claim guard (Step-9 deferred audit M1) ─────────────────────────
+// A corpus_reprocess worker that woke AFTER losing its claim (the reaper
+// reassigned its stuck job to another worker) must not clobber the NEW owner's
+// job row (stomp its claim / burn its `attempts`). The failure writers below
+// scope their UPDATE on `claimed_by` and treat a 0-row result as "claim moved".
+//
+// Why `claimed_by`, not `enqueue_version`: reap_stuck_corpus_reprocess_jobs does
+// NOT bump enqueue_version (only admin re-enqueue does), so an enqueue_version
+// guard would MISS the exact reaper-driven zombie this exists to stop.
+// claimed_by IS the worker's unique identity (`reprocess:${machine}:${pid}`).
+//
+// These are PURE seams so the decision logic is unit-tested without mocking the
+// whole worker (embed-worker-claim-guard.test.js).
+
+/** Append `.eq('claimed_by', claimedBy)` to a PostgREST update/select builder
+ *  when claimedBy is set; otherwise return the builder untouched (legacy/test
+ *  path). Falsy claimedBy is treated as "no guard" — we never scope on an empty
+ *  owner string. */
+export function applyClaimGuard(query, claimedBy) {
+  return claimedBy ? query.eq('claimed_by', claimedBy) : query;
+}
+
+/** True iff a guarded write (claimedBy set) matched 0 rows — i.e. the claim
+ *  moved to another worker between claim and write, so the caller should no-op +
+ *  breadcrumb rather than treat it as success. `updatedRows` must be the array
+ *  returned by `.select('id')`; a non-array (null/undefined from an error path)
+ *  is NOT a claim-moved signal (the catch block owns errors). */
+export function isClaimMoved(claimedBy, updatedRows) {
+  return Boolean(claimedBy) && Array.isArray(updatedRows) && updatedRows.length === 0;
+}
+
 export function makeCorpusReprocessWorker({
   supabase,
   geminiApiKey,
@@ -680,16 +711,39 @@ export function makeCorpusReprocessWorker({
     return json;
   }
 
+  // M1: claim-scoped failure writers. `claimedBy` is the closure identity (set
+  // at line ~622). Both updates are scoped on claimed_by via applyClaimGuard +
+  // `.select('id')` so a 0-row result (claim reassigned to another worker) is a
+  // no-op + breadcrumb, never a clobber of the new owner. The worker uses the
+  // SERVICE-ROLE supabase client, so `.select()` is RLS-unaffected and
+  // data.length faithfully reflects matched-and-updated rows — do NOT swap this
+  // closure to a JWT-bound client without revisiting (RLS would zero the count).
   async function markJobErrored(jobId, errorMsg) {
     try {
-      await supabase
-        .from('corpus_reprocess_jobs')
-        .update({
-          status: 'errored',
-          last_error: String(errorMsg).slice(0, 2000),
-          finished_at: new Date().toISOString(),
-        })
-        .eq('id', jobId);
+      const { data, error } = await applyClaimGuard(
+        supabase
+          .from('corpus_reprocess_jobs')
+          .update({
+            status: 'errored',
+            last_error: String(errorMsg).slice(0, 2000),
+            finished_at: new Date().toISOString(),
+          })
+          .eq('id', jobId),
+        claimedBy,
+      ).select('id');
+      // CODE-audit M1: supabase-js RETURNS update errors (doesn't throw), so the
+      // catch below won't see them — surface explicitly or a failed error-write
+      // leaves the job stuck `processing` until the reaper. Distinct from the
+      // claim-moved (0-row) path.
+      if (error) {
+        captureException(error, { op: 'reprocess_worker.markJobErrored.update', jobId });
+      } else if (isClaimMoved(claimedBy, data)) {
+        // claim no longer ours (reaper reassigned, OR finalize already finished
+        // it) — either way no-op; we don't own the row.
+        captureMessage('reprocess.claim_moved_noop', 'warning', {
+          op: 'reprocess_worker.markJobErrored', job_id: jobId, claimed_by: claimedBy,
+        });
+      }
     } catch (e) {
       captureException(e, { op: 'reprocess_worker.markJobErrored', jobId });
     }
@@ -704,16 +758,24 @@ export function makeCorpusReprocessWorker({
         .maybeSingle();
       const newAttempts = (row?.attempts || 0) + 1;
       const nextStatus = newAttempts >= 5 ? 'errored' : 'pending';
-      await supabase
-        .from('corpus_reprocess_jobs')
-        .update({
-          status: nextStatus,
-          attempts: newAttempts,
-          last_error: String(errorMsg).slice(0, 2000),
-          claimed_by: null,
-          claimed_at: null,
-        })
-        .eq('id', jobId);
+      const { data } = await applyClaimGuard(
+        supabase
+          .from('corpus_reprocess_jobs')
+          .update({
+            status: nextStatus,
+            attempts: newAttempts,
+            last_error: String(errorMsg).slice(0, 2000),
+            claimed_by: null,
+            claimed_at: null,
+          })
+          .eq('id', jobId),
+        claimedBy,
+      ).select('id');
+      if (isClaimMoved(claimedBy, data)) {
+        captureMessage('reprocess.claim_moved_noop', 'warning', {
+          op: 'reprocess_worker.bumpFailure', job_id: jobId, claimed_by: claimedBy,
+        });
+      }
     } catch (e) {
       captureException(e, { op: 'reprocess_worker.bumpFailure', jobId });
     }
@@ -1708,6 +1770,9 @@ export function makeCorpusReprocessWorker({
       return;
     }
     if (targetVersion !== 2 && targetVersion !== undefined && targetVersion !== null) {
+      // CODE-audit S4: the job was claimed earlier THIS tick, so claimed_by is
+      // ours by construction here — markJobErrored's guard passes; this dispatch
+      // path needs no extra ownership check.
       await markJobErrored(jobId, `unknown_target_version_${targetVersion}`);
       captureMessage('reprocess_worker.unknown_target_version', 'error', {
         op: 'reprocess_worker.dispatch',
