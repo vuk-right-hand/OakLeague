@@ -97,6 +97,12 @@ export async function GET(req: NextRequest) {
 
   const sb = supabaseAdmin();
 
+  // active_section_generation per sample (a creator has a handful of samples —
+  // not capped). Sections are capped (code-audit M2: a book-scale corpus could
+  // be thousands of rows); if we hit the cap the count is a floor → `capped`
+  // flag + the UI shows "≥N". The preview is advisory anyway — the POST returns
+  // the authoritative deleted count from the RPC.
+  const SECTION_CAP = 1000;
   const { data: samples, error: sErr } = await sb
     .from('sample_content')
     .select('id, active_section_generation')
@@ -104,7 +110,8 @@ export async function GET(req: NextRequest) {
   const { data: sections, error: secErr } = await sb
     .from('sample_content_sections')
     .select('sample_id, section_generation')
-    .eq('creator_id', creatorId);
+    .eq('creator_id', creatorId)
+    .limit(SECTION_CAP);
   if (sErr || secErr) {
     Sentry.captureException(sErr || secErr, { extra: { op: 'gc_preview', creator_id: creatorId } });
     return json(500, { error: 'preview_failed' });
@@ -121,5 +128,6 @@ export async function GET(req: NextRequest) {
     if (active !== undefined && sec.section_generation < active - 1) staleSections += 1;
   }
 
-  return json(200, { available: true, stale_sections: staleSections });
+  const capped = (sections?.length ?? 0) >= SECTION_CAP;
+  return json(200, { available: true, stale_sections: staleSections, capped });
 }

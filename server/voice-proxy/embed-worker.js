@@ -758,7 +758,7 @@ export function makeCorpusReprocessWorker({
         .maybeSingle();
       const newAttempts = (row?.attempts || 0) + 1;
       const nextStatus = newAttempts >= 5 ? 'errored' : 'pending';
-      const { data } = await applyClaimGuard(
+      const { data, error } = await applyClaimGuard(
         supabase
           .from('corpus_reprocess_jobs')
           .update({
@@ -771,7 +771,11 @@ export function makeCorpusReprocessWorker({
           .eq('id', jobId),
         claimedBy,
       ).select('id');
-      if (isClaimMoved(claimedBy, data)) {
+      // CODE-audit M1: supabase-js RETURNS update errors (doesn't throw) — surface
+      // them (symmetric with markJobErrored) so a failed bump isn't silent.
+      if (error) {
+        captureException(error, { op: 'reprocess_worker.bumpFailure.update', jobId });
+      } else if (isClaimMoved(claimedBy, data)) {
         captureMessage('reprocess.claim_moved_noop', 'warning', {
           op: 'reprocess_worker.bumpFailure', job_id: jobId, claimed_by: claimedBy,
         });

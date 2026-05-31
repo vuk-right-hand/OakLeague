@@ -73,8 +73,10 @@ export async function POST(req: NextRequest) {
       return json(404, { error: 'creator_not_found' });
     }
     // 23514: the only check_violation this RPC raises is the not-on-v3 guard.
-    // Match the leading token (the message interpolates the version value).
-    if (error.code === '23514' || msg.includes('purge_refused')) {
+    // Scope the token match INSIDE the 23514 branch (code-audit M1) so a future
+    // unrelated error whose message happens to contain 'purge_refused' can't
+    // mis-map to 409. The token is contractually pinned to the migration text.
+    if (error.code === '23514') {
       return json(409, { error: 'purge_refused_not_on_v3' });
     }
     if (error.code === '42501') {
