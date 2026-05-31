@@ -17,7 +17,7 @@
 //  13. Voyage data has all-invalid rows → fallback parse_error.
 //  14. Voyage out-of-range index → that row dropped, others kept.
 //  15. Document text truncated to MAX_DOCUMENT_CHARS in request body.
-//  16. Candidates above MAX_CANDIDATES truncated before request.
+//  16. Candidates above MAX_CANDIDATES (30) truncated before request.
 //  17. Bridge factory throws on RERANK_PROVIDER != 'voyage'.
 //  18. Bridge factory returns Voyage bridge with correct provider/model.
 //  19. voyageRerank throws RerankConfigError on missing API key.
@@ -202,7 +202,7 @@ describe('voyageRerank — happy path', () => {
     expect(body.documents[0].length).toBeLessThanOrEqual(3500);
   });
 
-  it('truncates candidates above MAX_CANDIDATES (25) before request', async () => {
+  it('truncates candidates above MAX_CANDIDATES (30) before request', async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse(200, { data: [{ index: 0, relevance_score: 0.5 }], usage: { total_tokens: 1 } }),
     );
@@ -217,7 +217,9 @@ describe('voyageRerank — happy path', () => {
     const body = JSON.parse((fetchMock.mock.calls as any[])[0][1].body) as {
       documents: string[];
     };
-    expect(body.documents.length).toBeLessThanOrEqual(25);
+    // Step-9 audit C4: cap raised 25→30 (S=6 × N=5 = 30 v3 candidates).
+    expect(body.documents.length).toBeLessThanOrEqual(30);
+    expect(body.documents.length).toBe(30);
   });
 
   it('filters empty-text candidates before send (Day-10 audit S5)', async () => {

@@ -45,6 +45,7 @@ DECLARE
   v_status      text;
   v_finished    timestamptz;
   v_done_ret    uuid;
+  v_active_gen  int;
 BEGIN
   SELECT array_fill(0::real, ARRAY[768])::halfvec(768) INTO v_vec;
 
@@ -62,11 +63,11 @@ BEGIN
   -- 1: service-role only.
   RETURN NEXT ok(
     NOT has_function_privilege('public',
-        'public.corpus_reprocess_finalize_v3(uuid, int)', 'EXECUTE')
+        'public.corpus_reprocess_finalize_v3(uuid, int, int)', 'EXECUTE')
     AND NOT has_function_privilege('authenticated'::regrole,
-        'public.corpus_reprocess_finalize_v3(uuid, int)', 'EXECUTE')
+        'public.corpus_reprocess_finalize_v3(uuid, int, int)', 'EXECUTE')
     AND has_function_privilege('service_role'::regrole,
-        'public.corpus_reprocess_finalize_v3(uuid, int)', 'EXECUTE'),
+        'public.corpus_reprocess_finalize_v3(uuid, int, int)', 'EXECUTE'),
     '1: corpus_reprocess_finalize_v3 is service-role-only'
   );
 
@@ -118,7 +119,15 @@ BEGIN
   RETURNING id INTO v_job1;
 
   -- 2: BUILD-PHASE happy path — v1 deleted, v2 + v3 + v2unit all SURVIVE.
-  SELECT public.corpus_reprocess_finalize_v3(v_job1, 1) INTO v_new_version;
+  -- finalize is called with p_target_generation=1 (the sample's default active
+  -- gen), so the swap here is 1->1: this case proves finalize WRITES the pointer
+  -- to the requested generation (not that it skips the UPDATE) alongside the
+  -- v1-delete / version-bump / job-done behavior. The pointer MOVE (1->2 +
+  -- route/fetch/gate following the new active gen) is proven in
+  -- v3_section_generations.test.sql case 8.
+  SELECT public.corpus_reprocess_finalize_v3(v_job1, 1, 1) INTO v_new_version;
+  SELECT active_section_generation INTO v_active_gen
+    FROM public.sample_content WHERE id = v_sample1;
   SELECT count(*) INTO v_v1_count FROM public.sample_content_chunks
    WHERE sample_id = v_sample1 AND chunker_version = 1;
   SELECT count(*) INTO v_v2_count FROM public.sample_content_chunks
@@ -133,6 +142,7 @@ BEGIN
     FROM public.corpus_reprocess_jobs WHERE id = v_job1;
   RETURN NEXT ok(
     v_new_version = 2
+      AND v_active_gen = 1    -- finalize WROTE the pointer to p_target_generation
       AND v_v1_count = 0      -- v1 deleted
       AND v_v2_count = 1      -- v2 PRESERVED (live read during build)
       AND v_v3_count = 1      -- v3 preserved
@@ -140,8 +150,8 @@ BEGIN
       AND v_v3units = 1       -- v3 unit preserved
       AND v_status = 'done'
       AND v_finished IS NOT NULL,
-    format('2: build-phase finalize_v3 → ver=%s v1=%s v2=%s v3=%s v2u=%s v3u=%s status=%s',
-           v_new_version, v_v1_count, v_v2_count, v_v3_count, v_v2units, v_v3units, v_status)
+    format('2: build-phase finalize_v3 → ver=%s gen=%s v1=%s v2=%s v3=%s v2u=%s v3u=%s status=%s',
+           v_new_version, v_active_gen, v_v1_count, v_v2_count, v_v3_count, v_v2units, v_v3units, v_status)
   );
 
   -- 6: sample2 v1 chunk NOT deleted (sample-scoped).
@@ -153,7 +163,7 @@ BEGIN
     (sample_id, target_version, status, attempts, enqueue_version, claimed_by, claimed_at)
   VALUES (v_sample2, 2, 'processing', 1, 1, 'test-worker', now())
   RETURNING id INTO v_job_v2;
-  SELECT public.corpus_reprocess_finalize_v3(v_job_v2, 1) INTO v_new_version;
+  SELECT public.corpus_reprocess_finalize_v3(v_job_v2, 1, 1) INTO v_new_version;
   SELECT current_corpus_version INTO v_v1_count FROM public.creators WHERE id = v_creator;
   RETURN NEXT ok(
     v_new_version IS NULL AND v_v1_count = 2,
@@ -166,7 +176,7 @@ BEGIN
     (sample_id, target_version, status, attempts, enqueue_version, claimed_by, claimed_at)
   VALUES (v_sample2, 3, 'processing', 1, 7, 'test-worker', now())
   RETURNING id INTO v_job2;
-  SELECT public.corpus_reprocess_finalize_v3(v_job2, 4) INTO v_new_version;
+  SELECT public.corpus_reprocess_finalize_v3(v_job2, 4, 1) INTO v_new_version;
   SELECT current_corpus_version INTO v_v1_count FROM public.creators WHERE id = v_creator;
   RETURN NEXT ok(
     v_new_version IS NULL AND v_v1_count = 2,
@@ -176,7 +186,7 @@ BEGIN
 
   -- 5: job not 'processing' → NULL.
   UPDATE public.corpus_reprocess_jobs SET status = 'done' WHERE id = v_job2;
-  SELECT public.corpus_reprocess_finalize_v3(v_job2, 7) INTO v_new_version;
+  SELECT public.corpus_reprocess_finalize_v3(v_job2, 7, 1) INTO v_new_version;
   RETURN NEXT ok(
     v_new_version IS NULL,
     format('5: non-processing job → NULL (got %s)', COALESCE(v_new_version::text, 'NULL'))
@@ -207,7 +217,7 @@ BEGIN
     (sample_id, target_version, status, attempts, enqueue_version, claimed_by, claimed_at)
   VALUES (v_sample2, 3, 'processing', 1, 1, 'test-worker', now())
   RETURNING id INTO v_job2;
-  SELECT public.corpus_reprocess_mark_done_v3(v_job2, 1) INTO v_done_ret;
+  SELECT public.corpus_reprocess_mark_done_v3(v_job2, 1, 1) INTO v_done_ret;
   SELECT count(*) INTO v_v1_count FROM public.sample_content_chunks
    WHERE sample_id = v_sample2 AND chunker_version = 1;
   SELECT count(*) INTO v_v2_count FROM public.sample_content_chunks
@@ -224,7 +234,7 @@ BEGIN
     (sample_id, target_version, status, attempts, enqueue_version, claimed_by, claimed_at)
   VALUES (v_sample2, 2, 'processing', 1, 1, 'test-worker', now())
   RETURNING id INTO v_job_v2;
-  SELECT public.corpus_reprocess_mark_done_v3(v_job_v2, 1) INTO v_done_ret;
+  SELECT public.corpus_reprocess_mark_done_v3(v_job_v2, 1, 1) INTO v_done_ret;
   SELECT status INTO v_status FROM public.corpus_reprocess_jobs WHERE id = v_job_v2;
   RETURN NEXT ok(
     v_done_ret IS NULL AND v_status = 'processing',

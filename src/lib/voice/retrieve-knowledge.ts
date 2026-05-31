@@ -99,6 +99,7 @@ import { rewriteQuery, QUERY_REWRITE_QUOTED_AT } from './query-rewrite';
 import {
   getRerankBridge,
   VOYAGE_RERANK_QUOTED_AT,
+  MAX_CANDIDATES as RERANK_MAX_CANDIDATES,
   type RerankCandidate,
 } from './rerank';
 import {
@@ -875,12 +876,16 @@ async function fetchParentNarrativesByIds(args: {
     // fetched=0 → always fell through to a fresh ~2s retrieve). Join through the
     // sample_id FK to read it. (The topk_v2 RPC already does this server-side;
     // this is the cache-hit re-fetch path, which had drifted.)
+    // Step-9 audit R5/C-2: go through the gen-filtered RPC instead of a raw
+    // by-id select. corpusVersionAtSession is frozen at session-open, so a
+    // mid-session re-ingest generation swap can't be caught by the cache key;
+    // the RPC drops any stale-generation id server-side (returns 0 → cache miss
+    // → fresh retrieve). v2 parents (gen 1) on a v2 creator (active gen 1) pass.
     const { data, error } = await withDeadline(
-      args.admin
-        .from('sample_content_narrative_units')
-        .select('id, text, title, sample_content!inner(source_type)')
-        .eq('creator_id', args.creatorId)
-        .in('id', args.ids),
+      args.admin.rpc('_fetch_active_parents_v3', {
+        p_creator_id: args.creatorId,
+        p_ids: args.ids,
+      }),
       args.deadlineMs,
       'parent_fetch',
     );
@@ -891,29 +896,18 @@ async function fetchParentNarrativesByIds(args: {
       );
       return [];
     }
-    // PostgREST returns the embedded to-one as an object; tolerate an array
-    // shape too (some PostgREST versions/relationship-detection return [{...}]).
-    type EmbeddedSample = { source_type: string };
-    type Row = {
-      id: string;
-      text: string;
-      title: string | null;
-      sample_content: EmbeddedSample | EmbeddedSample[] | null;
-    };
+    type Row = { id: string; text: string; title: string | null; source_type: string | null };
     const rows = (data ?? []) as Row[];
     return rows.flatMap((r) => {
-      const sc = Array.isArray(r.sample_content) ? r.sample_content[0] : r.sample_content;
-      // Audit C3 — the `!inner` join + NOT-NULL `sample_id` FK (ON DELETE
-      // CASCADE) means every unit HAS a parent sample with a valid enum
-      // source_type, so this should never fire. But if it somehow does (orphan
-      // mid-delete), DROP the row rather than inject a sourceless envelope
-      // ("--- BEGIN (source: ) ---" would confuse the brain). Fail closed.
-      if (!sc || !sc.source_type) {
+      // The RPC's JOIN to sample_content (NOT-NULL sample_id FK, ON DELETE
+      // CASCADE) means every returned row HAS a source_type. Defense in depth:
+      // drop a sourceless row rather than inject "--- BEGIN (source: ) ---".
+      if (!r.source_type) {
         // eslint-disable-next-line no-console
         console.warn(`[retrieve-knowledge] parent ${r.id} has no source_type — dropping`);
         return [];
       }
-      return [{ id: r.id, text: r.text, title: r.title, sourceType: sc.source_type }];
+      return [{ id: r.id, text: r.text, title: r.title, sourceType: r.source_type }];
     });
   } catch (e) {
     const why = isDeadlineExceeded(e) ? 'deadline_exceeded' : (e as Error)?.message ?? 'unknown';
@@ -1057,6 +1051,18 @@ export class RetrieveKnowledgeV3Error extends Error {
 // creator and a 5000-section company-brain should not share one S long-term.
 const DEFAULT_V3_TOP_S = 6;
 const DEFAULT_V3_N_PARENT_PER_SECTION = 5;
+// Step-9 audit S4: the rerank candidate cap MUST cover the frozen v3 fan-out
+// (top_s × n_parent_per_section parents), or rerank slices off — by RRF/blend
+// proxy score — the very parents the cross-encoder exists to re-rank. The cap
+// lived as a hand-synced literal in rerank.ts; tie it to the constants here so a
+// future fan-out bump that forgets the cap fails LOUD at module load. (If a
+// caller overrides args.topS ABOVE the default, the cap must be re-derived —
+// today prod freezes topS=6.)
+if (RERANK_MAX_CANDIDATES !== DEFAULT_V3_TOP_S * DEFAULT_V3_N_PARENT_PER_SECTION) {
+  throw new Error(
+    `rerank MAX_CANDIDATES (${RERANK_MAX_CANDIDATES}) != DEFAULT_V3_TOP_S (${DEFAULT_V3_TOP_S}) × DEFAULT_V3_N_PARENT_PER_SECTION (${DEFAULT_V3_N_PARENT_PER_SECTION}) = ${DEFAULT_V3_TOP_S * DEFAULT_V3_N_PARENT_PER_SECTION}. The v3 fan-out and the rerank cap drifted — bump MAX_CANDIDATES in rerank.ts in lockstep or rerank silently drops candidates (Step-9 audit S4).`,
+  );
+}
 const DEFAULT_V3_K_CHILD = 30;
 const DEFAULT_V3_RANK_MODE = 'max_blend' as const;
 const DEFAULT_V3_LAMBDA = 0.10;
@@ -1390,6 +1396,7 @@ async function runOrchestratorV3(
   let rows: RpcRowV3[] = [];
   let candidatesFromScope = 0;
   let flatFallbackFired = false;
+  let flatFallbackCapped: boolean | null = null;
   let scopedTopkLatencyMs = 0;
   let flatLatencyMs: number | null = null;
   const scopedTopkStart = Date.now();
@@ -1418,18 +1425,36 @@ async function runOrchestratorV3(
     const flatStart = Date.now();
     const flatDeadlineMs = Math.min(deadlineMs, flatStart + FLAT_FALLBACK_BUDGET_MS);
     try {
+      // Step-9 audit R2/C-1: go through the gen-filtered RPC, NOT a raw
+      // creator-wide select. The old raw `.from(sections).select(id)
+      // .eq(creator_id)` had no generation filter → mid-re-ingest it returned
+      // BOTH generations' ids (and duplicate section_index rows after the
+      // UNIQUE swap), feeding half-built sections into topk. The RPC filters
+      // to each sample's active_section_generation server-side.
       const { data: allSections, error: secErr } = await withDeadline(
-        admin
-          .from('sample_content_sections')
-          .select('id')
-          .eq('creator_id', args.creatorId)
-          .order('section_index', { ascending: true })
-          .limit(FLAT_FALLBACK_MAX_SECTIONS),
+        admin.rpc('_creator_active_section_ids_v3', {
+          p_creator_id: args.creatorId,
+          p_limit: FLAT_FALLBACK_MAX_SECTIONS,
+        }),
         flatDeadlineMs,
         'flat_sections_fetch',
       );
       if (!secErr && Array.isArray(allSections) && allSections.length > 0) {
-        const allIds = (allSections as Array<{ id: string }>).map((r) => r.id);
+        const allIds = (allSections as Array<{ section_id: string }>).map((r) => r.section_id);
+        // Step-9 audit M3: the flat fallback asks for at most
+        // FLAT_FALLBACK_MAX_SECTIONS active section ids. If the creator has MORE
+        // active sections than that, the RPC returns the first N by section_index
+        // and the fallback silently under-recalls later content (a large-corpus
+        // creator "forgetting the back half of book 2"). Emit a loud breadcrumb +
+        // telemetry flag so this surfaces BEFORE a creator reports it — the fix is
+        // to raise the cap AND re-derive the topk fan-out budget, not to ignore it.
+        if (allSections.length >= FLAT_FALLBACK_MAX_SECTIONS) {
+          flatFallbackCapped = true;
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[retrieve-knowledge-v3] flat fallback hit the ${FLAT_FALLBACK_MAX_SECTIONS}-section cap for creator=${args.creatorId}: active sections exceed the cap, so only the first ${FLAT_FALLBACK_MAX_SECTIONS} (by section_index) are considered — later content may be unreachable on a routing miss. Raise FLAT_FALLBACK_MAX_SECTIONS + re-derive the topk fan-out budget.`,
+          );
+        }
         // callTopk reads `deadlineMs` from closure; the flat call needs to
         // race against the TIGHTER `flatDeadlineMs`. Inline the call here
         // with the tight deadline rather than restructure callTopk.
@@ -1466,6 +1491,7 @@ async function runOrchestratorV3(
     sectionTop1Score: routeTop1,
     sectionTop1to2Gap: routeGap,
     flatFallbackFired,
+    flatFallbackCapped,
     // Round-5 M1: split latencies (route alone, scoped topk alone, flat alone).
     latencyMs: tsqStart - routeStart,
     scopedTopkLatencyMs,

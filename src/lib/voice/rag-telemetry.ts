@@ -104,6 +104,14 @@ export type RouteLeg = {
   sectionTop1to2Gap: number | null;
   /** True when the flat (unscoped) fallback was unioned with the scoped pass. */
   flatFallbackFired: boolean;
+  /**
+   * True when the flat fallback hit the FLAT_FALLBACK_MAX_SECTIONS cap (Step-9
+   * audit M3): the creator has MORE active sections than the cap, so the flat
+   * pass considered only the first N by section_index and may silently
+   * under-recall later content. A loud signal that the cap (+ topk fan-out)
+   * needs raising for a large-corpus creator. NULL when the fallback didn't run.
+   */
+  flatFallbackCapped?: boolean | null;
   /** Time spent in `_creator_route_sections_v3` alone. */
   latencyMs: number;
   /** Time spent in the SCOPED `_creator_knowledge_topk_v3` alone. NULL when not run. */
@@ -560,6 +568,7 @@ export function toPostHogEventBatch(t: RagTurnTelemetry): PostHogEvent[] {
         section_top1_score: t.route.sectionTop1Score,
         section_top1_to_2_gap: t.route.sectionTop1to2Gap,
         flat_fallback_fired: t.route.flatFallbackFired,
+        flat_fallback_capped: t.route.flatFallbackCapped ?? null,
         route_latency_ms: t.route.latencyMs,
         scoped_topk_latency_ms: t.route.scopedTopkLatencyMs ?? null,
         flat_latency_ms: t.route.flatLatencyMs ?? null,

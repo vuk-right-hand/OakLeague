@@ -141,10 +141,15 @@ export function hasWordContent(text) {
   return /[\p{L}\p{N}]/u.test(String(text ?? ''));
 }
 
-// v3 unit_index stride is secIdx*10000 (processV3Job), so a section must never
-// emit ≥10000 units or it collides into the next section's range (audit round-2
-// M1). Verbatim packing (≤6000 chars/unit, ≤32K-char sections) tops out at ~6;
-// Flash emits ~5-30. This is the loud guard if either ever pathologically blows.
+// v3 unit_index is now PER-GENERATION unique (UNIQUE(sample_id,
+// section_generation, unit_index) — mig 20260531000002), so the stride is no
+// longer load-bearing for cross-section collision avoidance the way it was
+// pre-C2/C3: any monotonic counter within a generation would satisfy the
+// constraint. processV3Job still encodes section position as secIdx*10000 +
+// unitIdx (a stable, debuggable layout), so a section emitting ≥10000 units
+// would still overrun into the next section's stride band — this cap stays the
+// loud guard against that pathological case. Verbatim packing (≤6000 chars/unit,
+// ≤32K-char sections) tops out at ~6; Flash emits ~5-30.
 export const MAX_UNITS_PER_SECTION = 9999;
 
 // AUDIT ROUND-1 C1 + ROUND-2 M3 — split a parent unit into child chunks, with a
@@ -734,8 +739,9 @@ export function makeCorpusReprocessWorker({
   //           _insert_chunk_v3_unsafe (server-derives sample/creator/section_index)
   //        e. After all children land: centroid = length-weighted mean of
   //           unit-normalized child embeddings (plan §11/M1) → UPDATE section
-  //   5. corpus_reprocess_mark_done_v3 (step 7's finalize_v3 will land + this
-  //      stub will delegate to it; for now: status flip only)
+  //   5. corpus_reprocess_mark_done_v3 → corpus_reprocess_finalize_v3: atomic
+  //      generation SWAP (active_section_generation = targetGen), v1-chunk
+  //      delete, corpus_version bump, job done (Step-9 audit C2/C3).
   //
   // SCOPE GUARDS preserved from v2: deadline / shutdown checkpoints, per-creator
   // budget cap (pre-flight + per-section accumulate), Anthropic failure-rate
@@ -1050,67 +1056,53 @@ export function makeCorpusReprocessWorker({
         partLabelBySecIdx[i] = { k, n };
       }
 
-      // Step 3: idempotent cleanup — ADDITIVE-BUILD (round-5 audit C1).
+      // Step 3: GENERATION-AWARE additive build (Step-9 audit C2/C3, plan REV 3).
       //
-      // We DELETE only THIS run's prior v3 artifacts (idempotent re-embed of
-      // a crashed/re-claimed v3 job), NOT the creator's live v2 corpus.
+      // Re-ingest builds a NEW generation (active+1) ALONGSIDE the live active
+      // generation, which stays fully readable the whole rebuild. finalize_v3
+      // swaps sample_content.active_section_generation atomically at the end; a
+      // deferred GC reclaims old generations later (keeping active + prior for
+      // rollback). This replaces the OLD "delete all sections up front, rebuild
+      // in place" — that blanked an already-live-v3 creator mid-rebuild.
       //
-      //   3 (was "3b"). DELETE this sample's v3 sections → CASCADE wipes the
-      //      v3 units (section_id matches) + v3 chunks (parent_unit_id +
-      //      section_id) of any PRIOR v3 attempt. v2 units/chunks are
-      //      UNTOUCHED.
-      //
-      // The OLD "3a" delete of v2-shape narrative_units (section_id NULL)
-      // was REMOVED: it CASCADE-wiped the creator's live v2 chunks mid-build,
-      // blanking the still-v2 read path for every processed sample until the
-      // flip (plan §6 promised "accumulate invisibly" — 3a broke that). The
-      // (sample_id, unit_index) UNIQUE collision that 3a existed to avoid is
-      // now handled by offsetting v3 unit_index above the surviving v2 range
-      // (v3UnitBase below). v2 + v3 rows coexist until the v2→v3 flip RPC
-      // (migration 20260528000053) does the one-shot v1+v2 cutover delete.
+      // targetGen = active + 1. DEFAULT 1 means a never-before-v3 sample has
+      // active=1, so its first v3 build is gen 2 (plan M-1) — gen 1's only rows
+      // are v2-legacy (section_id NULL) which the v3 read path never sees.
+      let targetGen;
+      {
+        const { data: sampleGenRow, error: genErr } = await supabase
+          .from('sample_content')
+          .select('active_section_generation')
+          .eq('id', sampleId)
+          .single();
+        if (genErr || !sampleGenRow) {
+          await bumpFailure(jobId, `v3_active_gen_lookup_failed:${genErr?.message || 'no_row'}`);
+          return;
+        }
+        targetGen = Number(sampleGenRow.active_section_generation) + 1;
+      }
+
+      // Idempotent re-claim cleanup: delete ONLY this run's PARTIAL target
+      // generation (a crashed/re-claimed prior attempt at the SAME targetGen) →
+      // CASCADE wipes its units + chunks. The ACTIVE generation (and any older
+      // ones) are UNTOUCHED — they keep serving reads. This is scoped to
+      // targetGen, never a blanket sample-wide delete.
       const { error: cleanupErr } = await supabase
         .from('sample_content_sections')
         .delete()
-        .eq('sample_id', sampleId);
+        .eq('sample_id', sampleId)
+        .eq('section_generation', targetGen);
       if (cleanupErr) {
         await markJobErrored(jobId, `v3_pre_insert_sections_cleanup_failed:${cleanupErr.message}`);
         return;
       }
 
-      // ADDITIVE-BUILD unit_index base. The (sample_id, unit_index) UNIQUE is
-      // sample-wide, so v3 units must not collide with the surviving v2 units
-      // (0..N). Read MAX(unit_index) for the sample AFTER the v3-section
-      // cleanup above (so a re-run sees only v2 units, giving a stable base)
-      // and start v3 units strictly above it. With v3UnitBase + secIdx*10000
-      // + unitIdx, v3 never overlaps v2 and the value stays well within int.
-      let v3UnitBase = 0;
-      {
-        const { data: maxRow, error: maxErr } = await supabase
-          .from('sample_content_narrative_units')
-          .select('unit_index')
-          .eq('sample_id', sampleId)
-          .order('unit_index', { ascending: false })
-          .limit(1)
-          .maybeSingle();
-        if (maxErr) {
-          await bumpFailure(jobId, `v3_unit_base_lookup_failed:${maxErr.message}`);
-          return;
-        }
-        v3UnitBase = maxRow ? (Number(maxRow.unit_index) + 1) : 0;
-      }
-
-      // Round-6 M2: int4 overflow guard. unit_index is int4 (max ~2.1B).
-      // The largest v3 value is v3UnitBase + (segments.length-1)*10000 +
-      // (units in last section). Bail loud rather than hit a Postgres 22003
-      // mid-insert if a pathological base + section count would overflow.
-      // 2e9 leaves headroom under 2_147_483_647.
-      if (v3UnitBase + segments.length * 10000 >= 2_000_000_000) {
-        await markJobErrored(
-          jobId,
-          `v3_unit_index_overflow_guard base=${v3UnitBase}_sections=${segments.length}`,
-        );
-        return;
-      }
+      // unit_index is now per-generation (UNIQUE(sample_id, section_generation,
+      // unit_index) — migration 20260531000002). It restarts at 0 for this
+      // generation, so the old v3UnitBase watermark + int4-overflow guard are
+      // GONE (Step-9 audit C4): no cross-generation collision is possible, and
+      // the index never grows unbounded across re-ingests. v2-legacy units stay
+      // at gen 1 and never collide with a gen ≥ 2 v3 build.
 
       // Step 4: per-section loop.
       for (let secIdx = 0; secIdx < segments.length; secIdx++) {
@@ -1270,6 +1262,7 @@ export function makeCorpusReprocessWorker({
             sample_id:        sampleId,
             creator_id:       creatorId,
             section_index:    secIdx,
+            section_generation: targetGen,   // Step-9 C2/C3 generation tag
             title:            finalSectionTitle,
             summary:          finalSectionSummary,
             summary_embedding: `[${summaryVec.join(',')}]`,
@@ -1303,30 +1296,21 @@ export function makeCorpusReprocessWorker({
 
           const unit = sectionUnits[unitIdx];
           const unitTokens = clampTokenCount(unit.text);
-          // narrative_units.unit_index is sample-wide unique. v3 uses a
-          // running counter that's section-aware AND offset above the
-          // surviving v2 range (v3UnitBase, round-5 audit C1 additive-build):
-          // v3UnitBase + secIdx*10000 + unitIdx is unique sample-wide, never
-          // collides with v2 units (0..v3UnitBase-1), and keeps section
-          // grouping obvious in logs. 10000 cap > any realistic units/section
-          // (Flash emits ~5-30 units per section).
-          //
-          // Round-6 M1 — LOAD-BEARING non-collision invariant: a v2 reprocess
-          // worker (target_version=2 job for the SAME sample) can run
-          // concurrently (claim's advisory lock is xact-scoped, released
-          // before processing). It writes v2 units counting from 0 upward.
-          // v3 never collides ONLY because v2 indices stay low (0..N) and v3
-          // starts at v3UnitBase = MAX+1 (≥ N+1). If v2 ever wrote indices
-          // ≥ v3UnitBase this would 23505. v2's counter starts at 0, so it
-          // holds — but the safety rests on that coupling. Do not change v2's
-          // unit_index scheme to start high without revisiting this.
-          const unitIndexSampleWide = v3UnitBase + secIdx * 10000 + unitIdx;
+          // unit_index is now PER-GENERATION unique (UNIQUE(sample_id,
+          // section_generation, unit_index) — migration 20260531000002). A
+          // section-aware counter secIdx*10000 + unitIdx is unique WITHIN this
+          // generation, which is all the constraint requires now. No cross-gen
+          // or v2 collision is possible (each generation has its own index
+          // space; v2-legacy units live at gen 1). The old v3UnitBase watermark
+          // + the Round-6 M1 v2-coupling invariant are GONE (Step-9 audit C4).
+          const unitIndexInGen = secIdx * 10000 + unitIdx;
           const { data: unitRow, error: unitErr } = await supabase
             .from('sample_content_narrative_units')
             .insert({
               sample_id:   sampleId,
               creator_id:  creatorId,
-              unit_index:  unitIndexSampleWide,
+              unit_index:  unitIndexInGen,
+              section_generation: targetGen,   // Step-9 C2/C3 generation tag
               title:       String(unit.title || '').slice(0, 200),
               text:        String(unit.text  || '').slice(0, 8000),
               token_count: unitTokens,
@@ -1602,10 +1586,12 @@ export function makeCorpusReprocessWorker({
         });
       }
 
-      // Atomic version-checked finish.
+      // Atomic version-checked finish + GENERATION SWAP (Step-9 audit C2/C3,
+      // M-1). p_target_generation activates the generation we just built; the
+      // expected/skipped counts written above describe it.
       const { data: doneId, error: finErr } = await supabase.rpc(
         'corpus_reprocess_mark_done_v3',
-        { p_job_id: jobId, p_claimed_version: claimedVersion },
+        { p_job_id: jobId, p_claimed_version: claimedVersion, p_target_generation: targetGen },
       );
       if (finErr) {
         const code = finErr?.code || '';
@@ -1976,14 +1962,20 @@ export function makeCorpusReprocessWorker({
 
       // Day-5-audit C3: idempotent retries. If a previous attempt partially
       // INSERTed narrative_units before failing, the second claim's UNIQUE
-      // (sample_id, unit_index) would conflict. DELETE here; CASCADE on
-      // sample_content_chunks.parent_unit_id cleans v2 children too. Empty
-      // on the happy first-run case (DELETE 0). One round-trip cost; saves
-      // a 5-attempt-then-errored death spiral.
+      // would conflict. DELETE here; CASCADE on sample_content_chunks.
+      // parent_unit_id cleans v2 children too.
+      //
+      // Step-9 audit M-6: scope to section_id IS NULL (v2-shape units ONLY).
+      // The OLD blanket `.eq('sample_id')` delete wiped LIVE v3 units (CASCADE
+      // their chunks) whenever a v2 reprocess ran against a sample that already
+      // had v3 rows (e.g. a corpus edit on a v3 creator pre-purge) — blanking
+      // the v3 read path. v3 units carry section_id NOT NULL; this filter
+      // leaves them alone.
       const { error: cleanupErr } = await supabase
         .from('sample_content_narrative_units')
         .delete()
-        .eq('sample_id', sampleId);
+        .eq('sample_id', sampleId)
+        .is('section_id', null);
       if (cleanupErr) {
         await bumpFailure(jobId, `pre_insert_cleanup_failed:${cleanupErr.message}`);
         return;

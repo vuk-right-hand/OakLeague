@@ -139,6 +139,17 @@ function buildAdmin(opts: {
         return { data: opts.topkRows ?? [], error: null };
       case 'semantic_query_cache_upsert':
         return { data: opts.cacheUpsertResult === undefined ? 'cache-row-uuid' : opts.cacheUpsertResult, error: null };
+      case '_fetch_active_parents_v3': {
+        // Step-9 R5/C-2: gen-filtered cache-hit parent re-fetch RPC. Returns the
+        // FLAT shape {id,text,title,source_type} (the RPC joins sample_content
+        // server-side). Map the test's nested parentFetchRows fixtures.
+        if (opts.parentFetchError) return { data: null, error: opts.parentFetchError };
+        const flat = (opts.parentFetchRows ?? []).map((r) => ({
+          id: r.id, text: r.text, title: r.title,
+          source_type: r.sample_content?.source_type ?? null,
+        }));
+        return { data: flat, error: null };
+      }
       default:
         return { data: null, error: { message: `unmocked rpc: ${name}` } };
     }
@@ -825,6 +836,20 @@ function buildAdminV3(opts: {
       }
       case 'semantic_query_cache_upsert':
         return { data: opts.cacheUpsertResult === undefined ? 'cache-row-uuid' : opts.cacheUpsertResult, error: null };
+      case '_creator_active_section_ids_v3':
+        // Step-9 R2/C-1: gen-filtered active-section ids for the flat fallback
+        // (replaces the raw .from('sample_content_sections') select). Returns
+        // {section_id} rows; map the test's allSectionsRows {id} fixtures.
+        return { data: (opts.allSectionsRows ?? []).map((r) => ({ section_id: r.id })), error: null };
+      case '_fetch_active_parents_v3': {
+        // Step-9 R5/C-2: gen-filtered cache-hit parent re-fetch RPC (flat shape).
+        if (opts.parentFetchError) return { data: null, error: opts.parentFetchError };
+        const flat = (opts.parentFetchRows ?? []).map((r) => ({
+          id: r.id, text: r.text, title: r.title,
+          source_type: r.sample_content?.source_type ?? null,
+        }));
+        return { data: flat, error: null };
+      }
       default:
         return { data: null, error: { message: `unmocked rpc: ${name}` } };
     }

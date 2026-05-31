@@ -93,17 +93,17 @@ BEGIN
   -- 5: mark_done_v3 service-role only.
   RETURN NEXT ok(
     NOT has_function_privilege('anon'::regrole,
-        'public.corpus_reprocess_mark_done_v3(uuid, int)', 'EXECUTE')
+        'public.corpus_reprocess_mark_done_v3(uuid, int, int)', 'EXECUTE')
     AND NOT has_function_privilege('authenticated'::regrole,
-        'public.corpus_reprocess_mark_done_v3(uuid, int)', 'EXECUTE')
+        'public.corpus_reprocess_mark_done_v3(uuid, int, int)', 'EXECUTE')
     AND has_function_privilege('service_role'::regrole,
-        'public.corpus_reprocess_mark_done_v3(uuid, int)', 'EXECUTE'),
+        'public.corpus_reprocess_mark_done_v3(uuid, int, int)', 'EXECUTE'),
     '5: mark_done_v3 is service-role-only'
   );
 
   -- 6: happy path — v3 job at status='processing' (claimed in test 3), matching
   -- enqueue_version → marks done.
-  SELECT public.corpus_reprocess_mark_done_v3(v_job_v3, 1) INTO v_done_ret;
+  SELECT public.corpus_reprocess_mark_done_v3(v_job_v3, 1, 1) INTO v_done_ret;
   SELECT status INTO v_status FROM public.corpus_reprocess_jobs WHERE id = v_job_v3;
   RETURN NEXT is(
     coalesce(v_done_ret::text, '<null>') || '|' || v_status,
@@ -116,7 +116,7 @@ BEGIN
   UPDATE public.corpus_reprocess_jobs
      SET status = 'processing', enqueue_version = 2
    WHERE id = v_job_v3;
-  SELECT public.corpus_reprocess_mark_done_v3(v_job_v3, 1) INTO v_done_ret;  -- claim=1, table=2
+  SELECT public.corpus_reprocess_mark_done_v3(v_job_v3, 1, 1) INTO v_done_ret;  -- claim=1, table=2
   SELECT status INTO v_status FROM public.corpus_reprocess_jobs WHERE id = v_job_v3;
   RETURN NEXT is(
     coalesce(v_done_ret::text, '<null>') || '|' || v_status,
@@ -130,7 +130,7 @@ BEGIN
   -- Reset v3 to done so claim picks v2 next.
   UPDATE public.corpus_reprocess_jobs SET status='done' WHERE id = v_job_v3;
   PERFORM public.claim_corpus_reprocess_job('test-worker-v2');
-  SELECT public.corpus_reprocess_mark_done_v3(v_job_v2, 1) INTO v_done_ret;
+  SELECT public.corpus_reprocess_mark_done_v3(v_job_v2, 1, 1) INTO v_done_ret;
   SELECT status INTO v_status FROM public.corpus_reprocess_jobs WHERE id = v_job_v2;
   RETURN NEXT is(
     coalesce(v_done_ret::text, '<null>') || '|' || v_status,

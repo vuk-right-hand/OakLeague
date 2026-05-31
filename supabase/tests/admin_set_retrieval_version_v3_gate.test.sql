@@ -20,15 +20,29 @@
 --    cleanup migration lands, flip the assert from "alive" to "deleted".
 -- 7. Round-5 C3 partner -- v=1->v=1 same-version also no-ops cleanly
 --    (idempotency holds at every base version, not just v=3).
--- 8. Round-5 C1 (additive-build cutover) -- flip v=2->v=3 DELETEs the
---    creator's chunker_version IN (1,2) chunks + v2-shape narrative_units
---    (section_id NULL), PRESERVES v3 chunks + v3 units. The one-shot v1+v2
---    cleanup that the additive build deferred from finalize_v3 to the flip.
--- 9. Round-5 C1 -- the v=2->v=3 flip's audit row carries cutover counts
---    (cutover_chunks_deleted + cutover_v2_units_deleted).
+-- 8. Step-9 audit C1 (SOFT CUTOVER) -- flip v=2->v=3 NO LONGER deletes the
+--    creator's chunker_version IN (1,2) chunks or v2-shape narrative_units.
+--    ALL versions survive (v1+v2 go dormant, v3 live) so rollback works. The
+--    audit row carries soft_cutover=true + legacy_chunks_purged=false.
+-- 9. Step-9 audit C1 (ROLLBACK) -- after the v2->v3 flip, flipping v=3->v=2
+--    still finds the (preserved) chunker_version=2 chunks -- rollback is NOT
+--    bricked. This is the bug the soft cutover fixes.
+-- 10. Step-9 audit C1 (PURGE) -- admin_purge_legacy_chunks on the v3 creator
+--    deletes the dormant v1+v2 chunks + v2-shape units, preserves v3, bumps
+--    current_corpus_version, returns counts.
+-- 11. Step-9 audit C1 (PURGE) -- admin_purge_legacy_chunks deletes dormant
+--    v1+v2 + v2-shape units, preserves v3, returns counts.
+-- 12. Step-9 audit M2 (ROLLBACK-AFTER-PURGE) -- once legacy_purged_at is set,
+--    admin_set_creator_retrieval_version refuses a 3->2 rollback
+--    (check_violation 'rollback_refused_legacy_purged' -- the v1/v2 corpus is
+--    gone, so the rollback would read empty). Pre-purge rollback (case 10)
+--    still succeeds; this proves the gate only fires post-purge.
+-- 13. Step-9 audit C1 (PURGE GUARD) -- admin_purge_legacy_chunks on a creator
+--    NOT on v3 raises check_violation 'purge_refused_creator_not_on_v3'
+--    (refuses to delete a live v2 corpus).
 
 BEGIN;
-SELECT plan(9);
+SELECT plan(13);
 
 CREATE FUNCTION pg_temp.unit_vec(p_position int) RETURNS halfvec(768)
 LANGUAGE plpgsql IMMUTABLE AS $$
@@ -216,11 +230,12 @@ BEGIN
     '7: same-version v=2->v=2 is a NO-OP (idempotency at every base version)'
   );
 
-  -- ── 8 + 9: Round-5 C1 — v2->v3 flip cutover cleanup ───────────────────
+  -- ── 8-11: Step-9 audit C1 — SOFT cutover + rollback + purge ───────────
   -- Fresh creator with v1 + v2 + v3 chunks coexisting (the additive-build
   -- end-state: build complete, creator_v3_ready=true, about to flip). Flip
-  -- v2->v3 and assert v1+v2 deleted, v3 survives, v2-unit deleted, v3-unit
-  -- survives, audit carries cutover counts.
+  -- v2->v3 and assert ALL versions SURVIVE (soft cutover), then prove
+  -- rollback to v2 still works, then prove the explicit purge deletes the
+  -- dormant legacy + guards a non-v3 creator.
   DECLARE
     v_user_c     uuid := tests.create_auth_user('av3-cutover@test');
     v_app_c      uuid;
@@ -233,8 +248,9 @@ BEGIN
     v_v3_after   int;
     v_v2u_after  int;
     v_v3u_after  int;
-    v_cut_chunks text;
-    v_cut_units  text;
+    v_soft       text;
+    v_purged_flag text;
+    v_purge_res  jsonb;
   BEGIN
     INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
       VALUES (gen_random_uuid(), v_user_c, 'approved', 'AV3C', 'av3c', '[]'::jsonb, '{}'::jsonb)
@@ -278,6 +294,7 @@ BEGIN
     PERFORM public.admin_set_creator_retrieval_version(v_creator_c, 3::smallint);
     PERFORM tests.reset_role();
 
+    -- 8: SOFT cutover — ALL versions survive the flip (v1+v2 dormant, v3 live).
     SELECT count(*) INTO v_v1_after FROM public.sample_content_chunks
      WHERE creator_id = v_creator_c AND chunker_version = 1;
     SELECT count(*) INTO v_v2_after FROM public.sample_content_chunks
@@ -289,25 +306,98 @@ BEGIN
     SELECT count(*) INTO v_v3u_after FROM public.sample_content_narrative_units
      WHERE creator_id = v_creator_c AND section_id IS NOT NULL;
     RETURN NEXT ok(
-      v_v1_after = 0 AND v_v2_after = 0 AND v_v3_after = 1
-        AND v_v2u_after = 0 AND v_v3u_after = 1,
-      format('8: v2->v3 flip cutover — v1=%s v2=%s v3=%s v2u=%s v3u=%s (want 0/0/1/0/1)',
+      v_v1_after = 1 AND v_v2_after = 1 AND v_v3_after = 1
+        AND v_v2u_after = 1 AND v_v3u_after = 1,
+      format('8: v2->v3 SOFT cutover — v1=%s v2=%s v3=%s v2u=%s v3u=%s (want 1/1/1/1/1, all survive)',
              v_v1_after, v_v2_after, v_v3_after, v_v2u_after, v_v3u_after)
     );
 
-    -- 9: audit carries cutover counts (1 chunk of each version + 1 v2 unit).
-    SELECT after->>'cutover_chunks_deleted', after->>'cutover_v2_units_deleted'
-      INTO v_cut_chunks, v_cut_units
+    -- 9: audit row carries soft_cutover=true + legacy_chunks_purged=false.
+    SELECT after->>'soft_cutover', after->>'legacy_chunks_purged'
+      INTO v_soft, v_purged_flag
       FROM public.admin_audit_log
      WHERE action = 'creator_retrieval_version_set'
        AND target_id = v_creator_c
        AND (after->>'retrieval_version') = '3'
      ORDER BY created_at DESC, id DESC LIMIT 1;
     RETURN NEXT is(
-      v_cut_chunks || '|' || v_cut_units, '2|1',
-      format('9: v2->v3 audit carries cutover counts (chunks=%s units=%s, want 2|1)',
-             COALESCE(v_cut_chunks, 'NULL'), COALESCE(v_cut_units, 'NULL'))
+      v_soft || '|' || v_purged_flag, 'true|false',
+      format('9: v2->v3 audit carries soft_cutover=%s legacy_chunks_purged=%s (want true|false)',
+             COALESCE(v_soft, 'NULL'), COALESCE(v_purged_flag, 'NULL'))
     );
+
+    -- 10: ROLLBACK — flip v3->v2 still finds the preserved v2 chunks. This is
+    -- the bug the soft cutover fixes: pre-fix, the v2 chunks were gone so a
+    -- v3->v2 rollback read zero chunks. Assert the v2 chunk survives the
+    -- round-trip (flip back to 2 then count chunker_version=2).
+    PERFORM tests.set_authenticated(v_admin);
+    PERFORM public.admin_set_creator_retrieval_version(v_creator_c, 2::smallint);
+    PERFORM tests.reset_role();
+    SELECT count(*) INTO v_v2_after FROM public.sample_content_chunks
+     WHERE creator_id = v_creator_c AND chunker_version = 2;
+    RETURN NEXT ok(
+      v_v2_after = 1,
+      format('10: rollback v3->v2 — v2 chunk preserved (count=%s, want 1, NOT bricked)',
+             v_v2_after)
+    );
+
+    -- 11: PURGE — flip back to v3, then admin_purge_legacy_chunks deletes the
+    -- dormant v1+v2 + v2-shape unit, preserves v3, returns counts.
+    PERFORM tests.set_authenticated(v_admin);
+    PERFORM public.admin_set_creator_retrieval_version(v_creator_c, 3::smallint);
+    SELECT public.admin_purge_legacy_chunks(v_creator_c) INTO v_purge_res;
+    PERFORM tests.reset_role();
+    SELECT count(*) INTO v_v1_after FROM public.sample_content_chunks
+     WHERE creator_id = v_creator_c AND chunker_version IN (1, 2);
+    SELECT count(*) INTO v_v3_after FROM public.sample_content_chunks
+     WHERE creator_id = v_creator_c AND chunker_version = 3;
+    SELECT count(*) INTO v_v2u_after FROM public.sample_content_narrative_units
+     WHERE creator_id = v_creator_c AND section_id IS NULL;
+    RETURN NEXT ok(
+      v_v1_after = 0 AND v_v3_after = 1 AND v_v2u_after = 0
+        AND (v_purge_res->>'legacy_chunks_deleted') = '2'
+        AND (v_purge_res->>'v2_narrative_units_deleted') = '1',
+      format('11: purge — legacy v1/v2=%s v3=%s v2u=%s res.chunks=%s res.units=%s (want 0/1/0, res 2/1)',
+             v_v1_after, v_v3_after, v_v2u_after,
+             v_purge_res->>'legacy_chunks_deleted', v_purge_res->>'v2_narrative_units_deleted')
+    );
+
+    -- 13: Step-9 audit M2 — ROLLBACK-AFTER-PURGE refused. creator_c is on v3
+    -- with legacy_purged_at now set (case 11). A 3->2 rollback must RAISE: the
+    -- v1/v2 corpus is gone, so it would read empty. Contrast case 10 where the
+    -- pre-purge rollback succeeded — same flip, opposite outcome, the only
+    -- difference being the purge stamped legacy_purged_at.
+    PERFORM tests.set_authenticated(v_admin);
+    RETURN NEXT throws_ok(
+      format('SELECT public.admin_set_creator_retrieval_version(%L::uuid, 2::smallint)', v_creator_c),
+      '23514',  -- check_violation (rollback_refused_legacy_purged)
+      NULL,
+      '12: M2 — rollback v3->v2 REFUSED after legacy purge (would read empty corpus)'
+    );
+    PERFORM tests.reset_role();
+  END;
+
+  -- ── 12: purge GUARD is its own slot.
+  -- New creator on v2 (never flipped to 3): purge must REFUSE.
+  DECLARE
+    v_user_d     uuid := tests.create_auth_user('av3-purgeguard@test');
+    v_app_d      uuid;
+    v_creator_d  uuid;
+  BEGIN
+    INSERT INTO public.creator_applications (id, user_id, status, display_name, handle, topics, proof)
+      VALUES (gen_random_uuid(), v_user_d, 'approved', 'AV3D', 'av3d', '[]'::jsonb, '{}'::jsonb)
+      RETURNING id INTO v_app_d;
+    INSERT INTO public.creators (id, user_id, application_id, display_name, handle, brain_status, brain_mode, retrieval_version)
+      VALUES (gen_random_uuid(), v_user_d, v_app_d, 'AV3D', 'av3d', 'ready', 'vector', 2)
+      RETURNING id INTO v_creator_d;
+    PERFORM tests.set_authenticated(v_admin);
+    RETURN NEXT throws_ok(
+      format('SELECT public.admin_purge_legacy_chunks(%L::uuid)', v_creator_d),
+      '23514',  -- check_violation SQLSTATE (matches the RPC's errcode='check_violation')
+      NULL,
+      '13: guard — admin_purge_legacy_chunks refuses a creator not on v3 (would brick live v2 corpus)'
+    );
+    PERFORM tests.reset_role();
   END;
 END;
 $fn$;
