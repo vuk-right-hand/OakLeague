@@ -20,14 +20,20 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // Mock @google/genai before importing the modules under test.
 const generateContentMock = vi.fn();
 const embedContentMock = vi.fn();
-vi.mock('@google/genai', () => ({
-  GoogleGenAI: vi.fn().mockImplementation(() => ({
-    models: {
-      generateContent: generateContentMock,
-      embedContent: embedContentMock,
-    },
-  })),
-}));
+// Mock only the GoogleGenAI client; keep the real ThinkingLevel/Type enum
+// exports so the v3 thinkingLevel path (gemini-3.x models) initializes.
+vi.mock('@google/genai', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@google/genai')>();
+  return {
+    ...actual,
+    GoogleGenAI: vi.fn().mockImplementation(() => ({
+      models: {
+        generateContent: generateContentMock,
+        embedContent: embedContentMock,
+      },
+    })),
+  };
+});
 
 import {
   retrieveKnowledgeV2,

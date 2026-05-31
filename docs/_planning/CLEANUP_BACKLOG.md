@@ -386,3 +386,78 @@ v3 failure; (2) brain-status route surfaces per-sample reprocess-job status; (3)
 page shows which chapter failed + a re-enqueue/resubmit action; (4) tests.
 **Acceptable for v1** (invite-only, hands-on admin re-enqueues) — TRIGGER: when creator
 count grows past hands-on, or before self-serve creator onboarding GA.
+
+---
+
+## v3 ingest: re-upgrade a verbatim-fallback section to AI-chunking (Vuk 2026-05-30)
+
+Decision-gated on the sweep. IF AI-chunking is even marginally better than verbatim
+(quality/latency/UX), then a section that fell to verbatim because Flash transiently
+failed must NOT be permanently stuck on the inferior path. Desired lifecycle:
+  ai-chunking attempt → fails → verbatim (words safe, creator can go live) →
+  LATER re-attempt ai-chunking → if it succeeds, UPGRADE that section in place → done.
+So verbatim is a temporary safety net, not a permanent downgrade.
+
+Why it's not in the current commit: today a verbatim section only gets re-attempted
+if the WHOLE sample is re-enqueued (which re-runs every section). We want a
+per-section, idempotent re-attempt that only re-does the verbatim-flagged sections.
+
+Design sketch (revisit AFTER the sweep confirms the gap is worth it):
+- Persist on sample_content_sections: a `fallback_reason` (already emitted by the
+  route) + a section-text hash, so a re-claim can tell verbatim-fallback sections
+  from healthy ones.
+- A low-priority re-attempt pass (cron or admin button) that, for sections flagged
+  verbatim, re-runs ONLY narrative-chunk-section; on success swaps that section's
+  units/chunks/centroid atomically + clears the flag; on fail leaves verbatim intact.
+- Bounded retries + backoff so a permanently-pathological section doesn't loop.
+- This pairs with the already-logged "flip-flop persistence" item (store the decision
+  so temp-0 borderline sections don't oscillate).
+TRIGGER: after the sweep, IF we keep AI-chunking as the primary path (not verbatim-only).
+
+---
+
+## v3 config FROZEN + decisions (Vuk + sweep, 2026-05-30)
+
+**DECIDED — keep AI-chunker as the single primary path; NO verbatim-only mode.**
+Reasoning (Vuk): AI-chunker COGS on a small creator is negligible (cents/book, one-
+time), so verbatim-only would not save meaningful money; it WOULD add a second code
+path, a "small vs big" threshold nobody can define ("who's gonna count the words?"),
+and more places to fail. Keep infra lean = one path. Verbatim stays ONLY as the
+never-lose-a-word fallback inside the AI path (already shipped, commit 942283d).
+The scale argument reinforces this: at company-brain scale (YC use case — 10M+ words,
+5yr Slack/email/drive × employees → 5k-50k sections) ROUTING is the bottleneck, and
+routing quality depends on the AI-written section SUMMARY embeddings. Verbatim has no
+real summary (faked from first sentences) → at huge section counts the query routes to
+the wrong handful and the right answer never becomes a candidate. Verbatim ≈ AI at
+~100-500k words; AI wins DECISIVELY at 10M+. So AI-chunker is what makes company-brain
+scale possible. "Best content wins" (Vuk): the moat is content quality in the chunks,
+not ranking cleverness — sweep showed rank_mode/topk_min/λ barely move recall@1.
+
+**FROZEN config (retrieve-knowledge.ts DEFAULT_V3_*):** S=6, rank_mode=max_blend,
+λ=0.10, topk_min per-mode defaults. From §8 sweep (AoD full book, 12 needles):
+S=4 → routing 58% / r@1 39%; S=6 → 81% / 47%; S=8 → 83% / 47% (6→8 is noise, S=6
+wins r@2 56% vs 53%). NOTE recall@1 ~47% is the STRICT substring-proxy metric and
+badly understates real answer quality (yesterday's answers read excellent; many
+"misses" returned correct in-voice answers). No config cleared the design's 95%
+routing floor — but the floor is proxy-strict, not a real-quality verdict.
+
+**TODO — adaptive S (Step 9 refinement, route RPC already comments "ship conservative
+S adaptive").** A fixed S=6 is a v1 simplification. S is a ceiling (`LIMIT top_s`), so
+it's safe for tiny creators, but a 3-section solo creator and a 5000-section company
+brain should not share one S. Make S scale with the creator's section count (e.g.
+clamp(ceil(sqrt(sections)) or a small fraction, [3,10])). TRIGGER: company-brain /
+large-corpus onboarding, or when a creator's section count >> book scale.
+
+---
+
+## RAG v3 — model-pin validation + config freeze (2026-05-31)
+
+**Validation of record (replaces the throwaway `scripts/tmp-model-probe.mjs`, deleted post-commit).** `gemini-3.1-flash-lite` pinned for `NARRATIVE_CHUNK_MODEL` + `QUERY_REWRITE_MODEL` (was `gemini-2.5-flash`, retires 2026-10-16). Proven 2026-05-31:
+- Direct `generateContent` call → Google echoed `modelVersion: "gemini-3.1-flash-lite"` (ground truth, not inference).
+- Live `/api/internal/narrative-chunk-section` with a real AoD section → HTTP 200, `fallback:false`, attempt 1, coverage lengthRatio 0.9935 / trigram 0.907 (binds `responseSchema` + `thinkingLevel:MINIMAL`, clears the coverage gate through prod code).
+- `tsc --noEmit` exit 0; full voice vitest 527 passed / 4 skipped.
+- COGS pinned to 3.1-flash-lite $0.25/$1.50 per 1M across ALL surfaces: `embed-worker.js FLASH_USD_PER_M_*`, `query-rewrite.ts QUERY_REWRITE_USD_*`, `rag-telemetry.test.ts` fixtures, and `diag-eval-v3.mjs` mirrors. Config freeze: `DEFAULT_V3_TOP_S=6`, `max_blend`, λ=0.10.
+
+**Deferred audit findings (2026-05-31 auditor round on the model-pin changeset):**
+- **M5 — real-API gated regression for narrative-chunk-section.** No `RUN_REAL_API_TESTS=1` test exercises real 3.1-flash-lite (the 3 touched suites mock `generateContent`). Add a minimal gated test: one canned section → real `narrativeChunkSection` → assert non-null + non-empty units + `fallback:false`-equivalent. Mirrors the voice-provider real-API discipline (CLAUDE.md). Catches silent model deprecation / responseSchema-semantics drift. Do during Step 9.
+- **M3 — deploy-ordering trap (runbook, not code).** `NARRATIVE_CHUNK_MODEL` + `FLASH_USD_PER_M_*` are read on Fly; `QUERY_REWRITE_MODEL` + `QUERY_REWRITE_USD_*` on Vercel. A stale prod env override silently runs 3.1-lite at 2.5 prices or mislabels COGS rows. Before merge: verify these six are UNSET in both environments (so the pinned code defaults win) or set to the new values. Add to PROD_DEPLOY_GATE.

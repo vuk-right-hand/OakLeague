@@ -30,12 +30,18 @@ import { z } from 'zod';
 import { sanitizeForLLMPrompt } from './preprocess';
 
 // Configurable via env so a future model swap doesn't require code change.
-// Pinned default — banned: -latest. CLAUDE.md "Verify, Don't Guess" extends
-// in spirit to bare model names; audit-7 small flagged the unpinned default.
-// The string below MUST be a Google-published, dated GA tag. When `2.5-flash`
-// is superseded, bump here AND in the env var on Vercel/Fly in the same PR.
+// Pinned default — banned: -latest. CLAUDE.md "Verify, Don't Guess".
+// `gemini-3.1-flash-lite` (pinned 2026-05-30): GA/stable, supports
+// responseSchema structured output + thinkingLevel (verified ai.google.dev
+// 2026-05-30); cheaper than 2.5-flash ($0.25/$1.50 vs $0.30/$2.50 per M),
+// faster, newer-gen. Replaces gemini-2.5-flash which retires 2026-10-16.
+// The isV3 regex below routes this to the thinkingLevel:MINIMAL path.
+// When superseded, bump here AND the NARRATIVE_CHUNK_MODEL env on Fly/Vercel
+// in the same PR, then re-run the §8 AoD ingest and confirm the
+// section-coverage fallback rate stays near-zero (the bulletproofing gate is
+// the validator: a model that can't bind responseSchema spikes the fallback).
 export const NARRATIVE_CHUNK_MODEL =
-  process.env.NARRATIVE_CHUNK_MODEL || 'gemini-2.5-flash';
+  process.env.NARRATIVE_CHUNK_MODEL || 'gemini-3.1-flash-lite';
 
 // Per-Flash-call wall-clock ceiling. 30s comfortably covers the 95th percentile
 // of structured-JSON generation on a 50K-char document; past 30s we assume
@@ -299,10 +305,12 @@ async function callFlashOnce(args: {
     const isV3 = /^gemini-3(\.|-)/i.test(NARRATIVE_CHUNK_MODEL);
     // SDK-canonical enum for generateContent (serializes to "MINIMAL", uppercase).
     // Same LOGICAL level as the JS proxy mirror brain-llm-common.js#thinkingConfigFor,
-    // but DIFFERENT WIRE CASING — the proxy sends lowercase 'minimal'. Inert today
-    // (default model is gemini-2.5-flash → isV3=false → thinkingBudget:0 path). Before
-    // any gemini-3.x model is pinned here, the v3 enable gate (P1-9) MUST verify which
-    // casing the pinned model actually honors so the two paths don't silently diverge.
+    // but DIFFERENT WIRE CASING — the proxy sends lowercase 'minimal'. ACTIVE now:
+    // the pinned default gemini-3.1-flash-lite matches isV3 → thinkingLevel:MINIMAL.
+    // Validated 2026-05-31 (see CLEANUP_BACKLOG "model-pin validation"): a direct
+    // call echoed modelVersion=gemini-3.1-flash-lite, and the v3 section route bound
+    // responseSchema with thinkingLevel:MINIMAL (coverage pass, fallback:false).
+    // The 2.x thinkingBudget:0 branch remains for an env-override fallback model.
     const thinkingConfig = isV3
       ? { thinkingLevel: ThinkingLevel.MINIMAL }
       : { thinkingBudget: 0 };
@@ -318,11 +326,12 @@ async function callFlashOnce(args: {
         temperature: 0.2,
         responseMimeType: 'application/json',
         thinkingConfig,
-        // gemini-2.5-flash silently defaults maxOutputTokens to 8192 (model max
-        // is 65535). A 70K-char doc needs ~18K tokens of structured JSON; without
-        // an explicit cap the response truncates mid-JSON → Zod parse fails →
-        // fallback_to_v1. Verified 2026-05-20 against Google AI Dev Forum + the
-        // google-gemini/gemini-cli#23081 silent-truncation issue.
+        // An explicit maxOutputTokens cap is load-bearing: a 70K-char doc needs
+        // ~18K tokens of structured JSON; without the cap a model that silently
+        // defaults to a low ceiling (gemini-2.5-flash defaulted to 8192; observed
+        // 2026-05-20 against Google AI Dev Forum + google-gemini/gemini-cli#23081)
+        // truncates mid-JSON → Zod parse fails → fallback_to_v1. 65535 is the
+        // conservative max-headroom floor; kept for gemini-3.1-flash-lite (66K max).
         // 2026-05-21 (audit M4) — 32768 → 65535 (model max). A large doc whose
         // units re-emit most of the source text as JSON `text` fields can
         // exceed 32768 output tokens and truncate; the local splitter only

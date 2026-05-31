@@ -42,20 +42,23 @@ const SB_URL = process.env.EVAL_SB_URL || 'http://127.0.0.1:54321';
 const SB_KEY = process.env.EVAL_SB_SERVICE_KEY || 'sb_secret_N7UND0UgjKTVK-Uodkm0Hg_xSvEMPvz';
 const INTERNAL_API_BASE_URL = process.env.EVAL_INTERNAL_API_BASE_URL || 'http://localhost:3000';
 const EMBED_MODEL = process.env.EMBEDDING_MODEL || 'gemini-embedding-001';
-const REWRITE_MODEL = process.env.QUERY_REWRITE_MODEL || 'gemini-2.5-flash';
+// Mirrors the prod default pinned in src/lib/voice/query-rewrite.ts (2026-05-30:
+// gemini-2.5-flash → gemini-3.1-flash-lite). Keep in lockstep or the harness's
+// cost-per-query deltas compare against a baseline prod no longer runs.
+const REWRITE_MODEL = process.env.QUERY_REWRITE_MODEL || 'gemini-3.1-flash-lite';
 const VOYAGE_RERANK_MODEL = process.env.VOYAGE_RERANK_MODEL || 'rerank-2.5';
 const VOYAGE_RERANK_URL = 'https://api.voyageai.com/v1/rerank';
 const EMBED_DIM = 768;
 
 // Pricing pins (USD per 1M tokens unless noted) — mirror embed-worker.js + rerank.ts.
 const EMBED_USD_PER_M = Number(process.env.EMBEDDING_USD_PER_M || '0.15');
-const FLASH_USD_PER_M_IN = Number(process.env.FLASH_USD_PER_M_INPUT || '0.30');
+const FLASH_USD_PER_M_IN = Number(process.env.FLASH_USD_PER_M_INPUT || '0.25'); // 3.1-flash-lite (was 2.5 $0.30); mirror embed-worker.js
 const VOYAGE_USD_PER_M = Number(process.env.VOYAGE_RERANK_USD_PER_M || '0.05');
 const EVAL_MAX_USD = Number(process.env.EVAL_MAX_USD || '8');
 
 // Read-path defaults (mirror retrieve-knowledge.ts).
 const DEFAULT_K_CHILD = 30;
-const DEFAULT_TOP_S = 4;
+const DEFAULT_TOP_S = 6; // frozen prod value (was 4 during the §8 sweep that derived it)
 const DEFAULT_N_PARENT = 5;
 const DEFAULT_RANK_MODE = 'max_blend';
 const DEFAULT_LAMBDA = 0.1;
@@ -166,10 +169,17 @@ async function rewriteLatencyProbe(utterance) {
   return Date.now() - t0;
 }
 
+// Gentle global throttle so a tight sweep loop doesn't burst past Voyage's
+// requests-per-minute cap (the sweep fires hundreds of reranks back-to-back).
+// Env-tunable; 0 to disable.
+const VOYAGE_THROTTLE_MS = Number(process.env.EVAL_VOYAGE_THROTTLE_MS || '350');
+const VOYAGE_MAX_ATTEMPTS = Number(process.env.EVAL_VOYAGE_MAX_ATTEMPTS || '7');
+
 async function voyageRerank(query, documents, topK) {
   const t0 = Date.now();
+  if (VOYAGE_THROTTLE_MS > 0) await sleep(VOYAGE_THROTTLE_MS);
   let resp;
-  for (let attempt = 1; attempt <= 4; attempt++) {
+  for (let attempt = 1; attempt <= VOYAGE_MAX_ATTEMPTS; attempt++) {
     try {
       resp = await fetch(VOYAGE_RERANK_URL, {
         method: 'POST',
@@ -179,11 +189,18 @@ async function voyageRerank(query, documents, topK) {
           top_k: topK, truncation: true, return_documents: false,
         }),
       });
-      if (resp.status === 429 || resp.status >= 500) throw new Error(`voyage_${resp.status}`);
+      if (resp.status === 429 || resp.status >= 500) {
+        // Honor Retry-After when present; else exponential backoff capped at 30s.
+        const ra = Number(resp.headers.get('retry-after'));
+        const waitMs = Number.isFinite(ra) && ra > 0
+          ? Math.min(ra * 1000, 30_000)
+          : Math.min(1000 * 2 ** (attempt - 1), 30_000);
+        throw Object.assign(new Error(`voyage_${resp.status}`), { waitMs });
+      }
       break;
     } catch (e) {
-      if (attempt >= 4) throw e;
-      await sleep(800 * 2 ** (attempt - 1));
+      if (attempt >= VOYAGE_MAX_ATTEMPTS) throw e;
+      await sleep(e?.waitMs ?? Math.min(1000 * 2 ** (attempt - 1), 30_000));
     }
   }
   const json = await resp.json();
@@ -673,7 +690,22 @@ async function sweep(corpus) {
             let routing = 0, r1 = 0, r2 = 0;
             for (const item of qs) {
               assertBudget('sweep'); // audit-2 C3: per-question, not per-cell (a cell is many reranks)
-              const r = await retrieveV3(c3, [tag], item.q, { rankMode, topS, nParent: DEFAULT_N_PARENT, topkMinSim, routeMinSim, lambda, withRerank: true, flatFallback: false });
+              // Crash-proofing: a Voyage 429 that survives all in-call retries
+              // must NOT abort the whole sweep. Retry the question with a long
+              // cooldown a few times; if it still fails, record the cell as
+              // degraded (rerankErr) and move on so partial results survive.
+              let r = null;
+              for (let qa = 1; qa <= 3; qa++) {
+                try {
+                  r = await retrieveV3(c3, [tag], item.q, { rankMode, topS, nParent: DEFAULT_N_PARENT, topkMinSim, routeMinSim, lambda, withRerank: true, flatFallback: false });
+                  break;
+                } catch (e) {
+                  if (!/voyage_429|voyage_5\d\d/.test(String(e?.message)) || qa === 3) throw e;
+                  const cool = Number(process.env.EVAL_SWEEP_429_COOLDOWN_MS || '20000') * qa;
+                  log(`  ⏳ voyage rate-limit on a sweep question — cooling ${cool}ms then retry (${qa}/3)`);
+                  await sleep(cool);
+                }
+              }
               if (anyIn(r.sectionIds, item.sections)) routing++;
               const rank = bestRank(r.rankedUnitIds, item.units);
               if (rank === 0) r1++; if (rank !== Infinity && rank < 2) r2++;
@@ -682,6 +714,13 @@ async function sweep(corpus) {
               routingPct: +(100 * routing / qs.length).toFixed(1),
               recall1: +(100 * r1 / qs.length).toFixed(1),
               recall2: +(100 * r2 / qs.length).toFixed(1) });
+            // Incremental persist: write the grid after EVERY cell so a late
+            // crash never costs us the cells already computed (Vuk Q3).
+            try {
+              await fs.mkdir(OUT_DIR, { recursive: true });
+              await fs.writeFile(path.resolve(OUT_DIR, `sweep-${corpus}.json`), JSON.stringify(rows, null, 2));
+            } catch { /* best-effort incremental write */ }
+            log(`  · cell ${rows.length}: ${rankMode} S=${topS} routeMin=${routeMinSim} topkMin=${topkMinSim} λ=${lambda} → routing=${rows[rows.length-1].routingPct}% r@1=${rows[rows.length-1].recall1}%`);
           }
         }
       }
@@ -758,8 +797,8 @@ async function debug(corpus) {
     const sec0 = n.acceptable_section_ids[0];
     const inSection = await topkV3(c3, [sec0], qVec, tsq, 'max', 20, 0.0, 0);
     const candRankInSec = bestRank(inSection.map((c) => c.parent_unit_id), n.acceptable_unit_ids);
-    // candidates over routed top-4 (default S) + rerank
-    const r = await retrieveV3(c3, [tag], q, { rankMode: 'max', topS: 4, topkMinSim: 0, routeMinSim: 0, withRerank: true, flatFallback: false });
+    // candidates over routed top-S (frozen default) + rerank
+    const r = await retrieveV3(c3, [tag], q, { rankMode: 'max', topS: DEFAULT_TOP_S, topkMinSim: 0, routeMinSim: 0, withRerank: true, flatFallback: false });
     const candRank = bestRank(r.candUnitIds, n.acceptable_unit_ids);
     const rrRank = bestRank(r.rankedUnitIds, n.acceptable_unit_ids);
     const fmt = (x) => x === Infinity ? null : x;

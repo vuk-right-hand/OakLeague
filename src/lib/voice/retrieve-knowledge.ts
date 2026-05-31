@@ -996,7 +996,7 @@ export type RetrieveKnowledgeV3Args = {
   rankMode?: 'max' | 'max_blend' | 'vec_max' | 'best_child';
   /** v3-specific: lambda for max_blend. Default 0.10. */
   lambda?: number;
-  /** v3-specific: p_top_s for route_sections. Default 4. Clamped server-side [1, 10]. */
+  /** v3-specific: p_top_s for route_sections. Default 6 (DEFAULT_V3_TOP_S). Clamped server-side [1, 10]. */
   topS?: number;
   /** v3-specific: p_n_parent_per_section for topk. Default 5. Clamped server-side [1, 20]. */
   nParentPerSection?: number;
@@ -1045,7 +1045,17 @@ export class RetrieveKnowledgeV3Error extends Error {
   }
 }
 
-const DEFAULT_V3_TOP_S = 4;
+// Frozen from the §8 eval sweep (2026-05-30, AoD full-book / 12 needles, S=6).
+// Sweep result: routing 4→6 jumps 58%→81% and recall@1 39%→47%; 6→8 is noise
+// (recall@1 identical, S=6 actually wins recall@2 56% vs 53%). rank_mode /
+// topk_min / λ had ~no effect on recall@1, so they stay at their prior defaults.
+// S is a CEILING (route RPC does `LIMIT top_s`), so a creator with <6 sections
+// returns all of them — no padding. Picked 6 over 8 because per-turn rerank
+// payload + topk cost scale with sections actually searched; at book/company
+// scale 6 reranks ~25% less text than 8 for equal recall@1. See
+// CLEANUP_BACKLOG "adaptive-S" — a fixed S is a v1 simplification; a 3-section
+// creator and a 5000-section company-brain should not share one S long-term.
+const DEFAULT_V3_TOP_S = 6;
 const DEFAULT_V3_N_PARENT_PER_SECTION = 5;
 const DEFAULT_V3_K_CHILD = 30;
 const DEFAULT_V3_RANK_MODE = 'max_blend' as const;

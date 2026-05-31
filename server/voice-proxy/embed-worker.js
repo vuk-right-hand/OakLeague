@@ -558,11 +558,14 @@ const ANTHROPIC_USD_PER_M_INPUT_BASE      = Number(process.env.ANTHROPIC_USD_PER
 const ANTHROPIC_USD_PER_M_INPUT_CACHE_1H  = Number(process.env.ANTHROPIC_USD_PER_M_INPUT_CACHE_1H  || '2.00');
 const ANTHROPIC_USD_PER_M_INPUT_CACHE_RD  = Number(process.env.ANTHROPIC_USD_PER_M_INPUT_CACHE_RD  || '0.10');
 const ANTHROPIC_USD_PER_M_OUTPUT          = Number(process.env.ANTHROPIC_USD_PER_M_OUTPUT          || '5.00');
-// Gemini 2.5 Flash:
-//   * Input:  $0.30 / 1M
-//   * Output: $2.50 / 1M
-const FLASH_USD_PER_M_INPUT  = Number(process.env.FLASH_USD_PER_M_INPUT  || '0.30');
-const FLASH_USD_PER_M_OUTPUT = Number(process.env.FLASH_USD_PER_M_OUTPUT || '2.50');
+// Gemini 3.1 Flash-Lite (pinned 2026-05-30 alongside NARRATIVE_CHUNK_MODEL;
+// verified ai.google.dev/gemini-api/docs/pricing 2026-05-31). Moved together
+// with the model string per CLAUDE.md "bump model + price in the same PR":
+//   * Input:  $0.25 / 1M
+//   * Output: $1.50 / 1M
+// (was gemini-2.5-flash $0.30/$2.50 — retires 2026-10-16.)
+const FLASH_USD_PER_M_INPUT  = Number(process.env.FLASH_USD_PER_M_INPUT  || '0.25');
+const FLASH_USD_PER_M_OUTPUT = Number(process.env.FLASH_USD_PER_M_OUTPUT || '1.50');
 
 // Day-5-audit M4: Retry-After max wait, bumped 5s → 30s so we honor
 // Anthropic's published backoff window before retrying.
@@ -804,7 +807,7 @@ export function makeCorpusReprocessWorker({
           unit_label: 'tokens',
           cost_usd: flashCostUsd,
           metadata: {
-            model: process.env.NARRATIVE_CHUNK_MODEL || 'gemini-2.5-flash',
+            model: process.env.NARRATIVE_CHUNK_MODEL || 'gemini-3.1-flash-lite',
             creator_id: creatorId,
             sample_id:  sampleId,
             prompt_tokens:      promptTok,
@@ -840,7 +843,7 @@ export function makeCorpusReprocessWorker({
           unit_label: 'tokens',
           cost_usd: flashCostUsd,
           metadata: {
-            model: process.env.NARRATIVE_CHUNK_MODEL || 'gemini-2.5-flash',
+            model: process.env.NARRATIVE_CHUNK_MODEL || 'gemini-3.1-flash-lite',
             creator_id: creatorId,
             sample_id: sampleId,
             prompt_tokens:      v3FlashPromptTokens,
@@ -1771,7 +1774,7 @@ export function makeCorpusReprocessWorker({
           unit_label: 'tokens',
           cost_usd: flashCostUsd,
           metadata: {
-            model: process.env.NARRATIVE_CHUNK_MODEL || 'gemini-2.5-flash',
+            model: process.env.NARRATIVE_CHUNK_MODEL || 'gemini-3.1-flash-lite',
             creator_id: creatorId,
             sample_id: sampleId,
             prompt_tokens: flashPromptTokens,
