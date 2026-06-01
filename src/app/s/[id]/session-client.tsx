@@ -39,6 +39,11 @@ export function envelopeStorageKey(sessionId: string): string {
   return `oak_session_envelope_${sessionId}`;
 }
 
+// P0-1 — after this long in 'thinking', show the soft "still thinking…" caption
+// under the dots (purely cosmetic; the hard dead-turn cutover is TURN_DEAD_MS in
+// the pipe). Below the ~8s mark covers a typical slow turn before a failover.
+const THINKING_CAPTION_MS = 8_000;
+
 function readEnvelope(sessionId: string): OpenEnvelope | null {
   try {
     const raw = sessionStorage.getItem(envelopeStorageKey(sessionId));
@@ -214,6 +219,21 @@ function LiveSession(props: LiveProps) {
   const phase = pipe.state.phase;
   const showReconnect = shouldShowReconnectOverlay(pipe.state);
   const isOpening = phase === 'opening';
+
+  // P0-1 — soft "still thinking…" caption. Client-local (no reducer state): when
+  // we've sat in 'thinking' past THINKING_CAPTION_MS, add a faint reassurance
+  // line under the dots so an 8–29s Haiku failover doesn't feel dead. Cleared
+  // the instant we leave 'thinking'. The hard turn-dead → reconnecting safety
+  // net lives in the pipe (TURN_DEAD_MS); this is purely cosmetic.
+  const [thinkingStalled, setThinkingStalled] = useState(false);
+  useEffect(() => {
+    if (phase !== 'thinking') {
+      setThinkingStalled(false);
+      return;
+    }
+    const t = window.setTimeout(() => setThinkingStalled(true), THINKING_CAPTION_MS);
+    return () => window.clearTimeout(t);
+  }, [phase]);
   const isRollingOver = phase === 'opening' && pipe.state.openedAtMs !== null && pipe.state.brainReady === false && pipe.state.avatarReady === false;
 
   // ── Recording wiring (Day 3) ──────────────────────────────────────────
@@ -374,6 +394,10 @@ function LiveSession(props: LiveProps) {
             Voice catching up…
           </div>
         )}
+        {/* P0-1 — pre-answer thinking indicator. Shown only while the brain is
+            working (mic stopped, no audio yet). Clears the instant the first
+            audio_out flips phase → speaking, or turn_complete → ready. */}
+        {phase === 'thinking' && <ThinkingDots stalled={thinkingStalled} />}
         {showReconnect && (
           <OverlayCenter
             label="Connection interrupted"
@@ -430,16 +454,17 @@ function MicButton({
   onPressStart: () => void;
   onPressEnd: () => void;
 }) {
+  // Mic is enabled in ready/listening/speaking — deliberately NOT in 'thinking'
+  // (P0-1: the mic is inert while the brain works; the dots carry the feedback,
+  // and barge resumes the instant the answer is 'speaking').
   const enabled = phase === 'ready' || phase === 'listening' || phase === 'speaking';
   // 2026-05-13 — `active` derives from the physical mic state (pipe.micActive),
-  // NOT phase === 'listening'. The reducer's phase is server-driven (it
-  // transitions out of 'listening' when Gemini's auto-VAD ends the user's
-  // turn — `tts_audio_chunk` flips phase: listening → speaking). The mic
-  // can be physically off while phase still says 'speaking'. We always want
+  // NOT phase === 'listening'. We run MANUAL VAD, so the user's turn ends when
+  // `stopMic` fires `mic_stopped` (phase → 'thinking'); the mic can be
+  // physically off while phase still says 'thinking'/'speaking'. We always want
   // the button label to match what the mic is doing, not what the model is
-  // doing. The hook's forceMicSilent path syncs micActive to false the
-  // instant the server takes over, so the button flips at the same time as
-  // the avatar starts speaking — no more "Tap" while audio is flowing.
+  // doing — `stopMic` sets micActive=false the instant the turn ends, so the
+  // button flips out of "Stop" the moment the user's turn closes.
   const active = micActive;
 
   // 2026-05-12 fix v4: tap-to-toggle (was hold-to-talk; the hold pattern was
@@ -542,6 +567,61 @@ function OverlayCenter({
           {action.label}
         </button>
       )}
+    </div>
+  );
+}
+
+// P0-1 — the pre-answer indicator. Three pulsing dots centered low over the
+// avatar (above the mic). The fade-in stays at opacity 0 for the first ~250ms
+// (keyframe 0–55%) so a sub-300ms turn that mounts-then-unmounts never flashes.
+// `aria-live="polite"` + the visually-hidden "Thinking…" text gives screen
+// readers the same signal sighted users get. `stalled` adds the soft caption.
+function ThinkingDots({ stalled }: { stalled: boolean }) {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      style={{
+        position: 'absolute', left: '50%', bottom: 140,
+        transform: 'translateX(-50%)',
+        display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8,
+        pointerEvents: 'none',
+        animation: 'oakThinkingIn 450ms ease-out both',
+      }}
+    >
+      <style>{`
+        @keyframes oakThinkingIn { 0%, 55% { opacity: 0 } 100% { opacity: 1 } }
+        @keyframes oakThinkingDot {
+          0%, 80%, 100% { opacity: 0.25; transform: translateY(0) }
+          40% { opacity: 1; transform: translateY(-3px) }
+        }
+      `}</style>
+      <div style={{ display: 'flex', gap: 6 }} aria-hidden="true">
+        {[0, 1, 2].map((i) => (
+          <span
+            key={i}
+            style={{
+              width: 8, height: 8, borderRadius: 4, background: '#fff',
+              animation: `oakThinkingDot 1.2s ${i * 0.16}s infinite ease-in-out`,
+            }}
+          />
+        ))}
+      </div>
+      {stalled && (
+        // Decorative — the visually-hidden span below is the single SR source,
+        // so this caption stays aria-hidden to avoid a double announce.
+        <div aria-hidden="true" style={{ fontSize: 12, opacity: 0.7, textShadow: '0 1px 2px rgba(0,0,0,0.8)' }}>
+          still thinking…
+        </div>
+      )}
+      <span
+        style={{
+          position: 'absolute', width: 1, height: 1,
+          overflow: 'hidden', clip: 'rect(0 0 0 0)', whiteSpace: 'nowrap',
+        }}
+      >
+        Thinking…
+      </span>
     </div>
   );
 }

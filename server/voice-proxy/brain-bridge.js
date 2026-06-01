@@ -305,6 +305,44 @@ function variableDepthClause(tier) {
   );
 }
 
+// ── P0-3 — grounding hedge clauses (persona-only path only) ─────────────────
+//
+// Appended LAST (after the depth clause) so recency favors the hedge over L2's
+// "tell it directly from your experience" — and only when there is NO reference
+// envelope (an empty/failed retrieval). Grounded turns never see these. The
+// orchestrator decides which (off_domain vs retrieval_failed), gated by
+// V3_OFF_DOMAIN_HEDGE_ENABLED. Both forbid fabricating specifics so an
+// ungrounded turn stays honest instead of a confident monologue grounded in
+// nothing (the P0-3 failure).
+//
+// off_domain: retrieval ran cleanly and found nothing — the topic is genuinely
+// outside the creator's material. Soft hedge, NOT a hard "I don't know that":
+// acknowledge it's outside what they've lived, then give a general-principles
+// take in their voice, so a (post-calibration) false positive still reads as
+// the creator being honest and helpful, not a refusal.
+const OFF_DOMAIN_HEDGE_CLAUSE =
+  '\n\nGROUNDING: You have no specific material of your own on this topic — it ' +
+  'sits outside what you have direct experience with. Briefly, in your own ' +
+  'voice, say it is a bit outside what you have lived or worked through, then ' +
+  'offer a short general-principles take if you genuinely have one. Do NOT ' +
+  'invent specifics, quotes, numbers, stories, or claims of personal ' +
+  'experience you do not have. Keep it honest and human.';
+
+// retrieval_failed: a timeout or error — the topic MIGHT be the creator's
+// domain; we just could not fetch the material. Do NOT claim ignorance.
+// Ask for a concrete example/rephrase to buy the beat and re-ground next turn.
+const RETRIEVAL_FAILED_CLAUSE =
+  '\n\nGROUNDING: You could not pull your reference material this moment. Do ' +
+  'NOT guess or invent specifics. Briefly, in your own voice, ask the user for ' +
+  'a concrete example or to rephrase what they mean, so you can answer it ' +
+  'properly. Keep it short and natural.';
+
+function groundingClause(groundingState) {
+  if (groundingState === 'off_domain') return OFF_DOMAIN_HEDGE_CLAUSE;
+  if (groundingState === 'retrieval_failed') return RETRIEVAL_FAILED_CLAUSE;
+  return ''; // 'grounded' | 'none' | undefined → no extra clause
+}
+
 /**
  * Phase 3 — the depth directive appended after L1. Pure + DI-friendly.
  *
@@ -423,7 +461,7 @@ function buildContinuityPreamble(priorTurn) {
   );
 }
 
-export function assembleBrainContents({ persona, referenceEnvelopeText, question, tier, forceBrief, depthMode, priorTurn }) {
+export function assembleBrainContents({ persona, referenceEnvelopeText, question, tier, forceBrief, depthMode, priorTurn, groundingState }) {
   if (typeof question !== 'string' || question.trim().length === 0) {
     throw new BrainBridgeError(
       'empty_input',
@@ -437,8 +475,12 @@ export function assembleBrainContents({ persona, referenceEnvelopeText, question
   // by recency over any "background only") · depth clause (Phase 3, per-turn/
   // tier-aware, last so it never weakens the security boundary above it).
   const depthClause = buildDepthClause({ tier, persona, forceBrief, depthMode });
+  // P0-3 — the grounding hedge rides LAST (after depthClause → recency favors it
+  // over L2's "tell it directly") and ONLY on the persona-only path. A grounded
+  // turn has its reference material; it never hedges.
+  const groundingHedge = referenceEnvelopeText ? '' : groundingClause(groundingState);
   const systemInstruction =
-    `${persona || ''}${PERSONA_VOICE_CLAUSE}${L1_HIERARCHY_CLAUSE}${L2_STYLE_GROUNDING_CLAUSE}${depthClause}`;
+    `${persona || ''}${PERSONA_VOICE_CLAUSE}${L1_HIERARCHY_CLAUSE}${L2_STYLE_GROUNDING_CLAUSE}${depthClause}${groundingHedge}`;
   const contents = [];
   if (referenceEnvelopeText) {
     assertSaltedEnvelope(referenceEnvelopeText); // M2 fail-loud
@@ -499,6 +541,11 @@ export async function* generateDeepAnswer({
   // labeled background preamble into the question turn (audit C1/C3); never the
   // raw prior user STT and never a model-role turn. Tail-capped inside assemble.
   priorTurn,
+  // P0-3 — 'grounded' | 'off_domain' | 'retrieval_failed' | 'none'. On the
+  // persona-only path (no envelope) selects a hedge clause appended LAST; ignored
+  // when a reference envelope is present. Failover (Haiku) reuses the assembled
+  // systemInstruction, so the hedge rides into Haiku automatically.
+  groundingState,
 }) {
   // Audit C3 — the empty_input guard MUST run BEFORE getBrainPricing().
   // An empty STT transcript is a no-paid-call skip by definition; it must
@@ -510,9 +557,10 @@ export async function* generateDeepAnswer({
     persona,
     referenceEnvelopeText,
     question,
-    tier,        // Phase 3 — tier-aware depth budget
-    forceBrief,  // Phase 3 — M2 trivial/greeting floor
-    priorTurn,   // B2 — last-turn Q+A for "please continue" continuity
+    tier,          // Phase 3 — tier-aware depth budget
+    forceBrief,    // Phase 3 — M2 trivial/greeting floor
+    priorTurn,     // B2 — last-turn Q+A for "please continue" continuity
+    groundingState, // P0-3 — persona-only hedge selector
   }); // throws empty_input / misconfigured(M2) — BEFORE any cost/pricing
   const pricing = getBrainPricing(); // throws misconfigured → caller 1011
   const client = genaiClient || clientFor(apiKey);

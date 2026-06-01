@@ -1,26 +1,28 @@
-# ⛔ V3 PRE-FLIP GATE (whole-build audit 2026-06-01) — fix BEFORE flipping any creator to retrieval_version=3
+# ✅ V3 PRE-FLIP GATE — UX P0s DONE + min_sim CALIBRATED (2026-06-01)
 
 The v3 schema + proxy + admin UI are LIVE on prod (dormant). A whole-build UX+security
 audit (2026-06-01) ran before the main merge. **Security C1/H1 (live cross-tenant corpus
 leak) is FIXED + on prod (mig 20260601000001, commit b26c0a8, anon probe verified 42501).**
-The main merge is HELD (Vuk, 2026-06-01) until the 3 UX P0s below are fixed — next session,
-full plan→auditor→build loop. These are the gate to a creator v3 flip (Phase 3):
+**The 3 UX P0s are now FIXED** (full plan→2× plan-audit→build→code-audit loop, 0 Critical/
+Medium; vitest 1229✓, proxy node:test 444✓, build green) and **min_sim is CALIBRATED**
+(aod sweep 2026-06-01). The ONLY remaining gate before a creator v3 flip (Phase 3) is the
+**live human "is it him" voice test** on a flipped scratch creator — an in-person check, not
+automatable here.
 
-- **UX P0-1 — silent pre-answer gap.** 1.5–3.5s dead air + frozen avatar after mic-stop,
-  NO thinking indicator → every turn reads "broken" → user re-taps → kills the answer.
-  Add a `thinking` state: `src/app/s/[id]/session-reducer.ts` (new state on mic_stopped) +
-  `session-client.tsx` (render indicator until first audio_out). BIGGEST "flawless" threat.
-- **UX P0-2 — raw error-code leak.** `brain_not_ready` / `creator_not_published` /
-  `profile_not_ready` / `voice_proxy_unreachable` / 500s render the raw string to the user
-  (`src/lib/feed/ask-error-pill.tsx` — not in handled set; fallback interpolates {error}).
-  A freshly-flipped v3 creator with an uncompiled brain shows "brain_not_ready". Add human
-  copy + a generic fallback that never prints a raw code.
-- **UX P0-3 — confident ungrounded answers.** Empty v3 retrieval → persona-only deep answer,
-  fluent + in-voice + grounded in nothing, no signal. Compounded by `min_sim` placeholders
-  (`retrieve-knowledge.ts:1069-1082 DEFAULT_V3_MIN_SIM_BY_MODE`). FIX: (a) HARD GATE — pin
-  per-mode min_sim via the §7 harness before any v3 flip; (b) wire `envelopeText===null &&
-  routePhaseRan` → `forceBrief` in `decoupled-orchestrator.js:632-660` so an ungrounded turn
-  is short+hedged, not a confident monologue.
+- **UX P0-1 — silent pre-answer gap → DONE.** Added a `thinking` PipeState (mic disabled
+  during it) + three pulsing `ThinkingDots` + a ref-based turn-dead watchdog (35s → existing
+  `reconnecting`). `session-reducer.ts` / `use-session-pipe.ts` / `session-client.tsx`.
+- **UX P0-2 — raw error-code leak → DONE.** Pure `resolveAskErrorDisplay` (`ask-error-copy.ts`)
+  maps known codes to human copy; generic fallback NEVER prints a raw code. `ask-error-pill.tsx`.
+- **UX P0-3 — confident ungrounded answers → DONE.** Two-branch grounding: off-domain (soft
+  in-voice hedge) vs retrieval-failure ("give me an example"), via a `t.retrieveFailed` flag +
+  `groundingState` in `decoupled-orchestrator.js` → hedge clause appended LAST in `brain-bridge.js`.
+  Off-domain copy gated by `V3_OFF_DOMAIN_HEDGE_ENABLED` (default OFF).
+- **min_sim — CALIBRATED, no change needed.** The aod sweep (113 grid points) showed
+  topk_min_sim/route_min_sim have NO recall effect across [0,0.3]; off-topic returns empty at
+  floor 0 (routing does the rejection). The placeholder floors (`max_blend=0.20`, `vec_max=0.40`)
+  are validated-safe; env-overridable via `V3_MIN_SIM_*` (`v3-min-sim.ts`). Because the floor
+  doesn't drop on-domain hits, `V3_OFF_DOMAIN_HEDGE_ENABLED=1` is safe to flip at prod when wanted.
 
 UX P1s (track, not gate): P1-1 barge tail ~250ms (simli-bridge.ts:507 — mute local sink on
 cancel); P1-2 7s silence cutoff too aggressive (use-session-pipe.ts:1153 → ~10-12s); P1-4

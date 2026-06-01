@@ -19,6 +19,7 @@ export type PipeState =
   | 'opening'
   | 'ready'        // idle mid-conversation (neither side speaking)
   | 'listening'    // mic is streaming to brain
+  | 'thinking'     // user finished (mic stopped); brain processing; no audio yet (P0-1)
   | 'speaking'     // brain pipe is streaming TTS audio to the avatar bridge
   | 'paused'       // visibilitychange=hidden; mic stopped; pipes kept warm
   | 'reconnecting' // PC or WS degraded; user-gesture required
@@ -169,12 +170,19 @@ export function reduce(state: SessionState, action: Action): SessionState {
       return { ...state, phase: 'listening' };
 
     case 'mic_stopped':
+      // P0-1: user finished talking → brain is now working. Enter 'thinking'
+      // (NOT 'ready') so the UI can show the pre-answer indicator instead of a
+      // frozen avatar. The mic is disabled in 'thinking' (see session-client) —
+      // 'thinking' is deliberately NOT a barge source; barge resumes once the
+      // answer is 'speaking'.
       if (state.phase !== 'listening') return state;
-      return { ...state, phase: 'ready' };
+      return { ...state, phase: 'thinking' };
 
     case 'tts_audio_chunk':
-      // Transitions listening → speaking on first model chunk; ignored mid-pause.
-      if (state.phase === 'listening' || state.phase === 'ready') {
+      // Transitions to 'speaking' on the first model chunk. Source set includes
+      // 'thinking' (the normal post-mic-stop path) plus 'listening'/'ready' for
+      // edge paths (a late chunk before mic_stopped registered). Ignored mid-pause.
+      if (state.phase === 'thinking' || state.phase === 'listening' || state.phase === 'ready') {
         return { ...state, phase: 'speaking' };
       }
       return state;
@@ -184,7 +192,9 @@ export function reduce(state: SessionState, action: Action): SessionState {
       // frames for one turn — a synthesized one on a recovered turn_complete_
       // timeout, then a genuinely-late real one if Gemini finally emits it. The
       // second is a safe no-op here. Do NOT "optimize" this into a state flip.
-      if (state.phase === 'speaking') return { ...state, phase: 'ready' };
+      // 'thinking → ready' covers a turn that produced NO audio (empty / degrade)
+      // so the pipe never strands on the thinking indicator.
+      if (state.phase === 'speaking' || state.phase === 'thinking') return { ...state, phase: 'ready' };
       return state;
 
     case 'barge_in':
@@ -301,6 +311,7 @@ export function isPipeWarm(state: SessionState): boolean {
   return (
     state.phase === 'ready' ||
     state.phase === 'listening' ||
+    state.phase === 'thinking' ||
     state.phase === 'speaking' ||
     state.phase === 'paused'
   );

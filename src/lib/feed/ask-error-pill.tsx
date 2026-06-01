@@ -18,6 +18,7 @@
 
 import Link from 'next/link';
 import type { CSSProperties } from 'react';
+import { resolveAskErrorDisplay } from './ask-error-copy';
 
 type Props = {
   /** API error code from the /api/sessions/open response body, or
@@ -28,23 +29,14 @@ type Props = {
   style?: CSSProperties;
 };
 
-const CAP_HIT_CODES = new Set([
-  'rate_limited',
-  'kill_switch_blocked',
-  // Defensive: keep the legacy string the prior dead conditional checked
-  // so a stale server build doesn't break the friendly copy.
-  'kill_switch_fired',
-  // use-session-pipe rewire PR-1: /api/sessions/open now returns 429 with
-  // error: 'daily_cap_hit' BEFORE session_open RPC creates a row. Map
-  // it to the same friendly cap copy so the new HTTP-layer cap surface
-  // doesn't regress the cap UX.
-  'daily_cap_hit',
-]);
-
+// P0-2: all error-code → copy classification lives in the framework-free
+// ask-error-copy.ts (pure + unit-tested). This component only RENDERS the
+// directive it returns. The catch-all branch NEVER prints a raw code.
 export function AskErrorPill({ error, style }: Props) {
-  if (!error) return null;
+  const display = resolveAskErrorDisplay(error);
+  if (!display) return null;
 
-  if (CAP_HIT_CODES.has(error)) {
+  if (display.kind === 'cap') {
     return (
       <div role="alert" style={{ ...basePill, ...style }}>
         <span>Daily limit reached. Resets in {formatTimeUntilLocalMidnight()}.</span>{' '}
@@ -55,29 +47,9 @@ export function AskErrorPill({ error, style }: Props) {
     );
   }
 
-  // R3-C1 (UX) — Pipeline α' pre-WS gate: creator's voice clone hasn't
-  // been uploaded yet. Friendly copy so demo day "this creator's voice
-  // isn't ready" doesn't surface as the generic "Couldn't start session"
-  // string.
-  if (error === 'creator_voice_not_trained') {
-    return (
-      <div role="alert" style={{ ...basePill, ...style }}>
-        This creator&apos;s voice isn&apos;t ready yet — check back soon.
-      </div>
-    );
-  }
-
-  if (error === 'creator_not_ready') {
-    return (
-      <div role="alert" style={{ ...basePill, ...style }}>
-        This creator isn&apos;t fully set up yet — check back soon.
-      </div>
-    );
-  }
-
   return (
     <div role="alert" style={{ ...basePill, ...style }}>
-      Couldn&apos;t start session: {error}
+      {display.text}
     </div>
   );
 }

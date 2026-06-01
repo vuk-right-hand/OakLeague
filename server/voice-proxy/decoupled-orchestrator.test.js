@@ -315,6 +315,68 @@ test('M6: ceiling-timeout ABORTS the retrieve signal (kills the billing tail)', 
   assert.equal(capturedSignal.aborted, true, 'over-ceiling retrieve socket aborted — no billing tail');
 });
 
+// ── P0-3 — groundingState classification (off-domain vs retrieval-failure) ──
+
+// Drives one paraphrase-OFF turn and returns the groundingState the deep answer
+// was called with. `envOn` toggles V3_OFF_DOMAIN_HEDGE_ENABLED for the call.
+async function groundingFor(retrieveImpl, { question = 'what is your framework for hiring?', retrieveCeilingMs, envOn = false } = {}) {
+  const prev = process.env.V3_OFF_DOMAIN_HEDGE_ENABLED;
+  if (envOn) process.env.V3_OFF_DOMAIN_HEDGE_ENABLED = '1';
+  else delete process.env.V3_OFF_DOMAIN_HEDGE_ENABLED;
+  let seen = 'unset';
+  try {
+    const { orch } = harness({
+      paraphraseEnabled: false,
+      ...(retrieveCeilingMs ? { retrieveCeilingMs } : {}),
+      retrieve: retrieveImpl,
+      generateDeepAnswer: ({ groundingState }) => {
+        seen = groundingState;
+        return genStream(['A.'], { operation: 'brain_deep_answer', text: 'A.', firstChunkMs: 5 });
+      },
+    });
+    orch.onUserTranscript(question, 1);
+    await tick();
+    await orch.onTurnComplete();
+  } finally {
+    if (prev === undefined) delete process.env.V3_OFF_DOMAIN_HEDGE_ENABLED;
+    else process.env.V3_OFF_DOMAIN_HEDGE_ENABLED = prev;
+  }
+  return seen;
+}
+
+test('P0-3: a real envelope → groundingState "grounded"', async () => {
+  const env = '--- BEGIN REFERENCE a1b2c3 ---\nx\n--- END REFERENCE a1b2c3 ---';
+  assert.equal(await groundingFor(async () => env), 'grounded');
+});
+
+test('P0-3: clean-empty retrieval (attempted) + hedge ON → "off_domain"', async () => {
+  assert.equal(await groundingFor(async () => null, { envOn: true }), 'off_domain');
+});
+
+test('P0-3: clean-empty retrieval + hedge OFF (default) → "retrieval_failed" (conservative — no false "not my expertise")', async () => {
+  assert.equal(await groundingFor(async () => null, { envOn: false }), 'retrieval_failed');
+});
+
+test('P0-3: a thrown retrieval → t.retrieveFailed → "retrieval_failed" (even with hedge ON)', async () => {
+  assert.equal(
+    await groundingFor(async () => { throw new Error('shim 503'); }, { envOn: true }),
+    'retrieval_failed',
+  );
+});
+
+test('P0-3: a ceiling timeout → "retrieval_failed" (classified off the timeout sentinel, not the post-abort value)', async () => {
+  const grounding = await groundingFor(
+    () => new Promise((res) => setTimeout(() => res('--- BEGIN REFERENCE a1b2c3 ---\nx\n--- END REFERENCE a1b2c3 ---'), 5000)),
+    { retrieveCeilingMs: 20, envOn: true },
+  );
+  assert.equal(grounding, 'retrieval_failed');
+});
+
+test('P0-3: a trivial Q skips retrieval → "none" (today\'s plain persona-only, no hedge)', async () => {
+  // 'hey' is trivial → retrievalAttempted=false → not off_domain even with hedge ON.
+  assert.equal(await groundingFor(async () => null, { question: 'hey', envOn: true }), 'none');
+});
+
 // Audit M7 — onUserTranscript after the fatal latch must NOT be a
 // silent no-op: a breadcrumb makes the "user spoke during the teardown
 // race" window greppable in triage (onFatal owns the user-visible 1011).
@@ -811,21 +873,25 @@ test('paraphrase OFF: trivial Q does NOT become lastCompleted (M3 — no retriev
 // forward its `tier` and `forceBrief: t.isTrivial` to generateDeepAnswer.
 // Without this test, a regression (or a wrong tier source) ships silently.
 
-test('Phase 3 C3: substantive turn forwards tier + forceBrief:false to generateDeepAnswer', async () => {
+test('Phase 3 C3: substantive GROUNDED turn forwards tier + forceBrief:false to generateDeepAnswer', async () => {
   let deepArgs = null;
   const { orch } = harness({
     paraphraseEnabled: false,
     tier: 'premium',
     generateDeepAnswer: (args) => { deepArgs = args; return genStream(['ok.'],
       { operation: 'brain_deep_answer', text: 'ok.', firstChunkMs: 7 }); },
-    retrieve: async () => null,
+    // Grounded turn: a real envelope → groundingState 'grounded' → not briefed.
+    // (P0-3: an EMPTY retrieval on a substantive Q now correctly force-briefs the
+    // hedge/clarifier — see the dedicated groundingState tests above.)
+    retrieve: async () => '--- BEGIN REFERENCE a1b2c3 ---\nx\n--- END REFERENCE a1b2c3 ---',
   });
   orch.onUserTranscript('walk me through your first 1000 users', 1);
   await tick();
   await orch.onTurnComplete();
   assert.ok(deepArgs, 'generateDeepAnswer was called');
   assert.equal(deepArgs.tier, 'premium', 'session tier threads through');
-  assert.equal(deepArgs.forceBrief, false, 'substantive Q is not force-briefed');
+  assert.equal(deepArgs.forceBrief, false, 'substantive grounded Q is not force-briefed');
+  assert.equal(deepArgs.groundingState, 'grounded');
 });
 
 test('Phase 3 C3: trivial turn (paraphrase off) forwards forceBrief:true (M2 floor)', async () => {

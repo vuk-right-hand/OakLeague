@@ -96,6 +96,7 @@ import {
   vectorToPgText,
 } from './embed';
 import { rewriteQuery, QUERY_REWRITE_QUOTED_AT } from './query-rewrite';
+import { resolveV3MinSimByMode } from './v3-min-sim';
 import {
   getRerankBridge,
   VOYAGE_RERANK_QUOTED_AT,
@@ -995,9 +996,11 @@ export type RetrieveKnowledgeV3Args = {
   /** v3-specific: p_n_parent_per_section for topk. Default 5. Clamped server-side [1, 20]. */
   nParentPerSection?: number;
   /**
-   * v3-specific: p_min_sim for topk (PLACEHOLDER — the §7 harness will
-   * pin this before v3 takes traffic; default 0.30 from v2 is meaningless
-   * for MAX-child ranking).
+   * v3-specific: p_min_sim for topk. Omit to use the per-rank-mode default from
+   * `DEFAULT_V3_MIN_SIM_BY_MODE` (0.20 for the default max_blend mode; see
+   * v3-min-sim.ts). CALIBRATED 2026-06-01 — the floor has no recall effect in
+   * [0,0.3]; env-overridable via V3_MIN_SIM_*. An explicit value wins over the
+   * default (the eval harness passes per-grid-point values this way).
    */
   minSim?: number;
 };
@@ -1066,20 +1069,14 @@ if (RERANK_MAX_CANDIDATES !== DEFAULT_V3_TOP_S * DEFAULT_V3_N_PARENT_PER_SECTION
 const DEFAULT_V3_K_CHILD = 30;
 const DEFAULT_V3_RANK_MODE = 'max_blend' as const;
 const DEFAULT_V3_LAMBDA = 0.10;
-// Per-rank-mode placeholder floors (audit M4). v2's flat 0.30 was tuned for
-// SUM-RRF and is meaningless for MAX-child ranking. These are STILL
-// placeholders — the §7 harness must pin per-mode prod values BEFORE v3
-// takes prod traffic. Per-mode defaults at least make the intent visible
-// (max-modes need a LOWER floor than vec_max).
-const DEFAULT_V3_MIN_SIM_BY_MODE: Record<
-  'max' | 'max_blend' | 'vec_max' | 'best_child',
-  number
-> = {
-  max:        0.20, // MAX(rrf) needs a low floor (rrf scale ~0.01-0.03)
-  max_blend:  0.20, // MAX(rrf) + lambda*ln boost — same scale concerns
-  vec_max:    0.40, // pure cosine — gate higher to avoid distant ranks
-  best_child: 0.20, // MAX(rrf) flavor
-};
+// Per-rank-mode floors (audit M4). v2's flat 0.30 was tuned for SUM-RRF and is
+// meaningless for MAX-child ranking. Per-mode defaults live in v3-min-sim.ts and
+// are env-overridable (V3_MIN_SIM_* — clamped to (0,1], invalid → placeholder +
+// log) so the §7 harness output can be pinned WITHOUT a code edit. CALIBRATED
+// 2026-06-01 (aod sweep): the floor has no recall effect in [0,0.3] and off-topic
+// already returns empty at floor 0, so the defaults are validated-safe (see
+// v3-min-sim.ts header). Resolved once at module load against process.env.
+const DEFAULT_V3_MIN_SIM_BY_MODE = resolveV3MinSimByMode();
 // Flat-fallback hard cap on sections widened to (round-5 C3). Books with
 // 200+ sections would otherwise feed an unbounded ANY filter to topk_v3.
 const FLAT_FALLBACK_MAX_SECTIONS = 50;

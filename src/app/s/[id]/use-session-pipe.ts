@@ -93,6 +93,14 @@ const AUDIO_CONTEXT_RESUME_VERIFY_MS = 300;
 // iOS WebKit: verify AudioContext.state === 'running' 300ms after resume()
 // (R3-M4 — visibilitychange is not a user gesture).
 
+// P0-1 turn-dead watchdog threshold. A turn stuck in 'thinking' (no audio_out,
+// no turn_complete) longer than this is treated as a genuinely dead turn and
+// routed into 'reconnecting'. MUST sit beyond every legitimate slow path: the
+// ~29s Haiku failover ceiling and the ~30s proxy synthesized-turn_complete
+// self-heal (.claude_learnings 2026-05-27). 35s clears both → no false-close.
+const TURN_DEAD_MS = 35_000;
+const TURN_DEAD_POLL_MS = 1_000;
+
 
 export type PipeHandle = {
   state: SessionState;
@@ -209,6 +217,17 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   // that left phase stuck at speaking after every turn). Reset on startMic /
   // endSession / visibility-hidden so a stuck flag never blocks the next turn.
   const expectingTtsRef = useRef<boolean>(false);
+  // P0-1 turn-dead watchdog. Set to performance.now() on mic_stopped (the user
+  // finished; we're in 'thinking' awaiting the first audio_out); cleared on the
+  // first real audio_out AND on turn_complete. A wall-clock interval (NOT a
+  // suspended setTimeout — survives an iOS background/resume round-trip) routes
+  // a turn with NO audio + NO turn_complete past TURN_DEAD_MS into the EXISTING
+  // 'reconnecting' path. The threshold sits BEYOND every legitimate slow path
+  // (~29s Haiku failover, ~30s proxy synthesized turn_complete self-heal) so it
+  // only fires when the turn is genuinely dead (e.g. iOS killed the WS with no
+  // close frame). It NEVER touches expectingTtsRef — a late real audio_out still
+  // flips thinking→speaking. Fires once (nulled after dispatch).
+  const turnAwaitingAudioRef = useRef<number | null>(null);
   // 2026-05-27 (v2) — avatar tail-flush. The Simli chunker carries the final
   // <6000B remainder of a turn's audio; with no "next chunk" to complete a
   // frame, that tail must be flushed explicitly at the TRUE end of the turn's
@@ -711,6 +730,8 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
             userPerceivedT0Ref.current = null;
             captureSafe('user_perceived_response_ms', { ms, session_id: sessionIdRef.current });
           }
+          // P0-1 — the answer is producing audio; disarm the turn-dead watchdog.
+          turnAwaitingAudioRef.current = null;
           try { bridgeRef.current?.sendAudio(bytes); } catch { /* bridge closed */ }
           // 2026-05-27 (v2) — no per-chunk tail-flush re-arm here anymore. That
           // was the stutter: it fired commitUtterance on Cartesia's mid-answer
@@ -744,6 +765,9 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
           // arrive after this point are treated as stale and don't re-flip
           // phase ready→speaking.
           expectingTtsRef.current = false;
+          // P0-1 — turn resolved (even an empty/degraded one); disarm the
+          // turn-dead watchdog so it can't fire on a turn that completed cleanly.
+          turnAwaitingAudioRef.current = null;
           // Backstop tail-flush (2026-05-27 v2): if 'tts_audio_done' was lost
           // (ws drop, Cartesia never emitted `done`), the +6-20s-late
           // turn_complete still flushes the stranded carry. No-op on empty.
@@ -883,6 +907,31 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     }, HEARTBEAT_MS);
     return () => window.clearInterval(t);
   }, [state.phase]);
+
+  // ── P0-1 turn-dead watchdog ────────────────────────────────────────────────
+  // Mounted ONCE for the session lifetime (NOT phase-gated) so it survives a
+  // 'thinking → paused → ready' round-trip — on iOS the WS can die in the
+  // background with no close frame, leaving a turn that never produces audio and
+  // never gets a turn_complete. The trigger is the wall-clock ref, not phase, so
+  // a resumed-into-dead-'ready' turn is still caught. A backgrounded interval is
+  // throttled, but the first post-resume tick re-reads performance.now() and
+  // sees the elapsed > TURN_DEAD_MS, then routes into the existing 'reconnecting'
+  // path (recoverable via retryAfterGesture — never a silent close). Fires once
+  // per turn (the ref is nulled on dispatch, and re-armed only by the next
+  // mic_stopped).
+  useEffect(() => {
+    const t = window.setInterval(() => {
+      const startedAt = turnAwaitingAudioRef.current;
+      if (startedAt === null) return;
+      if (closedRef.current || rollingOverRef.current) return;
+      if (performance.now() - startedAt > TURN_DEAD_MS) {
+        turnAwaitingAudioRef.current = null;
+        captureSafe('turn_dead_watchdog', { session_id: sessionIdRef.current });
+        dispatchRef({ kind: 'pc_degraded' });
+      }
+    }, TURN_DEAD_POLL_MS);
+    return () => window.clearInterval(t);
+  }, []);
 
   // ── Visibility handling (pause/resume + iOS AudioContext recovery) ─────────
   useEffect(() => {
@@ -1130,6 +1179,11 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     // Reset the tts-expecting gate — any leftover tail audio from a prior
     // turn must not be treated as the current turn's response window.
     expectingTtsRef.current = false;
+    // P0-1 — a new turn supersedes any prior 'thinking' wait; disarm the
+    // turn-dead watchdog so a stale ref can't fire pc_degraded mid new turn.
+    // (NOT cleared on visibility_hidden — the ref must persist across an iOS
+    // background so a resumed-into-dead turn is still caught.)
+    turnAwaitingAudioRef.current = null;
     // Silence-detection seed: count tap-moment as "voice activity" so the
     // 7s silence window starts from tap, not from -∞. A user who taps and
     // immediately goes silent still gets a 7s mic-open window. The
@@ -1250,6 +1304,11 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     // R3-M7 — user_perceived_response_ms t0 = mic-tap-release. Cleared
     // when first proxy audio_out frame arrives.
     userPerceivedT0Ref.current = performance.now();
+    // P0-1 — arm the turn-dead watchdog: we're now in 'thinking' awaiting the
+    // first audio_out. Cleared on first audio_out / turn_complete (same as
+    // userPerceivedT0Ref). The wall-clock interval routes a never-answered turn
+    // into 'reconnecting' past TURN_DEAD_MS.
+    turnAwaitingAudioRef.current = performance.now();
     try { proxyRef.current?.sendControl({ type: 'turn_end' }); } catch (e) {
       Sentry.captureException(e, { level: 'warning', extra: { op: 'sendControl_turn_end', session_id: sessionIdRef.current } });
     }
