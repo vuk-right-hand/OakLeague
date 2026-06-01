@@ -288,6 +288,27 @@ function LiveSession(props: LiveProps) {
     askDeps,
     onStop: onAskStop,
   });
+  // Feature B — one-time nudge to record the session ("it might get really
+  // good — capture it"). Appears a beat after the avatar is live, sits above the
+  // record button, auto-hides the instant recording starts (button leaves
+  // 'idle'), and is dismissible. Shown once per session (dismiss persists for
+  // the component's life).
+  const [recordPillDismissed, setRecordPillDismissed] = useState(false);
+  const [recordPillReady, setRecordPillReady] = useState(false);
+  useEffect(() => {
+    // Reset readiness when the avatar isn't live (audit M3) so a reconnect
+    // re-applies the 1.2s "settle" delay rather than snapping the pill back
+    // mid-recovery. recordPillDismissed persists (once-per-session dismissal).
+    if (!reactCaptureOn || !askEnabled) {
+      setRecordPillReady(false);
+      return;
+    }
+    const t = window.setTimeout(() => setRecordPillReady(true), 1200);
+    return () => window.clearTimeout(t);
+  }, [reactCaptureOn, askEnabled]);
+  const showRecordPill =
+    reactCaptureOn && askEnabled && recordPillReady && !recordPillDismissed &&
+    recording.buttonProps.state === 'idle';
   // Audit C1 Day 3 — endSession() is synchronous: it dispatches user_close,
   // closes the bridge, the audio context, the mixer, the gemini WS — all
   // before any phase-watching effect can run. By the time `phase==='closed'`
@@ -363,8 +384,9 @@ function LiveSession(props: LiveProps) {
           </button>
         </div>
 
-        {/* Bottom hook title */}
-        {props.hookTitle && (
+        {/* Bottom hook title — hidden while the record-nudge pill is up so the
+            two don't overlap in the bottom band (audit M4). */}
+        {props.hookTitle && !showRecordPill && (
           <div
             style={{
               position: 'absolute', bottom: 120, left: 16, right: 16,
@@ -377,7 +399,10 @@ function LiveSession(props: LiveProps) {
         )}
 
         {/* Overlays */}
-        {isOpening && !isRollingOver && <OverlayCenter label="Connecting…" />}
+        {/* Feature A, stage 2 — the room mask (stage 1, on the source page)
+            hands off here: black "Starting the call…" until brain + avatar are
+            live, then the avatar shows. */}
+        {isOpening && !isRollingOver && <OverlayCenter label="Starting the call…" />}
         {isRollingOver && <OverlayCenter label="Reconnecting…" />}
         {/* R3-Missing-6 — Cartesia-down banner. Avatar pipe stays warm
             (Simli RTC unaffected); user sees a small badge instead of the
@@ -412,6 +437,38 @@ function LiveSession(props: LiveProps) {
             label={friendlyErrorLabel(pipe.state.errorMessage)}
             sublabel="Returning to feed…"
           />
+        )}
+
+        {/* Feature B — record nudge pill, anchored just above the record button. */}
+        {showRecordPill && (
+          <div
+            role="status"
+            aria-label="Record this session"
+            style={{
+              position: 'absolute', right: 16, bottom: 92, zIndex: 3,
+              maxWidth: 248, background: 'rgba(20,20,22,0.94)', color: '#fff',
+              borderRadius: 14, padding: '10px 12px',
+              boxShadow: '0 6px 24px rgba(0,0,0,0.45)',
+              display: 'flex', gap: 8, alignItems: 'flex-start',
+            }}
+          >
+            <div style={{ fontSize: 12.5, lineHeight: 1.4 }}>
+              <div style={{ fontWeight: 700, marginBottom: 2 }}>Record this? It might get really good.</div>
+              <div style={{ opacity: 0.82 }}>Split-screen video you can save &amp; share — tap the button to start.</div>
+            </div>
+            <button
+              type="button"
+              aria-label="Dismiss"
+              onClick={() => setRecordPillDismissed(true)}
+              style={{
+                flexShrink: 0, background: 'transparent', border: 'none',
+                color: 'rgba(255,255,255,0.7)', fontSize: 16, lineHeight: 1,
+                cursor: 'pointer', padding: 2,
+              }}
+            >
+              ×
+            </button>
+          </div>
         )}
 
         {/* React button — Day 3 Ask-mode capture. Mounts only with the

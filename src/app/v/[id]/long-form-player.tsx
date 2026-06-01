@@ -8,6 +8,8 @@ import { recordFeedEvent } from '@/lib/feed/client-events';
 import { captureSafe } from '@/lib/posthog-safe-capture';
 import { useDeviceId } from '@/lib/feed/device-id';
 import { AskErrorPill } from '@/lib/feed/ask-error-pill';
+import { EnterPrivateRoomOverlay } from '@/components/session/EnterPrivateRoomOverlay';
+import { holdEnterRoomBeat } from '@/lib/session/enter-timing';
 import { envelopeStorageKey } from '@/app/s/[id]/session-client';
 import type { OpenEnvelope } from '@/lib/avatar/avatar-envelope';
 import { ReactButton } from '@/components/recording/ReactButton';
@@ -69,6 +71,10 @@ export function LongFormPlayer({
   const [asking, setAsking] = useState(false);
   const [askError, setAskError] = useState<string | null>(null);
   const [ended, setEnded] = useState(false);
+  // Feature A — "Let's go somewhere private…" room mask. True from tap until we
+  // navigate to /s/[id]; NOT reset on the success path (let the route change
+  // unmount it, so there's no flash of the paused video before /s/[id] mounts).
+  const [entering, setEntering] = useState(false);
 
   // Long-form duet capture. Same pipeline as hook-mode; the source video
   // is the long-form HLS stream. Only mounts when the user is authed +
@@ -292,6 +298,8 @@ export function LongFormPlayer({
     el?.pause();
     setAsking(true);
     setAskError(null);
+    setEntering(true); // show the room mask immediately on tap
+    const enterStartedAt = performance.now();
 
     try {
       const r = await fetch('/api/sessions/open', {
@@ -333,6 +341,8 @@ export function LongFormPlayer({
           });
         }
         if (r.status === 401) { window.location.href = '/login'; return; }
+        // Drop the room mask on a non-auth failure so the error pill is visible.
+        setEntering(false);
         // Audit M7: resume play on non-auth failure so the user isn't
         // stuck on a paused frame staring at an error pill.
         if (wasPlaying) void el?.play();
@@ -351,8 +361,13 @@ export function LongFormPlayer({
       try {
         sessionStorage.setItem(envelopeStorageKey(env.session_id), JSON.stringify(env));
       } catch { /* sessionStorage blocked — next page shows "expired" */ }
+      // Hold the room mask for the minimum beat (masks a fast /open), then
+      // navigate. `entering` is intentionally NOT cleared — the route change
+      // unmounts the overlay, so the room stays up until /s/[id] takes over.
+      await holdEnterRoomBeat(enterStartedAt);
       router.push(`/s/${env.session_id}`);
     } catch {
+      setEntering(false);
       if (wasPlaying) void el?.play();
       setAskError('network');
     } finally {
@@ -374,6 +389,8 @@ export function LongFormPlayer({
   }, [router]);
 
   return (
+    <>
+    <EnterPrivateRoomOverlay visible={entering} />
     <main
       style={{
         height: '100vh',
@@ -637,5 +654,6 @@ export function LongFormPlayer({
         </div>
       )}
     </main>
+    </>
   );
 }

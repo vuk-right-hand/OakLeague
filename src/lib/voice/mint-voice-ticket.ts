@@ -6,9 +6,12 @@
 //   1. Bound to a pre-opened session_id (cutover discriminator).
 //   2. NOT admin-gated — caller has already run getCallerUserId().
 //
-// Bumped TTL = 120s (R4-S). Slow-LTE mint+WS-open round-trips can
-// approach 60s on a cold mobile network; 120s leaves buffer without
-// becoming a hoarding window.
+// Bumped TTL = 125s. Slow-LTE mint+WS-open round-trips can approach 60s on a
+// cold mobile network; this leaves buffer without becoming a hoarding window.
+// (R4-S set 120; +5s added for the Feature-A "private room" enter-mask, which on
+// a FAST network can hold ~3.5s on the source page before /s/[id] consumes the
+// ticket. On a slow network the hold ≈ 0 — see enter-timing.ts — so this cushion
+// only ever pads the fast-network case where the budget was already ample.)
 //
 // Defense-in-depth on session ownership: this lib trusts `userId` and
 // `sessionId` arguments. The voice_tickets_session_user_match trigger
@@ -110,7 +113,7 @@ export type MintVoiceTicketResult = {
   expiresAt: string; // ISO
 };
 
-const TTL_SECONDS = 120;
+const TTL_SECONDS = 125;
 
 export async function mintVoiceTicket(args: MintVoiceTicketArgs): Promise<MintVoiceTicketResult> {
   if (!args.ua || args.ua.length < 1 || args.ua.length > 2048) {
