@@ -4,10 +4,11 @@
 // the ~1–3s /api/sessions/open round-trip reads as "walking into a private
 // session," not dead air.
 //
-// The image lives at /public/session-room.jpg. If it's absent the overlay
-// degrades to a warm dark gradient (the `backgroundColor` shows through) — so
-// this ships and works before the asset is dropped in, and just gets richer
-// once it is.
+// The image is served at /Images/session-room.webp (the file lives under
+// public/Images/, recompressed from the source PNG to ~56KB so it streams
+// instantly on LTE behind the 65% scrim). If it's absent the overlay degrades
+// to a warm dark gradient (the `backgroundColor` shows through) — so this ships
+// and works before the asset is dropped in, and just gets richer once it is.
 //
 // Stage 2 ("Starting the call…", black) lives on /s/[id] (session-client) — this
 // component is ONLY the room stage on the source page.
@@ -23,7 +24,7 @@
 
 import type { CSSProperties } from 'react';
 
-const ROOM_IMAGE_SRC = '/session-room.jpg';
+const ROOM_IMAGE_SRC = '/Images/session-room.webp';
 
 export function EnterPrivateRoomOverlay({ visible }: { visible: boolean }) {
   if (!visible) return null;
