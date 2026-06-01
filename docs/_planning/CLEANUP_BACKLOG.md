@@ -1,3 +1,36 @@
+# ⛔ V3 PRE-FLIP GATE (whole-build audit 2026-06-01) — fix BEFORE flipping any creator to retrieval_version=3
+
+The v3 schema + proxy + admin UI are LIVE on prod (dormant). A whole-build UX+security
+audit (2026-06-01) ran before the main merge. **Security C1/H1 (live cross-tenant corpus
+leak) is FIXED + on prod (mig 20260601000001, commit b26c0a8, anon probe verified 42501).**
+The main merge is HELD (Vuk, 2026-06-01) until the 3 UX P0s below are fixed — next session,
+full plan→auditor→build loop. These are the gate to a creator v3 flip (Phase 3):
+
+- **UX P0-1 — silent pre-answer gap.** 1.5–3.5s dead air + frozen avatar after mic-stop,
+  NO thinking indicator → every turn reads "broken" → user re-taps → kills the answer.
+  Add a `thinking` state: `src/app/s/[id]/session-reducer.ts` (new state on mic_stopped) +
+  `session-client.tsx` (render indicator until first audio_out). BIGGEST "flawless" threat.
+- **UX P0-2 — raw error-code leak.** `brain_not_ready` / `creator_not_published` /
+  `profile_not_ready` / `voice_proxy_unreachable` / 500s render the raw string to the user
+  (`src/lib/feed/ask-error-pill.tsx` — not in handled set; fallback interpolates {error}).
+  A freshly-flipped v3 creator with an uncompiled brain shows "brain_not_ready". Add human
+  copy + a generic fallback that never prints a raw code.
+- **UX P0-3 — confident ungrounded answers.** Empty v3 retrieval → persona-only deep answer,
+  fluent + in-voice + grounded in nothing, no signal. Compounded by `min_sim` placeholders
+  (`retrieve-knowledge.ts:1069-1082 DEFAULT_V3_MIN_SIM_BY_MODE`). FIX: (a) HARD GATE — pin
+  per-mode min_sim via the §7 harness before any v3 flip; (b) wire `envelopeText===null &&
+  routePhaseRan` → `forceBrief` in `decoupled-orchestrator.js:632-660` so an ungrounded turn
+  is short+hedged, not a confident monologue.
+
+UX P1s (track, not gate): P1-1 barge tail ~250ms (simli-bridge.ts:507 — mute local sink on
+cancel); P1-2 7s silence cutoff too aggressive (use-session-pipe.ts:1153 → ~10-12s); P1-4
+rollover fires mid-turn (gate timer on turn-idle, use-session-pipe.ts:1006); P1-5 withDeadline
+doesn't cancel inner query (abortSignal). Security (track, not block): M2 60s HMAC replay
+window (no nonce store); M3 ingest /api/internal/* routes use plain-bearer not HMAC; M5 GC
+preview 1000-row count cap (cosmetic). Full reports: UX auditor + security auditor, 2026-06-01.
+
+---
+
 # CLEANUP_BACKLOG — orphaned debt on `rag-sota-phase-2-days-8-12`
 
 Captured 2026-05-21. These are **pre-existing items left by prior work**, not
