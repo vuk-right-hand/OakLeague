@@ -11,6 +11,8 @@ import { recordFeedEvent } from '@/lib/feed/client-events';
 import { captureSafe } from '@/lib/posthog-safe-capture';
 import { useDeviceId } from '@/lib/feed/device-id';
 import { AskErrorPill } from '@/lib/feed/ask-error-pill';
+import { EnterPrivateRoomOverlay } from '@/components/session/EnterPrivateRoomOverlay';
+import { holdEnterRoomBeat } from '@/lib/session/enter-timing';
 import { useFeedImpressionTracker } from './feed-impression-context';
 import { ReactButton } from '@/components/recording/ReactButton';
 import { RecordingPreview } from '@/components/recording/RecordingPreview';
@@ -90,6 +92,9 @@ export function HookPanel({
   const router = useRouter();
   const [asking, setAsking] = useState(false);
   const [askError, setAskError] = useState<string | null>(null);
+  // Feature A — room mask, true from Ask-tap until /s/[id] navigation. Not reset
+  // on success (route change unmounts it → no flash of the paused hook).
+  const [entering, setEntering] = useState(false);
   // Audit S2: tap-to-pause after the unmute gesture (TikTok expectation).
   const playerRef = useRef<HTMLVideoElement | null>(null);
   const [paused, setPaused] = useState(false);
@@ -408,6 +413,7 @@ export function HookPanel({
         overflow: 'hidden',
       }}
     >
+      <EnterPrivateRoomOverlay visible={entering} />
       {shouldMount ? (
         <MuxVideo
           key={hook.hook_id}
@@ -604,6 +610,12 @@ export function HookPanel({
 
           setAsking(true);
           setAskError(null);
+          setEntering(true); // show the room mask immediately on tap
+          // Freeze the hook behind the mask — audio must not keep playing
+          // under the "private room" overlay (audit M5). Resumed on failure.
+          const hookWasPlaying = !!playerRef.current && !playerRef.current.paused;
+          try { playerRef.current?.pause(); } catch { /* */ }
+          const enterStartedAt = performance.now();
           try {
             const r = await fetch('/api/sessions/open', {
               method: 'POST',
@@ -647,6 +659,8 @@ export function HookPanel({
               // CLAUDE.md hard rule: auth-affecting nav must full-page reload.
               // Cookie state can be stale post-login otherwise.
               if (r.status === 401) { window.location.href = '/login'; return; }
+              setEntering(false); // drop the room mask so the error pill shows
+              if (hookWasPlaying) { try { void playerRef.current?.play(); } catch { /* */ } }
               setAskError(body?.error ?? `error_${r.status}`);
               return;
             }
@@ -662,8 +676,13 @@ export function HookPanel({
             try {
               sessionStorage.setItem(envelopeStorageKey(env.session_id), JSON.stringify(env));
             } catch { /* sessionStorage blocked — next page shows "expired" */ }
+            // Hold the room mask for the minimum beat, then navigate; the route
+            // change unmounts the overlay (intentionally not cleared here).
+            await holdEnterRoomBeat(enterStartedAt);
             router.push(`/s/${env.session_id}`);
           } catch {
+            setEntering(false);
+            if (hookWasPlaying) { try { void playerRef.current?.play(); } catch { /* */ } }
             setAskError('network');
           } finally {
             setAsking(false);
