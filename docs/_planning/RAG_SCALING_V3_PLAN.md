@@ -1,7 +1,7 @@
 # RAG Scaling — `retrieval_version=3` Implementation Plan
 
-**Status:** PLAN (auditor pending). No code until approved. Not deployable until `PROD_DEPLOY_GATE` Step 1c.
-**Branch:** `rag-sota-phase-2-days-8-12` (current) → new work on a dedicated `rag-v3-scaling` branch.
+**Status:** BUILD (approved by Vuk 2026-05-28, post 3-round audit). Not deployable until `PROD_DEPLOY_GATE` Step 1c.
+**Branch:** `rag-v3-scaling` (active). Step 2 (`section-segment.ts`) shipped 2026-05-28 — 44 unit tests + 1-round audit + 21/0 parity check against the spike on Vuk's 91k-word AoD corpus.
 **Author brief:** `docs/_planning/RAG_SCALING_ARCHITECTURE_BRIEF.md`. This document is the *answer* to that brief.
 
 > **The moat in one line.** Take retrieval from "works for one 13k-word transcript" to "flawless at
@@ -39,12 +39,14 @@ qualitative rubric — a plan that maxes recall numbers but makes him recite has
 
 ## 0. Ground truth — what I verified in the code (not prose)
 
-Read end-to-end before writing this: `narrative-chunk.ts`, `retrieve-knowledge.ts`,
+Read end-to-end before writing this: `src/lib/voice/narrative-chunk.ts`, `src/lib/voice/retrieve-knowledge.ts`,
 `creator_knowledge_topk_v2.sql`, `sample_content_chunks_v2.sql`,
-`sample_content_narrative_units.sql`, `contextual-retrieval.ts`, `build-injection-envelope.ts`,
-`embed-worker.js` (both `makeEmbedWorker` + `makeCorpusReprocessWorker`),
-`creators_current_corpus_version_finalize.sql`, `brain-prefix.ts`, `server/voice-proxy/index.js`
+`sample_content_narrative_units.sql`, `src/lib/voice/contextual-retrieval.ts`, `src/lib/voice/build-injection-envelope.ts`,
+`server/voice-proxy/embed-worker.js` (both `makeEmbedWorker` + `makeCorpusReprocessWorker`),
+`creators_current_corpus_version_finalize.sql`, `src/lib/voice/brain-prefix.ts`, `server/voice-proxy/index.js`
 (dispatch).
+
+> **Path note for builders.** All `embed-worker.js` citations below are at `server/voice-proxy/embed-worker.js` (NOT under `src/lib/voice/`). All proxy citations are at `server/voice-proxy/index.js`. Audit round-4 M5.
 
 Confirmed facts that drive every decision below:
 
@@ -274,6 +276,43 @@ We chose **routed parent/child + section summaries** over a **RAPTOR recursive s
   philosophy on X") underperform, we add **one** optional summary layer (section-summary as an
   injectable unit) behind the same v3 plumbing — bounded, not a recursive tree.
 
+### 2.5b Considered & rejected: GraphRAG / knowledge-graph retrieval (e.g. graphify)
+
+Evaluated 2026-05-27 (Vuk raised graphify — a popular codebase-comprehension skill that builds a
+Leiden-clustered entity/relationship knowledge graph and answers *relational* queries like "what
+connects auth to the database?"). **Rejected for OakLeague's core retrieval, for four concrete
+reasons:**
+1. **Wrong problem shape.** GraphRAG wins when the value is in *relationships between entities*
+   (code call-graphs, citation/medical ontologies) and queries are multi-hop. Our retrieval target
+   is a *narrative passage* ("tell the lumberjack story", "his philosophy on sleep") — single-hop
+   semantic recall + the creator's voice. Shredding a story into nodes/edges makes "tell the story"
+   *harder*, not easier.
+2. **No user-token win left to capture.** GraphRAG's token savings come from returning a compact
+   subgraph instead of dumping files. **We already inject top-1/2 in a ~4KB envelope** (§2.3 Stage
+   4) — a connected subgraph would be *larger*, not smaller. The premise "save user tokens on
+   retrieval" is already solved by minimal injection.
+3. **It worsens the cost we actually pay.** Our dominant spend is ingestion (per-chunk Haiku
+   contextual-gen). A graph adds entity-extraction + community-detection passes on top, and
+   reintroduces the **rebuild-cost wall** that made us reject RAPTOR (adding a creator's 5th book
+   churns cross-entity edges → re-cluster). Our per-chapter-sample incremental model avoids it.
+4. **It's infra we explicitly don't build.** CLAUDE.md: "operator-network + cloned-voice + RAG-brain
+   company, not an infrastructure company." A graph DB + extraction pipeline + clustering is exactly
+   the retrieval infra we said we wouldn't own. **Our Document→Section→Unit→Chunk hierarchy with
+   parent FKs + topic-routing IS already a constrained graph (a tree)** — ~80% of the structural
+   benefit, none of the rebuild/infra cost.
+
+**What we keep from the idea:** (a) the synthesis/multi-hop need is real and is already the §2.5
+summary-layer escape hatch — enable only if the harness proves it; (b) one cheap content-modeling
+borrow (not a graph): a `unit_type: principle | story | fact` tag so frameworks/opinions are
+first-class retrievable units, sharpening "exactly him" on opinion questions at ~zero cost.
+
+**Reconciliation (see §15).** "Reject graph" applies to graph-as-PRIMARY-LOOKUP only. The
+*interconnection* instinct is correct for two things — **centrality** (which ideas the creator
+returns to = the PageRank analog) and **association adjacency** (pre-warming related units so
+follow-ups flow). §15 folds those in as a *lightweight* relationship layer on top of the library
+("library for finding, lightweight graph for connecting") — no graph DB, no entity-extraction
+pipeline.
+
 ---
 
 ## 3. COGS model (CLAUDE.md hard rule — every paid call logged; ingestion is the big one)
@@ -349,10 +388,16 @@ full `npm run db:test` green after EACH; blast-radius grep before each.
 6. **`…_creator_knowledge_topk_v3.sql`** — scoped hybrid RPC: takes `p_section_ids uuid[]`,
    `p_query_vec`, `p_query_tsq`, `p_k_child`, `p_n_parent_per_section`, `p_min_sim`,
    **`p_rank_mode` + `p_lambda`** (so §3b's ranking candidates a–d are switchable for the harness).
-   Same vector+BM25+RRF at child level **scoped to `section_id = ANY(p_section_ids)` and
-   `chunker_version=3`**, parent aggregation per `p_rank_mode` (default = max-dominant blend), top-N
+   `p_rank_mode` is an enum with **canonical IDs pinned at this same point in §7 #2** —
+   `'max' | 'max_blend' | 'vec_max' | 'best_child'`, default `'max_blend'` (audit round-4 M2 — no
+   ad-hoc renaming at freeze). Same vector+BM25+RRF at child level **scoped to `section_id =
+   ANY(p_section_ids)` and `chunker_version=3`**, parent aggregation per `p_rank_mode`, top-N
    **per section**. Pre-truncate parent text 3500 chars before JOIN (keep v2's M6 optimization).
-   Returns same column shape as v2 (so the orchestrator/rerank/envelope code barely changes).
+   Returns same column shape as v2 **plus a distinctly-named `parent_score`** (audit round-2 M7;
+   round-4 Small) so v2 SUM and v3 MAX scores never get compared as the same metric in dashboards.
+   **`p_min_sim` is a GATE OUTPUT of §7**, not a guess copied from v2's 0.30 (which was tuned
+   for SUM-RRF and is meaningless for MAX); the migration ships with a placeholder default and the
+   prod-flip blocker (§7 #3) is "harness-produced `p_min_sim` value pinned in code."
 
 7. **BM25 OR-semantics — REUSE #3a, no new SQL.** The workstream's #3a OR-tsquery fix is already in
    the RAG branch and v3 calls it directly. This item is a merge-coordination checkpoint, **not** a
@@ -393,16 +438,21 @@ v2 cache rows on v3 cutover automatically.
 - **Bridge boundaries unchanged.** Embeddings, rerank, chunker-LLM, contextual-gen all stay behind
   their typed interfaces; v3 adds no provider SDK leak. Late-chunking (v3.1) would be an
   embedding-bridge swap only.
-- **Proxy `index.js` — collapse dispatch to ONE chokepoint (round-3 C-3, supersedes the grep
-  backstop).** There are ~11 hardcoded `=== 2` / `version === 2` sites with a silent `else→v1`
-  fall-through (verified: `1492, 1510, 1557, 1626, 1639, 1657, 1722, 1725, 2435`, + spike-a `615`),
-  including the **LIVE decoupled path** `retrieveEnvelopeForDecoupled` (`index.js:1721-1746`) whose
-  `else` runs `retrieveTopK` (chunker_version=1) — a v3 session there silently retrieves ZERO → he
-  blanks every turn. Grep-for-`=== 2` cannot catch the dangerous site because the bug is the
-  *absent* v3 arm, not a present v2 one. **Fix: introduce a single `resolveRetrievalPath(version)`
-  helper** that maps {1,2,3}→{v1 in-proc, v2 shim, v3 shim} and **throws on any unknown version**
-  (fail-loud, never silent-v1), and route every call site through it. The throw is what guarantees a
-  future v4 (or a missed site) fails visibly instead of silently degrading to v1.
+- **Proxy `index.js` — collapse dispatch to ONE chokepoint (round-3 C-3, round-4 C5).** There
+  are ~9 hardcoded `=== 2` / `version === 2` sites with a silent `else→v1` fall-through, including
+  the **LIVE decoupled path** `retrieveEnvelopeForDecoupled` whose `else` runs `retrieveTopK`
+  (chunker_version=1) — a v3 session there silently retrieves ZERO → he blanks every turn. Grep-for-
+  `=== 2` cannot catch the dangerous site because the bug is the *absent* v3 arm, not a present v2 one.
+  **Don't trust line-number enumerations** (they're stale across audit rounds — round-1 cited one set,
+  round-2 another, round-4 found the real grep yields a third). **Use grep at build time:**
+  `grep -nE '\bretrievalVersionAtSession === \d\b|Number\(cd\.retrieval_version\) === \d'
+  server/voice-proxy/index.js`. Each match is either a DISPATCH (wrap in `resolveRetrievalPath()`)
+  or a PROBE (wrap in `assertRetrievalPathSupportedOnSpike(version)`). **Fix shape: introduce a single
+  `resolveRetrievalPath(version)`** helper that maps {1,2,3}→{v1 in-proc, v2 shim, v3 shim} and
+  **throws on any unknown version** (fail-loud, never silent-v1). The spike-a admin-preview probe
+  uses a sibling `assertRetrievalPathSupportedOnSpike(version)` that also throws on 3 with a guidance
+  message (until v3 supports the preview path, which is a later, deliberate decision). The throw is
+  what guarantees a future v4 (or a missed site) fails visibly instead of silently degrading to v1.
 - **Injection**: `build-injection-envelope.ts` unchanged except reorder passages best-first
   (KohakuRAG's +80% finding) — already roughly the case via score sort; assert it. Keep top-1/2
   low-blend.
@@ -422,9 +472,16 @@ v2 cache rows on v3 cutover automatically.
    into the v3 reprocess queue (`target_version=3`) **without touching `retrieval_version`.** The
    creator keeps reading their current path the entire time. v3 chunks/sections accumulate
    invisibly (they're version-filtered out of v2 reads).
-2. **Verify.** A `creator_v3_ready(creator_id)` check passes only when **every** non-errored sample
-   for that creator has v3 chunks present (and section rows, and `current_corpus_version` reflects
-   the rebuild). The eval harness (§7) green on that creator is part of "verified."
+2. **Verify.** `creator_v3_ready(creator_id) → boolean` is pinned (audit round-4 M3 — was vague,
+   would let half-built creators pass) as: returns `true` ⇔ for **every** `sample_content` row
+   belonging to that creator with `processing_status != 'errored'`, all three of:
+   (a) `corpus_reprocess_jobs` has a row with `target_version=3 AND status='done'` for that
+   `sample_id`,
+   (b) `sample_content_sections` has ≥1 row for that `sample_id` AND every section in it has
+   non-NULL `summary_embedding` AND non-NULL `centroid_embedding`,
+   (c) `sample_content_chunks` has ≥1 row with `chunker_version=3` for **every**
+   `section_id` from (b) (no orphan section without children).
+   The eval harness (§7) green on that creator is part of "verified" before the admin flips.
 3. **Flip last, gated.** `admin_set_creator_retrieval_version(creator, 3)` is **rejected unless
    `creator_v3_ready` is true** — the admin literally cannot flip a half-built creator. The flip is
    then a single atomic read-path cutover with the corpus already warm. Monotonic 1→2→3 still holds;
@@ -433,14 +490,24 @@ v2 cache rows on v3 cutover automatically.
   cache invalidation. **No global rebuild** (RAPTOR's cost does not exist here).
 - v1 and v2 creators completely unaffected (frozen read paths + version-filtered RPCs).
 - **Granularity decision (round-3, drives re-ingest COGS — DECIDE BEFORE CODE):** the worker DELETEs
-  *all* of a sample's units on reprocess (`embed-worker.js:948`), so if a 400-page book is ONE
-  `sample_content` row, editing one chapter re-pays the **whole book's** Haiku contextual-gen.
-  Section-checkpoint resumability (C5) only saves *crashes*, not deliberate edits. **Resolution:**
-  a book is ingested as **many samples (≈one per chapter/upload unit)**, not one monolith — editing
-  a chapter re-pays only that chapter, and it makes Decision-B's per-book cap mostly moot. The
-  Section level still exists *within* each sample for routing. (Alternative — section-level
-  incremental reprocess within one sample — is more worker surgery; chapter-as-sample is simpler and
-  uses the existing per-sample machinery.)
+  *all* of a sample's units on reprocess (`server/voice-proxy/embed-worker.js:948`), so if a 400-page
+  book is ONE `sample_content` row, editing one chapter re-pays the **whole book's** Haiku
+  contextual-gen. Section-checkpoint resumability (C5) only saves *crashes*, not deliberate edits.
+  **Resolution:** a book is ingested as **many samples (≈one per chapter/upload unit)**, not one
+  monolith — editing a chapter re-pays only that chapter, and it makes Decision-B's per-book cap
+  mostly moot. The Section level still exists *within* each sample for routing. (Alternative —
+  section-level incremental reprocess within one sample — is more worker surgery; chapter-as-sample
+  is simpler and uses the existing per-sample machinery.)
+- **Operator UX for chapter-as-sample (round-4 M6 — collateral of the granularity decision).**
+  `sample_content.topic_tags` is NOT NULL and the worker hard-fails when empty
+  (`server/voice-proxy/embed-worker.js:959`). Splitting one book into 30+ chapter-samples means
+  admins must remember to tag every chapter — easy to miss on chapter 17, and the operator gets
+  no clear recovery path from the resulting `markJobErrored` failure. **Sub-task for §8 step 4:**
+  add a "book template" admin flow that captures `topic_tags[]` ONCE at book-create time, then
+  pre-fills every chapter-sample upload from that template (overridable per chapter). Out-of-scope
+  for v3 retrieval correctness but in-scope for "v3 doesn't make ingest worse than v2." UI sits in
+  the existing admin console; data model is just a `book_templates` table (creator_id, title,
+  topic_tags[], created_at) referenced by `sample_content.book_template_id NULL`.
 
 ---
 
@@ -478,9 +545,13 @@ Build `scripts/diag-eval-v3.mjs` (read-only against a scratch creator) + a fixtu
      {inject top-1, top-2}. A v3 that wins recall@k but recites, blanks, or confidently-wrongs has
      **failed** regardless of the numbers.
 - **Gate:** v3 ships only when (2) holds at book-scale, (6) shows no regression, **and (7) the
-  recognition moment is intact** (no blanking, tells the story, speaks not recites). λ, S, and
-  inject-K are tuned on this harness — *with metric (7) as the tiebreaker when (1)–(6) are close* —
-  then frozen. The numbers serve the recognition moment, not the other way around.
+  recognition moment is intact** (no blanking, tells the story, speaks not recites). λ, S, inject-K,
+  **`p_min_sim` (routing/scoped-pass floor), and the inject min-rerank-score (Stage 4 silence gate)**
+  are ALL tuned on this harness (round-4 C1 — these last two were unspecified before, defaults are
+  meaningless because they were calibrated for v2's SUM-RRF). They are gate outputs, hard-blocked
+  from prod-flip until §7 has produced concrete values pinned into code/migration constants —
+  *with metric (7) as the tiebreaker when (1)–(6) are close* — then frozen. The numbers serve the
+  recognition moment, not the other way around.
 
 ---
 
@@ -490,27 +561,58 @@ Build `scripts/diag-eval-v3.mjs` (read-only against a scratch creator) + a fixtu
 > → eval → rollout. The worker rewrite (step 4) is gated behind the v3 queue so nothing ships to
 > v2 creators mid-build.
 
-0. ☐ **PROVE THE CORE HYPOTHESIS CHEAP, FIRST (round-3 de-risk — an afternoon, ZERO new schema).**
-   Before any sectioning, worker rewrite (the "riskiest 700-line edit"), or migration lockstep:
-   `topk_v2` *already* computes `MAX(vec_sim)` + `MAX(bm25)` per parent (`20260521000002:197-198`)
-   and *already* clamps `k_parent` to 50 while the caller passes only 20. So: (a) bump the caller's
-   `k_parent` 20→50 (one number, no migration) = 2.5× rerank window; (b) clone `topk_v2`, swap
-   `ORDER BY rrf_sum` → a `MAX`-based expression; (c) run on a synthetic large corpus via the diag
-   scripts. **If MAX-ranking + wider window doesn't measurably move "right unit reaches reranker,"
-   the entire hierarchy is questionable — and you've spent an afternoon, not two weeks.** Gate the
-   whole plan on this.
+0. ☑ **PROVE THE CORE HYPOTHESIS CHEAP, FIRST (round-3 de-risk).** Has two parts (round-4 M1 split
+   the muddled original):
+   - **0a — synthetic Block-C pgTAP test.** DONE 2026-05-27. `supabase/tests/rag_v3_regression_baseline.test.sql`
+     Block C is green: needle ranks #23 by SUM(rrf) but #1 by MAX(vector) on a synthetic 23-unit
+     corpus. Ranking-lever proof on synthetic data — no schema. (`topk_v2` already returns both
+     SUM and MAX columns at `20260521000002:197-198`; `k_parent` clamps to 50 vs caller's 20.)
+   - **0b — real-corpus empirical proof.** DONE 2026-05-27 via `scripts/aod-needle-test.mjs`.
+     Full Vuk AoD corpus (307 units / 834 chunks) ingested into local DB; 5 needle queries; 3
+     show MAX-vs-SUM divergence including textbook case ("loop of manifestation" → literal
+     title-match unit at MAX-rank #1 vs SUM-rank #6). **Pass bar (round-4 M1): ≥1 query where
+     MAX surfaces the right unit AND SUM buries it deeper than rank-5.** Hit on multiple queries.
+   - **Gate disposition: PASSED.** The entire-plan-go-or-no-go gate cleared on real Vuk content
+     BEFORE any v3 code shipped. Proceed to step 1b+ with empirical justification.
 1. ☐ **Reproduce Wall B at scale** with the eval harness scaffold + synthetic large corpus on a
    scratch creator (diag scripts) — capture the recall drop + unit-falls-out-of-rerank-window
    *before* changing anything. (Baseline evidence; pairs with step 0.)
 1b. ☐ **Ship the v2 cache-bump as a STANDALONE pre-v3 migration (round-3 C-2)** — independent of the
    v3 lockstep, separately tested + deployed, so the live v2 ingestion RPC change can't ride into
    the experimental path's blast radius. Low-severity, self-healing; do it cleanly and alone.
-2. ☐ **`section-segment.ts`** (pure) + unit tests (book/transcript/unstructured/empty/no-structure).
+2. ☑ **`section-segment.ts`** (pure) + unit tests (book/transcript/unstructured/empty/no-structure). **DONE 2026-05-28**: shipped at `src/lib/voice/section-segment.ts`; 44 unit tests; auditor pass applied 4 Critical + 7 Medium + several Smalls (form-feed line-anchored, source-slice identity invariant, dialog/EOF sentence-split, CJK auto-detect, numbered-heading mid-list filter, cueMode `book|transcript|auto`, leading-whitespace ownership, perf sanity). Parity-verified against `segment-dry-run.mjs` spike on Vuk's 91k-word AoD corpus: **21 sections, 0 oversize, max-tok 7321 (cap 7500), zero false-positive cues across all 8 modules.**
 3. ☐ **Migrations 1–4** (sections table, unit FK, chunks v3 enum+section_id, insert_v3 RPC) +
    pgTAP for each (RLS, slug guards, parameter-trust, enum freeze). Full `db:test` green.
-4. ☐ **Ingestion redesign** — `narrative-chunk.ts` per-section + summary; `embed-worker.js`
+4. ☐ **Ingestion redesign** — `narrative-chunk.ts` per-section + summary; `server/voice-proxy/embed-worker.js`
    per-section loop + centroid + section inserts; route via v3 queue. Tests: worker fixture run,
-   resumability, idempotent re-claim, cogs_log on every exit, book-size pre-flight cap.
+   resumability, idempotent re-claim, cogs_log on every exit, book-size pre-flight cap. **Round-4
+   sub-tasks (each is a build-blocker — do them under step 4, not "later"):**
+   - **4a (round-4 C2):** land a real Gemini `responseSchema` on the per-section Flash call,
+     resolving the TODO at `src/lib/voice/narrative-chunk.ts:269-272`. Schema enforces
+     `{ units: [{title, text}], sectionTitle: string, sectionSummary: string }`. Per-section
+     ingestion MULTIPLIES schema-drift retry-tax (30–80 sections/book × tax) — the §3 COGS model
+     assumes the schema is enforced. Verify against the actual pinned `@google/genai` field name
+     (`responseSchema` vs `responseJsonSchema`) before writing.
+   - **4b (round-4 C3):** decide and pin the contextual-gen cache-key change. §11/M3 promises
+     "per-section cache" but the cache key is owned by `/api/internal/contextual-gen`
+     (`src/app/api/internal/contextual-gen/route.ts`), not the worker. Two options: (i) ROUTE owns
+     the change — accept an optional `section_id` and key the cache on `{creator_id, section_id}`;
+     (ii) WORKER owns it — pass `section_text` as the `doc` field (the whole-sample-as-prefix model
+     dies). Pick (ii) — smaller blast radius, worker already knows the section boundaries. Update
+     COGS model accordingly (cache write/read mix changes; M3 estimate revisits).
+   - **4c (round-4 C4):** Section title/summary contract for downstream. When `Section.cue === null`
+     (paragraph-pack mode) → Flash MUST synthesize `sectionTitle` from first ~100 chars of section
+     text. When `Section.cue` is set and an oversize chapter sub-packs into N sub-sections →
+     sub-section #k inherits the parent cue + suffix " (part k/N)" so the sections table's
+     downstream uniqueness/dedup logic doesn't see N identical titles. Both rules enforced by a Zod
+     check after Flash response; on violation, retry with a stricter prompt.
+   - **4d (round-4 M7):** per-section "produced ≥1 unit OR explicit reason" assertion. A v3 worker
+     that silently emits zero units for every section (e.g. because 4a was skipped and `responseSchema`
+     is absent, or 4c failed validation and the retry didn't help) lets `creator_v3_ready` stay
+     false forever with no operator-visible cause. Worker writes a per-section row to a new admin
+     surface (`corpus_reprocess_sections` debug table or extends `corpus_reprocess_jobs.last_error`)
+     with the success/skip/error reason; the admin queue surfaces sections with zero output as
+     warnings, not silent-green.
 5. ☐ **Migrations 5–7** (route RPC, topk_v3 scoped+MAX, OR-tsquery) + pgTAP (MAX-not-SUM proven on
    the lumberjack fixture; scoped to sections; BM25 OR fires).
 6. ☐ **Retrieval redesign** — `retrieveKnowledgeV3` + proxy v3 dispatch + telemetry. Tests:
@@ -546,8 +648,10 @@ Build `scripts/diag-eval-v3.mjs` (read-only against a scratch creator) + a fixtu
 1. **Section granularity for transcripts** — ~6–8k-token windows, or topic-shift detection
    (embedding-cosine valley between adjacent paragraph windows)? Window is simpler/cheaper; topic-
    shift is better routing. Lean: window for v3, topic-shift as v3.1 if eval shows section bleed.
-2. **λ (count bonus) + S (sections routed)** — tuned on the eval harness; ship conservative
-   (λ≈0.1, S adaptive 2–6). Confirm.
+2. **λ (count bonus) + S (sections routed) + `p_min_sim` + inject min-rerank-score** — ALL four
+   tuned on the eval harness (§7), no pre-commits. Conservative seeds: λ≈0.1, S adaptive 2–6.
+   `p_min_sim` and the inject floor are gate outputs (round-4 C1 — no v2-derived guess). The
+   migration ships with placeholder defaults; freeze is hard-blocked until §7 produces values.
 3. **Book ingest cap** — DOWNSTREAM of the granularity decision (§6, round-3): with a book = many
    chapter-samples, no single sample approaches `CREATOR_EMBEDDING_DAILY_CAP_USD=$10`, so the
    per-book cap is mostly moot. A `creator_ingest_cap_usd` pre-flight (M2) still guards pathological
@@ -696,13 +800,16 @@ test. All verified against code and applied.
   the worker. Migration list updated: it's a *return-value + dispatch* change, not just the CHECK
   widening.
 
-- **R2-C3 — the proxy has ~8 hardcoded `=== 2` retrieval-dispatch branches; a v3 session falls
+- **R2-C3 — the proxy has ~9 hardcoded `=== 2` retrieval-dispatch branches; a v3 session falls
   through to the v1 in-proc path → queries `chunker_version=1` (none exist for a v3 creator) → ZERO
-  retrieval on EVERY turn → he blanks. CATASTROPHIC, FIXED.** My §5 said "extend the dispatch at
-  `index.js:950`" — wrong line (that's the `decoupled` const) and wrong scope. **Resolution:**
-  enumerate every site — `index.js:1484, 1502, 1618, 1631, 1649, 1714, 1717, 2427` + the spike-a
-  probe `:607` — and give each an explicit v3 arm (v3 HTTP shim/route). **No `>= 2` shortcut** (v2
-  and v3 call different RPCs). Step 6 gets a blast-radius grep gate for `=== 2` / `version === 2`.
+  retrieval on EVERY turn → he blanks. CATASTROPHIC, FIXED in round-3, refined in round-4 C5.** My
+  §5 originally said "extend the dispatch at `index.js:950`" — wrong line (that's the `decoupled`
+  const) and wrong scope. Round-3 enumerated by line number; round-4 confirmed those numbers had
+  ALREADY rotted by the time of audit. **Real disposition (current as of round-4):** §5 directs
+  builders to grep at build time (`grep -nE '\bretrievalVersionAtSession === \d\b|Number\(cd\.retrieval_version\) === \d' server/voice-proxy/index.js`), wrap dispatches in
+  `resolveRetrievalPath()`, wrap the spike-a probe in `assertRetrievalPathSupportedOnSpike()`. Both
+  throw on unknown version (fail-loud). **No `>= 2` shortcut** (v2 and v3 call different RPCs).
+  Step 6 gets a blast-radius grep gate.
 
 - **R2-C4 — the 4-col UNIQUE with NULL `section_index` silently disables dedup for v1/v2 rows
   (Postgres treats NULLs as distinct), reopening the exact duplicate-key bug `20260523000003` fixed.
@@ -810,6 +917,55 @@ including one that would brick a live creator. Applied:
   units/children today) — write it explicitly so an 80-section book can't hit a NOT-NULL violation
   mid-ingest. (Migration item 1's `topic_tags text[]≥1` stays; the worker fills it from the sample.)
 
+## 14. Regression-risk register — "what are the odds v3 breaks what works?"
+
+Vuk's question (2026-05-27): the current system works *really well*; before coding, quantify the
+odds v3 degrades it, and pin those odds with tests. Below: every **shared surface** v3 touches, the
+working thing it could break, a probability rating, and the **guard** (existing test or the new
+tripwire in `supabase/tests/rag_v3_regression_baseline.test.sql`, run via `npm run db:test`).
+
+**The design principle that keeps the odds low: v3 is ADDITIVE, not a rewrite.** `chunker_version`
+and `retrieval_version` are frozen enums; v1/v2 read paths filter their own version; v3 lands as a
+*third* path behind the session snapshot. The danger is never "v3 logic is wrong" (that only hurts
+v3 creators in dogfood) — it's **v3 work editing a SHARED object in place.** So the register is a
+list of shared objects + the tripwire that fires if one is touched.
+
+| Shared surface | What breaks if v3 touches it wrong | Odds (pre-guard) | Guard |
+|---|---|---|---|
+| `creator_knowledge_topk_v2` RPC | every live v2 retrieval — wrong order / zero rows | **Med** (plan step 0 *clones* it; risk only if someone edits in place) | `creator_knowledge_topk_v2.test.sql` (15 assertions incl. #13 SUM-behavior, #5 v2-only filter, #14 k-clamp). Red on any in-place change. |
+| `corpus_reprocess_mark_done` (live v2 finish) | R2-C1 fix folds a version-bump + delete here → a wrong edit breaks **every v2 reprocess** | **High** (it's the live ingest finish; the plan deliberately isolates this as standalone step 1b) | **NEW A1/A2 tripwire** — pins "no bump, no delete" today; goes red *on purpose* when the bump lands → forces a conscious, isolated, tested change. |
+| `sample_content_chunks` UNIQUE (3-col) | R2-C4 section dimension could loosen v1/v2 dedup via NULL-distinct → dup-key bug `20260523000003` returns | **Med** | **NEW B1 tripwire** — dup `(sample,chunker,index)` must raise 23505; red if a 4-col NULL-bearing unique replaces it without a partial-index guard. |
+| `retrieval_version` CHECK + `admin_set_creator_retrieval_version` + `sessions…CHECK` | v3 flip rejected, or downgrade orphans v3 rows | **High** if forgotten (all hard-pin `{1,2}`) | `creators_retrieval_version.test.sql` #6/#7 already assert "v=3 rejected" → they flip red→green when the v3 migration lands = the checklist that the gating set was applied. |
+| Proxy dispatch (~9 `=== 2` sites today, incl. live `retrieveEnvelopeForDecoupled`) | v3 session silently falls to v1 → **zero retrieval every turn ("he blanks")** | **High → eliminated** by R3-C3 + R4-C5 | the `resolveRetrievalPath(version)` chokepoint **throws on unknown version** — a missed site fails LOUD at session-open, never silent-v1. (Its own unit test ships with the helper.) Grep recipe pinned in §5 so the count stays current. |
+| `enqueue_*` triggers + `target_version CHECK` + claim/enqueue RPCs | v3 creator's sample edit raises / wrong-pipeline | **High** if the lockstep set is incomplete | enumerated migration set (§11/§12); `enqueue_routes_by_retrieval_version.test.sql` + `claim_corpus_reprocess_job.test.sql` cover current behavior and must be extended in the same change. |
+| `semantic_query_cache` (keyed on `current_corpus_version`) | stale parents after reprocess | **Low** (self-heals — `retrieve-knowledge.ts:628-655` falls through to fresh retrieve); R2-C1 corrects severity | the A1 tripwire (version-bump) is the fix's gate; cache test `semantic_query_cache.test.sql` covers key behavior. |
+| `embed-worker.js` reprocess loop (~700 lines) | v3 restructure breaks v2 ingest | **Med→Low** — v3 branches on `target_version` (R2-C2); v2 path code unchanged | gated behind the v3 queue; v2 jobs (`target_version=2`) never enter the v3 branch. |
+
+**Net odds of breaking the working system, with the plan's guards in place: LOW** — *provided* the
+two High-risk shared edits (mark_done version-bump, the gating CHECK set) are done as the plan now
+specifies (standalone pre-v3 migration for the cache-bump; lockstep migration set for the flip), and
+the dispatch chokepoint replaces the grep. The tripwires make "did I break v2?" a red/green signal,
+not a hope. **Highest residual risk is human, not architectural:** editing `topk_v2` or `mark_done`
+in place instead of cloning/isolating — which the tripwires catch on the next `db:test`.
+
+### Odds the plan WORKS to full extent — measured, not asserted
+
+`supabase/tests/rag_v3_regression_baseline.test.sql` Block C is the cheap step-0 proof, and it
+**passes green today** (6/6) on a synthetic 23-unit corpus with zero API calls:
+- **C1** — Wall B reproduced: the single-strong "needle" unit is buried below the `k_parent=20`
+  SUM-RRF window → never reaches the reranker. *The failure the plan exists to fix is real and now
+  has a regression test.*
+- **C2** — Lever 1 (wider `k_parent=50`, already supported, **no schema**) pulls the needle back
+  into candidates.
+- **C3** — Lever 2: in the same candidate set the needle ranks **#23 by SUM(rrf)** (buried) but
+  **#1 by MAX(vector)** — `topk_v2` already returns both columns, so MAX-ranking is proven to fix
+  the burial *before writing the v3 RPC*. 
+This is as close to "know the outcome in advance" as it gets without the live book corpus: the core
+lever (MAX + wider window) demonstrably recovers a buried needle. What's still unproven by this
+synthetic test and MUST be measured on the real eval harness (§7): routing precision at book scale,
+the cross-encoder's behavior on scoped candidates, latency under the 3500ms live ceiling, and the
+"exactly him" rubric. Those are the genuine unknowns; the ranking lever is no longer one.
+
 ### Net after three rounds
 Diagnosis verified correct by an independent reviewer; architecture (routed hierarchy + MAX, reject
 RAPTOR) confirmed as the right call. The dangerous-to-get-wrong parts are now pinned: **build-then-
@@ -817,3 +973,182 @@ flip ordering** (can't brick a live creator), **live v2 RPC change isolated** fr
 path, **dispatch chokepoint that fails loud**, **routing precision as the real recall gate**, latency
 anchored to the live ceiling, and a **cheap afternoon proof of the core hypothesis gating the
 expensive build.** Re-audit at step 3 (migrations written) per Vuk's guidance — not auto-chained.
+
+---
+
+## 14a. Audit round 4 — final pre-build pass (Vuk-requested 2026-05-28)
+
+Final adversarial review after the plan absorbed Step 2's "DONE" annotation + status-to-BUILD flip
+and three rounds of prior edits. Auditor verdict: **NOT buildable as written** until 5 Criticals
+fixed. All 5 Criticals + 7 Mediums + 6 Smalls applied; this section is the disposition record.
+
+### Critical (round 4) — all FIXED inline
+
+- **R4-C1 — `p_min_sim` (routing floor) and inject min-rerank-score (Stage 4 silence gate) had no
+  source.** Plan referenced both but never said where the numbers come from. v2's 0.30 was
+  SUM-RRF-calibrated, meaningless for MAX. **Fix:** §4 item 6 and §7 #3/#7 both now name these as
+  harness-tuned gate outputs hard-blocking prod-flip; migration ships with placeholder; §10 OQ #2
+  expanded.
+- **R4-C2 — `responseSchema` for per-section Flash was a `narrative-chunk.ts:269-272` TODO; per-
+  section ingest amplifies schema-drift retry tax by N (30–80 calls/book × tax) — §3 COGS assumes
+  enforcement.** **Fix:** §8 step 4a is now an explicit sub-task: land `responseSchema` resolving
+  the TODO, verify against pinned `@google/genai` field name.
+- **R4-C3 — §11/M3 "per-section cache" was fixed-on-paper, broken-in-code.** The 1h cache key is
+  owned by `/api/internal/contextual-gen`, not the worker. §8 step 4 didn't name the owning file.
+  **Fix:** §8 step 4b pins: worker passes `section_text` as the `doc` field (option ii — smaller
+  blast radius than route refactor).
+- **R4-C4 — Section title/summary contract was undefined for paragraph-pack mode (cue=null) and
+  for oversize-chapter sub-sections (which would inherit identical cues).** Downstream Flash and
+  the sections table would silently misbehave. **Fix:** §8 step 4c pins: Flash synthesizes title
+  for cue=null sections; sub-section #k gets parent cue + suffix " (part k/N)"; Zod-enforced.
+- **R4-C5 — proxy dispatch line-number enumerations in §5 and §12/R2-C3 had ALREADY rotted by the
+  time of round-4 audit (round-1 cited one set, round-2 another, current grep gave a third).**
+  Builder following stale numbers would mis-wrap the spike-a probe (which isn't a dispatch).
+  **Fix:** §5 replaces enumerations with a grep recipe + names `assertRetrievalPathSupportedOnSpike()`
+  for the probe (distinct from the dispatch chokepoint).
+
+### Medium (round 4) — all FIXED
+
+- **R4-M1 — §8 step 0 had no defined pass bar; "afternoon proof" conflated synthetic and real-
+  corpus probes.** **Fix:** step 0 split into 0a (synthetic Block-C, DONE) + 0b (real Vuk corpus,
+  DONE via `aod-needle-test.mjs`) with explicit pass bar pinned. Gate disposition: PASSED.
+- **R4-M2 — `p_rank_mode` IDs unpinned; §4 said "default = max-dominant blend" but §2.3 a–d had no
+  canonical names.** Builder + harness would diverge on IDs. **Fix:** pinned in §4 item 6 +
+  cross-referenced in §7: `'max' | 'max_blend' | 'vec_max' | 'best_child'`, default `'max_blend'`.
+- **R4-M3 — `creator_v3_ready` definition was vague; "reflects the rebuild" could mean "any v3
+  chunk exists" → flip a half-built creator → blanks on half the corpus.** **Fix:** §6 step 2
+  pinned to three concrete conditions: completed job, sections with embeddings, every section
+  has ≥1 chunk.
+- **R4-M4 — `section-segment.test.ts` test name + assertion encoded safe=8000 but shipped code is
+  safe=7500 (Flash responseSchema headroom).** **Fix:** test name + assertion updated to 7500;
+  code comment justifies the choice.
+- **R4-M5 — every `embed-worker.js` citation in the plan omitted the `server/voice-proxy/` prefix;
+  builder grep would miss the actual file.** **Fix:** §0 adds a one-time path note for builders.
+- **R4-M6 — chapter-as-sample (round-3 granularity decision) leaks operator pain: 30+ chapters
+  per book × NOT NULL `topic_tags` = remembering tags every upload.** **Fix:** §6 adds a
+  book-template sub-task to §8 step 4 — capture tags once at book-create, pre-fill chapters.
+- **R4-M7 — silent-zero-output failure mode: worker succeeds for a section but Flash returns no
+  units → `creator_v3_ready` stays false forever with no operator-visible cause.** **Fix:** §8
+  step 4d pins a per-section "produced ≥1 unit OR explicit reason" assertion + admin surface.
+
+### Small (round 4) — folded in
+
+- §0 #7 migration `20260516000004_admin_set_retrieval_version_cleans_v2_zombies.sql` cite
+  **verified** as accurate (auditor flagged for verification; file present).
+- `section-segment.ts:48-49` headroom comment is informal; per-section dry-run measurement before
+  step 4 freeze will pin the exact number. Acceptable as-is until Flash output volume on real
+  sections is measured.
+- §4 item 6 now lists `parent_score` in the column shape (was implicit via §11/M7 + §12/Small only).
+- §14 table row corrected: "~9 sites" not "~11" (round-4 C5 grep).
+- `server/voice-proxy/embed-worker.js:948` per-sample DELETE is correct under chapter-as-sample
+  decision; the `sampleChunkIndex` variable stays as-is (chunk_index remains sample-wide per the
+  R2-C4 partial-unique fix for v3 chunker_version=3); when section_index is added (v3), the index
+  remains sample-wide for v1/v2 compatibility. Folded into §11/R2-C4 disposition by reference.
+- §10 OQ #2 "Confirm" → upgraded to gate language (round-4 C1).
+- `narrative-chunk.ts:288-297` already family-aware-dispatches `thinkingLevel` vs `thinkingBudget`;
+  §8 step 4 builder MUST NOT re-implement this — preserve the existing dispatch.
+
+### Net after four rounds
+
+The plan is now **buildable as written**. Every "decided" item from rounds 1–3 was re-verified for
+"actually present in the plan, not just declared FIXED on paper." The dangerous places where a
+builder could legitimately make a wrong call (silent-v1 fallthrough, schema drift, cache thrash,
+half-built flip, identical-titled sub-sections, vague gate floors) are now pinned to specific
+files + specific functions + specific values (or named as harness-gate-outputs with placeholder
+defaults). Step 0 cleared on real Vuk content. Step 2 shipped. Begin step 1b.
+
+---
+
+## 15. The proven playbook — Google/Perplexity ranking inside bounded knowledge
+
+Vuk (2026-05-27): *there has to be a proven method to "clone a human brain"; Google/Perplexity
+average the web fast + precise — we need that within the boundary of the creator's allowed
+knowledge; and the brain works on association (question→association→answer→…).* Researched + verified
+the actual mechanisms (DOJ trial + 2024 API leak for Google; Perplexity's published pipeline) and
+mapped them to OakLeague. The conclusion reconciles the §2.5b GraphRAG rejection.
+
+### What Google/Perplexity actually do (verified)
+- **Google** ranks in two phases: (1) initial relevance + **PageRank** (authority via backlinks =
+  endorsement, distance from trusted sources) + page quality; (2) **NavBoost re-ranks by engagement**
+  — `goodClicks` / `badClicks` / `lastLongestClicks`, dwell time, 13-month window. *Relevance finds;
+  authority + engagement re-order.*
+- **Perplexity** = our exact shape + more: intent classification → **hybrid (BM25 + dense)** →
+  **3-tier reranker** (incl. an authority/quality gate) → top-3–8 by directness + authority + recency.
+
+### The synthesis — "library for FINDING, lightweight graph for CONNECTING"
+v3's library (hierarchy + routing + rerank) is the *relevance* engine = Perplexity's hybrid+rerank
+within the creator's boundary. On top of it sit **three proven mechanisms we don't yet use** — two
+of which ARE the "interconnection / association web" instinct behind graphify. This is where the
+graph idea is *right* (connection), having been *wrong* as the primary lookup (§2.5b):
+
+1. **Authority / centrality — the PageRank analog (in-corpus, cheap, do early in v3.1).** A creator
+   has no external backlinks, but has an internal endorsement signal: the ideas he **returns to,
+   cross-references, builds frameworks around** = graphify's "god nodes." Compute a per-unit
+   centrality score (concept co-occurrence / repetition across the corpus) and boost by it. Effect:
+   his *core recurring beliefs* surface first — exactly what makes him feel like *him*. Cheap because
+   it's computed once at ingestion from data we already extract.
+2. **Engagement re-ranking — the NavBoost analog (v3.2+, needs usage data).** Google promotes what
+   users click + dwell on. Our analog: log which injected units produced *engaged* turns (user keeps
+   talking, thumbs-up, doesn't bail) and boost them on a rolling window. This is the **learning-to-
+   rank loop that makes retrieval "precise" over time** — the real path from "good" to "uncanny,"
+   bounded entirely within the creator's own corpus.
+3. **Association adjacency — how the brain chains (v3.1–3.2, the graphify "web").** Conversation is
+   associative: answer → related thought → follow-up. After we inject a unit, **pre-warm its
+   neighbors** (same section, shared-concept units, units the creator explicitly links) so the
+   follow-up is instant and flows *by association*, like talking to the real person. This is a
+   **lightweight unit↔unit relationship layer** (shared-concept adjacency, NOT a full entity graph,
+   NOT a Neo4j) — the bounded, right-sized version of the interconnected web.
+
+### Why "sorting has the biggest impact" is exactly correct (Vuk's instinct = Google's architecture)
+At query time we have ~3.5s and one shot — no room for heavy reasoning. So **all the intelligence
+must be front-loaded into how knowledge is organized at ingestion**, exactly like Google spends
+enormous offline compute building its index (crawl, PageRank, clustering) so that *query* time is a
+fast lookup + rerank. Our ingestion already front-loads: sectioning, section summaries, contextual
+headers, embeddings. v3.1 adds centrality + concept tags + association edges to the same offline
+pass. **Get the right knowledge in the right places once; retrieval becomes a breeze forever.** This
+validates the v3 emphasis on ingestion redesign over query-time cleverness.
+
+### The "100% clone" expectation, honestly framed
+Nothing retrieves perfectly — but the bar isn't perfect recall of every fact. It's: *the right answer
+to the questions people actually ask, in his voice, reliably enough that the recognition fires.* The
+proven stack (hybrid + rerank + authority + engagement, all within bounded knowledge) is exactly how
+Google/Perplexity hit "feels like it knows everything" — and our boundary is far smaller and cleaner
+than the open web, which makes the target *easier*, not harder.
+
+### Strategic framing (YC)
+This is **YC's Summer-2026 "Company Brain" Request for Startups** — *"pull knowledge from fragmented
+sources, structure it, keep it current, turn it into [a brain] for AI; every company will need one;
+the layer does not yet exist"* — applied to a **person/creator** instead of a company's internal
+docs. Same primitive (bounded knowledge → structured → routed → retrieved), different target. See
+[[project_yc_company_brain_rfs]].
+
+### OakLeague's structural edge — the video-context prior (warm start) [Vuk, 2026-05-27]
+Google/Perplexity answer cold queries against the whole web. **We don't — and that's our unfair
+advantage.** An "ask" session is *born from a specific video* (hook clip → long-form → mic tap). The
+vast majority of questions in that session are *about what the user just watched.* So we know the
+likely topic **before the first word is spoken.** Three exploitations, all on top of the library:
+1. **Warm start / pre-route.** At session-open we already have the video's + hook's `topic_tags`
+   (`brain-prefix.ts` uses them for the persona seed). v3 reuses them as a **routing prior**: pre-
+   compute the top sections for *that video's* topics and warm them — so the first answer is faster
+   and lands in the right neighborhood. This is the routing prior the §2.3 router blends with the
+   query (soft boost, never a hard gate — an off-topic question still works).
+2. **Per-video question learning (NavBoost, localized).** Log the questions a video's session
+   actually generates and which units satisfied them; **rank that video's likely topics by real
+   demand.** "Cold" videos start from `topic_tags`; "warm" videos route from accumulated question
+   patterns. This is engagement re-rank scoped to the *video*, which is a far stronger signal than
+   global because intent is already narrowed by what they're watching.
+3. **Optional intent picker (ChatGPT-style).** After "start convo," an optional "what do you want to
+   get into — business / productivity / life?" tap further narrows the prior before question #1.
+   Cheap, and it pre-warms the right shelf.
+**Why competitors structurally can't copy this:** Google/Perplexity have no "what did you just
+watch" prior and no bounded allowed-knowledge set — they must average the open web cold. We route
+inside one creator's corpus, pre-narrowed by the exact video in front of the user. *The boundary is
+the moat.* (Roadmap: the prior is a v3-core nicety via `topic_tags`; per-video learning is v3.2 with
+the engagement loop.)
+
+### Roadmap placement (no scope creep into v3 core)
+v3 ships the **library (find)** — that's the moat-critical fix for the two walls. The three
+mechanisms layer on AFTER, gated on evidence: **centrality (v3.1, cheap, in-corpus)** → **association
+adjacency (v3.1–3.2)** → **engagement re-rank + per-video learning (v3.2+, needs usage data)**. The
+video-context prior (above) rides v3 core via existing `topic_tags`. Each is additive behind the
+same `retrieval_version`/bridge pattern; none blocks v3 shipping.

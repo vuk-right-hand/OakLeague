@@ -2,7 +2,9 @@
 -- + legacy creator_knowledge_topk chunker_version=1 freeze.
 --
 -- 1. chunker_version default = 1 for new inserts via legacy v1 path.
--- 2. CHECK rejects chunker_version=3.
+-- 2. CHECK rejects chunker_version=4 (post-v3 enum extension 2026-05-28
+--    accepts (1, 2, 3); v3-specific behavior is covered by
+--    sample_content_chunks_v3.test.sql — this test only locks the enum CEILING).
 -- 3. chunk_context > 1000 chars rejected by CHECK.
 -- 4. text_search GENERATED column populates from coalesce(chunk_context,'') || ' ' || text.
 -- 5. _insert_chunk_v2_unsafe service_role-only grant.
@@ -72,17 +74,18 @@ BEGIN
     FROM public.sample_content_chunks WHERE id = v_chunk_v1;
   RETURN NEXT is(v_default::int, 1, '1: legacy direct INSERT defaults to chunker_version=1');
 
-  -- 2: CHECK rejects chunker_version=3.
+  -- 2: CHECK rejects chunker_version=4 (post-v3 extension still rejects
+  -- values outside {1,2,3} — see migration 20260528000012).
   BEGIN
     INSERT INTO public.sample_content_chunks
       (sample_id, creator_id, chunk_index, text, token_count, topic_tags,
        embedding, embedded_at, chunker_version)
     VALUES
       (v_sample, v_creator, 99, 'should fail', 10, ARRAY['topic_a'],
-       v_dummy_vec, now(), 3);
-    RETURN NEXT fail('2: chunker_version=3 should have raised check_violation');
+       v_dummy_vec, now(), 4);
+    RETURN NEXT fail('2: chunker_version=4 should have raised check_violation');
   EXCEPTION WHEN check_violation THEN
-    RETURN NEXT pass('2: CHECK rejects chunker_version=3');
+    RETURN NEXT pass('2: CHECK rejects chunker_version=4 (enum ceiling)');
   END;
 
   -- 3: chunk_context > 1000 chars rejected.

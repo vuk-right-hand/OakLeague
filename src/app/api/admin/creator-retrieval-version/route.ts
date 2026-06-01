@@ -54,9 +54,11 @@ export async function POST(req: NextRequest) {
     ? body.creator_id : null;
   if (!creatorId) return json(400, { error: 'bad_creator_id' });
 
-  // Only accept literal numeric 1 or 2 — defends against `"2"` strings,
-  // truthy "yes", or arrays of [2].
-  const version = body.version === 1 || body.version === 2 ? body.version : null;
+  // Only accept literal numeric 1, 2, or 3 — defends against `"2"` strings,
+  // truthy "yes", or arrays of [2]. Step-9 C4: 3 added (v3 flip) — the RPC owns
+  // the creator_v3_ready gate + the soft cutover; this route just forwards.
+  const version =
+    body.version === 1 || body.version === 2 || body.version === 3 ? body.version : null;
   if (version === null) return json(400, { error: 'bad_version' });
 
   // The public wrapper admin_set_creator_retrieval_version asserts admin
@@ -94,6 +96,20 @@ export async function POST(req: NextRequest) {
     }
     if (error.code === '42501') {
       return json(403, { error: 'forbidden' });
+    }
+    // Step-9 C4 + audit M-C: the flip RPC raises check_violation (23514) for
+    // BOTH the post-purge rollback refusal AND the v3-not-ready gate. Map to 409
+    // with an actionable code, discriminating on the LEADING token (the messages
+    // interpolate values, so match the token, not the whole sentence). `msg` is
+    // already lowercased above; the tokens are lowercase in the migration.
+    if (error.code === '23514') {
+      if (msg.includes('rollback_refused')) {
+        return json(409, { error: 'rollback_refused_legacy_purged' });
+      }
+      if (msg.includes('creator_v3_not_ready')) {
+        return json(409, { error: 'creator_v3_not_ready' });
+      }
+      return json(409, { error: 'flip_refused' });
     }
     Sentry.captureException(error, {
       extra: { op: 'admin_set_creator_retrieval_version', creator_id: creatorId, version, admin_user_id: admin.userId },

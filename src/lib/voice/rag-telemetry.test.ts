@@ -50,13 +50,13 @@ describe('toCogsLogRows', () => {
   it('emits one row per filled paid leg (rewrite + embed + rerank)', () => {
     const t = newTurnTelemetry(BASE_ARGS);
     t.rewrite = {
-      modelId: 'gemini-2.5-flash',
+      modelId: 'gemini-3.1-flash-lite',
       fallback: false,
       inputTokens: 100,
       outputTokens: 30,
-      usdPerInputToken: 0.0000003,
-      usdPerOutputToken: 0.0000025,
-      quotedAt: '2026-05-14',
+      usdPerInputToken: 0.00000025,
+      usdPerOutputToken: 0.0000015,
+      quotedAt: '2026-05-30',
       latencyMs: 250,
       noContextAfterResumption: false,
     };
@@ -83,7 +83,7 @@ describe('toCogsLogRows', () => {
     expect(rows[0].service).toBe('gemini');
     expect(rows[0].units).toBe(130); // 100 input + 30 output
     // Cost rounded to 6 decimals by round6 — precision matches that.
-    expect(rows[0].cost_usd).toBeCloseTo(100 * 0.0000003 + 30 * 0.0000025, 6);
+    expect(rows[0].cost_usd).toBeCloseTo(100 * 0.00000025 + 30 * 0.0000015, 6);
     expect(rows[1].operation).toBe('embedding');
     expect(rows[1].units).toBe(50);
     expect(rows[1].cost_usd).toBeCloseTo(50 * 0.00000015, 6);
@@ -96,14 +96,14 @@ describe('toCogsLogRows', () => {
   it('skips rewrite row when both input and output tokens are zero (fallback that never hit API)', () => {
     const t = newTurnTelemetry(BASE_ARGS);
     t.rewrite = {
-      modelId: 'gemini-2.5-flash',
+      modelId: 'gemini-3.1-flash-lite',
       fallback: true,
       fallbackReason: 'budget_exhausted',
       inputTokens: 0,
       outputTokens: 0,
-      usdPerInputToken: 0.0000003,
-      usdPerOutputToken: 0.0000025,
-      quotedAt: '2026-05-14',
+      usdPerInputToken: 0.00000025,
+      usdPerOutputToken: 0.0000015,
+      quotedAt: '2026-05-30',
       latencyMs: 5,
       noContextAfterResumption: false,
     };
@@ -113,14 +113,14 @@ describe('toCogsLogRows', () => {
   it('emits rewrite row when fallback hit API and returned partial tokens (transport_error)', () => {
     const t = newTurnTelemetry(BASE_ARGS);
     t.rewrite = {
-      modelId: 'gemini-2.5-flash',
+      modelId: 'gemini-3.1-flash-lite',
       fallback: true,
       fallbackReason: 'transport_error',
       inputTokens: 100,
       outputTokens: 0,
-      usdPerInputToken: 0.0000003,
-      usdPerOutputToken: 0.0000025,
-      quotedAt: '2026-05-14',
+      usdPerInputToken: 0.00000025,
+      usdPerOutputToken: 0.0000015,
+      quotedAt: '2026-05-30',
       latencyMs: 250,
       noContextAfterResumption: false,
     };
@@ -226,14 +226,14 @@ describe('toPostHogEventBatch', () => {
   it('maps rewrite timeout → rag_rewrite_transport_failed', () => {
     const t = newTurnTelemetry(BASE_ARGS);
     t.rewrite = {
-      modelId: 'gemini-2.5-flash',
+      modelId: 'gemini-3.1-flash-lite',
       fallback: true,
       fallbackReason: 'timeout',
       inputTokens: 0,
       outputTokens: 0,
       usdPerInputToken: 0,
       usdPerOutputToken: 0,
-      quotedAt: '2026-05-14',
+      quotedAt: '2026-05-30',
       latencyMs: 3000,
       noContextAfterResumption: false,
     };
@@ -347,32 +347,32 @@ describe('toPostHogEventBatch', () => {
   it('Final-cross C2: emits rag_rewrite_no_context_post_resumption when flagged', () => {
     const t = newTurnTelemetry(BASE_ARGS);
     t.rewrite = {
-      modelId: 'gemini-2.5-flash',
+      modelId: 'gemini-3.1-flash-lite',
       fallback: false,
       inputTokens: 50,
       outputTokens: 10,
-      usdPerInputToken: 0.0000003,
-      usdPerOutputToken: 0.0000025,
-      quotedAt: '2026-05-14',
+      usdPerInputToken: 0.00000025,
+      usdPerOutputToken: 0.0000015,
+      quotedAt: '2026-05-30',
       latencyMs: 200,
       noContextAfterResumption: true,
     };
     const evs = toPostHogEventBatch(t);
     const ev = evs.find((e) => e.name === 'rag_rewrite_no_context_post_resumption');
     expect(ev).toBeDefined();
-    expect(ev?.properties.model).toBe('gemini-2.5-flash');
+    expect(ev?.properties.model).toBe('gemini-3.1-flash-lite');
   });
 
   it('Final-cross C2: does NOT emit when noContextAfterResumption is false', () => {
     const t = newTurnTelemetry(BASE_ARGS);
     t.rewrite = {
-      modelId: 'gemini-2.5-flash',
+      modelId: 'gemini-3.1-flash-lite',
       fallback: false,
       inputTokens: 50,
       outputTokens: 10,
-      usdPerInputToken: 0.0000003,
-      usdPerOutputToken: 0.0000025,
-      quotedAt: '2026-05-14',
+      usdPerInputToken: 0.00000025,
+      usdPerOutputToken: 0.0000015,
+      quotedAt: '2026-05-30',
       latencyMs: 200,
       noContextAfterResumption: false,
     };

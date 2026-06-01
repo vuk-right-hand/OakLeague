@@ -11,15 +11,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // reply and the module sees it via generateContent().
 const mockGenerateContent = vi.fn();
 
-vi.mock('@google/genai', () => ({
-  GoogleGenAI: class {
-    models = {
-      generateContent: mockGenerateContent,
-    };
-  },
-}));
+// Mock only the GoogleGenAI client class; import the real Type enum +
+// ThinkingLevel so the v3 step-4a responseSchema constant (which references
+// GenaiType.OBJECT etc. at module load) initializes correctly.
+vi.mock('@google/genai', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@google/genai')>();
+  return {
+    ...actual,
+    GoogleGenAI: class {
+      models = {
+        generateContent: mockGenerateContent,
+      };
+    },
+  };
+});
 
-import { narrativeChunk, NarrativeChunkError } from './narrative-chunk';
+import { narrativeChunk, narrativeChunkSection, NarrativeChunkError } from './narrative-chunk';
 
 beforeEach(() => {
   mockGenerateContent.mockReset();
@@ -425,5 +432,172 @@ describe('narrativeChunk — Zod schema bounds', () => {
 
     const result = await narrativeChunk({ sanitizedDocument: 'doc' });
     expect(result).toBeNull();
+  });
+});
+
+
+// ── narrativeChunkSection (v3 per-section, step 4a) ─────────────────────
+
+const goodSectionPayload = {
+  sectionTitle: 'The Lumberjack Story',
+  sectionSummary: 'A short story about a lumberjack who proves consistent effort beats raw strength.',
+  units: [
+    { title: 'Meeting the Lumberjack', text: 'I met him on the trail at dawn.' },
+    { title: 'The Bet',                 text: 'We bet on who could fell more trees.' },
+  ],
+};
+
+describe('narrativeChunkSection — happy path', () => {
+  it('returns units + sectionTitle + sectionSummary on first attempt', async () => {
+    mockGenerateContent.mockResolvedValueOnce(flashOk(goodSectionPayload));
+    const r = await narrativeChunkSection({ sanitizedSection: 'section body text' });
+    expect(r).not.toBeNull();
+    expect(r!.attempt).toBe(1);
+    expect(r!.units).toHaveLength(2);
+    expect(r!.sectionTitle).toBe('The Lumberjack Story');
+    expect(r!.sectionSummary).toContain('lumberjack');
+    expect(mockGenerateContent).toHaveBeenCalledTimes(1);
+  });
+
+  it('passes responseSchema to Flash config (SDK-level v3 step 4a contract)', async () => {
+    mockGenerateContent.mockResolvedValueOnce(flashOk(goodSectionPayload));
+    await narrativeChunkSection({ sanitizedSection: 'body' });
+    const callArgs = mockGenerateContent.mock.calls[0]![0] as {
+      config: { responseSchema?: unknown; responseMimeType?: string };
+    };
+    expect(callArgs.config.responseMimeType).toBe('application/json');
+    expect(callArgs.config.responseSchema).toBeDefined();
+    // Schema must declare units, sectionTitle, sectionSummary as required.
+    const schema = callArgs.config.responseSchema as { required?: string[] };
+    expect(schema.required).toEqual(
+      expect.arrayContaining(['units', 'sectionTitle', 'sectionSummary']),
+    );
+  });
+
+  it('includes the section cue in the prompt for orientation', async () => {
+    mockGenerateContent.mockResolvedValueOnce(flashOk(goodSectionPayload));
+    await narrativeChunkSection({
+      sanitizedSection: 'body',
+      sectionCue: '# Chapter 3: The Bet',
+    });
+    const callArgs = mockGenerateContent.mock.calls[0]![0] as { contents: string };
+    expect(callArgs.contents).toContain('# Chapter 3: The Bet');
+  });
+
+  it('null/undefined cue is fine (paragraph-pack mode)', async () => {
+    mockGenerateContent.mockResolvedValueOnce(flashOk(goodSectionPayload));
+    const r = await narrativeChunkSection({ sanitizedSection: 'body', sectionCue: null });
+    expect(r).not.toBeNull();
+  });
+});
+
+describe('narrativeChunkSection — retry contract', () => {
+  it('retries once on schema-violation, succeeds on attempt 2', async () => {
+    const malformed = { units: [{ title: 'ok', text: 'ok' }] }; // missing sectionTitle/Summary
+    mockGenerateContent
+      .mockResolvedValueOnce(flashOk(malformed))
+      .mockResolvedValueOnce(flashOk(goodSectionPayload));
+    const r = await narrativeChunkSection({ sanitizedSection: 'body' });
+    expect(r).not.toBeNull();
+    expect(r!.attempt).toBe(2);
+    expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns null on second-attempt schema failure (worker fallback signal)', async () => {
+    const malformed = { units: [{ title: 'ok', text: 'ok' }] };
+    mockGenerateContent
+      .mockResolvedValueOnce(flashOk(malformed))
+      .mockResolvedValueOnce(flashOk(malformed));
+    const r = await narrativeChunkSection({ sanitizedSection: 'body' });
+    expect(r).toBeNull();
+    expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+  });
+
+  it('strict-prompt addendum fires on attempt 2', async () => {
+    const malformed = { units: [{ title: 'ok', text: 'ok' }] };
+    mockGenerateContent
+      .mockResolvedValueOnce(flashOk(malformed))
+      .mockResolvedValueOnce(flashOk(goodSectionPayload));
+    await narrativeChunkSection({ sanitizedSection: 'body' });
+    const attempt2Args = mockGenerateContent.mock.calls[1]![0] as { contents: string };
+    expect(attempt2Args.contents).toContain('CRITICAL');
+    expect(attempt2Args.contents).toContain('sectionTitle');
+  });
+});
+
+describe('narrativeChunkSection — error cases', () => {
+  it('throws empty_input on whitespace-only section', async () => {
+    await expect(
+      narrativeChunkSection({ sanitizedSection: '   \n  \t  ' }),
+    ).rejects.toThrow(NarrativeChunkError);
+  });
+
+  it('throws api_key_missing when env var unset (does NOT retry)', async () => {
+    // Same singleton-cache concern as v2's api_key_missing test (above):
+    // reset modules + re-import to get a fresh _client.
+    const saved = process.env.GEMINI_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    try {
+      vi.resetModules();
+      const mod = await import('./narrative-chunk');
+      await expect(mod.narrativeChunkSection({ sanitizedSection: 'body' }))
+        .rejects.toMatchObject({ code: 'api_key_missing', attempt: 1 });
+      expect(mockGenerateContent).not.toHaveBeenCalled();
+    } finally {
+      process.env.GEMINI_API_KEY = saved;
+    }
+  });
+
+  it('returns null on transport_error → transport_error (both attempts blow up)', async () => {
+    mockGenerateContent.mockRejectedValue(new Error('upstream 503'));
+    const r = await narrativeChunkSection({ sanitizedSection: 'body' });
+    expect(r).toBeNull();
+    expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('narrativeChunkSection — defensive oversize splitter (shared with v2)', () => {
+  it('splits a unit whose text exceeds HARD_MAX_UNIT_CHARS rather than failing', async () => {
+    const oversized = {
+      sectionTitle: 'Big Section',
+      sectionSummary: 'Section with one oversize unit.',
+      units: [{ title: 'big', text: 'z'.repeat(8001) }],
+    };
+    mockGenerateContent.mockResolvedValueOnce(flashOk(oversized));
+    const r = await narrativeChunkSection({ sanitizedSection: 'body' });
+    expect(r).not.toBeNull();
+    expect(r!.units.length).toBeGreaterThanOrEqual(2);
+    for (const u of r!.units) {
+      expect(u.text.length).toBeLessThanOrEqual(8000);
+    }
+    expect(mockGenerateContent).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('narrativeChunkSection — limits match sample_content_sections CHECKs', () => {
+  it('rejects sectionTitle > 200 chars (matches table CHECK)', async () => {
+    const bad = {
+      sectionTitle: 'x'.repeat(201),
+      sectionSummary: 'ok',
+      units: [{ title: 'ok', text: 'ok' }],
+    };
+    mockGenerateContent
+      .mockResolvedValueOnce(flashOk(bad))
+      .mockResolvedValueOnce(flashOk(bad));
+    const r = await narrativeChunkSection({ sanitizedSection: 'body' });
+    expect(r).toBeNull();
+  });
+
+  it('rejects sectionSummary > 2000 chars (matches table CHECK)', async () => {
+    const bad = {
+      sectionTitle: 'ok',
+      sectionSummary: 'x'.repeat(2001),
+      units: [{ title: 'ok', text: 'ok' }],
+    };
+    mockGenerateContent
+      .mockResolvedValueOnce(flashOk(bad))
+      .mockResolvedValueOnce(flashOk(bad));
+    const r = await narrativeChunkSection({ sanitizedSection: 'body' });
+    expect(r).toBeNull();
   });
 });

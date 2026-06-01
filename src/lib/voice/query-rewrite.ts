@@ -64,15 +64,18 @@
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { z } from 'zod';
 
-// Pinned model. `gemini-2.5-flash` is the current GA alias; matches
-// narrative-chunk.ts pattern. CLAUDE.md bans -latest and undated
-// -preview. Override via env for swap-readiness.
+// Pinned model. `gemini-3.1-flash-lite` (pinned 2026-05-30): GA/stable,
+// low-latency, cheaper than 2.5-flash ($0.25/$1.50 vs $0.30/$2.50 per M) —
+// ideal for query-rewrite (trivial, per-turn, latency-sensitive). Replaces
+// gemini-2.5-flash (retires 2026-10-16). isV3 regex below routes it to the
+// thinkingLevel path. CLAUDE.md bans -latest and undated -preview. Override
+// via env for swap-readiness.
 export const QUERY_REWRITE_MODEL =
-  process.env.QUERY_REWRITE_MODEL || 'gemini-2.5-flash';
+  process.env.QUERY_REWRITE_MODEL || 'gemini-3.1-flash-lite';
 
 // Boot-time guard. CLAUDE.md: banned model strings.
 // Allow: dated GA (`-002`, `-001`, `-2025-04-01`, `-04-2026`, `-2025-09`)
-//        or unsuffixed GA aliases (`gemini-2.5-flash`, `gemini-3.1-flash`)
+//        or unsuffixed GA aliases (`gemini-3.1-flash-lite`, `gemini-2.5-flash`)
 //        — Google's GA alias is considered pinned-enough per
 //        existing narrative-chunk.ts policy.
 // Reject: `-latest`, `-preview` without a multi-digit date suffix,
@@ -91,17 +94,17 @@ export const QUERY_REWRITE_MODEL =
   }
 }
 
-// Pricing pin. $0.30 / 1M input + $2.50 / 1M output for Gemini 2.5 Flash
-// at the time of writing. Caller blends these into cogs_log via the
-// modelId + quotedAtRate fields returned below. Override via env to
-// follow rate changes.
+// Pricing pin. $0.25 / 1M input + $1.50 / 1M output for Gemini 3.1 Flash-Lite
+// (pinned 2026-05-30 alongside QUERY_REWRITE_MODEL; was 2.5 Flash $0.30/$2.50).
+// Caller blends these into cogs_log via the modelId + quotedAtRate fields
+// returned below. Override via env to follow rate changes.
 export const QUERY_REWRITE_USD_PER_INPUT_TOKEN = Number(
-  process.env.QUERY_REWRITE_USD_PER_INPUT_TOKEN || '0.0000003',
+  process.env.QUERY_REWRITE_USD_PER_INPUT_TOKEN || '0.00000025',
 );
 export const QUERY_REWRITE_USD_PER_OUTPUT_TOKEN = Number(
-  process.env.QUERY_REWRITE_USD_PER_OUTPUT_TOKEN || '0.0000025',
+  process.env.QUERY_REWRITE_USD_PER_OUTPUT_TOKEN || '0.0000015',
 );
-export const QUERY_REWRITE_QUOTED_AT = process.env.QUERY_REWRITE_QUOTED_AT || '2026-05-14';
+export const QUERY_REWRITE_QUOTED_AT = process.env.QUERY_REWRITE_QUOTED_AT || '2026-05-30';
 
 // Caps. lastAssistantResponse capped at 1500 chars so the rewrite prompt
 // stays under ~4KB even with a max-length utterance. Per-call timeout 3s
@@ -287,10 +290,11 @@ export async function rewriteQuery(input: RewriteInput): Promise<RewriteResult> 
     const isV3 = /^gemini-3(\.|-)/i.test(QUERY_REWRITE_MODEL);
     // SDK-canonical enum for generateContent (serializes to "MINIMAL", uppercase).
     // Same LOGICAL level as the JS proxy mirror brain-llm-common.js#thinkingConfigFor,
-    // but DIFFERENT WIRE CASING — the proxy sends lowercase 'minimal'. Inert today
-    // (default model is gemini-2.5-flash → isV3=false → thinkingBudget:0 path). Before
-    // any gemini-3.x model is pinned here, the v3 enable gate (P1-9) MUST verify which
-    // casing the pinned model actually honors so the two paths don't silently diverge.
+    // but DIFFERENT WIRE CASING — the proxy sends lowercase 'minimal'. ACTIVE now:
+    // the pinned default gemini-3.1-flash-lite matches isV3 → thinkingLevel:MINIMAL
+    // (validated 2026-05-31, see CLEANUP_BACKLOG "model-pin validation" — Google
+    // echoed modelVersion=gemini-3.1-flash-lite). The 2.x thinkingBudget:0 branch
+    // remains for an env-override fallback model.
     const thinkingConfig = isV3
       ? { thinkingLevel: ThinkingLevel.MINIMAL }
       : { thinkingBudget: 0 };
@@ -426,9 +430,11 @@ function mkFallback(args: {
 
 function buildPrompt(args: { utterance: string; lastAsst: string }): string {
   // Single user-content prompt; the model returns JSON directly per
-  // responseMimeType. The instruction is intentionally short — Gemini
-  // 2.5 Flash on temperature 0 produces deterministic enough JSON for
-  // a one-field schema.
+  // responseMimeType. The instruction is intentionally short — a one-field
+  // schema at temperature 0. (Real-model JSON-shaping stability on
+  // gemini-3.1-flash-lite is unit-test-mocked; track a real-API gated check
+  // per CLEANUP_BACKLOG M5 rather than asserting a model-specific determinism
+  // claim here.)
   return [
     'You rewrite a user utterance into a standalone search query for a knowledge-retrieval system.',
     'If the utterance references the prior assistant turn ("tell me more", "what about that"), expand it using the topic of the prior turn.',

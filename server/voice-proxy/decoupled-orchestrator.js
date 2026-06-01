@@ -226,6 +226,13 @@ export function makeDecoupledOrchestrator({
       // Set in onUserTranscript via isTrivialQuestion.
       isTrivial: false,
       retrievePromise: null,
+      // P0-3 grounding discriminator (whole-build UX audit). retrievalAttempted:
+      // did we actually run retrieval for this turn (substantive, non-trivial,
+      // non-truncated)? retrieveFailed: did the retrieval throw/abort (vs. resolve
+      // cleanly empty)? Together with the timeout sentinel these classify WHY an
+      // envelope was empty — off-domain (clean empty) vs. retrieval failure.
+      retrievalAttempted: false,
+      retrieveFailed: false,
       retrieveAbort: makeAbort(),
       paraphraseAbort: makeAbort(),
       deepAbort: makeAbort(),
@@ -500,12 +507,21 @@ export function makeDecoupledOrchestrator({
     // (the bridge will throw empty_input on the paraphrase/deep anyway).
     // P1-10 — also skip retrieval on trivial Qs (no deep_answer will use it).
     // C-5 — and skip on suspected truncation (don't ground on a partial Q).
-    t.retrievePromise = hasQuestion && !t.isTrivial && !t.truncationSuspected
+    // P0-3 — record whether we actually attempt retrieval for this turn. Only an
+    // ATTEMPTED-but-empty retrieval is treated as "off-domain"; a skipped one
+    // (trivial / truncated / no-question) stays today's plain persona-only.
+    t.retrievalAttempted = hasQuestion && !t.isTrivial && !t.truncationSuspected;
+    t.retrievePromise = t.retrievalAttempted
       ? Promise.resolve()
           .then(() => retrieve(t.question, t.retrieveAbort.signal))
           .catch((e) => {
             log.warn?.(`[decoupled] retrieval degraded: ${e && e.message}`);
             captureException(e, { op: 'decoupled.retrieve', sessionId, turnNumber });
+            // P0-3 — a throw/abort is a FAILURE (might be his domain; we just
+            // couldn't fetch), distinct from a clean-empty result (off-domain).
+            // Flag it (NOT a truthy string sentinel — that would feed
+            // assertSaltedEnvelope and throw); the envelope stays null.
+            t.retrieveFailed = true;
             return null;
           })
       : Promise.resolve(null);
@@ -604,6 +620,7 @@ export function makeDecoupledOrchestrator({
       // Audit M3 — bound the retrieval wait. The paraphrase bought a
       // beat; spending it on an unbounded retrieve = dead air.
       let envelopeText = null;
+      let retrieveTimedOut = false;
       if (!t.deepAbort.signal.aborted) {
         let timer;
         const ceiling = new Promise((res) => {
@@ -614,6 +631,7 @@ export function makeDecoupledOrchestrator({
         catch { raced = null; }
         finally { clearTimeout(timer); }
         if (raced === '__retrieve_timeout__') {
+          retrieveTimedOut = true;
           t.degraded.push('retrieve:timeout');
           session.degraded.push('r:timeout');
           envelopeText = null; // persona-only, deep answer starts NOW
@@ -623,11 +641,37 @@ export function makeDecoupledOrchestrator({
           // billing tail stops the instant we stop waiting.
           try { t.retrieveAbort.abort(); } catch {}
         } else {
+          // `retrieve` contract is string-envelope | null (decoupled-orchestrator
+          // header :120; honored by retrieveEnvelopeForDecoupled). A clean-empty
+          // result is exactly null → off-domain; a real envelope is a salted
+          // string → grounded. No truthy-non-envelope value reaches here.
           envelopeText = raced || null;
         }
       }
       retrieveDoneMs = now() - tcStart;
       if (t.deepAbort.signal.aborted || fatal) return; // barged/fatal pre-stream
+
+      // P0-3 — classify WHY the envelope is empty so the persona-only deep answer
+      // can hedge correctly (off-domain) vs. ask for an example (retrieval
+      // failure), instead of fabricating confidently. Strict precedence (audit
+      // M4): grounded → retrieval_failed → off_domain → none.
+      // min_sim CALIBRATED 2026-06-01 (aod sweep): the floor has no recall effect
+      // in [0,0.3] and off-topic returns empty at floor 0, so a clean-empty result
+      // IS trustworthy as "off his domain". V3_OFF_DOMAIN_HEDGE_ENABLED still
+      // defaults OFF (off_domain → the "give me an example" copy) — a deliberate
+      // choice, left off pending the live human "is it him" voice test, not a
+      // wait-on-data hold. Flip to '1' to enable the "outside my experience" hedge.
+      const offDomainHedgeEnabled = process.env.V3_OFF_DOMAIN_HEDGE_ENABLED === '1';
+      let groundingState;
+      if (envelopeText) {
+        groundingState = 'grounded';
+      } else if (retrieveTimedOut || t.retrieveFailed) {
+        groundingState = 'retrieval_failed';
+      } else if (t.retrievalAttempted) {
+        groundingState = offDomainHedgeEnabled ? 'off_domain' : 'retrieval_failed';
+      } else {
+        groundingState = 'none';
+      }
 
       const gen = generateDeepAnswer({
         persona,
@@ -643,7 +687,16 @@ export function makeDecoupledOrchestrator({
         // we only half-heard it, so a short exploratory persona-only reply beats
         // a confident 450-word monologue answering a fragment.
         tier,
-        forceBrief: t.isTrivial || t.truncationSuspected,
+        // P0-3 — keep an ungrounded turn short AND honest. forceBrief covers the
+        // trivial/truncated floors AND the off-domain / retrieval-failed cases so
+        // a hedge/clarifier stays 1-3 sentences, not a confident monologue.
+        forceBrief:
+          t.isTrivial || t.truncationSuspected ||
+          groundingState === 'off_domain' || groundingState === 'retrieval_failed',
+        // P0-3 — tells brain-bridge which persona-only hedge clause to append
+        // (off_domain → "outside my experience"; retrieval_failed → "give me an
+        // example"). 'grounded'/'none' add nothing.
+        groundingState,
         // B2 — dialogue continuity. `lastCompleted` is the PRIOR substantive
         // turn here (t isn't assigned to it until this turn finishes). Only the
         // prior ANSWER is threaded (audit C1/C3 — never the raw prior STT, never

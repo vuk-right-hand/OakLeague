@@ -152,12 +152,20 @@ const MIN_REMAINING_MS = 500;
 // to give the request a hard byte ceiling for predictable latency.
 const MAX_DOCUMENT_CHARS = 3500;
 // Maximum number of candidates we forward to rerank. Day-10 audit S2:
-// tightened from 50 (dead defense) to 25 — matches TOKEN_BUCKET_CAPACITY
-// symmetry. Day-8 RPC `creator_knowledge_topk_v2` returns at most
-// p_k_parent (default 20) parents, so 25 leaves margin for a future
-// p_k_parent bump without forcing a code change. Voyage's hard cap is
-// 1000 docs; we are nowhere near it.
-const MAX_CANDIDATES = 25;
+// tightened from 50 (dead defense) to 25 — sized for v2 where
+// `creator_knowledge_topk_v2` returns at most p_k_parent (default 20) parents.
+// v3 (Step-9 audit C4) raised the ceiling: `creator_knowledge_topk_v3` can
+// return DEFAULT_V3_TOP_S (6) × DEFAULT_V3_N_PARENT_PER_SECTION (5) = 30
+// parents, ordered by parent_score DESC. Slicing to 25 BEFORE rerank dropped
+// the 5 lowest-parent_score parents — but parent_score (MAX-RRF/blend) is the
+// weak first-stage proxy that rerank exists to CORRECT (plan §0.0b): a parent
+// ranked #26-30 by RRF can be #1 by Voyage cross-encoder and was never seen.
+// 30 = the frozen v3 fan-out, still a SINGLE Voyage call (hard cap 1000 docs)
+// so the token-bucket math is unchanged. Exported so retrieve-knowledge.ts can
+// boot-assert it equals DEFAULT_V3_TOP_S × DEFAULT_V3_N_PARENT_PER_SECTION
+// (Step-9 audit S4) — a fan-out bump that forgets this cap then fails LOUD at
+// module load instead of silently dropping the best-by-rerank parents.
+export const MAX_CANDIDATES = 30;
 
 // API endpoint. Voyage's rerank endpoint URL, verified 2026-05-13.
 const VOYAGE_RERANK_URL = 'https://api.voyageai.com/v1/rerank';

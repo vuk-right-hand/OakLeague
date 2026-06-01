@@ -62,7 +62,9 @@ import { z } from 'zod';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import {
   retrieveKnowledgeV2,
+  retrieveKnowledgeV3,
   RetrieveKnowledgeV2Error,
+  RetrieveKnowledgeV3Error,
 } from '@/lib/voice/retrieve-knowledge';
 import { toPostHogEventBatch } from '@/lib/voice/rag-telemetry';
 import { verifyRequest, INTERNAL_SECRET_MIN_LENGTH } from '@/lib/voice/internal-request-signature';
@@ -90,6 +92,16 @@ const RequestSchema = z.object({
   // 8s violates the Vercel function maxDuration headroom.
   budget_ms: z.number().int().positive(),
   top_k: z.number().int().min(1).max(20).optional(),
+  // ── v3-only OPTIONAL fields (RAG v3 step 6c, plan §5). ──────────────
+  // Honored only when sessions.retrieval_version_at_session=3. Sending
+  // them on a v2 session is silently ignored (no schema error — v2
+  // orchestrator just doesn't read them).
+  topic_tags: z.array(z.string().min(1).max(64)).max(10).optional(),
+  rank_mode: z.enum(['max', 'max_blend', 'vec_max', 'best_child']).optional(),
+  lambda: z.number().min(0).max(10).optional(),
+  top_s: z.number().int().min(1).max(10).optional(),
+  n_parent_per_section: z.number().int().min(1).max(20).optional(),
+  min_sim: z.number().min(0).max(1).optional(),
 });
 
 const BUDGET_MS_MIN = 1000;
@@ -195,7 +207,28 @@ export async function POST(req: NextRequest) {
   else if (sess.user_id !== parsed.data.user_id) denyReason = 'session_user_mismatch';
   else if (sess.creator_id !== parsed.data.creator_id) denyReason = 'session_creator_mismatch';
   else if (sess.ended_at !== null) denyReason = 'session_ended';
-  else if (sess.retrieval_version_at_session !== 2) denyReason = 'wrong_retrieval_version';
+  // v3 step 6c: accept v=2 OR v=3 sessions (route dispatches below).
+  // v=1 sessions still use the in-proc retrieveTopK on the proxy side.
+  else if (
+    sess.retrieval_version_at_session !== 2 && sess.retrieval_version_at_session !== 3
+  ) denyReason = 'wrong_retrieval_version';
+  // Round-5 M6: reject v3-only args on a v2 session. A harness misconfig
+  // or copy-pasted v3 body hitting a v2 session would otherwise parse
+  // clean + dispatch to v2 + silently drop the v3 args. The caller
+  // believes ranking is `vec_max` but gets v2 SUM-RRF.
+  else if (
+    sess.retrieval_version_at_session === 2
+    && (
+      parsed.data.topic_tags !== undefined
+      || parsed.data.rank_mode !== undefined
+      || parsed.data.lambda !== undefined
+      || parsed.data.top_s !== undefined
+      || parsed.data.n_parent_per_section !== undefined
+      || parsed.data.min_sim !== undefined
+    )
+  ) {
+    denyReason = 'v3_args_on_v2_session';
+  }
   if (denyReason !== null) {
     console.warn('[retrieve-knowledge]', requestId, `forbidden: ${denyReason}`);
     return jsonError('forbidden', 403, requestId, { retryable: false });
@@ -233,7 +266,60 @@ export async function POST(req: NextRequest) {
     (sess && sess.corpus_version_at_session) ?? 1,
   );
 
+  // v3 step 6c: dispatch v2 vs v3 based on the session's snapshot, NOT
+  // the body's claim. The session's retrieval_version_at_session was
+  // captured at session-open via FOR SHARE and is the source of truth.
+  const sessRetrievalVersion = Number(
+    (sess && sess.retrieval_version_at_session) ?? 2,
+  );
+
   try {
+    if (sessRetrievalVersion === 3) {
+      const result = await retrieveKnowledgeV3({
+        supabaseAdmin: admin,
+        userId: parsed.data.user_id,
+        creatorId: parsed.data.creator_id,
+        sessionId: parsed.data.session_id,
+        rawUtterance: parsed.data.raw_utterance,
+        lastAssistantResponse: parsed.data.last_assistant_response,
+        corpusVersionAtSession: snapshotCorpusVersion,
+        deadlineMs,
+        geminiApiKey,
+        voyageApiKey,
+        topK: parsed.data.top_k,
+        topicTags: parsed.data.topic_tags ?? null,
+        rankMode: parsed.data.rank_mode,
+        lambda: parsed.data.lambda,
+        topS: parsed.data.top_s,
+        nParentPerSection: parsed.data.n_parent_per_section,
+        minSim: parsed.data.min_sim,
+      });
+      const posthogEventsV3 = toPostHogEventBatch(result.telemetry);
+      return NextResponse.json(
+        {
+          parents: result.parents.map((p) => ({
+            parent_unit_id: p.parentUnitId,
+            text: p.text,
+            title: p.title,
+            source_type: p.sourceType,
+            score: p.score,
+            score_source: p.scoreSource,
+          })),
+          telemetry: result.telemetry,
+          budget_exceeded: result.budgetExceeded,
+          rewrite_fallback: result.rewriteFallback,
+          // v3-only response fields. Proxy reads these for telemetry +
+          // grafana cards; absent on v2 responses so consumers gate on
+          // their presence.
+          sections_routed: result.sectionsRouted,
+          flat_fallback_fired: result.flatFallbackFired,
+          posthog_events: posthogEventsV3,
+          request_id: requestId,
+        },
+        { status: 200, headers: { 'cache-control': 'no-store' } },
+      );
+    }
+
     const result = await retrieveKnowledgeV2({
       supabaseAdmin: admin,
       userId: parsed.data.user_id,
@@ -276,6 +362,48 @@ export async function POST(req: NextRequest) {
       { status: 200, headers: { 'cache-control': 'no-store' } },
     );
   } catch (e) {
+    if (e instanceof RetrieveKnowledgeV3Error) {
+      // v3 errors mirror v2's HTTP mapping.
+      const isDeadlineV3 = /deadline_exceeded/i.test(e.message);
+      if (e.code === 'empty_utterance' || e.code === 'invalid_corpus_version') {
+        return jsonError(e.code, 400, requestId, {
+          retryable: false,
+          message: e.message,
+        });
+      }
+      if (isDeadlineV3) {
+        return jsonError(e.code, 504, requestId, {
+          retryable: false,
+          message: e.message,
+        });
+      }
+      // Round-5 M5: detect 42883 (undefined function) inside rpc_failed
+      // -> Sentry FATAL. Catches "v3 migrations didn't land on this Vercel
+      // deploy" silently degrading to persona-only-with-no-signal.
+      // PG error message format: 'route_sections_v3: <pgerr msg>'. The
+      // pgerr msg for missing function contains 'does not exist' AND the
+      // SQLSTATE attribute lives on the wrapped Error from supabase-js.
+      const looksLikeMissingFn =
+        e.code === 'rpc_failed' && /does not exist|function.*does not exist|undefined_function/i.test(e.message);
+      if (looksLikeMissingFn) {
+        Sentry.captureException(e, {
+          level: 'fatal',
+          tags: { request_id: requestId, stage: 'v3_function_missing', code: e.code },
+        });
+        return jsonError('v3_function_missing', 500, requestId, {
+          retryable: false,
+          message: e.message,
+        });
+      }
+      Sentry.captureException(e, {
+        level: 'warning',
+        tags: { request_id: requestId, stage: 'orchestrator_v3', code: e.code },
+      });
+      return jsonError(e.code, 500, requestId, {
+        retryable: false,
+        message: e.message,
+      });
+    }
     if (e instanceof RetrieveKnowledgeV2Error) {
       // Map orchestrator's taxonomy to HTTP. 504 for deadline_exceeded
       // (rare but possible if budget_ms was too tight); 400 for empty

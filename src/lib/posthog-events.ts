@@ -42,6 +42,10 @@ export const AvatarHealthEvents = {
 export const UxEvents = {
   user_perceived_response_ms: 'user_perceived_response_ms',
   daily_cap_hit:              'daily_cap_hit',
+  // P0-1 — a turn sat in 'thinking' past TURN_DEAD_MS with no audio and no
+  // turn_complete; the client routed it into 'reconnecting' (likely a silently
+  // dead WS, e.g. iOS background). A rising count = real dead-turn incidents.
+  turn_dead_watchdog:         'turn_dead_watchdog',
 } as const;
 
 // Feed / funnel surface (hook impressions, quartiles, ask-click, welcome) ---

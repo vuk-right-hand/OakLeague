@@ -96,6 +96,54 @@ describe('session-reducer — turn lifecycle', () => {
   });
 });
 
+describe('session-reducer — thinking state (P0-1)', () => {
+  function thinking(): SessionState {
+    let s = boot();
+    s = reduce(s, { kind: 'brain_ready' });
+    s = reduce(s, { kind: 'avatar_ready' });
+    s = reduce(s, { kind: 'mic_started' });   // listening
+    s = reduce(s, { kind: 'mic_stopped' });   // → thinking
+    return s;
+  }
+
+  it('mic_stopped: listening → thinking (not ready)', () => {
+    const s = thinking();
+    expect(s.phase).toBe('thinking');
+  });
+
+  it('tts_audio_chunk: thinking → speaking', () => {
+    const s = reduce(thinking(), { kind: 'tts_audio_chunk' });
+    expect(s.phase).toBe('speaking');
+  });
+
+  it('turn_complete: thinking → ready (a turn that produced no audio never strands)', () => {
+    const s = reduce(thinking(), { kind: 'turn_complete' });
+    expect(s.phase).toBe('ready');
+  });
+
+  it('mic_started from thinking is a no-op (mic disabled — not a barge source)', () => {
+    const t = thinking();
+    const s = reduce(t, { kind: 'mic_started' });
+    expect(s).toBe(t); // unchanged reference
+    expect(s.phase).toBe('thinking');
+  });
+
+  it('thinking survives a stray barge_in / cartesia_reconnecting without phase change', () => {
+    let s = reduce(thinking(), { kind: 'barge_in' });
+    expect(s.phase).toBe('thinking');
+    s = reduce(s, { kind: 'cartesia_reconnecting' });
+    expect(s.phase).toBe('thinking');
+    expect(s.cartesiaReconnecting).toBe(true);
+  });
+
+  it('thinking → paused on visibility_hidden, then paused → ready on visibility_visible (NOT back to thinking)', () => {
+    let s = reduce(thinking(), { kind: 'visibility_hidden' });
+    expect(s.phase).toBe('paused');
+    s = reduce(s, { kind: 'visibility_visible' });
+    expect(s.phase).toBe('ready');
+  });
+});
+
 describe('session-reducer — visibility', () => {
   function ready(): SessionState {
     let s = boot();
@@ -232,7 +280,7 @@ describe('session-reducer — close', () => {
 });
 
 describe('session-reducer — invariants', () => {
-  it('isPipeWarm holds for ready/listening/speaking/paused, false for opening/reconnecting/closed', () => {
+  it('isPipeWarm holds for ready/listening/thinking/speaking/paused, false for opening/reconnecting/closed', () => {
     let s = boot();
     expect(isPipeWarm(s)).toBe(false); // opening
     s = reduce(s, { kind: 'brain_ready' });
@@ -240,6 +288,9 @@ describe('session-reducer — invariants', () => {
     expect(isPipeWarm(s)).toBe(true); // ready
     s = reduce(s, { kind: 'mic_started' });
     expect(isPipeWarm(s)).toBe(true); // listening
+    s = reduce(s, { kind: 'mic_stopped' });
+    expect(s.phase).toBe('thinking');
+    expect(isPipeWarm(s)).toBe(true); // thinking (P0-1)
     s = reduce(s, { kind: 'tts_audio_chunk' });
     expect(isPipeWarm(s)).toBe(true); // speaking
     s = reduce(s, { kind: 'pc_degraded' });

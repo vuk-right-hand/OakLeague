@@ -188,11 +188,16 @@ BEGIN
       FROM public.admin_audit_log
      WHERE target_id = v_creator3 AND action = 'creator_retrieval_version_set'
      ORDER BY created_at DESC LIMIT 1;
+    -- Round-5 M3 (Step 6a audit): cleanup-count keys are only present on
+    -- v2->v1 transitions. A 1->2 upgrade audit row carries ONLY
+    -- {retrieval_version: 2} -- the dashboard query
+    -- `WHERE after ? 'v2_chunks_deleted'` now cleanly filters to
+    -- cleanup-bearing flips instead of every flip.
     RETURN NEXT ok(
       (v_audit_after->>'retrieval_version')::int = 2
-        AND (v_audit_after->>'v2_chunks_deleted')::int = 0
-        AND (v_audit_after->>'v2_narrative_units_deleted')::int = 0,
-      '6: 1→2 upgrade reports zero deletes in audit log'
+        AND NOT (v_audit_after ? 'v2_chunks_deleted')
+        AND NOT (v_audit_after ? 'v2_narrative_units_deleted'),
+      '6: 1->2 upgrade omits cleanup keys from audit (round-5 M3 -- post-step-6a)'
     );
   END;
 END;

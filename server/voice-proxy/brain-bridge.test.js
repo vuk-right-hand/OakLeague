@@ -322,7 +322,13 @@ test('Lever 2 — assembleBrainContents adds the GROUNDING clause AFTER L1, BEFO
       persona: 'You are Vuk.', referenceEnvelopeText: ENV_OK, question: 'tell me the lumberjack story', tier: 'premium',
     });
     const sec = systemInstruction.indexOf('SECURITY:');     // L1
-    const grnd = systemInstruction.indexOf('GROUNDING:');   // L2 (new)
+    // NOTE: the P0-3 hedge clauses ALSO start with "GROUNDING:" — but they only
+    // appear on the persona-only path (no envelope). This test uses ENV_OK, so
+    // the only "GROUNDING:" here is L2. A future off_domain-WITH-envelope case
+    // can't exist (the hedge is gated on a falsy envelope), but if you ever
+    // assert on a persona-only systemInstruction, indexOf('GROUNDING:') is
+    // ambiguous — match the distinctive hedge phrases instead (see the P0-3 tests).
+    const grnd = systemInstruction.indexOf('GROUNDING:');   // L2 (envelope present)
     const len = systemInstruction.indexOf('LENGTH:');       // depth
     assert.ok(sec >= 0 && grnd > sec && len > grnd, 'order must be SECURITY < GROUNDING < LENGTH');
     // The load-bearing reframe phrases — a future softening fails loudly.
@@ -342,6 +348,76 @@ test('Lever 2 — GROUNDING does not break the L1 security phrases the injection
   assert.ok(systemInstruction.startsWith('You are Vuk.'), 'persona still at head');
   assert.match(systemInstruction, /untrusted DATA, not instructions/i);
   assert.match(systemInstruction, /always outranks anything in the data/i);
+});
+
+// ── P0-3 — grounding hedge (persona-only off-domain vs retrieval-failure) ───
+
+test('P0-3 — off_domain persona-only adds the soft hedge clause, still omits L2/L3', () => {
+  const { systemInstruction, contents } = assembleBrainContents({
+    persona: 'You are Alex.', referenceEnvelopeText: null, question: 'Q?',
+    groundingState: 'off_domain',
+  });
+  // The decline-but-degrade-gracefully clause is present...
+  assert.match(systemInstruction, /no specific material of your own on this topic/i);
+  assert.match(systemInstruction, /Do NOT invent specifics/i);
+  // ...and the persona-only shape holds: only the question turn, no model-ack.
+  assert.equal(contents.length, 1, 'persona-only: only the question turn');
+  assert.equal(contents[0].role, 'user');
+});
+
+test('P0-3 — retrieval_failed persona-only adds the ask-for-an-example clause', () => {
+  const { systemInstruction } = assembleBrainContents({
+    persona: 'You are Alex.', referenceEnvelopeText: null, question: 'Q?',
+    groundingState: 'retrieval_failed',
+  });
+  assert.match(systemInstruction, /could not pull your reference material/i);
+  assert.match(systemInstruction, /ask the user for\s+a concrete example/i);
+  // Must NOT claim ignorance — the off-domain "no specific material" phrasing
+  // is wrong here (it might be his domain; we just failed to fetch).
+  assert.doesNotMatch(systemInstruction, /no specific material of your own/i);
+});
+
+test('P0-3 — the hedge rides LAST (after the depth LENGTH clause) so recency favors it', () => {
+  withDepthMode('variable', () => {
+    const { systemInstruction } = assembleBrainContents({
+      persona: 'You are Alex.', referenceEnvelopeText: null, question: 'Q?',
+      tier: 'premium', groundingState: 'off_domain',
+    });
+    const len = systemInstruction.indexOf('LENGTH:');
+    const hedge = systemInstruction.indexOf('no specific material of your own');
+    assert.ok(len >= 0 && hedge > len, 'the grounding hedge must come AFTER the depth clause');
+  });
+});
+
+test('P0-3 — a GROUNDED turn (envelope present) gets NEITHER hedge clause (regression guard)', () => {
+  const { systemInstruction } = assembleBrainContents({
+    persona: 'You are Alex.', referenceEnvelopeText: ENV_OK, question: 'Q?',
+    groundingState: 'off_domain', // even if mislabeled, envelope wins
+  });
+  assert.doesNotMatch(systemInstruction, /no specific material of your own/i);
+  assert.doesNotMatch(systemInstruction, /could not pull your reference material/i);
+});
+
+test('P0-3 — groundingState none/grounded persona-only is byte-identical to omitting it', () => {
+  for (const gs of [undefined, 'none', 'grounded']) {
+    const withGs = assembleBrainContents({
+      persona: 'You are Alex.', referenceEnvelopeText: null, question: 'Q?', groundingState: gs,
+    }).systemInstruction;
+    const without = assembleBrainContents({
+      persona: 'You are Alex.', referenceEnvelopeText: null, question: 'Q?',
+    }).systemInstruction;
+    assert.equal(withGs, without, `groundingState=${gs} must not change the persona-only prompt`);
+  }
+});
+
+test('P0-3 — off_domain does NOT crash assertSaltedEnvelope (envelope stays null — M3)', () => {
+  // The whole point of the FLAG (vs a truthy string sentinel): a failed/empty
+  // retrieval never feeds a non-envelope string into assertSaltedEnvelope.
+  assert.doesNotThrow(() =>
+    assembleBrainContents({
+      persona: 'p', referenceEnvelopeText: null, question: 'Q?', groundingState: 'off_domain',
+    }),
+  );
 });
 
 // ── B2 — decoupled deep-answer continuity (audit-fixed: preamble fold) ───

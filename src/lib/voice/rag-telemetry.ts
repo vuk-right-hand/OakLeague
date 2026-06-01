@@ -79,6 +79,45 @@ export type RetrieveLeg = {
   /** Highest RRF score after fusion. NULL when no rows. */
   rrfTop1Score: number | null;
   latencyMs: number;
+  // v3-only fields (NULL on v1/v2 paths). Plan §5 retrieval telemetry contract.
+  /** Highest v3 parent_score (per-rank-mode aggregation). NULL on v1/v2 + when no rows. */
+  parentScoreTop1?: number | null;
+  /** v3 p_rank_mode used. NULL on v1/v2 paths. */
+  parentRankSource?: 'max' | 'max_blend' | 'vec_max' | 'best_child' | null;
+  /** v3 count of candidates that came from the SCOPED pass (vs flat-fallback union). */
+  candidatesFromScope?: number;
+};
+
+// v3-only: routing step (sections), runs BEFORE retrieve. Plan §4 item 5.
+//
+// Audit round-5 M1: split latencies. `latencyMs` is the ROUTE RPC alone
+// (not route+tsquery+topk). `scopedTopkLatencyMs` is the scoped topk_v3
+// alone. `flatLatencyMs` is the flat-fallback section-fetch + second
+// topk_v3 alone (NULL when fallback didn't fire). Together with
+// rerank.latencyMs they decompose every v3 turn's hot path.
+export type RouteLeg = {
+  /** Number of section rows returned by _creator_route_sections_v3. */
+  sectionsReturned: number;
+  /** Top-1 section score (cosine max + soft topic boost). NULL when no rows. */
+  sectionTop1Score: number | null;
+  /** Gap between top-1 and top-2 section scores. NULL on <2 rows. Used by adaptive flat-fallback trigger. */
+  sectionTop1to2Gap: number | null;
+  /** True when the flat (unscoped) fallback was unioned with the scoped pass. */
+  flatFallbackFired: boolean;
+  /**
+   * True when the flat fallback hit the FLAT_FALLBACK_MAX_SECTIONS cap (Step-9
+   * audit M3): the creator has MORE active sections than the cap, so the flat
+   * pass considered only the first N by section_index and may silently
+   * under-recall later content. A loud signal that the cap (+ topk fan-out)
+   * needs raising for a large-corpus creator. NULL when the fallback didn't run.
+   */
+  flatFallbackCapped?: boolean | null;
+  /** Time spent in `_creator_route_sections_v3` alone. */
+  latencyMs: number;
+  /** Time spent in the SCOPED `_creator_knowledge_topk_v3` alone. NULL when not run. */
+  scopedTopkLatencyMs?: number | null;
+  /** Time spent in the FLAT-fallback section fetch + second topk. NULL when not run. */
+  flatLatencyMs?: number | null;
 };
 
 export type RerankLeg = {
@@ -111,7 +150,7 @@ export type RagTurnTelemetry = {
   userId: string;
   sessionId: string | null;
   creatorId: string;
-  retrievalVersion: 1 | 2;
+  retrievalVersion: 1 | 2 | 3;
   corpusVersionAtSession: number;
 
   // Cache result (set by the orchestrator BEFORE any other leg).
@@ -122,6 +161,8 @@ export type RagTurnTelemetry = {
   // Per-leg shapes. NULL when the leg didn't run.
   rewrite: RewriteLeg | null;
   embed: EmbedLeg | null;
+  // v3-only routing step (NULL on v1/v2 paths).
+  route: RouteLeg | null;
   retrieve: RetrieveLeg | null;
   rerank: RerankLeg | null;
   envelope: EnvelopeLeg | null;
@@ -136,7 +177,7 @@ export function newTurnTelemetry(args: {
   userId: string;
   sessionId: string | null;
   creatorId: string;
-  retrievalVersion: 1 | 2;
+  retrievalVersion: 1 | 2 | 3;
   corpusVersionAtSession: number;
 }): RagTurnTelemetry {
   return {
@@ -150,6 +191,7 @@ export function newTurnTelemetry(args: {
     cacheAgeSeconds: null,
     rewrite: null,
     embed: null,
+    route: null,
     retrieve: null,
     rerank: null,
     envelope: null,
@@ -512,6 +554,39 @@ export function toPostHogEventBatch(t: RagTurnTelemetry): PostHogEvent[] {
         passage_count: t.envelope.passageCount,
       },
     });
+  }
+
+  // v3 routing events (audit round-5 M2). Without these the §7 harness
+  // can't compute routing recall@k from PostHog — only from raw cogs_log
+  // metadata, which doesn't carry the route leg's signals.
+  if (t.retrievalVersion === 3 && t.route) {
+    events.push({
+      name: 'rag_v3_route_executed',
+      properties: {
+        ...base,
+        sections_returned: t.route.sectionsReturned,
+        section_top1_score: t.route.sectionTop1Score,
+        section_top1_to_2_gap: t.route.sectionTop1to2Gap,
+        flat_fallback_fired: t.route.flatFallbackFired,
+        flat_fallback_capped: t.route.flatFallbackCapped ?? null,
+        route_latency_ms: t.route.latencyMs,
+        scoped_topk_latency_ms: t.route.scopedTopkLatencyMs ?? null,
+        flat_latency_ms: t.route.flatLatencyMs ?? null,
+        parent_rank_source: t.retrieve?.parentRankSource ?? null,
+        parent_score_top1: t.retrieve?.parentScoreTop1 ?? null,
+        candidates_from_scope: t.retrieve?.candidatesFromScope ?? null,
+      },
+    });
+    if (t.route.flatFallbackFired) {
+      events.push({
+        name: 'rag_v3_flat_fallback_fired',
+        properties: {
+          ...base,
+          sections_returned: t.route.sectionsReturned,
+          flat_latency_ms: t.route.flatLatencyMs ?? null,
+        },
+      });
+    }
   }
 
   return events;

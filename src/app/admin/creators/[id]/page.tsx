@@ -9,6 +9,7 @@ import { CorpusComparePanel } from './corpus-compare-panel';
 import { TtsProviderPanel } from './tts-provider-panel';
 import { PublishPanel } from './publish-panel';
 import { ConsentPanel } from './consent-panel';
+import { LegacyLifecyclePanel } from './legacy-lifecycle-panel';
 
 export const dynamic = 'force-dynamic';
 
@@ -35,9 +36,12 @@ type Creator = {
   // Brain wire-up PR-3.
   system_prompt: string | null;
   brain_compiled_at: string | null;
-  // RAG SOTA Day-6: retrieval_version (1=legacy, 2=v2 hybrid). Defaults to 1
-  // for every creator until admin flips it post-corpus-reprocess.
+  // RAG SOTA Day-6: retrieval_version (1=legacy, 2=v2 hybrid, 3=v3 routed).
+  // Defaults to 1 for every creator until admin flips it post-corpus-reprocess.
   retrieval_version: number;
+  // Step-9 M5: stamped by admin_purge_legacy_chunks. Non-NULL ⇒ legacy v1/v2
+  // corpus deleted ⇒ rollback off v3 is refused. Drives the lifecycle panel.
+  legacy_purged_at: string | null;
   // pgvector RAG (M2). 'drawer' | 'vector'. Drives whether the publish
   // readiness gate requires embedded v2 chunks (only for vector + v2).
   brain_mode: 'drawer' | 'vector';
@@ -115,7 +119,7 @@ export default async function AdminCreatorDetail({
       .select(`
         id, user_id, handle, display_name, creator_type, brain_status, voice_id,
         simli_face_id, published_at, created_at, updated_at, application_id,
-        bio, system_prompt, brain_compiled_at, retrieval_version, brain_mode,
+        bio, system_prompt, brain_compiled_at, retrieval_version, legacy_purged_at, brain_mode,
         tts_provider,
         hume_voice_id, hume_voice_id_preview, hume_voice_id_dev,
         hume_voice_name, hume_voice_name_preview, hume_voice_name_dev,
@@ -347,6 +351,19 @@ export default async function AdminCreatorDetail({
           </span>
         </h2>
         <CorpusReprocessPanel creatorId={creator.id} />
+      </section>
+
+      <section style={{ marginBottom: 32 }}>
+        <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>
+          v3 soft-cutover lifecycle
+          <span style={{ opacity: 0.5, fontSize: 13, fontWeight: 400 }}>
+            {' '}— purge dormant v1/v2 after a v3 soak · GC old v3 generations
+          </span>
+        </h2>
+        <LegacyLifecyclePanel
+          creatorId={creator.id}
+          initialLegacyPurgedAt={creator.legacy_purged_at}
+        />
       </section>
 
       <section style={{ marginBottom: 32 }}>

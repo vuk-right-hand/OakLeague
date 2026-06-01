@@ -155,6 +155,12 @@ BEGIN
   -- Setup: row at status='processing', enqueue_version=1. Pin enqueue_version=1
   -- explicitly — test 7's reap bumped it 1→2 (Day-5 C5 fencing), so without
   -- this reset the "matching version" call would mismatch the post-reap value.
+  --
+  -- NOTE (migration 20260528000001, RAG v3 step 1b): mark_done now ALSO bumps
+  -- creators.current_corpus_version and DELETEs chunker_version=1 chunks for
+  -- v_sample. Tests 10/11 don't assert on those, but future extensions of
+  -- this file MUST account for the side effect (e.g. "why is the version 2?
+  -- I didn't seed any v2 work" — answer: test 10 already ran mark_done).
   UPDATE public.corpus_reprocess_jobs
      SET status = 'processing',
          claimed_by = 'fly-test-host',
