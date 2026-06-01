@@ -55,6 +55,7 @@ COPY index.js \
      posthog-client.js \
      proxy-handlers.js \
      quota-gate.js \
+     retrieval-path.js \
      retrieve-knowledge-v2-client.js \
      retrieve-knowledge.js \
      sentry.js \
