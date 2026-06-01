@@ -119,17 +119,19 @@ BEGIN
      pg_temp.unit_vec(5), pg_temp.unit_vec(6))
   RETURNING id INTO v_sec3;
 
-  -- 1: privileges.
+  -- 1: privileges. SECURITY HOTFIX (audit C1, mig 20260601000001): this SECURITY
+  -- DEFINER fn trusts a caller-supplied creator_id, so authenticated MUST be
+  -- DENIED (was a cross-tenant corpus-exfil hole). service_role ONLY.
   RETURN NEXT ok(
     NOT has_function_privilege('public',
         'public._creator_knowledge_topk_v3(uuid, uuid[], halfvec, tsquery, int, int, float, text, float)', 'EXECUTE')
     AND NOT has_function_privilege('anon'::regrole,
         'public._creator_knowledge_topk_v3(uuid, uuid[], halfvec, tsquery, int, int, float, text, float)', 'EXECUTE')
-    AND has_function_privilege('authenticated'::regrole,
+    AND NOT has_function_privilege('authenticated'::regrole,
         'public._creator_knowledge_topk_v3(uuid, uuid[], halfvec, tsquery, int, int, float, text, float)', 'EXECUTE')
     AND has_function_privilege('service_role'::regrole,
         'public._creator_knowledge_topk_v3(uuid, uuid[], halfvec, tsquery, int, int, float, text, float)', 'EXECUTE'),
-    '1: service_role + authenticated EXECUTE; public/anon denied'
+    '1: service_role ONLY EXECUTE; public/anon/authenticated denied (audit C1)'
   );
 
   -- 2: unknown rank_mode → RAISE.

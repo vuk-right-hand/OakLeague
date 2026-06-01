@@ -62,17 +62,19 @@ BEGIN
   INSERT INTO public.creator_topics (creator_id, slug, title, sort_order)
     VALUES (v_creator, 'topic-a', 'Topic A', 0);
 
-  -- 1: privileges.
+  -- 1: privileges. SECURITY HOTFIX (audit H1, mig 20260601000001): authenticated
+  -- DENIED — leaked per-creator readiness for arbitrary creator_id. Only called
+  -- in-DB (by admin_set_creator_retrieval_version) + via service-role. service_role ONLY.
   RETURN NEXT ok(
     NOT has_function_privilege('public',
         'public.creator_v3_ready(uuid)', 'EXECUTE')
     AND NOT has_function_privilege('anon'::regrole,
         'public.creator_v3_ready(uuid)', 'EXECUTE')
-    AND has_function_privilege('authenticated'::regrole,
+    AND NOT has_function_privilege('authenticated'::regrole,
         'public.creator_v3_ready(uuid)', 'EXECUTE')
     AND has_function_privilege('service_role'::regrole,
         'public.creator_v3_ready(uuid)', 'EXECUTE'),
-    '1: service_role + authenticated EXECUTE; public/anon denied'
+    '1: service_role ONLY EXECUTE; public/anon/authenticated denied (audit H1)'
   );
 
   -- 2: zero samples → FALSE.

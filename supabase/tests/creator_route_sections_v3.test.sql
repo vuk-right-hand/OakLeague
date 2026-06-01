@@ -78,15 +78,16 @@ BEGIN
             'body', ARRAY['topic-a','topic-b'], 'ready')
     RETURNING id INTO v_sample;
 
-  -- 1: privileges.
+  -- 1: privileges. SECURITY HOTFIX (audit C1, mig 20260601000001): authenticated
+  -- DENIED — SECURITY DEFINER + trusts caller creator_id. service_role ONLY.
   RETURN NEXT ok(
     NOT has_function_privilege('anon'::regrole,
         'public._creator_route_sections_v3(uuid, halfvec, text[], int, float, float)', 'EXECUTE')
-    AND has_function_privilege('authenticated'::regrole,
+    AND NOT has_function_privilege('authenticated'::regrole,
         'public._creator_route_sections_v3(uuid, halfvec, text[], int, float, float)', 'EXECUTE')
     AND has_function_privilege('service_role'::regrole,
         'public._creator_route_sections_v3(uuid, halfvec, text[], int, float, float)', 'EXECUTE'),
-    '1: service_role + authenticated EXECUTE; anon denied'
+    '1: service_role ONLY EXECUTE; anon/authenticated denied (audit C1)'
   );
 
   -- 2: zero sections → zero rows.
