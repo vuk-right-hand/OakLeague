@@ -2,14 +2,14 @@
 /**
  * One-shot admin RPC caller for retrieval_version flip — Day-14 dogfood gate.
  *
- * Calls admin_set_creator_retrieval_version(p_creator_id, 1|2) against PROD
+ * Calls admin_set_creator_retrieval_version(p_creator_id, 1|2|3) against PROD
  * as an admin user so the RPC's `_assert_caller_is_admin` check passes.
- * Same magic-link → verifyOtp → bearer-auth pattern as
- * one-shot-flip-creator-decoupled.mjs.
+ * (v3 flip is gated server-side on creator_v3_ready.) Same magic-link →
+ * verifyOtp → bearer-auth pattern as one-shot-flip-creator-decoupled.mjs.
  *
  * Usage:
  *   node --env-file=.env.local scripts/one-shot-flip-creator-retrieval-version.mjs \
- *     --admin <email> --creator <uuid> --version <1|2>
+ *     --admin <email> --creator <uuid> --version <1|2|3>
  */
 
 import { createClient } from '@supabase/supabase-js';
@@ -32,8 +32,8 @@ if (!SUPABASE_URL || !SERVICE_KEY || !ANON_KEY) {
   console.error('SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY + NEXT_PUBLIC_SUPABASE_ANON_KEY required in env');
   process.exit(2);
 }
-if (!ADMIN_EMAIL || !CREATOR_ID || ![1, 2].includes(VERSION)) {
-  console.error('Required: --admin <email> --creator <uuid> --version <1|2>');
+if (!ADMIN_EMAIL || !CREATOR_ID || ![1, 2, 3].includes(VERSION)) {
+  console.error('Required: --admin <email> --creator <uuid> --version <1|2|3>');
   process.exit(2);
 }
 if (!/^[0-9a-f-]{36}$/i.test(CREATOR_ID)) {

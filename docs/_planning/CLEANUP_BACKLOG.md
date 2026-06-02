@@ -515,3 +515,30 @@ CODE audit of the built Step-9 changeset (C1 soft-cutover + C2/C3 generation mac
 **Deferred (logged, with rationale):**
 - **M1 — concurrent/zombie re-ingest can clobber a live claim + burn `attempts`. DEFERRED.** A worker that lost its claim mid-build (reaper requeued, second worker claimed) can hit a `(sample_id, section_generation, section_index)` 23505 against the new owner, and its `bumpFailure`/`markJobErrored` update the job row by `id` unconditionally — clobbering the live claim. **Why deferred, not fixed now:** the window is closed by construction in the normal case — `REPROCESS_CLAIM_TIMEOUT_MS=540_000` (worker self-deadline, checked before every section AND every unit) sits a full 60s UNDER the 600s reaper requeue TTL, so worker A self-abandons before the reaper can hand the job to worker B. The residual is a single sub-operation overrunning by >60s without hitting a `timeLeft()` checkpoint — self-healing (active generation is NEVER touched; finalize's `enqueue_version` guard abandons the stale worker; `attempts` caps at 5). **The proper fix** (an `enqueue_version`-guarded `.eq()` on the `bumpFailure`/`markJobErrored` updates, threaded via an optional `claimedVersion` param) touches a SHARED v2+v3 helper across ~30 call sites — not something to land hastily in the same commit as the C1/C2/C3 machinery. **TRIGGER:** when the reaper TTL is ever lowered toward the worker self-deadline (closing the 60s margin), OR when prod telemetry shows v3 jobs falsely `errored` with 23505 in `last_error`. Fix = thread `claimedVersion` → guard both helper updates with `.eq('enqueue_version', claimedVersion)` (a stale worker then no-ops instead of clobbering).
 - **M5 — `admin_purge_legacy_chunks` + `admin_gc_stale_section_generations` are not wired to any API route / admin-console action. DEFERRED to the admin-console build (CLAUDE.md Days 13-14 window).** Today they're invokable only via raw SQL by an admin. **Runbook until the UI lands (soft-cutover lifecycle, per creator):** (1) re-ingest builds gen N+1 alongside live gen N; (2) `admin_set_creator_retrieval_version(creator, 3)` flips to v3 (soft — v1/v2 stay dormant for rollback); (3) **soak** on v3; if broken, `admin_set_creator_retrieval_version(creator, 2)` rolls back instantly (legacy corpus intact); (4) once confident, `admin_purge_legacy_chunks(creator)` deletes the dormant v1/v2 (stamps `legacy_purged_at` — rollback now refused, see M2); (5) `admin_gc_stale_section_generations(creator)` reclaims v3 generations below active-1 (keeps active + prior). **TRIGGER:** the Days 13-14 admin-console build — add confirm-dialog + audit-preview routes for steps 4 and 5 (both are destructive + currently UI-less).
+
+---
+
+## RAG v3 — first live flip (2026-06-02): hotfix + two pre-existing gaps logged
+
+The first real v3 flip (creator `vuk_lehendas` → retrieval_version=3, full AoD book) worked
+flawlessly AFTER one hotfix. The diff-auditor surfaced two PRE-EXISTING v3-rollout gaps (not
+caused by the flip, not blocking) — logged here:
+
+- **HOTFIX SHIPPED (mig 20260602000002):** `sessions_retrieval_version_at_session_chk` was pinned
+  `IN (1,2)` (mig 20260522000100) and never widened when the v3 work widened the creators
+  constraint to `(1,2,3)` (mig 20260528000041). Every v3 session-open 500'd on the CHECK. Widened
+  to `(1,2,3)` + added a sibling-guardrail comment. Applied to prod + committed. See
+  `.claude_learnings.md` 2026-06-02.
+- **M2 (auditor) — legacy spike-a `openSession()` hard-pins `retrieval_version_at_session=1`**
+  (`server/voice-proxy/index.js:677`). On a v3 creator this routes the admin spike-a preview to v1
+  `retrieveTopK` → filters `chunker_version=1` chunks that no longer exist → blanks every turn.
+  `assertRetrievalPathSupportedOnSpike()` (`retrieval-path.js:83`) only `console.warn`s. **Fix:**
+  promote that probe to a HARD REFUSE for a creator whose `retrieval_version=3` (or snapshot the
+  real version into spike-a sessions too). **TRIGGER:** before using admin spike-a preview against
+  any v3 creator. Low urgency (admin-only path; real `/api/sessions/open` is correct).
+- **S1 (auditor) — admin UI flip button caps at v2.** `corpus-compare-panel.tsx:108`
+  `flipRetrievalVersion(nextVersion: 1 | 2)` + state-sync at `:136` only accept 1|2, so the admin
+  console CANNOT flip a creator to 3 (only `scripts/one-shot-flip-creator-retrieval-version.mjs`
+  can) and would silently drop a `3` response. **Fix:** widen the panel's union + state-sync to
+  include 3. **TRIGGER:** when v3 flips should be self-serve from the admin console (post first
+  manual flips). UI/RPC range now disagree.
