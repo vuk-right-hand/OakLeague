@@ -57,9 +57,15 @@ function parseArgs(argv) {
     allV1: false,
     allV2: false,
     force: false,
+    targetVersion: 2,
     adminUserId: null,
     adminEmail: null,
   };
+  // Target-version is resolved AFTER the loop from two signals (--target-version
+  // <v> and the --v3 shorthand) so we can hard-fail on a conflict / missing value
+  // instead of silently last-wins (audit M3/M4).
+  let tvFlag = null;   // raw value after --target-version (string | undefined)
+  let sawV3 = false;   // --v3 shorthand present
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--creator-id') out.creatorId = argv[++i];
@@ -67,13 +73,15 @@ function parseArgs(argv) {
     else if (a === '--all-v1') out.allV1 = true;
     else if (a === '--all-v2') out.allV2 = true;
     else if (a === '--force') out.force = true;
+    else if (a === '--target-version') { tvFlag = argv[++i]; }
+    else if (a === '--v3') { sawV3 = true; }
     else if (a === '--admin-id') out.adminUserId = argv[++i];
     else if (a === '--admin-email') out.adminEmail = argv[++i];
     else if (a === '--help' || a === '-h') {
       console.log(
         `Usage: node scripts/corpus-reprocess.mjs ` +
         `(--creator-id <uuid> | --handle <h> | --all-v1 | --all-v2) ` +
-        `[--force] [--admin-id <uuid>|--admin-email <addr>]`,
+        `[--force] [--target-version <2|3> | --v3] [--admin-id <uuid>|--admin-email <addr>]`,
       );
       process.exit(0);
     } else {
@@ -97,6 +105,34 @@ function parseArgs(argv) {
   }
   if (out.adminUserId && !UUID_RE.test(out.adminUserId)) {
     console.error(`--admin-id must be a UUID, got: ${out.adminUserId}`);
+    process.exit(1);
+  }
+  // ── Resolve target version (audit M3/M4) ──────────────────────────────────
+  // Missing value: `--target-version` as the last arg, or followed by another
+  // flag, leaves tvFlag undefined or a `--`-prefixed token.
+  if (tvFlag !== null && (tvFlag === undefined || String(tvFlag).startsWith('--'))) {
+    console.error('--target-version requires a value (2 or 3)');
+    process.exit(1);
+  }
+  // Conflict: --v3 and an explicit --target-version that isn't 3.
+  if (sawV3 && tvFlag !== null && tvFlag !== '3') {
+    console.error(`--v3 conflicts with --target-version ${tvFlag}`);
+    process.exit(1);
+  }
+  const tvResolved = sawV3 ? '3' : (tvFlag ?? '2');
+  // Defense matching the RPC's 22023 target_version_invalid — fail fast on a
+  // typo (e.g. --target-version 30) rather than round-tripping to PG.
+  if (tvResolved !== '2' && tvResolved !== '3') {
+    console.error(`--target-version must be 2 or 3, got: ${tvFlag}`);
+    process.exit(1);
+  }
+  out.targetVersion = Number(tvResolved);
+  // v3 is the per-creator build-then-flip path; a v3 build for a whole
+  // retrieval_version bucket (--all-v1 / --all-v2) is almost always a mistake
+  // (v1 creators have no v2 corpus to build from; batch v3 is not how the flip
+  // is validated). Require a single creator target for v3.
+  if (out.targetVersion === 3 && (out.allV1 || out.allV2)) {
+    console.error('--target-version 3 / --v3 requires --creator-id or --handle (not --all-v1/--all-v2)');
     process.exit(1);
   }
   return out;
@@ -185,11 +221,12 @@ async function resolveTargets(sb, args) {
   return data.map((r) => ({ id: r.id, handle: r.handle }));
 }
 
-async function enqueueOne(sb, adminUserId, creatorId, handle, force) {
+async function enqueueOne(sb, adminUserId, creatorId, handle, force, targetVersion) {
   const { data, error } = await sb.rpc('_admin_enqueue_corpus_reprocess_unsafe', {
-    p_admin_user_id: adminUserId,
-    p_creator_id:    creatorId,
-    p_force:         force,
+    p_admin_user_id:  adminUserId,
+    p_creator_id:     creatorId,
+    p_force:          force,
+    p_target_version: targetVersion,
   });
   if (error) {
     const code = error.code ?? '';
@@ -223,13 +260,13 @@ async function main() {
     process.exit(0);
   }
 
-  console.log(`enqueuing v2 re-process for ${targets.length} creator${targets.length === 1 ? '' : 's'} (force=${args.force})`);
+  console.log(`enqueuing v${args.targetVersion} re-process for ${targets.length} creator${targets.length === 1 ? '' : 's'} (force=${args.force})`);
 
   let totalEnqueued = 0;
   let totalSkipped = 0;
   let anyError = false;
   for (const t of targets) {
-    const res = await enqueueOne(sb, adminUserId, t.id, t.handle, args.force);
+    const res = await enqueueOne(sb, adminUserId, t.id, t.handle, args.force, args.targetVersion);
     const label = t.handle ? `@${t.handle} (${t.id.slice(0, 8)})` : t.id;
     if (!res.ok) {
       console.error(`  ✗ ${label}: ${res.code} ${res.msg}`);

@@ -20,9 +20,13 @@
 --  12. _unsafe non-admin admin_user_id → 42501
 --  13. Mixed force=false (1 done + 1 pending) → enqueued=1, skipped_already_queued=1
 --  14. force=true with claimed_at >540s ago → 2 enqueued, 0 skipped
+--  15. v3 enqueue (target_version=3) writes v3 rows, leaves the v2 queue intact
+--  16. target_version=4 → 22023 target_version_invalid
+--  17. v3 skipped_already_queued counts the v3 queue ONLY (V3_FLIP audit C2)
+--  18. audit before.target_version records the queue
 
 BEGIN;
-SELECT plan(14);
+SELECT plan(18);
 
 CREATE FUNCTION pg_temp.run() RETURNS SETOF text LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -42,6 +46,7 @@ DECLARE
   v_enq_v_pre   int;
   v_enq_v_post  int;
   v_pre_audit   int;
+  v_v2_jobs     int;
 BEGIN
   -- ── Setup (postgres role) ───────────────────────────────────────────────
   INSERT INTO public.admin_roles (user_id, email, role)
@@ -259,6 +264,69 @@ BEGIN
   RETURN NEXT ok(
     v_enqueued = 2 AND v_skipped = 0,
     format('14: force=true with claimed_at >540s ago → enqueued=%s skipped=%s', v_enqueued, v_skipped)
+  );
+
+  -- ── 15: v3 enqueue (target_version=3) writes v3 rows, v2 queue intact ────
+  -- No v3 jobs exist yet → force=false inserts 2 new v3 rows; the existing v2
+  -- jobs (sample1, sample2) are untouched. Proves the v3 queue is separate.
+  PERFORM tests.set_authenticated(v_admin);
+  SELECT enqueued_count, skipped_already_queued INTO v_enqueued, v_already
+    FROM public.admin_enqueue_corpus_reprocess(v_creator, false, 3::smallint);
+  PERFORM tests.reset_role();
+  SELECT count(*) INTO v_job_count
+    FROM public.corpus_reprocess_jobs
+   WHERE sample_id IN (v_sample1, v_sample2) AND target_version = 3;
+  SELECT count(*) INTO v_v2_jobs
+    FROM public.corpus_reprocess_jobs
+   WHERE sample_id IN (v_sample1, v_sample2) AND target_version = 2;
+  RETURN NEXT ok(
+    v_enqueued = 2 AND v_already = 0 AND v_job_count = 2 AND v_v2_jobs = 2,
+    format('15: v3 enqueue → enqueued=%s already=%s v3_jobs=%s v2_jobs=%s (want 2/0/2/2)',
+           v_enqueued, v_already, v_job_count, v_v2_jobs)
+  );
+
+  -- ── 16: target_version=4 → 22023 target_version_invalid ──────────────────
+  PERFORM tests.set_authenticated(v_admin);
+  BEGIN
+    PERFORM public.admin_enqueue_corpus_reprocess(v_creator, false, 4::smallint);
+    RETURN NEXT fail('16: target_version=4 should have raised');
+  EXCEPTION
+    WHEN sqlstate '22023' THEN
+      RETURN NEXT pass('16: target_version=4 → 22023 target_version_invalid');
+    WHEN OTHERS THEN
+      RETURN NEXT fail(format('16: target_version=4 → unexpected sqlstate %s', SQLSTATE));
+  END;
+  PERFORM tests.reset_role();
+
+  -- ── 17: v3 skipped_already_queued counts the v3 queue ONLY (audit C2) ────
+  -- v3 state after test 15: sample1+sample2 pending. Mark sample2's v3 job done.
+  -- v2 state: sample1+sample2 still pending. A v3 force=false enqueue must
+  -- report already=1 (only sample1's v3 pending) + enqueued=1 (sample2 v3 done
+  -- re-enqueued). If the pre-snapshot join were still hardcoded target_version=2
+  -- (both v2 pending), already would be 2 — so already=1 proves the C2 fix.
+  UPDATE public.corpus_reprocess_jobs
+     SET status = 'done', finished_at = now()
+   WHERE sample_id = v_sample2 AND target_version = 3;
+  PERFORM tests.set_authenticated(v_admin);
+  SELECT enqueued_count, skipped_already_queued INTO v_enqueued, v_already
+    FROM public.admin_enqueue_corpus_reprocess(v_creator, false, 3::smallint);
+  PERFORM tests.reset_role();
+  RETURN NEXT ok(
+    v_enqueued = 1 AND v_already = 1,
+    format('17: v3 skipped_already_queued counts v3 queue only → enqueued=%s already=%s (want 1/1)',
+           v_enqueued, v_already)
+  );
+
+  -- ── 18: audit before.target_version records the queue ────────────────────
+  -- Tests 15 + 17 both ran v3 enqueues → ≥1 audit row carries target_version=3.
+  SELECT count(*) INTO v_job_count
+    FROM public.admin_audit_log
+   WHERE target_id = v_creator
+     AND action = 'creator_corpus_reprocess_enqueue'
+     AND before->>'target_version' = '3';
+  RETURN NEXT ok(
+    v_job_count >= 1,
+    format('18: ≥1 audit row carries before.target_version=3 (got %s)', v_job_count)
   );
 END;
 $fn$;
