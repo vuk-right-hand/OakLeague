@@ -197,17 +197,50 @@ describe('POST /api/admin/corpus-reprocess — happy path', () => {
     expect(body.skipped_already_queued).toBe(8);
   });
 
-  it('forwards p_admin_user_id, p_creator_id, p_force=true to the rpc', async () => {
+  it('forwards p_admin_user_id, p_creator_id, p_force=true, p_target_version=2 (default) to the rpc', async () => {
     mockRpc.mockResolvedValueOnce({
       data: [{ enqueued_count: 3, total_ready_samples: 3, skipped_in_flight: 1, skipped_already_queued: 0 }],
       error: null,
     });
     await POST(mkReq({ body: { creator_id: CREATOR_ID, force: true } }));
     expect(mockRpc).toHaveBeenCalledWith('_admin_enqueue_corpus_reprocess_unsafe', {
-      p_admin_user_id: ADMIN_USER_ID,
-      p_creator_id:    CREATOR_ID,
-      p_force:         true,
+      p_admin_user_id:  ADMIN_USER_ID,
+      p_creator_id:     CREATOR_ID,
+      p_force:          true,
+      p_target_version: 2,
     });
+  });
+
+  it('forwards p_target_version=3 (v3 build-then-flip path); accepts string "3"', async () => {
+    mockRpc.mockResolvedValue({
+      data: [{ enqueued_count: 4, total_ready_samples: 4, skipped_in_flight: 0, skipped_already_queued: 0 }],
+      error: null,
+    });
+    const res = await POST(mkReq({ body: { creator_id: CREATOR_ID, target_version: 3 } }));
+    expect(res.status).toBe(200);
+    expect((await res.json()).target_version).toBe(3);
+    expect(mockRpc).toHaveBeenLastCalledWith('_admin_enqueue_corpus_reprocess_unsafe',
+      expect.objectContaining({ p_target_version: 3 }));
+    // string "3" coerces to 3 as well
+    await POST(mkReq({ body: { creator_id: CREATOR_ID, target_version: '3' } }));
+    expect(mockRpc).toHaveBeenLastCalledWith('_admin_enqueue_corpus_reprocess_unsafe',
+      expect.objectContaining({ p_target_version: 3 }));
+  });
+
+  it('400 bad_target_version on an out-of-range version (e.g. 30) — before any rpc', async () => {
+    mockRpc.mockClear();
+    const res = await POST(mkReq({ body: { creator_id: CREATOR_ID, target_version: 30 } }));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe('bad_target_version');
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+
+  it('400 bad_target_version rejects array coercion ([3] → Number 3) (audit M2)', async () => {
+    mockRpc.mockClear();
+    const res = await POST(mkReq({ body: { creator_id: CREATOR_ID, target_version: [3] } }));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe('bad_target_version');
+    expect(mockRpc).not.toHaveBeenCalled();
   });
 
   it('coerces non-literal-true force values to false', async () => {

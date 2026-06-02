@@ -1,7 +1,8 @@
-// POST /api/admin/corpus-reprocess — admin enqueues a v2 re-process for
-// every ready sample of a creator. Bypasses the on-sample_content trigger's
-// retrieval_version gate so a v1 creator's corpus can be re-processed into
-// v2 chunks BEFORE flipping their retrieval_version.
+// POST /api/admin/corpus-reprocess — admin enqueues a corpus re-process for
+// every ready sample of a creator (target_version 2 default, or 3 for the v3
+// build-then-flip path). Bypasses the on-sample_content trigger's
+// retrieval_version gate so a creator's corpus can be re-processed into v2/v3
+// chunks BEFORE flipping their retrieval_version.
 //
 // GET  /api/admin/corpus-reprocess?creator_id=…&limit=… — admin reads the
 // queue state. The /admin/creators/[id] panel polls this every 5s to render
@@ -29,7 +30,7 @@ export const dynamic = 'force-dynamic';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-type EnqueueBody = { creator_id?: unknown; force?: unknown };
+type EnqueueBody = { creator_id?: unknown; force?: unknown; target_version?: unknown };
 
 type EnqueueResultRow = {
   enqueued_count: number;
@@ -119,11 +120,27 @@ export async function POST(req: NextRequest) {
   // strings or the field being injected as something weird.
   const force = body.force === true;
 
+  // target_version is optional; default 2 (the v2 re-process button's behavior).
+  // 3 is the v3 build-then-flip path. Accept only a number or string primitive
+  // (matching the strict discipline of `force` above — reject arrays/objects so
+  // `[3]` can't sneak through Number() coercion); must resolve to 2 or 3 else a
+  // 400. The RPC also enforces (2,3) via 22023 target_version_invalid.
+  let targetVersion = 2;
+  if (body.target_version !== undefined && body.target_version !== null) {
+    if (typeof body.target_version !== 'number' && typeof body.target_version !== 'string') {
+      return json(400, { error: 'bad_target_version' });
+    }
+    const tv = Number(body.target_version);
+    if (tv !== 2 && tv !== 3) return json(400, { error: 'bad_target_version' });
+    targetVersion = tv;
+  }
+
   const sb = supabaseAdmin();
   const { data, error } = await sb.rpc('_admin_enqueue_corpus_reprocess_unsafe', {
-    p_admin_user_id: admin.userId,
-    p_creator_id:    creatorId,
-    p_force:         force,
+    p_admin_user_id:  admin.userId,
+    p_creator_id:     creatorId,
+    p_force:          force,
+    p_target_version: targetVersion,
   });
 
   if (error) {
@@ -173,6 +190,7 @@ export async function POST(req: NextRequest) {
     ok: true,
     creator_id: creatorId,
     force,
+    target_version:         targetVersion,
     enqueued_count:         row.enqueued_count,
     total_ready_samples:    row.total_ready_samples,
     skipped_in_flight:      row.skipped_in_flight,
