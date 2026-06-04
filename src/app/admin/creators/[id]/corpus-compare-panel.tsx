@@ -1,7 +1,10 @@
 'use client';
 
 // /admin/creators/[id] — Day-7 side-by-side v1 vs v2 retrieval comparison
-// panel + "Promote v2" cleanup button.
+// panel + "Promote v2" cleanup button + retrieval_version flip buttons.
+// NOTE (2026-06-02): the flip buttons now span v1/v2/v3 (per-version row); the
+// compare grid below is still v1-vs-v2 only (the compare endpoint predates v3) —
+// a v3 column is tracked in CLEANUP_BACKLOG, not wired here yet.
 //
 // UX:
 //   1. Admin types a question (e.g. "what's the twins story?").
@@ -105,15 +108,29 @@ export function CorpusComparePanel({
 
   // Phase-1 unit audit C2 + M4: button to flip retrieval_version, so admin
   // doesn't have to open SQL editor post-Promote.
-  const flipRetrievalVersion = useCallback(async (nextVersion: 1 | 2) => {
+  const flipRetrievalVersion = useCallback(async (nextVersion: 1 | 2 | 3) => {
     if (flipBusy) return;
     setFlipBusy(true);
-    const verb = nextVersion === 2 ? 'enable v2 retrieval' : 'roll back to v1 retrieval';
+    const isRollback = nextVersion < currentVersion;
+    const verb =
+      nextVersion === 3 ? 'enable v3 hierarchical retrieval'
+      : nextVersion === 2 ? (isRollback ? 'roll back to v2 retrieval' : 'enable v2 retrieval')
+      : 'roll back to v1 retrieval';
+    // Message must match what admin_set_creator_retrieval_version actually does:
+    //  • DELETE only on 2→1 (zombie-cleans v2 chunks when v_prev=2 AND next=1).
+    //  • Flips FROM 3 are SOFT cutover — nothing is deleted; v1/v2 stay dormant
+    //    so a re-flip is instant. (Refused if legacy was already purged.)
+    //  • x→3 is gated on creator_v3_ready.
+    const tail =
+      (currentVersion === 2 && nextVersion === 1)
+        ? 'Downgrading v2→v1 DELETES this creator\'s v2 chunks + narrative_units (zombie cleanup). Continue?'
+      : nextVersion === 3
+        ? 'GATED on creator_v3_ready (every ready sample needs v3 sections + chunks). Soft cutover — v1/v2 stay dormant for instant rollback. Persona recompiles. Continue?'
+      : isRollback
+        ? 'Soft-cutover rollback — higher-version chunks stay DORMANT (not deleted), so you can re-flip instantly. Persona recompiles. (Refused if legacy was purged.) Continue?'
+        : 'The creator\'s persona will be recompiled to add the v2 clarifier rule. Continue?';
     const ok = window.confirm(
-      `Flip retrieval_version to ${nextVersion}? This will ${verb} for this creator. ` +
-      (nextVersion === 1
-        ? 'Downgrading also DELETES any v2 chunks + narrative_units this creator has (zombie cleanup). Continue?'
-        : 'The creator\'s persona will be recompiled to add the v2 clarifier rule. Continue?'),
+      `Flip retrieval_version to ${nextVersion}? This will ${verb} for this creator. ${tail}`,
     );
     if (!ok) {
       setFlipBusy(false);
@@ -133,7 +150,11 @@ export function CorpusComparePanel({
       const body = (await res.json()) as FlipResponse;
       if (!res.ok || !body.ok) {
         setError(body.error ?? `http_${res.status}`);
-      } else if (body.retrieval_version === 1 || body.retrieval_version === 2) {
+      } else if (
+        body.retrieval_version === 1 ||
+        body.retrieval_version === 2 ||
+        body.retrieval_version === 3
+      ) {
         setCurrentVersion(body.retrieval_version);
       }
     } catch (e) {
@@ -234,30 +255,39 @@ export function CorpusComparePanel({
         >
           {promoteBusy ? 'Promoting…' : 'Promote v2 (delete v1)'}
         </button>
-        {/* Phase-1 unit audit C2 + M4: flip button so admin can complete the
-            v1→v2 transition without leaving the page (or remediate after a
-            premature promote that left the creator at retrieval_version=1
-            with no v1 chunks). */}
-        <button
-          type="button"
-          onClick={() => flipRetrievalVersion(currentVersion === 1 ? 2 : 1)}
-          disabled={flipBusy}
-          style={{
-            padding: '6px 12px',
-            fontSize: 13,
-            background: flipBusy ? '#222' : (currentVersion === 1 ? '#1a6e3d' : '#444'),
-            color: '#fff',
-            border: '1px solid ' + (currentVersion === 1 ? '#2aa35f' : '#666'),
-            borderRadius: 4,
-            cursor: flipBusy ? 'wait' : 'pointer',
-          }}
-        >
-          {flipBusy
-            ? 'Flipping…'
-            : currentVersion === 1
-              ? 'Flip retrieval_version → 2'
-              : 'Roll back retrieval_version → 1'}
-        </button>
+        {/* Phase-1 unit audit C2 + M4: flip buttons so admin can move the
+            creator between retrieval versions without leaving the page. One
+            button per version != current (1, 2, 3). v3 is gated server-side on
+            creator_v3_ready; the route returns 409 creator_v3_not_ready if not.
+            (RAG v3, 2026-06-02: widened from a single 1↔2 toggle to include 3.) */}
+        <span style={{ fontSize: 12, color: '#999', alignSelf: 'center' }}>
+          retrieval_version: <strong style={{ color: '#fff' }}>{currentVersion}</strong> →
+        </span>
+        {([1, 2, 3] as const)
+          .filter((v) => v !== currentVersion)
+          .map((v) => {
+            const isV3 = v === 3;
+            const isDowngrade = v < currentVersion;
+            return (
+              <button
+                key={v}
+                type="button"
+                onClick={() => flipRetrievalVersion(v)}
+                disabled={flipBusy}
+                style={{
+                  padding: '6px 12px',
+                  fontSize: 13,
+                  background: flipBusy ? '#222' : (isV3 ? '#1a4a6e' : isDowngrade ? '#444' : '#1a6e3d'),
+                  color: '#fff',
+                  border: '1px solid ' + (isV3 ? '#2a7fa3' : isDowngrade ? '#666' : '#2aa35f'),
+                  borderRadius: 4,
+                  cursor: flipBusy ? 'wait' : 'pointer',
+                }}
+              >
+                {flipBusy ? 'Flipping…' : `${isDowngrade ? 'Roll back' : 'Flip'} → ${v}`}
+              </button>
+            );
+          })}
         {error && (
           <span style={{ fontSize: 12, color: '#ff6b6b' }}>error: {error}</span>
         )}

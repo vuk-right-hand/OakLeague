@@ -635,8 +635,10 @@ async function openSession({ userId, creatorId, modelWire, ttsProvider }) {
   // retrieval_version_at_session=1, but the creator may already be at
   // v2 (Day-15+). v1 retrieveTopK queries chunker_version=1 chunks
   // which may not exist for v2-reprocessed creators → admin sees
-  // silent zero retrieval. Probe + warn so the surface is visible
-  // (admin-only path; one extra read is cheap).
+  // silent zero retrieval. Probe so the surface is visible (admin-only path;
+  // one extra read is cheap). As of 2026-06-02 the probe REFUSES v2/v3 (a
+  // creator is now live on v3 and would blank every turn on this path).
+  let spikeRetrievalSupported = true; // default supported so a read hiccup never locks admin out
   try {
     const { data: cd } = await supabase
       .from('creators')
@@ -644,13 +646,22 @@ async function openSession({ userId, creatorId, modelWire, ttsProvider }) {
       .eq('id', creatorId)
       .maybeSingle();
     if (cd) {
-      // RAG v3 step 6c: spike-a probe is now centralized in the helper so
-      // a future v4+ warning logic change happens in one place.
-      assertRetrievalPathSupportedOnSpike(Number(cd.retrieval_version));
+      // RAG v3 step 6c: spike-a probe centralized in the helper. Returns a
+      // support verdict — v1 (or unknown) = ok; v2/v3 = refuse (hard-pinned
+      // v1 retrieval can't serve them). Admin uses real /api/sessions/open.
+      spikeRetrievalSupported = assertRetrievalPathSupportedOnSpike(Number(cd.retrieval_version));
     }
   } catch (e) {
-    // Non-fatal — admin-only path, never block on probe failure.
+    // Non-fatal — admin-only path, never block on probe READ failure (verdict
+    // stays `true` so a transient creators-read hiccup doesn't lock admin out).
+    // M3: surface to Sentry too — on a v3 creator a swallowed probe-read failure
+    // means admin may be in a silently-blanking spike-a session (verdict default
+    // true), and the console.warn alone isn't visible to them.
     console.warn(`[session-open spike-a] retrieval_version probe failed: ${e?.message || e}`);
+    captureException(e, { op: 'spike_a_retrieval_version_probe', creatorId });
+  }
+  if (!spikeRetrievalSupported) {
+    return { err: 'spike_a_retrieval_version_unsupported' };
   }
   // Audit C3 (unit-wide) — write tts_provider_at_session snapshot on the
   // legacy spike-a admin path too. Without this, sessions opened by the
@@ -923,6 +934,14 @@ wss.on('connection', async (ws, req) => {
   if (sess.err === 'kill_switch_fired')      return closeWs(ws, 4003, 'kill_switch_fired');
   if (sess.err === 'session_not_attachable') return closeWs(ws, 4001, 'session_not_attachable');
   if (sess.err === 'upstream_error')         return closeWs(ws, 4005, 'upstream_error');
+  // Default-catch (2026-06-02): ANY openSession err MUST close cleanly here.
+  // Without this, an unmapped err (e.g. spike_a_retrieval_version_unsupported)
+  // falls through to `sess.sessionId.slice()` below with an undefined id →
+  // TypeError in the connection handler (which has no try/catch) → abrupt
+  // socket drop / unhandled rejection. The reason string carries the err code
+  // to the client. Add a specific `closeWs` mapping ABOVE only when a code
+  // needs its own distinct WS close code; otherwise this catch handles it.
+  if (sess.err) return closeWs(ws, 4005, sess.err);
   const sessionId = sess.sessionId;
   console.log(`[ws ${connId}] session ok id=${sessionId.slice(0,8)}`);
 

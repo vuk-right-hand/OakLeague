@@ -62,15 +62,20 @@ export function resolveRetrievalPath(version) {
  * Spike-a admin-preview probe. Spike-a hard-pins v1 retrieveTopK; if a
  * creator is at v2 or v3 today, this path returns zero retrieval (the v1
  * RPC filters chunker_version=1 chunks that don't exist for v2/v3-
- * reprocessed creators). Warn loudly so the admin sees the surface in
- * Sentry / proxy logs BEFORE they dogfood and report "no retrieval."
+ * reprocessed creators). Warns loudly AND returns a support verdict so the
+ * caller can REFUSE the spike-a session instead of opening one that blanks
+ * every turn.
  *
- * Non-fatal: never throw. Spike-a is admin-only; even a misleading warning
- * is better than blocking admin entirely. Plan §5: throw on v3 ONLY when
- * spike-a learns to support it (deliberate later decision).
+ * Returns `true` if spike-a can serve this version (v1, or unknown/NaN which
+ * historically default-pins to v1), `false` for v2/v3 (caller must refuse).
+ * Never throws — the caller's probe try/catch treats a throw as non-fatal and
+ * would open the blanking session anyway, so the verdict MUST come back as a
+ * return value, not an exception. (RAG v3, 2026-06-02: promoted from warn-only
+ * to a hard refuse now that a creator is live on v3.)
  *
  * @param {number | null | undefined} version
  * @param {(msg: string) => void} [warn]  -- defaults to console.warn
+ * @returns {boolean} true = spike-a supports this version; false = caller refuse
  */
 export function assertRetrievalPathSupportedOnSpike(version, warn) {
   const log = warn || ((m) => console.warn(m));
@@ -78,13 +83,18 @@ export function assertRetrievalPathSupportedOnSpike(version, warn) {
   if (n === 2) {
     log(
       '[spike-a] creator at retrieval_version=2 but spike-a path hard-pins '
-      + 'v1; expect ZERO retrieval (chunker_version=1 filter mismatch)',
+      + 'v1; expect ZERO retrieval (chunker_version=1 filter mismatch). '
+      + 'Refusing the spike-a session -- use real /api/sessions/open instead.',
     );
-  } else if (n === 3) {
+    return false;
+  }
+  if (n === 3) {
     log(
       '[spike-a] creator at retrieval_version=3 but spike-a path hard-pins '
       + 'v1; expect ZERO retrieval (chunker_version=1 filter mismatch). '
-      + 'Spike-a does NOT support v3 today -- use real /api/sessions/open instead.',
+      + 'Refusing the spike-a session -- use real /api/sessions/open instead.',
     );
+    return false;
   }
+  return true;
 }

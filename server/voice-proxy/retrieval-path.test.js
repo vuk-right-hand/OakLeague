@@ -43,31 +43,34 @@ test('resolveRetrievalPath throw message lists allowed versions + cites plan §5
   }
 });
 
-test('assertRetrievalPathSupportedOnSpike is silent on v=1 (only spike-a-supported version)', () => {
+test('assertRetrievalPathSupportedOnSpike is silent on v=1 + returns true (only spike-a-supported version)', () => {
   const calls = [];
-  assertRetrievalPathSupportedOnSpike(1, (m) => calls.push(m));
+  const ok = assertRetrievalPathSupportedOnSpike(1, (m) => calls.push(m));
   assert.equal(calls.length, 0);
+  assert.equal(ok, true);
 });
 
-test('assertRetrievalPathSupportedOnSpike warns on v=2 (zero-retrieval surface)', () => {
+test('assertRetrievalPathSupportedOnSpike warns on v=2 + returns false (caller must refuse)', () => {
   const calls = [];
-  assertRetrievalPathSupportedOnSpike(2, (m) => calls.push(m));
+  const ok = assertRetrievalPathSupportedOnSpike(2, (m) => calls.push(m));
   assert.equal(calls.length, 1);
   assert.match(calls[0], /retrieval_version=2/);
   assert.match(calls[0], /ZERO retrieval/);
+  assert.equal(ok, false);
 });
 
-test('assertRetrievalPathSupportedOnSpike warns on v=3 + points to real session-open path', () => {
+test('assertRetrievalPathSupportedOnSpike warns on v=3 + returns false + points to real session-open path', () => {
   const calls = [];
-  assertRetrievalPathSupportedOnSpike(3, (m) => calls.push(m));
+  const ok = assertRetrievalPathSupportedOnSpike(3, (m) => calls.push(m));
   assert.equal(calls.length, 1);
   assert.match(calls[0], /retrieval_version=3/);
   assert.match(calls[0], /\/api\/sessions\/open/);
+  assert.equal(ok, false);
 });
 
-test('assertRetrievalPathSupportedOnSpike does NOT throw on any input', () => {
+test('assertRetrievalPathSupportedOnSpike does NOT throw + returns true on unknown input (admin never locked out)', () => {
   const calls = [];
-  assert.doesNotThrow(() => assertRetrievalPathSupportedOnSpike(null, (m) => calls.push(m)));
-  assert.doesNotThrow(() => assertRetrievalPathSupportedOnSpike(99, (m) => calls.push(m)));
-  assert.doesNotThrow(() => assertRetrievalPathSupportedOnSpike('foo', (m) => calls.push(m)));
+  assert.doesNotThrow(() => assert.equal(assertRetrievalPathSupportedOnSpike(null, (m) => calls.push(m)), true));
+  assert.doesNotThrow(() => assert.equal(assertRetrievalPathSupportedOnSpike(99, (m) => calls.push(m)), true));
+  assert.doesNotThrow(() => assert.equal(assertRetrievalPathSupportedOnSpike('foo', (m) => calls.push(m)), true));
 });

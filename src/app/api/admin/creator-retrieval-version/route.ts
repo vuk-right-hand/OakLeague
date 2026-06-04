@@ -1,6 +1,8 @@
 // POST /api/admin/creator-retrieval-version — flip creators.retrieval_version
-// between 1 and 2. Wraps the existing admin_set_creator_retrieval_version
+// between 1, 2, and 3. Wraps the existing admin_set_creator_retrieval_version
 // RPC so the panel can offer a button instead of "open Supabase SQL editor."
+// (v3 flip is gated server-side on creator_v3_ready; the RPC returns
+// creator_v3_not_ready / rollback_refused_legacy_purged which this route maps.)
 //
 // Phase-1 unit audit C2 + M4. The promote workflow requires flipping
 // retrieval_version=2 RIGHT AFTER deleting v1 chunks — otherwise voice
