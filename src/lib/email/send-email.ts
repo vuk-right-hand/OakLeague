@@ -23,7 +23,12 @@ import * as Sentry from '@sentry/nextjs';
 //                         deliver to the Resend account owner — we warn loudly.
 //   RESEND_REPLY_TO     — optional default reply-to.
 
-export type EmailStatus = 'sent' | 'skipped' | 'failed';
+//   'sent_sandbox' — Resend accepted it, BUT the sender is a @resend.dev
+//                    sandbox address, so it ONLY reaches the Resend account
+//                    owner. The recipient almost certainly got nothing. Callers
+//                    MUST treat this like a non-delivery (show copy-link) so an
+//                    admin doesn't believe a real creator was emailed.
+export type EmailStatus = 'sent' | 'sent_sandbox' | 'skipped' | 'failed';
 export type SendEmailResult = { status: EmailStatus; id?: string; error?: string };
 
 let warnedSandbox = false;
@@ -45,7 +50,8 @@ export async function sendEmail(args: {
 
   // Loud warning (once per process) when sending from the Resend sandbox domain
   // — every email to a non-owner address will silently fail to deliver.
-  if (!warnedSandbox && /@resend\.dev>?\s*$/i.test(from)) {
+  const isSandbox = /@resend\.dev>?\s*$/i.test(from);
+  if (!warnedSandbox && isSandbox) {
     warnedSandbox = true;
     console.warn(
       '[email] RESEND_FROM_EMAIL is a resend.dev sandbox sender — delivery is ' +
@@ -75,7 +81,9 @@ export async function sendEmail(args: {
       return { status: 'failed', error: error.message ?? 'send_failed' };
     }
 
-    return { status: 'sent', id: data?.id };
+    // Accepted by Resend — but flag sandbox sends as non-delivery to the
+    // recipient so callers surface the copy-link fallback (audit Small).
+    return { status: isSandbox ? 'sent_sandbox' : 'sent', id: data?.id };
   } catch (e) {
     // State 2b: SDK/network threw.
     Sentry.captureException(e, { extra: { op: 'sendEmail', subject: args.subject } });

@@ -60,9 +60,15 @@ export async function GET() {
     if (jar.get('invite_nonce')?.value) {
       state = 'invited';
     } else {
-      // Has the caller submitted a still-pending creator request? Match on
+      // Has the caller an OPEN creator request (pending OR invited)? Match on
       // lowercased email (creator_requests is service-role only, so use the
       // admin client). +tag variants are an accepted edge miss.
+      //
+      // 'invited' is included (audit M4): after an admin approves, the row goes
+      // pending→invited but the user has NO invite_nonce cookie until they click
+      // the emailed link. Matching only 'pending' would flip their nav back to
+      // "Become a Creator" in that window, looping them into the funnel they
+      // already cleared. 'declined' is correctly excluded (→ not_invited).
       let requested = false;
       const email = user.email?.toLowerCase();
       if (email) {
@@ -71,7 +77,7 @@ export async function GET() {
           .from('creator_requests')
           .select('id')
           .eq('email', email)
-          .eq('status', 'pending')
+          .in('status', ['pending', 'invited'])
           .limit(1)
           .maybeSingle<{ id: string }>();
         requested = !!reqRow;

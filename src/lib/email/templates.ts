@@ -38,8 +38,11 @@ function shell(bodyHtml: string): string {
 }
 
 function button(url: string, label: string): string {
-  // url must already be a validated http(s) URL; escapeAttr guards the quote.
-  return `<p><a href="${escapeAttr(url)}" style="background:#0a0a0a;color:#fff;padding:10px 16px;border-radius:6px;text-decoration:none;display:inline-block;">${escapeHtml(label)}</a></p>`;
+  // Enforce http(s) here rather than trusting callers (audit Small): a future
+  // caller passing `javascript:`/`data:` would otherwise render a clickable
+  // XSS link in email clients that honor the scheme. Non-http(s) → inert '#'.
+  const safe = /^https?:\/\//i.test(url) ? url : '#';
+  return `<p><a href="${escapeAttr(safe)}" style="background:#0a0a0a;color:#fff;padding:10px 16px;border-radius:6px;text-decoration:none;display:inline-block;">${escapeHtml(label)}</a></p>`;
 }
 
 // ── Invite (WS0/WS1) ─────────────────────────────────────────────────────

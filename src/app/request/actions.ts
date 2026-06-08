@@ -2,6 +2,7 @@
 
 import { z } from 'zod';
 import { headers } from 'next/headers';
+import * as Sentry from '@sentry/nextjs';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import { verifyTurnstile } from '@/lib/turnstile';
 
@@ -64,6 +65,20 @@ function rateLimitEmailKey(email: string): string {
   return `${base}@${domain}`;
 }
 
+// Validate that a header-derived value is actually an IP before it's used as an
+// `inet` insert value AND as a rate-limit key (audit C3). A junk
+// x-forwarded-for ("not-an-ip") would (a) crash the `created_ip inet` insert
+// with 22P02 and lose the lead, and (b) give every junk string a fresh per-IP
+// rate bucket, trivially bypassing the per-IP limit. Junk/missing → null, and
+// callers collapse null to a single shared throttle bucket.
+function normalizeIp(raw: string): string | null {
+  const v = raw.trim();
+  if (!v || v === 'dev-local') return null;
+  const isV4 = /^\d{1,3}(\.\d{1,3}){3}$/.test(v);
+  const isV6 = v.includes(':') && /^[0-9a-fA-F:.]+$/.test(v);
+  return isV4 || isV6 ? v : null;
+}
+
 export async function submitCreatorRequest(
   input: unknown,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -81,18 +96,22 @@ export async function submitCreatorRequest(
   // the leftmost x-forwarded-for hop is attacker-controlled, so it's the last
   // resort only (mirrors apply/actions.ts, auditor M4).
   const hdrs = await headers();
-  const ip = (
+  const rawIp = (
     hdrs.get('x-real-ip') ||
     hdrs.get('x-vercel-forwarded-for') ||
     (hdrs.get('x-forwarded-for') ?? '').split(',')[0]
-  ).trim() || 'dev-local';
+  ).trim();
+  // null for junk/missing (audit C3). `ipKey` collapses null to ONE shared
+  // bucket so an attacker rotating garbage IP strings can't mint fresh buckets.
+  const ip = normalizeIp(rawIp);
+  const ipKey = ip ?? 'no-ip';
 
   // CAPTCHA FIRST (audit C-1): the rate-limit buckets must only be spent by
   // requests that cleared Turnstile, or an attacker without a token can flood
   // the global counter and lock the whole funnel for an hour. verifyTurnstile
   // returns false immediately for a missing token (no network call), so this
   // is also the cheapest pre-filter.
-  const captchaOk = await verifyTurnstile(parsed.data.turnstile_token, ip);
+  const captchaOk = await verifyTurnstile(parsed.data.turnstile_token, ip ?? '');
   if (!captchaOk) return { ok: false, error: 'captcha_failed' };
 
   const sb = supabaseAdmin();
@@ -101,12 +120,11 @@ export async function submitCreatorRequest(
   const emailLower = parsed.data.email.toLowerCase().trim();
   const rateKey = rateLimitEmailKey(parsed.data.email);
 
-  // Rate limit: per-IP (hourly), per-email (daily), and a global hourly ceiling
-  // so no single IP/email can flood and the table can't be filled at scale.
+  // BLOCKING limits: per-IP (hourly) + per-email (daily). These are scoped to a
+  // single actor, so blocking them can't take the funnel down for everyone.
   const limits: Array<{ scope: string; key: string; window: string; limit: number }> = [
-    { scope: 'creator_request_ip', key: ip, window: '1 hour', limit: 5 },
+    { scope: 'creator_request_ip', key: ipKey, window: '1 hour', limit: 5 },
     { scope: 'creator_request_email', key: rateKey, window: '24 hours', limit: 3 },
-    { scope: 'creator_request_global', key: 'global', window: '1 hour', limit: 200 },
   ];
   for (const l of limits) {
     const { data: allowed, error: rlErr } = await sb.rpc('rate_limit_hit', {
@@ -117,6 +135,25 @@ export async function submitCreatorRequest(
     });
     if (rlErr) return { ok: false, error: 'rate_check_failed' };
     if (allowed === false) return { ok: false, error: 'rate_limited' };
+  }
+
+  // GLOBAL ceiling is a TRIPWIRE, not a gate (audit C2). A blocking counter
+  // keyed to a constant string is a single shared kill-switch: one attacker who
+  // trips it locks out every legitimate creator request for the window — exactly
+  // what we don't want during a launch/demo. So we observe + alert and NEVER
+  // block on it. If this fires we investigate; we don't deny real users.
+  {
+    const { data: globalOk } = await sb.rpc('rate_limit_hit', {
+      p_scope: 'creator_request_global',
+      p_key: 'global',
+      p_window: '1 hour',
+      p_limit: 500,
+    });
+    if (globalOk === false) {
+      Sentry.captureMessage('creator_request global hourly ceiling exceeded — possible flood', {
+        level: 'warning',
+      });
+    }
   }
 
   // Dedupe: if there's already an open (pending/invited) lead for this exact
@@ -137,7 +174,7 @@ export async function submitCreatorRequest(
     name: parsed.data.name || null,
     pitch: parsed.data.pitch || null,
     proof,
-    created_ip: ip === 'dev-local' ? null : ip,
+    created_ip: ip,
   });
 
   if (insertErr) return { ok: false, error: 'insert_failed' };

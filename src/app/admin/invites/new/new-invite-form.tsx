@@ -7,7 +7,10 @@ export function NewInviteForm() {
   const [email, setEmail] = useState('');
   const [notes, setNotes] = useState('');
   const [expiresInDays, setExpiresInDays] = useState(7);
-  const [result, setResult] = useState<{ url: string; emailStatus: 'sent' | 'skipped' | 'failed' } | null>(null);
+  const [result, setResult] = useState<{
+    url: string;
+    emailStatus: 'sent' | 'sent_sandbox' | 'skipped' | 'failed';
+  } | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
 
@@ -71,9 +74,11 @@ export function NewInviteForm() {
           >
             {result.emailStatus === 'sent'
               ? '✓ Invite email sent.'
-              : result.emailStatus === 'skipped'
-                ? '⚠ Email is disabled (no RESEND keys) — send this link manually:'
-                : '⚠ Email failed to send — send this link manually:'}
+              : result.emailStatus === 'sent_sandbox'
+                ? '⚠ Sent from the Resend SANDBOX — only the Resend account owner receives it, NOT the creator. Send this link manually:'
+                : result.emailStatus === 'skipped'
+                  ? '⚠ Email is disabled (no RESEND keys) — send this link manually:'
+                  : '⚠ Email failed to send — send this link manually:'}
           </div>
           <div style={{ fontSize: 12, opacity: 0.7 }}>Copy-fallback URL (shown once):</div>
           <code>{result.url}</code>

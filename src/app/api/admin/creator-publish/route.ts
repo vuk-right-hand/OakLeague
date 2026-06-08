@@ -77,6 +77,21 @@ export async function POST(req: NextRequest) {
   }
   const publish = body.publish;
 
+  // Snapshot prior publish state BEFORE the RPC (audit M1): the RPC sets
+  // published_at = now() unconditionally on every p_publish=true call, so we
+  // can't tell a first-publish from a republish afterwards. We email only on a
+  // false→true transition, not on every unpublish→republish cycle.
+  let wasPublished = false;
+  if (publish) {
+    const sbPre = supabaseAdmin();
+    const { data: pre } = await sbPre
+      .from('creators')
+      .select('published_at')
+      .eq('id', creatorId)
+      .maybeSingle<{ published_at: string | null }>();
+    wasPublished = !!pre?.published_at;
+  }
+
   // Call the public RPC via the JWT-bound client so auth.uid() resolves
   // (the RPC asserts admin + writes the audit row with auth.uid()).
   const { supabaseServer } = await import('@/lib/supabase/server');
@@ -133,10 +148,10 @@ export async function POST(req: NextRequest) {
       display_name: string | null;
     }>();
 
-  // "You're live" email — best effort, only on a real publish transition.
-  // Failure here never affects the publish response (audit C2: surfaced via
-  // Sentry inside sendEmail, not swallowed silently).
-  if (publish && row?.published_at && row.handle && row.user_id) {
+  // "You're live" email — best effort, only on a real false→true transition
+  // (audit M1: not on every republish). Failure here never affects the publish
+  // response (audit C2: surfaced via Sentry inside sendEmail, not swallowed).
+  if (publish && !wasPublished && row?.published_at && row.handle && row.user_id) {
     try {
       const { data: u } = await sb.auth.admin.getUserById(row.user_id);
       const email = u?.user?.email;

@@ -45,10 +45,15 @@ CREATE INDEX creator_requests_pending_idx
   ON public.creator_requests (created_at ASC)
   WHERE status = 'pending';
 
--- Dedupe lookup by email (action checks for an existing pending/invited row
--- before inserting a new lead).
-CREATE INDEX creator_requests_email_idx
-  ON public.creator_requests (lower(email), created_at DESC);
+-- Open-lead lookup by email. Both callers — the /request dedupe
+-- (status IN pending,invited) and the creator-status 'requested' check — filter
+-- on the BARE column `email = $1` (we store an already-lowercased address), so a
+-- functional lower(email) index can't serve them. This partial index on the
+-- bare column, scoped to open statuses, is what those queries actually hit and
+-- stays tiny as decided rows accumulate (audit M2).
+CREATE INDEX creator_requests_open_email_idx
+  ON public.creator_requests (email)
+  WHERE status IN ('pending', 'invited');
 
 -- Service-role only. RLS on, zero policies = deny-all for anon/authenticated.
 ALTER TABLE public.creator_requests ENABLE ROW LEVEL SECURITY;

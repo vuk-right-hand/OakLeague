@@ -9,14 +9,21 @@ let warnedNoSecretInProd = false;
 export async function verifyTurnstile(token: string, remoteIp: string): Promise<boolean> {
   const secret = process.env.TURNSTILE_SECRET_KEY;
   if (!secret) {
-    // Captcha disabled. In production this silently removes the bot defense on
-    // every public form — warn once so a missing env is noticed (audit Small).
-    if (process.env.NODE_ENV === 'production' && !warnedNoSecretInProd) {
-      warnedNoSecretInProd = true;
-      console.warn(
-        '[turnstile] TURNSTILE_SECRET_KEY is unset in production — captcha is ' +
-          'DISABLED on all public forms (waitlist, creator request). Set it.',
-      );
+    // In PRODUCTION, fail CLOSED (audit C1). A captcha that passes when the
+    // secret is misconfigured is not a captcha — it silently removes the only
+    // bot defense on every public form (waitlist, creator request) and lets an
+    // attacker flood the funnel. A loud outage forces the env to be set; a
+    // silent open hole gets exploited. In dev/CI we no-op (return true) so the
+    // forms work without a Cloudflare key.
+    if (process.env.NODE_ENV === 'production') {
+      if (!warnedNoSecretInProd) {
+        warnedNoSecretInProd = true;
+        console.error(
+          '[turnstile] TURNSTILE_SECRET_KEY is unset in production — failing ' +
+            'CLOSED on all public forms (waitlist, creator request). Set it.',
+        );
+      }
+      return false;
     }
     return true;
   }
