@@ -691,13 +691,14 @@ async function attachToSession({ sessionId, userId, creatorId, expectedTier }) {
 
 async function openSession({ userId, creatorId, modelWire, ttsProvider }) {
   const modelEnum = MODEL_TO_ENUM[modelWire];
-  // FISH_AUDIO_PHASE_1 wiring audit C4 — spike-a admin path is admin-dev
-  // only; never routes to Fish. Phase 1 deliberately scopes Fish to
-  // creators via `creators.tts_provider` consumed through real
-  // /api/sessions/open. A Fish ticket reaching this legacy path is a
-  // copy-paste / fixture leak. Mirror `spike_a_retrieval_version_unsupported`.
-  if (ttsProvider === 'fish') {
-    return { err: 'spike_a_fish_unsupported' };
+  // FISH_AUDIO_PHASE_1 wiring audit C4 + TS-widening audit M5 — spike-a
+  // admin path is admin-dev only; the spike-a/ticket route hardcodes
+  // tts_provider='cartesia'. Refuse ANY non-cartesia ticket reaching
+  // this legacy path so a copy-paste / fixture leak fails loud rather
+  // than silently opening on the wrong provider. Real provider routing
+  // happens through /api/sessions/open.
+  if (ttsProvider !== 'cartesia') {
+    return { err: `spike_a_${ttsProvider}_unsupported` };
   }
   // Day-13 audit-build M4 — admin spike-a path hard-pins
   // retrieval_version_at_session=1, but the creator may already be at

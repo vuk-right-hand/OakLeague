@@ -45,11 +45,11 @@ type Creator = {
   // pgvector RAG (M2). 'drawer' | 'vector'. Drives whether the publish
   // readiness gate requires embedded v2 chunks (only for vector + v2).
   brain_mode: 'drawer' | 'vector';
-  // HUME_TTS_PLAN §6.11. NULL on tts_provider = inherit env.
+  // HUME_TTS_PLAN §6.11 + FISH_AUDIO_PHASE_1 §6. NULL on tts_provider = inherit env.
   // Audit S5 (unit-wide) — all three env-scoped Hume columns selected so
   // the status cells can display the env that matches the admin's current
   // deploy (preview admins see preview values, not stale prod values).
-  tts_provider: 'cartesia' | 'hume' | null;
+  tts_provider: 'cartesia' | 'hume' | 'fish' | null;
   hume_voice_id: string | null;
   hume_voice_id_preview: string | null;
   hume_voice_id_dev: string | null;
@@ -68,6 +68,12 @@ type Creator = {
   hume_model_version: '1' | '2' | 'default' | null;
   hume_model_version_preview: '1' | '2' | 'default' | null;
   hume_model_version_dev: '1' | '2' | 'default' | null;
+  // FISH_AUDIO_PHASE_1 §6 — env-scoped Fish reference_id (M7 — added so
+  // status cell + panel warning can render). No companion name column
+  // (Fish DELETE is keyed by id).
+  fish_voice_id: string | null;
+  fish_voice_id_preview: string | null;
+  fish_voice_id_dev: string | null;
 };
 
 type Topic = {
@@ -126,7 +132,8 @@ export default async function AdminCreatorDetail({
         hume_tts_speed, hume_tts_speed_preview, hume_tts_speed_dev,
         hume_trailing_silence, hume_trailing_silence_preview, hume_trailing_silence_dev,
         hume_voice_description, hume_voice_description_preview, hume_voice_description_dev,
-        hume_model_version, hume_model_version_preview, hume_model_version_dev
+        hume_model_version, hume_model_version_preview, hume_model_version_dev,
+        fish_voice_id, fish_voice_id_preview, fish_voice_id_dev
       `)
       .eq('id', id)
       .maybeSingle<Creator>(),
@@ -170,6 +177,12 @@ export default async function AdminCreatorDetail({
   const envHumeModel     = currentEnv === 'production' ? creator.hume_model_version
                          : currentEnv === 'preview'    ? creator.hume_model_version_preview
                          :                               creator.hume_model_version_dev;
+  // FISH_AUDIO_PHASE_1 §6 + audit M7 — env-scoped Fish reference_id for
+  // the status cell and the panel's "you flipped to fish but voice_id is
+  // empty" warning (C2).
+  const envFishVoiceId   = currentEnv === 'production' ? creator.fish_voice_id
+                         : currentEnv === 'preview'    ? creator.fish_voice_id_preview
+                         :                               creator.fish_voice_id_dev;
 
   const topicRows = (topics ?? []) as Topic[];
   const sampleRows = (samples ?? []) as SampleRow[];
@@ -471,10 +484,12 @@ export default async function AdminCreatorDetail({
             value={envHumeSilence != null ? String(envHumeSilence) : '— (default 0.3)'}
           />
           <StatusCell label={`hume model (${envLabel})`} value={envHumeModel ?? '2 (default)'} />
+          <StatusCell label={`fish voice_id (${envLabel})`} value={envFishVoiceId ?? '—'} mono />
         </div>
         <TtsProviderPanel
           creatorId={creator.id}
           initialTtsProvider={creator.tts_provider}
+          initialFishVoiceId={envFishVoiceId}
           initialHumeVoiceId={envHumeVoiceId}
           initialHumeVoiceName={envHumeVoiceName}
           initialHumeTtsSpeed={

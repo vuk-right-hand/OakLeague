@@ -34,7 +34,11 @@ export class VoiceTicketMintError extends Error {
     | 'creator_not_found'
     | 'session_not_owned'
     | 'ticket_mint_failed'
-    | 'too_many_tickets';
+    | 'too_many_tickets'
+    // FISH_AUDIO_PHASE_1 TS-widening audit C4 — Fish account-level
+    // concurrency cap (5 concurrent on Starter, 1-slot headroom = ≥4).
+    // HTTP 503 (capacity, not bad input) so client retries.
+    | 'fish_capacity_full';
   readonly httpStatus: number;
   constructor(code: VoiceTicketMintError['code'], httpStatus: number, msg?: string) {
     super(msg ?? code);
@@ -81,13 +85,17 @@ export type MintVoiceTicketArgs = {
   // updated yet (spike-a admin ticket). DB column is NOT NULL DEFAULT 'cartesia'
   // (migration 0002) — explicit value here is the writer-discipline contract
   // (CI grep enforced by scripts/check-tts-provider-writes.sh).
-  ttsProvider?: 'cartesia' | 'hume';
+  // FISH_AUDIO_PHASE_1 §6 — Fish joins the union. Fish has NO prosody
+  // dials in Phase 1 (no speed / trailing_silence / description /
+  // model_version equivalents — out-of-scope per plan §6). The hume_*
+  // fields below stay null on fish tickets, identical to cartesia.
+  ttsProvider?: 'cartesia' | 'hume' | 'fish';
   // HUME_TTS_PLAN §6.3 — Hume prosody dials snapshotted from creator at mint
   // time, persisted on the ticket so the proxy's consumeTicket() is the only
   // DB read per session. All four required when ttsProvider='hume' (route is
   // responsible for the env-scoped resolution before calling here); ignored
-  // when ttsProvider='cartesia'. Mint hard-rejects ttsProvider='hume' with
-  // any of these NULL (HUME_TTS_PLAN unit-wide audit M-defensive).
+  // when ttsProvider='cartesia' or 'fish'. Mint hard-rejects ttsProvider='hume'
+  // with any of these NULL (HUME_TTS_PLAN unit-wide audit M-defensive).
   humeTtsSpeed?: number | null;
   humeTrailingSilence?: number | null;
   humeVoiceDescription?: string | null;
@@ -132,7 +140,7 @@ export async function mintVoiceTicket(args: MintVoiceTicketArgs): Promise<MintVo
   // half-resolved ticket. The DB CHECK on voice_tickets is the last line of
   // defense; this is the first.
   const ttsProvider = args.ttsProvider ?? 'cartesia';
-  if (ttsProvider !== 'cartesia' && ttsProvider !== 'hume') {
+  if (ttsProvider !== 'cartesia' && ttsProvider !== 'hume' && ttsProvider !== 'fish') {
     throw new VoiceTicketMintError('bad_tts_provider', 400);
   }
   if (ttsProvider === 'hume') {
@@ -169,6 +177,33 @@ export async function mintVoiceTicket(args: MintVoiceTicketArgs): Promise<MintVo
   }
   if ((liveCount ?? 0) >= 5) {
     throw new VoiceTicketMintError('too_many_tickets', 429);
+  }
+
+  // FISH_AUDIO_PHASE_1 TS-widening audit C4 — Fish account-level
+  // concurrency gate. Fish Starter tier = 5 concurrent fleet-wide. The
+  // per-user cap above doesn't protect against N users each holding 1
+  // Fish ticket. Reserve a 1-slot headroom (≥4 → refuse) so a transient
+  // burst doesn't trip Fish-side 429s mid-session. Lift this to 14
+  // (≥13 → refuse) after the $100 prepay → Elevated 15 tier upgrade.
+  // The gate is fish-only; cartesia + hume have their own provider caps
+  // (none today; Cartesia is rate-limited per-account by Cartesia itself
+  // but we haven't surfaced the concurrent-limit number).
+  if (args.ttsProvider === 'fish') {
+    const FISH_CONCURRENT_LIMIT = 5;
+    const FISH_HEADROOM = 1;
+    const { count: fishLive, error: fishCountErr } = await admin
+      .from('voice_tickets')
+      .select('ticket_id', { count: 'exact', head: true })
+      .eq('tts_provider', 'fish')
+      .is('consumed_at', null)
+      .gt('expires_at', new Date().toISOString());
+    if (fishCountErr) {
+      throw new VoiceTicketMintError('ticket_mint_failed', 500, fishCountErr.message);
+    }
+    if ((fishLive ?? 0) >= FISH_CONCURRENT_LIMIT - FISH_HEADROOM) {
+      throw new VoiceTicketMintError('fish_capacity_full', 503,
+        `fish fleet at ${fishLive}/${FISH_CONCURRENT_LIMIT} concurrent (1-slot headroom)`);
+    }
   }
 
   const expiresAt = new Date(Date.now() + TTL_SECONDS * 1000).toISOString();

@@ -130,9 +130,13 @@ export async function POST(req: NextRequest) {
       bound_ua_hash: uaHash,
       creator_id: creatorId,
       avatar_provider: 'simli',
-      // HUME_TTS_PLAN §5.5 writer discipline (2026-05-13): pass tts_provider
-      // explicitly. Spike-A is admin-gated dev-only path; cartesia is the
-      // appropriate baseline.
+      // HUME_TTS_PLAN §5.5 + FISH_AUDIO_PHASE_1 §6 writer discipline: pass
+      // tts_provider explicitly. Spike-A is admin-gated dev-only path —
+      // NEVER routes to fish (proxy openSession() refuses ttsProvider=
+      // 'fish' on the spike-a path; FISH_AUDIO_PHASE_1 wiring audit C4).
+      // Hardcode cartesia and keep it that way; if a future need ever
+      // forces a fish spike-a test, lift the openSession refusal BEFORE
+      // flipping this literal.
       tts_provider: 'cartesia',
     })
     .select('ticket_id, expires_at')

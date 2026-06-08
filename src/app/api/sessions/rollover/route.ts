@@ -120,6 +120,8 @@ export async function POST(req: NextRequest) {
       hume_trailing_silence, hume_trailing_silence_preview, hume_trailing_silence_dev,
       hume_voice_description, hume_voice_description_preview, hume_voice_description_dev,
       hume_model_version, hume_model_version_preview, hume_model_version_dev,
+      fish_voice_id, fish_voice_id_preview, fish_voice_id_dev,
+      tts_provider,
       published_at, system_prompt, brain_status, tts_speed, brain_mode, decoupled
     `)
     .eq('id', creatorId)
@@ -148,6 +150,16 @@ export async function POST(req: NextRequest) {
       hume_model_version: string | null;
       hume_model_version_preview: string | null;
       hume_model_version_dev: string | null;
+      // FISH_AUDIO_PHASE_1 §6 — env-scoped Fish reference_id columns
+      // (TS-widening audit C1). Without these, resolveVoiceId on a fish
+      // rollover returns null → 409 creator_voice_not_trained.
+      fish_voice_id: string | null;
+      fish_voice_id_preview: string | null;
+      fish_voice_id_dev: string | null;
+      // Audit M2: select tts_provider even though rollover relies on the
+      // SESSION snapshot (not the creator's current value). Surfacing it
+      // here makes future divergence guards possible without a re-SELECT.
+      tts_provider: 'cartesia' | 'hume' | 'fish' | null;
       // C3 (FIVE_CREATOR_ONBOARDING_READINESS P0-1): gate rollover on
       // publication too, so a takedown/unpublish during a live session also
       // blocks the 15-min rollover (a rollover IS a new session).
@@ -178,8 +190,9 @@ export async function POST(req: NextRequest) {
     .from('sessions')
     .select('tts_provider_at_session')
     .eq('id', oldId)
-    .maybeSingle<{ tts_provider_at_session: 'cartesia' | 'hume' | null }>();
-  const sessionProvider: 'cartesia' | 'hume' =
+    .maybeSingle<{ tts_provider_at_session: 'cartesia' | 'hume' | 'fish' | null }>();
+  // FISH_AUDIO_PHASE_1 §6 — 3-arm union for the locked-session snapshot.
+  const sessionProvider: 'cartesia' | 'hume' | 'fish' =
     oldProviderRow?.tts_provider_at_session ?? 'cartesia';
 
   // PR-2 audit C3: pre-gate the env-scoped voice column on rollover, mirror
@@ -193,10 +206,11 @@ export async function POST(req: NextRequest) {
     return json(503, { error: 'voice_proxy_unreachable' });
   }
   const useTtsLayer = proxyCfgR.useTtsLayer;
-  // Audit C4 — same predicate as proxy `useTts = useTtsLayer ||
-  // ttsProvider === 'hume'`. A hume-override creator whose env-scoped
-  // voice id is NULL must 409 here too, not slip to WS-open.
-  const useTts = useTtsLayer || sessionProvider === 'hume';
+  // Audit C4 + FISH_AUDIO_PHASE_1 — same predicate as proxy `useTts =
+  // useTtsLayer || ttsProvider === 'hume' || 'fish'`. A non-cartesia
+  // override creator whose env-scoped voice id is NULL must 409 here
+  // too, not slip to WS-open.
+  const useTts = useTtsLayer || sessionProvider === 'hume' || sessionProvider === 'fish';
   if (useTts && !envVoiceId) {
     return json(409, {
       error: 'creator_voice_not_trained',

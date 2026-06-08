@@ -133,7 +133,8 @@ describe('aggregateLiveSessions', () => {
       cost_usd_truth: 0, cost_usd_fallback: 0, tts_seconds: 0,
       cogs_rows: 0, cartesia_pending_rows: 0,
       leg2_total: 0, leg2_fallback: 0,
-      tts_provider: null, cost_usd_cartesia: 0, cost_usd_hume: 0,
+      tts_provider: null, cost_usd_cartesia: 0, cost_usd_hume: 0, cost_usd_fish: 0,
+      mixed_providers: [],
       tts_cap_exceeded_rows: 0,
     })).toBe(0);
   });
@@ -164,6 +165,51 @@ describe('aggregateLiveSessions', () => {
     expect(out.get('M')!.tts_provider).toBe('mixed');
     expect(out.get('M')!.cost_usd_cartesia).toBeCloseTo(0.1, 6);
     expect(out.get('M')!.cost_usd_hume).toBeCloseTo(0.2, 6);
+  });
+
+  // FISH_AUDIO_PHASE_1 §6 — fish bucketing + mixed coverage.
+  it('buckets fish-service rows into cost_usd_fish and tags tts_provider=fish', () => {
+    const out = aggregateLiveSessions([
+      liveRow({ session_id: 'F1', service: 'fish', operation: 'voice_tts_audio_seconds', cost_usd: 0.07, metadata: { tts_provider: 'fish' } }),
+      liveRow({ session_id: 'F1', service: 'fish', operation: 'voice_tts_characters',     cost_usd: 0.03, metadata: { tts_provider: 'fish' } }),
+    ]);
+    expect(out.get('F1')!.tts_provider).toBe('fish');
+    expect(out.get('F1')!.cost_usd_fish).toBeCloseTo(0.10, 6);
+    expect(out.get('F1')!.cost_usd_cartesia).toBe(0);
+    expect(out.get('F1')!.cost_usd_hume).toBe(0);
+  });
+
+  it('mixed surfaces across all three providers (cartesia + hume + fish)', () => {
+    const out = aggregateLiveSessions([
+      liveRow({ session_id: 'X', service: 'cartesia', cost_usd: 0.1, metadata: { tts_provider: 'cartesia' } }),
+      liveRow({ session_id: 'X', service: 'fish',     cost_usd: 0.2, metadata: { tts_provider: 'fish' } }),
+      liveRow({ session_id: 'X', service: 'hume',     cost_usd: 0.3, metadata: { tts_provider: 'hume' } }),
+    ]);
+    expect(out.get('X')!.tts_provider).toBe('mixed');
+    expect(out.get('X')!.cost_usd_cartesia).toBeCloseTo(0.1, 6);
+    expect(out.get('X')!.cost_usd_fish).toBeCloseTo(0.2, 6);
+    expect(out.get('X')!.cost_usd_hume).toBeCloseTo(0.3, 6);
+    // Audit M3 — mixed_providers surfaces which providers actually leaked
+    // into the session, sorted ASC. Lets dashboard distinguish a
+    // cartesia+fish bug from a cartesia+hume bug without raw-row drill-down.
+    expect(out.get('X')!.mixed_providers).toEqual(['cartesia', 'fish', 'hume']);
+  });
+
+  it('mixed_providers reflects the actual pair (cartesia + fish only)', () => {
+    const out = aggregateLiveSessions([
+      liveRow({ session_id: 'P', service: 'cartesia', cost_usd: 0.05, metadata: { tts_provider: 'cartesia' } }),
+      liveRow({ session_id: 'P', service: 'fish',     cost_usd: 0.05, metadata: { tts_provider: 'fish' } }),
+    ]);
+    expect(out.get('P')!.tts_provider).toBe('mixed');
+    expect(out.get('P')!.mixed_providers).toEqual(['cartesia', 'fish']);
+  });
+
+  it('mixed_providers on a clean single-provider session is the singleton', () => {
+    const out = aggregateLiveSessions([
+      liveRow({ session_id: 'S', service: 'fish', cost_usd: 0.05, metadata: { tts_provider: 'fish' } }),
+    ]);
+    expect(out.get('S')!.tts_provider).toBe('fish');
+    expect(out.get('S')!.mixed_providers).toEqual(['fish']);
   });
 
   it('counts tts_cap_exceeded rows separately (§6.9 C2 signal)', () => {
@@ -270,13 +316,14 @@ describe('aggregateHistoricalSummary', () => {
   });
 
   it('empty input yields empty output', () => {
-    const { byOperation, byProviderLeg, totalUsdTruth, totalUsdFallback, totalUsdCartesia, totalUsdHume } = aggregateHistoricalSummary([]);
+    const { byOperation, byProviderLeg, totalUsdTruth, totalUsdFallback, totalUsdCartesia, totalUsdHume, totalUsdFish } = aggregateHistoricalSummary([]);
     expect(byOperation).toEqual([]);
     expect(byProviderLeg).toEqual([]);
     expect(totalUsdTruth).toBe(0);
     expect(totalUsdFallback).toBe(0);
     expect(totalUsdCartesia).toBe(0);
     expect(totalUsdHume).toBe(0);
+    expect(totalUsdFish).toBe(0);
   });
 
   // HUME_TTS_PLAN §6.12 — provider × leg breakdown.

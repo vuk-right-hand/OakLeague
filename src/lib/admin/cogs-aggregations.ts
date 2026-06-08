@@ -6,12 +6,13 @@
 // counted into a SEPARATE bucket from token-truth rows so the dashboard
 // headline never silently merges the two.
 //
-// HUME_TTS_PLAN §6.12 — provider-aware aggregator. Every cogs row written by
-// `cogs_insert_turn_voice_v2` (proxy §6.10) carries `metadata.tts_provider`
-// = 'cartesia' | 'hume'. Pre-v2 rows lack the key; we tag those as 'cartesia'
-// (the only provider that existed). Mixed sessions impossible by §6.6
-// session-locked provider rule, but the aggregator handles the 'mixed' case
-// defensively so a future swap-with-bug surfaces visibly instead of silent.
+// HUME_TTS_PLAN §6.12 + FISH_AUDIO_PHASE_1 §6 — provider-aware aggregator.
+// Every cogs row written by `cogs_insert_turn_voice_v2` (forwards to v3 after
+// Phase 1 M3) carries `metadata.tts_provider` ∈ ('cartesia' | 'hume' | 'fish').
+// Pre-v2 rows lack the key; we tag those as 'cartesia' (the only provider
+// that existed). Mixed sessions impossible by §6.6 session-locked provider
+// rule, but the aggregator handles the 'mixed' case defensively so a future
+// swap-with-bug surfaces visibly instead of silent.
 
 export type CogsLiveRow = {
   session_id: string;
@@ -22,7 +23,7 @@ export type CogsLiveRow = {
   metadata: Record<string, unknown> | null;
 };
 
-export type TtsProviderTag = 'cartesia' | 'hume' | 'mixed' | null;
+export type TtsProviderTag = 'cartesia' | 'hume' | 'fish' | 'mixed' | null;
 
 export type LiveSessionAgg = {
   cost_usd_truth: number;
@@ -32,10 +33,18 @@ export type LiveSessionAgg = {
   cartesia_pending_rows: number;
   leg2_total: number;     // count of voice_audio_out_tokens rows
   leg2_fallback: number;  // count where metadata.fallback === 'seconds'
-  // HUME_TTS_PLAN §6.12 — provider-aware buckets.
+  // HUME_TTS_PLAN §6.12 + FISH_AUDIO_PHASE_1 §6 — provider-aware buckets.
   tts_provider: TtsProviderTag;
   cost_usd_cartesia: number;
   cost_usd_hume: number;
+  cost_usd_fish: number;
+  // FISH_AUDIO_PHASE_1 TS-widening audit M3 — when tts_provider==='mixed'
+  // (defensive — shouldn't happen by §6.6 session-locked rule), this
+  // field surfaces WHICH providers leaked into the session. Sorted ASC,
+  // joined by '+' (e.g. 'cartesia+fish'). Empty array on non-mixed
+  // sessions. Phase 1 IS the cutover window where mixed is most likely a
+  // real bug, not a defensive flag — knowing the pair makes triage cheap.
+  mixed_providers: ReadonlyArray<'cartesia' | 'hume' | 'fish'>;
   // Capped-turn signal (§6.9 C2 fix). Rows written via flushHumeCapExceededCogs
   // carry metadata.tts_cap_exceeded=true. Dashboard surface for "how often
   // does Hume cap fire?" — should be ~zero in steady state.
@@ -51,15 +60,18 @@ const TTS_AUDIO_OPERATION = 'voice_tts_audio_seconds';
 // Audit small fix: a row from `service='gemini'` is NOT a TTS row — it
 // belongs to no provider bucket. Tagging it cartesia would inflate the
 // cartesia totals with Gemini's audio-in / audio-out cost.
-const TTS_SERVICES = new Set(['cartesia', 'hume']);
-function rowProvider(r: { service: string; metadata: Record<string, unknown> | null }): 'cartesia' | 'hume' | null {
+// FISH_AUDIO_PHASE_1 §6 — Fish joins the TTS services set; same `service` enum
+// value is `'fish'` per migration 20260608100002.
+const TTS_SERVICES = new Set(['cartesia', 'hume', 'fish']);
+function rowProvider(r: { service: string; metadata: Record<string, unknown> | null }): 'cartesia' | 'hume' | 'fish' | null {
   if (!TTS_SERVICES.has(r.service)) return null;
   const v = r.metadata?.['tts_provider'];
   if (v === 'hume') return 'hume';
+  if (v === 'fish') return 'fish';
   return 'cartesia';
 }
 
-function mergeProviderTag(existing: TtsProviderTag, next: 'cartesia' | 'hume'): TtsProviderTag {
+function mergeProviderTag(existing: TtsProviderTag, next: 'cartesia' | 'hume' | 'fish'): TtsProviderTag {
   if (existing == null) return next;
   if (existing === 'mixed') return 'mixed';
   return existing === next ? existing : 'mixed';
@@ -67,6 +79,10 @@ function mergeProviderTag(existing: TtsProviderTag, next: 'cartesia' | 'hume'): 
 
 export function aggregateLiveSessions(rows: CogsLiveRow[]): Map<string, LiveSessionAgg> {
   const out = new Map<string, LiveSessionAgg>();
+  // FISH_AUDIO_PHASE_1 TS-widening audit M3 — track which providers each
+  // session has seen, in parallel to the Map<LiveSessionAgg> fold. Mirror
+  // into agg.mixed_providers in a post-fold pass below.
+  const providersSeen = new Map<string, Set<'cartesia' | 'hume' | 'fish'>>();
   for (const r of rows) {
     const cur =
       out.get(r.session_id) ??
@@ -81,6 +97,8 @@ export function aggregateLiveSessions(rows: CogsLiveRow[]): Map<string, LiveSess
         tts_provider: null,
         cost_usd_cartesia: 0,
         cost_usd_hume: 0,
+        cost_usd_fish: 0,
+        mixed_providers: [],
         tts_cap_exceeded_rows: 0,
       } as LiveSessionAgg);
 
@@ -113,14 +131,28 @@ export function aggregateLiveSessions(rows: CogsLiveRow[]): Map<string, LiveSess
     const prov = rowProvider(r);
     if (prov !== null) {
       cur.tts_provider = mergeProviderTag(cur.tts_provider, prov);
-      if (prov === 'hume') cur.cost_usd_hume     += cost;
-      else                 cur.cost_usd_cartesia += cost;
+      if (prov === 'hume')      cur.cost_usd_hume     += cost;
+      else if (prov === 'fish') cur.cost_usd_fish     += cost;
+      else                      cur.cost_usd_cartesia += cost;
+      // Audit M3 — record provider into the parallel Set for mixed_providers.
+      let seenSet = providersSeen.get(r.session_id);
+      if (!seenSet) { seenSet = new Set(); providersSeen.set(r.session_id, seenSet); }
+      seenSet.add(prov);
     }
     if (r.metadata?.['tts_cap_exceeded'] === true) {
       cur.tts_cap_exceeded_rows += 1;
     }
     cur.cogs_rows += 1;
     out.set(r.session_id, cur);
+  }
+  // Audit M3 — post-fold pass: lift the provider Set into LiveSessionAgg
+  // as a sorted readonly array. Surface even on non-mixed sessions for
+  // consistency (e.g. ['hume'] for a clean hume session).
+  for (const [sid, set] of providersSeen.entries()) {
+    const agg = out.get(sid);
+    if (agg) {
+      agg.mixed_providers = Array.from(set).sort() as Array<'cartesia' | 'hume' | 'fish'>;
+    }
   }
   return out;
 }
@@ -150,9 +182,9 @@ export type ByOperationAgg = {
   fallback_count: number;
 };
 
-// HUME_TTS_PLAN §6.12 — provider × leg breakdown for the dashboard widget.
+// HUME_TTS_PLAN §6.12 + FISH_AUDIO_PHASE_1 §6 — provider × leg breakdown.
 export type ProviderLegAgg = {
-  tts_provider: 'cartesia' | 'hume';
+  tts_provider: 'cartesia' | 'hume' | 'fish';
   operation: string;
   cost_usd_truth: number;
   cost_usd_fallback: number;
@@ -162,21 +194,25 @@ export type ProviderLegAgg = {
 
 export type HistoricalSummary = {
   byOperation: ByOperationAgg[];
-  // HUME_TTS_PLAN §6.12 — provider × operation breakdown for the dashboard
-  // widget. byOperation keeps the existing service-keyed fold; byProviderLeg
-  // surfaces (provider, operation) so cartesia-vs-hume comparisons are
-  // first-class. Pre-v2 rows tagged 'cartesia' (only provider that existed).
+  // HUME_TTS_PLAN §6.12 + FISH_AUDIO_PHASE_1 §6 — provider × operation
+  // breakdown for the dashboard widget. byOperation keeps the existing
+  // service-keyed fold; byProviderLeg surfaces (provider, operation) so
+  // cartesia/hume/fish comparisons are first-class. Pre-v2 rows tagged
+  // 'cartesia' (only provider that existed).
   byProviderLeg: ProviderLegAgg[];
   totalUsdTruth: number;
   totalUsdFallback: number;
   totalUsdCartesia: number;
   totalUsdHume: number;
+  totalUsdFish: number;
 };
 
-function rowProviderTag(r: CogsSummaryRow): 'cartesia' | 'hume' | null {
+function rowProviderTag(r: CogsSummaryRow): 'cartesia' | 'hume' | 'fish' | null {
   if (!TTS_SERVICES.has(r.service)) return null;
   const v = r.metadata?.['tts_provider'];
-  return v === 'hume' ? 'hume' : 'cartesia';
+  if (v === 'hume') return 'hume';
+  if (v === 'fish') return 'fish';
+  return 'cartesia';
 }
 
 export function aggregateHistoricalSummary(rows: CogsSummaryRow[]): HistoricalSummary {
@@ -186,6 +222,7 @@ export function aggregateHistoricalSummary(rows: CogsSummaryRow[]): HistoricalSu
   let totalUsdFallback = 0;
   let totalUsdCartesia = 0;
   let totalUsdHume = 0;
+  let totalUsdFish = 0;
 
   for (const r of rows) {
     const cost = Number(r.cost_usd) || 0;
@@ -228,8 +265,9 @@ export function aggregateHistoricalSummary(rows: CogsSummaryRow[]): HistoricalSu
     // to provider sub-totals (audit small fix).
     const prov = rowProviderTag(r);
     if (prov !== null) {
-      if (prov === 'hume') totalUsdHume     += cost;
-      else                 totalUsdCartesia += cost;
+      if (prov === 'hume')      totalUsdHume     += cost;
+      else if (prov === 'fish') totalUsdFish     += cost;
+      else                      totalUsdCartesia += cost;
       const pKey = `${prov}|${r.operation}`;
       const pCur = byProviderLeg.get(pKey);
       if (pCur) {
@@ -267,5 +305,6 @@ export function aggregateHistoricalSummary(rows: CogsSummaryRow[]): HistoricalSu
     totalUsdFallback,
     totalUsdCartesia,
     totalUsdHume,
+    totalUsdFish,
   };
 }

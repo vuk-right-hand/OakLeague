@@ -70,9 +70,13 @@ async function requireAdmin(): Promise<ActionResult | null> {
 
 // ── setCreatorTtsProvider ─────────────────────────────────────────────────
 
+// FISH_AUDIO_PHASE_1 §6 — 'fish' joins the Zod enum so the admin dropdown's
+// fish option flows through to the creator_set_tts_provider RPC. The RPC
+// accepts the wider enum because migration 20260608100001 widened
+// public.tts_provider.
 const TtsProviderInput = z.object({
   creatorId: z.string().uuid(),
-  value: z.enum(['inherit', 'cartesia', 'hume']),
+  value: z.enum(['inherit', 'cartesia', 'hume', 'fish']),
 });
 
 export async function setCreatorTtsProvider(input: unknown): Promise<ActionResult> {

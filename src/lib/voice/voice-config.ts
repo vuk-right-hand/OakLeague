@@ -1,5 +1,6 @@
 // R3-C2 (sec) — single source of truth for VOICE_TTS_LAYER_ENABLED.
-// HUME_TTS_PLAN §6.2 — extended to also surface `ttsProvider` ('cartesia'|'hume').
+// HUME_TTS_PLAN §6.2 + FISH_AUDIO_PHASE_1 §6 — extended to surface
+// `ttsProvider` ∈ ('cartesia' | 'hume' | 'fish').
 //
 // 2026-05-14 rename: env var + field was VOICE_CARTESIA_ENABLED / useCartesia,
 // renamed to VOICE_TTS_LAYER_ENABLED / useTtsLayer because the flag actually
@@ -26,7 +27,7 @@
 
 export type ProxyVoiceConfig = {
   useTtsLayer: boolean;
-  ttsProvider: 'cartesia' | 'hume';
+  ttsProvider: 'cartesia' | 'hume' | 'fish';
   // HUME_TTS_PLAN §6 audit M5 — true when this value is the fail-open
   // fallback (proxy unreachable, env unset, malformed body). The caller
   // can choose to 503 instead of silently using the fallback. Bridge
@@ -98,8 +99,22 @@ export async function getProxyVoiceConfig(): Promise<ProxyVoiceConfig> {
     // Accept new key first, fall back to legacy `useCartesia` for old Fly deploys.
     const useTtsLayer = body?.useTtsLayer === true || body?.useCartesia === true;
     const rawProvider = typeof body?.ttsProvider === 'string' ? body.ttsProvider : '';
-    const ttsProvider: 'cartesia' | 'hume' =
-      rawProvider === 'hume' ? 'hume' : 'cartesia';
+    // FISH_AUDIO_PHASE_1 §6 — 3-arm allowlist. Audit M4: a non-empty
+    // rawProvider that isn't in the allowlist (proxy bug, version skew,
+    // typo) MUST trigger failOpen — silently coercing 'cartersia' (typo)
+    // to 'cartesia' would mask a real configuration drift and bill
+    // sessions against the wrong provider. Empty string keeps the
+    // pre-existing "default to cartesia" semantic for older proxies that
+    // didn't return ttsProvider at all.
+    if (rawProvider !== '' && rawProvider !== 'cartesia' && rawProvider !== 'hume' && rawProvider !== 'fish') {
+      const value = failOpen();
+      _cache = { value, fetchedAt: now };
+      return value;
+    }
+    const ttsProvider: 'cartesia' | 'hume' | 'fish' =
+      rawProvider === 'hume' ? 'hume'
+      : rawProvider === 'fish' ? 'fish'
+      : 'cartesia';
     const value: ProxyVoiceConfig = { useTtsLayer, ttsProvider, failOpen: false };
     _cache = { value, fetchedAt: now };
     return value;

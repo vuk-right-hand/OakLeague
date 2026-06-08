@@ -188,6 +188,13 @@ export async function POST(req: Request) {
   // HUME_TTS_PLAN audit C2 fix (2026-05-13): scope the rate-limit count to
   // tts_provider='cartesia' so a Hume clone via the §5.2 paste-flow doesn't
   // burn this route's cap. Hume's rate-limit lives in its own route.
+  //
+  // FISH_AUDIO_PHASE_1 TS-widening audit M6 — TODO when the Fish admin
+  // clone-upload UI ships: COPY this rate-limit pattern into the new fish
+  // route, scoped by `tts_provider='fish'`. Do NOT share the cartesia cap
+  // — a creator paste-flow on fish shouldn't burn a cartesia admin's
+  // 3/24h quota. Phase 1 fish admin onboarding is direct service-role
+  // SQL (no route), so this comment is the contract for the future PR.
   const { count: successCount, error: rateErr } = await sb
     .from('voice_clone_uploads')
     .select('*', { count: 'exact', head: true })

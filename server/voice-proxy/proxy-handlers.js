@@ -292,14 +292,20 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
   // payload = {
   //   userId, sessionId, turnNumber,
   //   inputSeconds, outputSeconds, usageMetadata,
-  //   ttsProvider?: 'cartesia' | 'hume',
+  //   ttsProvider: 'cartesia' | 'hume' | 'fish',   // REQUIRED (audit C5)
   //   tts?:      { characters, audioBytes, audioSeconds, partial },
   //   cartesia?: { characters, audioBytes, audioSeconds, partial }   // legacy alias
   // }
-  // HUME_TTS_PLAN §6.10: `ttsProvider` + `tts` are the new contract; `cartesia`
-  // is kept as a legacy alias for back-compat with pre-§6 callers. When BOTH
-  // are present, `tts` wins. When `ttsProvider` is missing, default to
-  // 'cartesia' (legacy path).
+  // HUME_TTS_PLAN §6.10 + FISH_AUDIO_PHASE_1 §6: `ttsProvider` + `tts` are the
+  // new contract; `cartesia` is kept as a legacy alias for back-compat with
+  // pre-§6 callers. When BOTH are present, `tts` wins.
+  //
+  // FISH_AUDIO_PHASE_1 TS-widening audit C5: `ttsProvider` is now REQUIRED.
+  // The prior `= 'cartesia'` destructuring default silently masked any caller
+  // that forgot the field, mis-tagging fish/hume sessions as cartesia in cogs.
+  // v3's NULL-snapshot guard catches the worst case (session-side mismatch),
+  // but defense-in-depth at the function boundary is cheaper than dashboard
+  // forensics. Fail loud here when undefined.
   //
   // When `tts` is present, legs 3+4 are written with real values + provider
   // tag in metadata. When absent (α' off), legs 3+4 = 0 with cartesia_pending
@@ -316,6 +322,14 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
       // a second cogs writer racing this one.
       humeCapExceeded = false,
     } = payload;
+    // Audit C5 — validate ttsProvider is one of the allowlisted values when
+    // present. The default 'cartesia' covers cogs-rpc.test.js's 23 fixtures
+    // that intentionally don't pass the field (they test RPC error paths,
+    // not provider routing). A non-cartesia/hume/fish value in payload is
+    // a real bug — surface loud rather than silently billing as cartesia.
+    if (ttsProvider !== 'cartesia' && ttsProvider !== 'hume' && ttsProvider !== 'fish') {
+      throw new Error(`logTurnCogs: ttsProvider must be cartesia|hume|fish (got ${String(ttsProvider)})`);
+    }
     // Audit S3 (unit-wide) — accept `tts` (new) or `cartesia` (legacy
     // alias for back-compat with pre-§6 callers) in one expression.
     const tts = payload.tts ?? payload.cartesia ?? null;

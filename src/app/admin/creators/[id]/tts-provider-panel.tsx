@@ -22,12 +22,21 @@
 import { useTransition, useState } from 'react';
 import { setCreatorTtsProvider, setCreatorHumeVoice, setCreatorHumeProsody } from './actions';
 
-type Provider = 'inherit' | 'cartesia' | 'hume';
+// FISH_AUDIO_PHASE_1 §6 — 'fish' joins the dropdown alongside cartesia + hume.
+// Fish has no prosody dials in Phase 1; only the top provider override
+// applies to fish creators (Fish reference_id is pasted via direct DB
+// admin script today — the admin clone-upload UI is a follow-up).
+type Provider = 'inherit' | 'cartesia' | 'hume' | 'fish';
 type Env = 'production' | 'preview' | 'development';
 
 type Props = {
   creatorId: string;
-  initialTtsProvider: 'cartesia' | 'hume' | null;
+  initialTtsProvider: 'cartesia' | 'hume' | 'fish' | null;
+  // FISH_AUDIO_PHASE_1 wiring audit C2 — env-scoped fish voice id, used to
+  // warn the admin if they select 'fish' without having pasted a
+  // reference_id first (otherwise the next session-open 4014s with no
+  // panel-side hint).
+  initialFishVoiceId: string | null;
   initialHumeVoiceId: string | null;
   initialHumeVoiceName: string | null;
   initialHumeTtsSpeed: number | null;
@@ -77,6 +86,7 @@ export function TtsProviderPanel(props: Props) {
       <ProviderSubPanel
         creatorId={props.creatorId}
         initial={props.initialTtsProvider ?? 'inherit'}
+        initialFishVoiceId={props.initialFishVoiceId}
       />
       <HumeVoiceSubPanel
         creatorId={props.creatorId}
@@ -94,7 +104,15 @@ export function TtsProviderPanel(props: Props) {
   );
 }
 
-function ProviderSubPanel({ creatorId, initial }: { creatorId: string; initial: Provider }) {
+function ProviderSubPanel({
+  creatorId,
+  initial,
+  initialFishVoiceId,
+}: {
+  creatorId: string;
+  initial: Provider;
+  initialFishVoiceId: string | null;
+}) {
   const [value, setValue] = useState<Provider>(initial);
   const [status, setStatus] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
@@ -117,8 +135,10 @@ function ProviderSubPanel({ creatorId, initial }: { creatorId: string; initial: 
     <div style={{ border: '1px solid #222', padding: 12, borderRadius: 6 }}>
       <h3 style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>TTS provider override</h3>
       <p style={{ fontSize: 12, opacity: 0.7, marginBottom: 8 }}>
-        Inherit = follow the proxy's VOICE_TTS_PROVIDER env. Set to cartesia or
-        hume to override per-creator. Rejected while sessions are in-flight.
+        Inherit = follow the proxy&apos;s VOICE_TTS_PROVIDER env. Set to
+        cartesia, hume, or fish to override per-creator. Rejected while
+        sessions are in-flight. Fish reference_id is pasted via direct
+        service-role SQL today (admin upload UI is a follow-up).
       </p>
       <select
         value={value}
@@ -129,7 +149,25 @@ function ProviderSubPanel({ creatorId, initial }: { creatorId: string; initial: 
         <option value="inherit">inherit env (default)</option>
         <option value="cartesia">cartesia</option>
         <option value="hume">hume</option>
+        <option value="fish">fish</option>
       </select>
+      {value === 'fish' && initialFishVoiceId == null && (
+        // FISH_AUDIO_PHASE_1 wiring audit C2 — warn before Save when fish is
+        // selected but no fish_voice_id_<env> is set for the current env.
+        // Without this, the next /api/sessions/open 4014s with no admin-side
+        // hint that this is their own misconfig. RPC-side guard (preferred
+        // fix) is tracked as a follow-up — would block at the DB boundary
+        // and catch script-driven paths too.
+        <div style={{
+          marginTop: 8, padding: 8, border: '1px solid #a44',
+          borderRadius: 4, color: '#fcc', fontSize: 12, backgroundColor: '#400',
+        }}>
+          <strong>Warning:</strong> fish_voice_id is not set for this env.
+          Saving fish without a reference_id will cause every session-open
+          to 4014 tts_no_voice_fish until you paste the Fish reference_id
+          into creators.fish_voice_id_&lt;env&gt; via service-role SQL.
+        </div>
+      )}
       <button
         onClick={onSave}
         disabled={pending}

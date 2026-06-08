@@ -24,7 +24,7 @@ vi.mock('@/lib/auth-guards', () => ({
 // steady-state. Tests that need the proxy-unreachable path override.
 const mockGetProxyVoiceConfig = vi.fn(async () => ({
   useTtsLayer: true,
-  ttsProvider: 'cartesia' as 'cartesia' | 'hume',
+  ttsProvider: 'cartesia' as 'cartesia' | 'hume' | 'fish',
   failOpen: false,
 }));
 vi.mock('@/lib/voice/voice-config', () => ({

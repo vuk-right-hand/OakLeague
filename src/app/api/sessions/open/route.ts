@@ -167,6 +167,7 @@ export async function POST(req: NextRequest) {
       hume_trailing_silence, hume_trailing_silence_preview, hume_trailing_silence_dev,
       hume_voice_description, hume_voice_description_preview, hume_voice_description_dev,
       hume_model_version, hume_model_version_preview, hume_model_version_dev,
+      fish_voice_id, fish_voice_id_preview, fish_voice_id_dev,
       tts_provider,
       published_at, system_prompt, brain_status, tts_speed, brain_mode, decoupled
     `)
@@ -196,8 +197,16 @@ export async function POST(req: NextRequest) {
       hume_model_version: string | null;
       hume_model_version_preview: string | null;
       hume_model_version_dev: string | null;
+      // FISH_AUDIO_PHASE_1 §6 — env-scoped Fish reference_id columns.
+      // Audit C1: must be in BOTH the SELECT list AND the row type or
+      // resolveVoiceId(row, env, 'fish') sees undefined → null → every
+      // Fish session 409s creator_voice_not_trained.
+      fish_voice_id: string | null;
+      fish_voice_id_preview: string | null;
+      fish_voice_id_dev: string | null;
       // Per-creator override. NULL = inherit env (proxyCfg.ttsProvider).
-      tts_provider: 'cartesia' | 'hume' | null;
+      // FISH_AUDIO_PHASE_1 §6 — 3-arm union; mint helper widened in lockstep.
+      tts_provider: 'cartesia' | 'hume' | 'fish' | null;
       published_at: string | null;
       system_prompt: string | null;
       brain_status: 'pending' | 'queued' | 'training' | 'ready' | 'errored';
@@ -319,15 +328,16 @@ export async function POST(req: NextRequest) {
   }
   const useTtsLayer = proxyCfg.useTtsLayer;
   // Per-creator override wins, else inherit the frozen proxy env.
-  const sessionProvider: 'cartesia' | 'hume' =
+  // FISH_AUDIO_PHASE_1 §6 — 3-arm union.
+  const sessionProvider: 'cartesia' | 'hume' | 'fish' =
     creatorRow.tts_provider ?? proxyCfg.ttsProvider;
-  // Audit C4 — the proxy activates the TTS bridge when the env layer flag
-  // is on OR the session's provider is hume (per-creator override). The
-  // pre-WS voice-trained gate must use the SAME predicate, else a
-  // hume-override creator with no voice id slips past this optimization
-  // and only fails at WS-open (worse UX, wasted ticket mint). Mirror
-  // proxy index.js `useTts = useTtsLayer || ttsProvider === 'hume'`.
-  const useTts = useTtsLayer || sessionProvider === 'hume';
+  // Audit C4 + FISH_AUDIO_PHASE_1 wiring audit C1 — the proxy activates
+  // the TTS bridge when the env layer flag is on OR the session's provider
+  // is non-cartesia (per-creator override). The pre-WS voice-trained gate
+  // must use the SAME predicate, else a hume/fish-override creator with
+  // no voice id slips past this optimization and only fails at WS-open
+  // (worse UX, wasted ticket mint). Mirror proxy index.js's `useTts`.
+  const useTts = useTtsLayer || sessionProvider === 'hume' || sessionProvider === 'fish';
 
   // §6.2 — pre-WS gate runs LATER (post-session_open, below the takeover
   // snapshot read) so the takeover path can lock onto the original
@@ -528,14 +538,15 @@ export async function POST(req: NextRequest) {
   // must inherit the original cartesia (else the bridge instantiated for tab
   // 2 wouldn't match the in-flight session 's cogs accounting). Read the
   // snapshot and reuse it; only write if it's NULL (pre-migration row).
-  let snapshotProvider: 'cartesia' | 'hume' = sessionProvider;
+  // FISH_AUDIO_PHASE_1 §6 — 3-arm union for the locked-session snapshot.
+  let snapshotProvider: 'cartesia' | 'hume' | 'fish' = sessionProvider;
   if (isTakeover) {
     try {
       const { data: snap } = await admin
         .from('sessions')
         .select('tts_provider_at_session')
         .eq('id', sessionId)
-        .maybeSingle<{ tts_provider_at_session: 'cartesia' | 'hume' | null }>();
+        .maybeSingle<{ tts_provider_at_session: 'cartesia' | 'hume' | 'fish' | null }>();
       if (snap?.tts_provider_at_session) {
         snapshotProvider = snap.tts_provider_at_session;
       } else {
@@ -583,20 +594,28 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // U-C1 / HUME_TTS_PLAN §6.2 (audit C2 fix) — pre-WS voice-trained gate
-  // runs against the LOCKED snapshotProvider, not sessionProvider. On
-  // takeover, the snapshot is the source of truth — the gate must check
-  // the column for THAT provider, not the env-currently-derived one.
-  // Otherwise an env flip between the original open and the takeover
-  // could green-light a creator missing the locked provider's voice
-  // column and the proxy would close 4009/4014 immediately at WS-open.
+  // U-C1 / HUME_TTS_PLAN §6.2 (audit C2 fix) + FISH_AUDIO_PHASE_1 wiring
+  // TS-widening audit M1 — pre-WS voice-trained gate runs against the
+  // LOCKED snapshotProvider, not sessionProvider. On takeover, the
+  // snapshot is the source of truth — the gate must check the column for
+  // THAT provider, not the env-currently-derived one. Otherwise an env
+  // flip between the original open and the takeover could green-light a
+  // creator missing the locked provider's voice column and the proxy
+  // would close 4009/4014 immediately at WS-open.
+  //
+  // Audit M1: useTts was computed from sessionProvider above, but the
+  // snapshot is what the proxy will route on. Recompute against
+  // snapshotProvider so a takeover whose snapshot is hume/fish always
+  // engages the gate even if the current-env sessionProvider is
+  // cartesia (post-flip env).
+  const useTtsForGate = useTtsLayer || snapshotProvider === 'hume' || snapshotProvider === 'fish';
   //
   // Side-effect to handle: by the time this gate runs, `session_open` RPC
   // has already inserted a row (or takeover attached to an existing one).
   // A fresh-open 409 leaks that row — close it. A takeover 409 must NOT
   // close the row (it belongs to another tab).
   const envVoiceId = resolveVoiceId(creatorRow, undefined, snapshotProvider);
-  if (useTts && !envVoiceId) {
+  if (useTtsForGate && !envVoiceId) {
     if (!isTakeover) {
       try {
         await sb.rpc('session_close', {
