@@ -15,7 +15,7 @@ export const getCreatorForCaller = cache(
     const admin = supabaseAdmin();
     const { data, error } = await admin
       .from('creators')
-      .select('id, user_id, handle, display_name, bio, avatar_url, brain_status, published_at')
+      .select('id, user_id, handle, display_name, bio, avatar_url, brain_status, published_at, retrieval_version')
       .eq('id', creatorId)
       .maybeSingle();
 
@@ -32,6 +32,7 @@ export const getCreatorForCaller = cache(
       avatar_url: (data.avatar_url ?? null) as string | null,
       brain_status: data.brain_status as BrainStatus,
       published_at: (data.published_at ?? null) as string | null,
+      retrieval_version: (data.retrieval_version ?? 1) as number,
     };
 
     return { userId, creatorId, creator };

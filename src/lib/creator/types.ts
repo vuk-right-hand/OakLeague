@@ -20,6 +20,7 @@ export type CreatorRow = {
   avatar_url: string | null;
   brain_status: BrainStatus;
   published_at: string | null;
+  retrieval_version: number;
 };
 
 export type CreatorTopicRow = {

@@ -1,6 +1,7 @@
 import { getCreatorForCaller } from '@/lib/creator/get-creator';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import { BrainStatusBadge } from '@/components/creator/BrainStatusBadge';
+import { DeepBrainPanel } from '@/components/creator/DeepBrainPanel';
 import type { CreatorTopicRow } from '@/lib/creator/types';
 
 export const dynamic = 'force-dynamic';
@@ -55,6 +56,11 @@ export default async function CreatorDashboardPage() {
           </>
         )}
       </section>
+
+      <DeepBrainPanel
+        initialRetrievalVersion={creator.retrieval_version}
+        brainStatus={creator.brain_status}
+      />
 
       <section style={card}>
         <h2 style={sectionTitle}>Voice playback</h2>
