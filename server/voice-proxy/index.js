@@ -37,8 +37,9 @@ import { createClient } from '@supabase/supabase-js';
 import { GeminiBridge } from './gemini-bridge.js';
 import { CartesiaTTSBridge } from './cartesia-bridge.js';
 import { HumeTTSBridge } from './hume-bridge.js';
+import { FishTTSBridge } from './fish-bridge.js';
 import { decideQuotaGate } from './quota-gate.js';
-import { makeLogTurnCogs, installReaper, VOICE_TTS_LAYER_ENABLED, getCartesiaPricing, getHumePricing, _humePricingPrimeForBoot } from './proxy-handlers.js';
+import { makeLogTurnCogs, installReaper, VOICE_TTS_LAYER_ENABLED, getCartesiaPricing, getHumePricing, _humePricingPrimeForBoot, getFishPricing, _fishPricingPrimeForBoot } from './proxy-handlers.js';
 // DECOUPLED_BRAIN_PLAN P1-5 C3 ordering gate — boot-prime decoupled
 // brain/paraphrase pricing FATAL-at-boot (same posture as Cartesia/Hume).
 import { provisionDecoupledBrainPricing } from './decoupled-boot.js';
@@ -115,6 +116,11 @@ const INTERNAL_API_SECRET   = process.env.INTERNAL_API_SECRET || '';
 // BOTH provider pricings so the bridge never sees a missing rate at
 // session-open. Fails closed at boot — never at first turn.
 const HUME_API_KEY = process.env.HUME_API_KEY || '';
+// FISH_AUDIO_PHASE_1 §7 — Fish API key. Optional at boot when neither the
+// env default nor any creator override targets Fish (provisionPricing()
+// below probes; fail-closed when needed).
+const FISH_API_KEY = process.env.FISH_API_KEY || '';
+const FISH_TTS_MODEL = process.env.FISH_TTS_MODEL || 's2-pro';
 // Audit C2 (unit-wide) — single source of truth for Hume pricing lives in
 // proxy-handlers.js. The boot path here PRIMES that singleton; subsequent
 // callers (bridge construction in this file, logTurnCogs in proxy-handlers)
@@ -204,6 +210,51 @@ async function provisionPricing() {
     // honest "first Hume session fails" — a much narrower blast radius.
     console.warn('[boot] Hume pricing deferred to lazy validation due to probe failure');
   }
+
+  // FISH_AUDIO_PHASE_1 §5/§7 — same probe pattern for fish. Conditional
+  // priming on: (a) env default = fish, OR (b) any creator override =
+  // fish. `mustValidate=true` makes _fishPricingPrimeForBoot hard-exit;
+  // `mustValidate=false` warn-defers (in-process recovery via the singleton
+  // recovers on first getFishPricing() call at session-open).
+  let needFish = VOICE_TTS_PROVIDER === 'fish';
+  let fishProbeFailed = false;
+  if (!needFish) {
+    try {
+      const { data, error } = await supabase
+        .from('creators')
+        .select('id')
+        .eq('tts_provider', 'fish')
+        .limit(1);
+      if (error) {
+        console.warn(`[boot] fish creator-override probe failed: ${error.message} — skipping Fish pre-validation; lazy-validate at session-open if needed`);
+        fishProbeFailed = true;
+      } else if (Array.isArray(data) && data.length > 0) {
+        needFish = true;
+      }
+    } catch (e) {
+      console.warn(`[boot] fish creator-override probe threw: ${e?.message || e} — skipping Fish pre-validation; lazy-validate at session-open if needed`);
+      fishProbeFailed = true;
+    }
+  }
+  if (needFish) {
+    if (!FISH_API_KEY) {
+      console.error('FATAL: FISH_API_KEY missing — required when VOICE_TTS_PROVIDER=fish OR any creator has tts_provider=fish override');
+      process.exit(1);
+    }
+    _fishPricingPrimeForBoot({ mustValidate: true });
+  } else if (fishProbeFailed) {
+    // Asymmetry vs Hume (intentional, audit M6): Hume's warn-defer path only
+    // console.warn's and leaves _humePricing=null — getHumePricing() at first
+    // construction lazy-validates. Fish's warn-defer calls
+    // _fishPricingPrimeForBoot({mustValidate:false}) explicitly, which sets
+    // _fishProbeFailed=true on the singleton. getFishPricing() reads that flag
+    // and retries assertion on the NEXT call (in-process recovery, audit
+    // round-1 C4 + round-2 Small on the bridge audit) — so a transient env-
+    // probe blip at boot doesn't permanently lock out Fish sessions even if
+    // the env var IS set. Hume lacks this recovery upgrade.
+    console.warn('[boot] Fish pricing deferred to lazy validation due to probe failure');
+    _fishPricingPrimeForBoot({ mustValidate: false });
+  }
 }
 
 // R4-M6 — Cartesia is only safe with models we've Phase-0-verified for
@@ -238,19 +289,23 @@ const ALLOWED_MODELS = new Set([
 // typo doesn't silently route every session to the wrong bridge. Older code
 // reads VOICE_TTS_LAYER_ENABLED for the "α' on/off" bit; the two flags are
 // orthogonal — α' is the TTS layer, VOICE_TTS_PROVIDER is which TTS.
-const VOICE_TTS_PROVIDER_VALID = new Set(['cartesia', 'hume']);
+// FISH_AUDIO_PHASE_1 §6 — env-level TTS provider widened to include 'fish'.
+// Same semantics as cartesia/hume: `creators.tts_provider` per-creator
+// override wins at session-open; this is the default for creators with NULL
+// override.
+const VOICE_TTS_PROVIDER_VALID = new Set(['cartesia', 'hume', 'fish']);
 const VOICE_TTS_PROVIDER = (process.env.VOICE_TTS_PROVIDER || 'cartesia').toLowerCase();
 if (!VOICE_TTS_PROVIDER_VALID.has(VOICE_TTS_PROVIDER)) {
-  console.error(`FATAL: VOICE_TTS_PROVIDER=${process.env.VOICE_TTS_PROVIDER} invalid (must be 'cartesia' or 'hume')`);
+  console.error(`FATAL: VOICE_TTS_PROVIDER=${process.env.VOICE_TTS_PROVIDER} invalid (must be 'cartesia', 'hume' or 'fish')`);
   process.exit(1);
 }
-// Audit C5 (unit-wide, 2026-05-13) — VOICE_TTS_PROVIDER=hume implies the
+// Audit C5 (unit-wide, 2026-05-13) — non-cartesia provider env implies the
 // α' TTS layer must be on (VOICE_TTS_LAYER_ENABLED=1). Without that combo,
-// `useTts` stays false at runtime, the Hume bridge never instantiates,
-// and Gemini's stock voice leaks to users — violates CLAUDE.md hard rule
+// `useTts` stays false at runtime, the bridge never instantiates, and
+// Gemini's stock voice leaks to users — violates CLAUDE.md hard rule
 // "Gemini's stock voice is never user-facing, on any tier."
-if (VOICE_TTS_PROVIDER === 'hume' && !VOICE_TTS_LAYER_ENABLED) {
-  console.error('FATAL: VOICE_TTS_PROVIDER=hume requires VOICE_TTS_LAYER_ENABLED=1 (α\' TTS layer must be on)');
+if ((VOICE_TTS_PROVIDER === 'hume' || VOICE_TTS_PROVIDER === 'fish') && !VOICE_TTS_LAYER_ENABLED) {
+  console.error(`FATAL: VOICE_TTS_PROVIDER=${VOICE_TTS_PROVIDER} requires VOICE_TTS_LAYER_ENABLED=1 (α' TTS layer must be on)`);
   process.exit(1);
 }
 
@@ -505,10 +560,15 @@ async function consumeTicket(ticketId, uaHash) {
     // → legacy"; never loosen to truthy. DB CHECK guarantees a true
     // snapshot implies brain_mode='vector'.
     decoupled:      (data.decoupled === true),
-    // HUME_TTS_PLAN §6.1 — provider snapshot. NOT NULL by DB constraint
-    // (migration 0002), but a stray null on a pre-migration ticket would
-    // be a tts_provider mismatch trap below — coerce to a guard string.
-    ttsProvider:    (data.tts_provider === 'hume' ? 'hume' : 'cartesia'),
+    // HUME_TTS_PLAN §6.1 + FISH_AUDIO_PHASE_1 §6 — provider snapshot.
+    // NOT NULL by DB constraint (migration 0002), but a stray null on a
+    // pre-migration ticket would be a tts_provider mismatch trap below —
+    // coerce to a guard string. Allowlist set inline so a future enum
+    // widen requires this site to be updated explicitly (CLAUDE.md
+    // schema-blast-radius rule).
+    ttsProvider:    (data.tts_provider === 'hume' ? 'hume'
+                     : data.tts_provider === 'fish' ? 'fish'
+                     : 'cartesia'),
     // Hume prosody dials (migration 0005). NULL on cartesia tickets — bridge
     // selection branches on ttsProvider, so these are only read on the Hume
     // path. Numeric coercion mirrors ttsSpeed above.
@@ -631,6 +691,14 @@ async function attachToSession({ sessionId, userId, creatorId, expectedTier }) {
 
 async function openSession({ userId, creatorId, modelWire, ttsProvider }) {
   const modelEnum = MODEL_TO_ENUM[modelWire];
+  // FISH_AUDIO_PHASE_1 wiring audit C4 — spike-a admin path is admin-dev
+  // only; never routes to Fish. Phase 1 deliberately scopes Fish to
+  // creators via `creators.tts_provider` consumed through real
+  // /api/sessions/open. A Fish ticket reaching this legacy path is a
+  // copy-paste / fixture leak. Mirror `spike_a_retrieval_version_unsupported`.
+  if (ttsProvider === 'fish') {
+    return { err: 'spike_a_fish_unsupported' };
+  }
   // Day-13 audit-build M4 — admin spike-a path hard-pins
   // retrieval_version_at_session=1, but the creator may already be at
   // v2 (Day-15+). v1 retrieveTopK queries chunker_version=1 chunks
@@ -663,11 +731,15 @@ async function openSession({ userId, creatorId, modelWire, ttsProvider }) {
   if (!spikeRetrievalSupported) {
     return { err: 'spike_a_retrieval_version_unsupported' };
   }
-  // Audit C3 (unit-wide) — write tts_provider_at_session snapshot on the
-  // legacy spike-a admin path too. Without this, sessions opened by the
-  // proxy (no /api/sessions/open call) had NULL snapshot, which silently
-  // bypassed cogs_insert_turn_voice_v2's provider cross-check.
-  const ttsProviderAtSession = ttsProvider === 'hume' ? 'hume' : 'cartesia';
+  // Audit C3 (unit-wide) + FISH_AUDIO_PHASE_1 §6 — write
+  // tts_provider_at_session snapshot on the legacy spike-a admin path too.
+  // Without this, sessions opened by the proxy (no /api/sessions/open
+  // call) had NULL snapshot, which silently bypassed
+  // cogs_insert_turn_voice_v3's provider cross-check (was v2 → v3 in
+  // FISH §4 M3; v3 raises on NULL snapshot now).
+  const ttsProviderAtSession = ttsProvider === 'hume' ? 'hume'
+                             : ttsProvider === 'fish' ? 'fish'
+                             : 'cartesia';
   // Day-13: admin spike-a path doesn't read creators.retrieval_version
   // because it doesn't run through session_open RPC's FOR SHARE snapshot.
   // Admin is the only caller of this path; admin will never dogfood v2 via
@@ -1129,14 +1201,15 @@ wss.on('connection', async (ws, req) => {
   // ticket; we never re-derive from env. (Renamed 2026-05-14 from
   // `useCartesia` — the old name was misleading once Hume joined the layer.)
   const useTtsLayer = VOICE_TTS_LAYER_ENABLED;
-  const ttsProvider = consumed.ttsProvider; // 'cartesia' | 'hume', from ticket
-  // Audit C5 (unit-wide) — `useTts` activates the bridge. With α' off
-  // entirely, a ticket that requests Hume would skip bridge instantiation
-  // and leak Gemini stock audio. Activate the bridge when α' is on OR the
-  // ticket explicitly asks for Hume (a per-creator override). The boot-time
-  // assertion above guards the env=hume case; this guards the per-creator
+  const ttsProvider = consumed.ttsProvider; // 'cartesia' | 'hume' | 'fish', from ticket
+  // Audit C5 (unit-wide) + FISH_AUDIO_PHASE_1 wiring audit C1 — `useTts`
+  // activates the bridge. With α' off entirely, a ticket that requests Hume
+  // or Fish would skip bridge instantiation and leak Gemini stock audio.
+  // Activate the bridge when α' is on OR the ticket explicitly asks for a
+  // non-cartesia provider (per-creator override). The boot-time assertion
+  // above guards the env=hume|fish case; this guards the per-creator
   // override case.
-  const useTts = useTtsLayer || ttsProvider === 'hume';
+  const useTts = useTtsLayer || ttsProvider === 'hume' || ttsProvider === 'fish';
 
   const teardown = async (reason) => {
     if (closed) return;
@@ -1240,10 +1313,16 @@ wss.on('connection', async (ws, req) => {
     await endSession(sessionId, reason);
   };
 
-  // R4-M6 — model gate before any bridge instantiation when α' is on.
-  if (useTtsLayer && !CARTESIA_COMPATIBLE_MODELS.has(modelWire)) {
-    console.log(`[ws ${connId}] model_not_compatible_with_cartesia ${modelWire}`);
-    await teardown('model_not_compatible_with_cartesia');
+  // R4-M6 + FISH_AUDIO_PHASE_1 wiring audit M1 — model gate before any
+  // bridge instantiation. Gated on `useTts` (not `useTtsLayer`) so a
+  // per-creator hume/fish override session with α' off still passes
+  // through here — those sessions need outputTranscription too.
+  // The CARTESIA_COMPATIBLE_MODELS Set is really "Gemini models that
+  // support outputTranscription"; the legacy name is kept to avoid a
+  // rename ripple in this slice.
+  if (useTts && !CARTESIA_COMPATIBLE_MODELS.has(modelWire)) {
+    console.log(`[ws ${connId}] model_not_compatible_with_outputTranscription provider=${ttsProvider} model=${modelWire}`);
+    await teardown('model_not_compatible');
     return closeWs(ws, 4010, 'model_not_compatible');
   }
 
@@ -1266,13 +1345,24 @@ wss.on('connection', async (ws, req) => {
   if (useTts) {
     try {
       const env = consumed.voiceIdEnv;
-      const voiceCol = ttsProvider === 'hume'
-        ? (env === 'production' ? 'hume_voice_id'
-          : env === 'preview'    ? 'hume_voice_id_preview'
-          :                        'hume_voice_id_dev')
-        : (env === 'production' ? 'voice_id'
-          : env === 'preview'    ? 'voice_id_preview'
-          :                        'voice_id_dev');
+      let voiceCol;
+      if (ttsProvider === 'hume') {
+        voiceCol = env === 'production' ? 'hume_voice_id'
+                 : env === 'preview'    ? 'hume_voice_id_preview'
+                 :                        'hume_voice_id_dev';
+      } else if (ttsProvider === 'fish') {
+        // FISH_AUDIO_PHASE_1 §6 / migration 20260608100005 — env-scoped
+        // fish_voice_id columns mirror the hume_voice_id_<env> pattern.
+        voiceCol = env === 'production' ? 'fish_voice_id'
+                 : env === 'preview'    ? 'fish_voice_id_preview'
+                 :                        'fish_voice_id_dev';
+      } else {
+        voiceCol = env === 'production' ? 'voice_id'
+                 : env === 'preview'    ? 'voice_id_preview'
+                 :                        'voice_id_dev';
+      }
+      // Hume DELETE is keyed by NAME; cartesia + fish DELETE by ID. Only
+      // Hume needs the companion name column.
       const nameCol = ttsProvider === 'hume'
         ? (env === 'production' ? 'hume_voice_name'
           : env === 'preview'    ? 'hume_voice_name_preview'
@@ -1294,10 +1384,12 @@ wss.on('connection', async (ws, req) => {
       return closeWs(ws, 4005, 'upstream_error');
     }
     if (!creatorVoiceId) {
-      console.log(`[ws ${connId}] tts_no_voice provider=${ttsProvider} creator=${creatorId.slice(0,8)}`);
+      // Audit M7 — include the column queried (env-resolved) so operators
+      // bisect missing-clone vs wrong-env-column without a second query.
+      console.log(`[ws ${connId}] tts_no_voice provider=${ttsProvider} env=${consumed.voiceIdEnv} creator=${creatorId.slice(0,8)}`);
       await teardown(`tts_no_voice_${ttsProvider}`);
       // HUME_TTS_PLAN §6.3 — 4009 kept for back-compat with the harness when
-      // provider=cartesia; 4014 used for Hume (or any non-cartesia future).
+      // provider=cartesia; 4014 used for Hume + Fish (non-cartesia).
       if (ttsProvider === 'cartesia') {
         return closeWs(ws, 4009, 'cartesia_no_voice');
       }
@@ -1313,6 +1405,29 @@ wss.on('connection', async (ws, req) => {
       // Audit M1 (unit-wide) — provider-aware close reason.
       return closeWs(ws, 4013, `brain_unset_with_${ttsProvider}`);
     }
+
+    // FISH_AUDIO_PHASE_1 wiring audit C5 — Fish-specific pre-flight.
+    // The boot-time probe can warn-defer FISH_API_KEY/pricing validation
+    // when no fish creator existed at boot (lazy-prime pattern). If the
+    // fleet then flips a creator to fish without redeploying, the FIRST
+    // fish session-open is where the env-missing surfaces. Close with a
+    // distinct 4014 + fish_unprovisioned reason so a missing-env misconfig
+    // doesn't bisect as "upstream gemini failure" in dashboards.
+    if (ttsProvider === 'fish') {
+      if (!FISH_API_KEY) {
+        console.error(`[ws ${connId}] fish_unprovisioned no-api-key sess=${sessionId.slice(0,8)} creator=${creatorId.slice(0,8)}`);
+        captureMessage('fish_unprovisioned.api_key', 'error', { connId, sessionId, creatorId });
+        await teardown('fish_unprovisioned_api_key');
+        return closeWs(ws, 4014, 'fish_unprovisioned_api_key');
+      }
+      try { getFishPricing(); }
+      catch (e) {
+        console.error(`[ws ${connId}] fish_unprovisioned pricing-validation FAIL:`, e?.message || e);
+        captureException(e, { op: 'fish_pricing_unprovisioned', sessionId, creatorId });
+        await teardown('fish_unprovisioned_pricing');
+        return closeWs(ws, 4014, 'fish_unprovisioned_pricing');
+      }
+    }
   }
 
   // R3-C3 / R4-S8 — SERIAL open: Gemini first (it doesn't accept user
@@ -1321,18 +1436,19 @@ wss.on('connection', async (ws, req) => {
   try {
     bridge = new GeminiBridge({
       apiKey: GEMINI_API_KEY,
-      // Audit C4 — MUST be `useTts`, NOT `useTtsLayer`. `useTts =
-      // useTtsLayer || ttsProvider === 'hume'`. If a creator has a
-      // per-creator `tts_provider='hume'` override while the fleet env
+      // Audit C4 + FISH_AUDIO_PHASE_1 wiring audit C1 — MUST be `useTts`,
+      // NOT `useTtsLayer`. `useTts = useTtsLayer || ttsProvider === 'hume'
+      // || ttsProvider === 'fish'`. If a creator has a per-creator
+      // `tts_provider='hume'` or `'fish'` override while the fleet env
       // layer flag is OFF (useTtsLayer=false), driving these off
       // useTtsLayer leaves Gemini in audio-out mode (NOT discarding)
-      // WHILE the Hume bridge is also open → Gemini's stock synthesized
-      // voice can reach the user. That violates the CLAUDE.md hard rule
-      // "Gemini's stock voice is never user-facing, on any tier, any
-      // failure mode." Gating on `useTts` makes the per-creator override
-      // a correct α' session (transcript out, audio discarded). The
-      // legacy (layer off, cartesia, no override) path keeps useTts=false
-      // → audio-out preserved, no regression.
+      // WHILE the alternative bridge is also open → Gemini's stock
+      // synthesized voice can reach the user. That violates the CLAUDE.md
+      // hard rule "Gemini's stock voice is never user-facing, on any tier,
+      // any failure mode." Gating on `useTts` makes the per-creator
+      // override a correct α' session (transcript out, audio discarded).
+      // The legacy (layer off, cartesia, no override) path keeps
+      // useTts=false → audio-out preserved, no regression.
       enableOutputTranscription: useTts,
       discardAudioOut: useTts,
       // pgvector RAG plan (vector mode). When the ticket's brain_mode is
@@ -1436,12 +1552,50 @@ wss.on('connection', async (ws, req) => {
           modelVersion: consumed.humeModelVersion || '2',
           pricing: getHumePricing(),
         });
+      } else if (ttsProvider === 'fish') {
+        // FISH_AUDIO_PHASE_1 §6. FISH_API_KEY may be unvalidated at boot
+        // when env defaults to cartesia AND probeFailed (provisionPricing
+        // warn-defers); the bridge constructor throws synchronously if
+        // pricing is missing, which the catch below maps to a clean
+        // 4005 upstream_error. Same `pricing` singleton pattern as Hume.
+        if (!FISH_API_KEY) {
+          // Hard-fail INSIDE try so the catch below maps to upstream_error;
+          // do not crash the proxy on a single mis-provisioned ticket.
+          throw new Error('FISH_API_KEY missing at session-open: provider=fish ticket but boot was deferred without env');
+        }
+        ttsBridge = new FishTTSBridge({
+          apiKey: FISH_API_KEY,
+          voiceId: creatorVoiceId,
+          pricing: getFishPricing(),
+          model: FISH_TTS_MODEL,
+          // Phase 0.5 #1 confirmed Fish PCM @ 16k works → no resampler.
+          // Honors per-session avatar sample-rate routing same as cartesia.
+          sampleRate: ttsSampleRate,
+          // Phase 0.5 #6 long-answer drain measured 16.8s p99 → 34s floor
+          // (script-recommended × 2). Bridge default already 34000ms;
+          // pass explicit for visibility.
+          finalizeTimeoutMs: 34_000,
+        });
       } else {
         throw new Error(`unknown ttsProvider: ${ttsProvider}`);
       }
       const t0 = Date.now();
       await ttsBridge.open();
       console.log(`[ws ${connId}] tts.open ok provider=${ttsProvider} in ${Date.now() - t0}ms`);
+      // FISH_AUDIO_PHASE_1 §3 Phase 0.5 #2 + wiring audit M5 — speculative
+      // pre-open for turn 1. Phase 0.5 measured Fish cold TTFA p99 ≈ 1229ms
+      // vs Cartesia ~90ms — without pre-open, every turn eats the WS-setup
+      // delay BEFORE first audio. prewarmTurn opens the per-turn WS in the
+      // background; the subsequent `turnStart(contextId)` finds the warm
+      // socket and sends `start` immediately. Fire-and-forget — bridge
+      // emits `prewarm_ok` (logged above in event handler) or
+      // `fallback_required` (handled with closeWs) on failure. Cartesia/
+      // Hume bridges share a session-long WS; prewarm is fish-only today.
+      if (ttsProvider === 'fish' && typeof ttsBridge.prewarmTurn === 'function') {
+        const firstCtx = `${sessionId}:1`;
+        try { ttsBridge.prewarmTurn(firstCtx); }
+        catch (e) { captureException(e, { op: 'fish_prewarm_first_turn', sessionId, contextId: firstCtx }); }
+      }
     } catch (e) {
       console.error(`[ws ${connId}] tts-open FAIL provider=${ttsProvider}:`, e?.message || e);
       captureException(e, { op: 'tts-open', connId, sessionId, ttsProvider });
@@ -2285,6 +2439,15 @@ wss.on('connection', async (ws, req) => {
         if (e.contextId === liveCtx && ws.readyState === ws.OPEN) {
           try { ws.send(JSON.stringify({ type: 'tts_audio_done' })); } catch {}
         }
+        // FISH_AUDIO_PHASE_1 wiring audit M5 — speculative pre-open for
+        // the NEXT turn. Fire-and-forget; bridge's prewarmIdleTimeoutMs
+        // (25s default) auto-closes the warm WS if the user doesn't speak.
+        // Limited to fish — cartesia/hume share a session-long WS.
+        if (e.contextId === liveCtx && ttsProvider === 'fish' && ttsBridge && typeof ttsBridge.prewarmTurn === 'function') {
+          const nextCtx = `${sessionId}:${turnNumber + 1}`;
+          try { ttsBridge.prewarmTurn(nextCtx); }
+          catch (err) { captureException(err, { op: 'fish_prewarm_next_turn', sessionId, contextId: nextCtx }); }
+        }
       } else if (e.kind === 'reconnected') {
         if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'tts_reconnected', at: e.at }));
       } else if (e.kind === 'error') {
@@ -2350,6 +2513,32 @@ wss.on('connection', async (ws, req) => {
       } else if (e.kind === 'closed') {
         // Idle-window close handled by the bridge's auto-reconnect
         // (R3-M2 / R4-M2). No action required here.
+      } else if (e.kind === 'fallback_required') {
+        // FISH_AUDIO_PHASE_1 §6 wiring audit C3 — Fish bridge emits this
+        // on pre-first-audio failures (WS open error, finish:error,
+        // protocol violation, prewarm open failure). Auto-fallback to
+        // Cartesia re-dispatch is DEFERRED to a follow-up slice — for now
+        // we surface the event LOUDLY so the user doesn't sit in silence
+        // and operators can see the failure rate.
+        console.error(`[ws ${connId}] fish.fallback_required code=${e.code} contextId=${e.contextId} reason=${e.reason}`);
+        captureException(new Error(`fish.fallback_required.${e.code || 'unknown'}`), {
+          op: 'fish.fallback_required',
+          sessionId,
+          ttsProvider,
+          code: e.code,
+          contextId: e.contextId,
+          reason: e.reason,
+        });
+        if (ws.readyState === ws.OPEN) {
+          try { ws.send(JSON.stringify({ type: 'error', code: 'tts_failed', at: Date.now(), detail: e.code || 'fish_fallback_required' })); } catch {}
+        }
+        teardown('fish_fallback_required').catch(() => {});
+        closeWs(ws, 1011, 'fish_fallback_required');
+      } else if (e.kind === 'prewarm_ok') {
+        // FISH_AUDIO_PHASE_1 §3 Phase 0.5 #2 — speculative pre-open
+        // success. Lifecycle observability only; the prewarmTurn call
+        // site below logs the start, this confirms the warm WS is ready.
+        console.log(`[ws ${connId}] fish.prewarm_ok contextId=${e.contextId} ttfaSetupMs=${e.ttfaSetupMs ?? 'na'}`);
       }
     });
   }
@@ -2619,7 +2808,12 @@ wss.on('connection', async (ws, req) => {
           // context is nulled. 60s covers realistic answers; null-on-timeout
           // stays as the stuck-Cartesia safety net (now rare). Hume keeps 10s
           // (its turnEnd already carries flush; no decoupled long-tail path).
-          const ttsFinalizeTimeoutMs = (ttsProvider === 'cartesia') ? 60_000 : 10_000;
+          // FISH_AUDIO_PHASE_1 §3 #6 — Fish long-answer drain measured
+          // 16.8s p99 → 34s floor. Cartesia keeps 60s (decoupled long-tail).
+          // Hume keeps 10s (turnEnd already carries flush; no long tail).
+          const ttsFinalizeTimeoutMs = ttsProvider === 'cartesia' ? 60_000
+                                     : ttsProvider === 'fish'     ? 34_000
+                                     :                              10_000;
           ttsMetrics = await ttsBridge.turnEnd({ timeoutMs: ttsFinalizeTimeoutMs });
         }
         // U-M6 — surface a user-facing warning when the TTS bridge returned

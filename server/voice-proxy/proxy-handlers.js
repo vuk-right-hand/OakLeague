@@ -352,7 +352,14 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
       // joining sessions. tts_quoted_at carries provider-specific rate
       // provenance; tts_partial flags hangs/timeouts for reconciliation.
       meta.tts_provider = ttsProvider;
-      const pricing = ttsProvider === 'hume' ? getHumePricing() : getCartesiaPricing();
+      // FISH_AUDIO_PHASE_1 §6 + audit C2 — 3-arm pricing site. Pre-fix
+      // binary ternary collapsed `'fish'` to cartesia rate (~$50/M chars)
+      // when Fish is ~$15/M, defeating the cost lever AND mis-billing every
+      // Fish session in dashboards. Same shape mirrored at the leg-3+4
+      // computation below.
+      const pricing = ttsProvider === 'hume' ? getHumePricing()
+                    : ttsProvider === 'fish' ? getFishPricing()
+                    :                          getCartesiaPricing();
       meta.tts_quoted_at = pricing.quotedAt;
       if (tts.partial) meta.tts_partial = true;
       // Back-compat keys retained until dashboards are re-deployed for the
@@ -361,6 +368,13 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
       if (ttsProvider === 'cartesia') {
         meta.cartesia_quoted_at = pricing.quotedAt;
         if (tts.partial) meta.cartesia_partial = true;
+      }
+      // FISH_AUDIO_PHASE_1 §6 — provider-tagged metadata mirror of the
+      // cartesia branch above. Dashboard reads `meta.fish_quoted_at` and
+      // `meta.fish_partial` for per-provider provenance/timeout reconciliation.
+      if (ttsProvider === 'fish') {
+        meta.fish_quoted_at = pricing.quotedAt;
+        if (tts.partial) meta.fish_partial = true;
       }
     } else {
       // Pre-α' rows: keep the deferral flag for dashboard bucketing.
@@ -396,7 +410,14 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
     let ttsCost = 0;
     let ttsAudioSeconds = 0;
     if (tts) {
-      const pricing = ttsProvider === 'hume' ? getHumePricing() : getCartesiaPricing();
+      // FISH_AUDIO_PHASE_1 §6 + audit C2 — 3-arm pricing site. Pre-fix
+      // binary ternary collapsed `'fish'` to cartesia rate (~$50/M chars)
+      // when Fish is ~$15/M, defeating the cost lever AND mis-billing every
+      // Fish session in dashboards. Same shape mirrored at the leg-3+4
+      // computation below.
+      const pricing = ttsProvider === 'hume' ? getHumePricing()
+                    : ttsProvider === 'fish' ? getFishPricing()
+                    :                          getCartesiaPricing();
       ttsChars = Math.max(0, Math.round(tts.characters || 0));
       ttsCost = Number((ttsChars * pricing.usdPerChar).toFixed(6));
       ttsAudioSeconds = Number((tts.audioSeconds || 0).toFixed(4));

@@ -52,6 +52,21 @@ export const FATAL_END_REASONS = Object.freeze([
   // failing to finalize turns (a real upstream regression), so the burn-in
   // monitor must surface it. A single recovered timeout never reaches here.
   'gemini_unresponsive',
+  // FISH_AUDIO_PHASE_1 wiring audit M1 — model gate renamed to drop the
+  // misleading `_with_cartesia` suffix when the gate widened from
+  // `useTtsLayer` to `useTts` (covers cartesia + hume + fish). Closes 4010.
+  'model_not_compatible',
+  // FISH_AUDIO_PHASE_1 wiring audit C5 — distinct close codes for Fish
+  // boot-probe-deferred misconfig surfacing at first session-open. 4014
+  // family; burn-in surfaces both as fatal so a fleet-level flip without
+  // the env set is loud.
+  'fish_unprovisioned_api_key',
+  'fish_unprovisioned_pricing',
+  // FISH_AUDIO_PHASE_1 wiring audit C3 — Fish bridge emitted
+  // fallback_required pre-first-audio. Auto re-dispatch to Cartesia is
+  // deferred to a follow-up slice; today this teardown is the loud-failure
+  // signal so users don't sit in silence.
+  'fish_fallback_required',
 ]);
 
 export const FATAL_END_REASONS_SET = new Set(FATAL_END_REASONS);
