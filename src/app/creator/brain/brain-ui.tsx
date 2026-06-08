@@ -20,6 +20,11 @@ const SOURCE_TYPE_LABELS: Record<SampleSourceType, string> = {
   testimonial: 'Testimonial',
 };
 
+// WS3 launch constraint: creators add pasted/.txt transcripts only (COGS-bounded;
+// YouTube dropped — no fetch worker, audit C1). The label map above still renders
+// any legacy/admin-added rows of other types.
+const MAX_RAW_CHARS = 262144; // mirror addSampleSchema raw_text cap (256KB)
+
 function slugify(raw: string): string {
   return raw
     .toLowerCase()
@@ -257,13 +262,42 @@ function AddSampleForm({
   topic: CreatorTopicRow;
   allTopics: CreatorTopicRow[];
 }) {
-  const [sourceType, setSourceType] = useState<SampleSourceType>('youtube');
+  // WS3: transcript-only add path (paste or .txt). YouTube dropped — no fetch
+  // worker, so a URL-only sample would silently never ingest (audit C1).
   const [title, setTitle] = useState('');
-  const [sourceUrl, setSourceUrl] = useState('');
   const [rawText, setRawText] = useState('');
   const [extraTags, setExtraTags] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
+  const [fileErr, setFileErr] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
+
+  // M1: read a .txt client-side into the textarea, with a hard byte cap BEFORE
+  // reading (no 5MB allocation just to reject) + a text-MIME/extension check so
+  // a renamed binary can't become mojibake in the corpus.
+  async function onPickFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0];
+    e.target.value = ''; // allow re-picking the same file
+    if (!f) return;
+    setFileErr(null);
+    const isTxt = f.type === 'text/plain' || f.name.toLowerCase().endsWith('.txt');
+    if (!isTxt) {
+      setFileErr('Only .txt files are supported.');
+      return;
+    }
+    // f.size is BYTES (cheap pre-read reject so we never allocate a huge file
+    // just to bounce it). The authoritative gate is the post-read CHAR length
+    // below, which matches the server's char_length cap + the DB CHECK.
+    if (f.size > MAX_RAW_CHARS) {
+      setFileErr('File is too large (max 256KB).');
+      return;
+    }
+    const text = await f.text();
+    if (text.length > MAX_RAW_CHARS) {
+      setFileErr('File text is too long (max 256KB).');
+      return;
+    }
+    setRawText(text);
+  }
 
   function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -271,9 +305,8 @@ function AddSampleForm({
     const tags = [topic.slug, ...Array.from(extraTags)];
     startTransition(async () => {
       const res = await addSampleContent({
-        source_type: sourceType,
+        source_type: 'transcript',
         title: title.trim() || undefined,
-        source_url: sourceUrl.trim() || undefined,
         raw_text: rawText || undefined,
         topic_tags: tags,
       });
@@ -282,8 +315,8 @@ function AddSampleForm({
         return;
       }
       setTitle('');
-      setSourceUrl('');
       setRawText('');
+      setFileErr(null);
       setExtraTags(new Set());
     });
   }
@@ -303,44 +336,39 @@ function AddSampleForm({
         gap: 8,
       }}
     >
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        <select
-          value={sourceType}
-          onChange={(e) => setSourceType(e.target.value as SampleSourceType)}
-          style={inputStyle}
-          disabled={pending}
-        >
-          {(Object.keys(SOURCE_TYPE_LABELS) as SampleSourceType[]).map((k) => (
-            <option key={k} value={k}>
-              {SOURCE_TYPE_LABELS[k]}
-            </option>
-          ))}
-        </select>
-        <input
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          placeholder="Title (optional)"
-          style={{ ...inputStyle, flex: 1, minWidth: 200 }}
-          maxLength={200}
-          disabled={pending}
-        />
-      </div>
       <input
-        value={sourceUrl}
-        onChange={(e) => setSourceUrl(e.target.value)}
-        placeholder="https://… (optional)"
-        style={inputStyle}
-        maxLength={2048}
+        value={title}
+        onChange={(e) => setTitle(e.target.value)}
+        placeholder="Title (optional)"
+        style={{ ...inputStyle, minWidth: 200 }}
+        maxLength={200}
         disabled={pending}
       />
+
       <textarea
         value={rawText}
-        onChange={(e) => setRawText(e.target.value)}
-        placeholder="Raw text / notes (optional, up to 256KB)"
+        onChange={(e) => setRawText(e.target.value.slice(0, MAX_RAW_CHARS))}
+        placeholder="Paste a transcript or notes (up to 256KB)…"
         style={{ ...inputStyle, minHeight: 80, fontFamily: 'inherit' }}
-        maxLength={262144}
+        maxLength={MAX_RAW_CHARS}
         disabled={pending}
       />
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, fontSize: 12, opacity: 0.7 }}>
+        <label style={{ cursor: 'pointer' }}>
+          <input
+            type="file"
+            accept=".txt,text/plain"
+            onChange={onPickFile}
+            disabled={pending}
+            style={{ display: 'none' }}
+          />
+          <span style={buttonGhost}>Upload .txt</span>
+        </label>
+        <span>
+          {rawText.length.toLocaleString()} / {MAX_RAW_CHARS.toLocaleString()} chars
+        </span>
+      </div>
+      {fileErr && <p style={errorText}>{fileErr}</p>}
       {otherTopics.length > 0 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
           <span style={{ fontSize: 12, opacity: 0.7 }}>Also tag:</span>
@@ -421,6 +449,8 @@ function errorLabel(code: string): string {
       return 'At least one topic tag is required.';
     case 'raw_text_too_long':
       return 'Raw text is too long (max 256KB).';
+    case 'raw_text_required':
+      return 'Paste a transcript or upload a .txt file.';
     case 'url_too_long':
       return 'URL is too long.';
     case 'url_insecure_scheme':

@@ -16,13 +16,13 @@ import type { SampleSourceType } from '@/lib/creator/types';
 
 type Result<T = null> = { ok: true; data: T } | { ok: false; error: string };
 
-const SOURCE_TYPES: readonly SampleSourceType[] = [
-  'youtube',
-  'transcript',
-  'book_or_doc',
-  'mastermind_or_course',
-  'testimonial',
-] as const;
+// WS3 launch constraint (COGS-bounded): creators add pasted/.txt TRANSCRIPTS
+// only. YouTube was dropped from the add path because a URL-only sample has no
+// transcript-fetch worker to populate raw_text, so the embedding trigger
+// (fires on raw_text NOT NULL) would never run — i.e. it would silently ingest
+// nothing (audit C1). YouTube-link ingestion is a future pipeline (needs a
+// transcript fetcher). The DB enum still supports richer types for admin paths.
+const SOURCE_TYPES: readonly SampleSourceType[] = ['transcript'] as const;
 
 const SLUG_RE = /^[a-z0-9_-]+$/;
 
@@ -52,35 +52,36 @@ const deleteTopicSchema = z.object({
   topicId: z.string().uuid(),
 });
 
-const addSampleSchema = z.object({
-  source_type: z.enum([
-    'youtube',
-    'transcript',
-    'book_or_doc',
-    'mastermind_or_course',
-    'testimonial',
-  ] as const),
-  title: z
-    .string()
-    .trim()
-    .max(200, 'title_too_long')
-    .optional()
-    .transform((v) => (v && v.length > 0 ? v : null)),
-  source_url: z
-    .string()
-    .trim()
-    .max(2048, 'url_too_long')
-    .optional()
-    .transform((v) => (v && v.length > 0 ? v : null)),
-  raw_text: z
-    .string()
-    .max(262144, 'raw_text_too_long')
-    .optional()
-    .transform((v) => (v && v.length > 0 ? v : null)),
-  topic_tags: z
-    .array(z.string().min(2).max(40).regex(SLUG_RE, 'invalid_topic_tags'))
-    .min(1, 'topic_tags_required'),
-});
+const addSampleSchema = z
+  .object({
+    // WS3: creator add path is transcript only (see SOURCE_TYPES note).
+    source_type: z.enum(['transcript'] as const),
+    title: z
+      .string()
+      .trim()
+      .max(200, 'title_too_long')
+      .optional()
+      .transform((v) => (v && v.length > 0 ? v : null)),
+    source_url: z
+      .string()
+      .trim()
+      .max(2048, 'url_too_long')
+      .optional()
+      .transform((v) => (v && v.length > 0 ? v : null)),
+    raw_text: z
+      .string()
+      .max(262144, 'raw_text_too_long')
+      .optional()
+      .transform((v) => (v && v.length > 0 ? v : null)),
+    topic_tags: z
+      .array(z.string().min(2).max(40).regex(SLUG_RE, 'invalid_topic_tags'))
+      .min(1, 'topic_tags_required'),
+  })
+  // M2: a transcript with no text is a dead, quota-burning row that never
+  // embeds — require the text rather than silently accepting an empty source.
+  .refine((d) => d.source_type !== 'transcript' || (d.raw_text?.length ?? 0) > 0, {
+    message: 'raw_text_required',
+  });
 
 const deleteSampleSchema = z.object({
   id: z.string().uuid(),

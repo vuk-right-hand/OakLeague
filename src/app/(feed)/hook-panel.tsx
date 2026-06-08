@@ -16,6 +16,7 @@ import { holdEnterRoomBeat } from '@/lib/session/enter-timing';
 import { useFeedImpressionTracker } from './feed-impression-context';
 import { ReactButton } from '@/components/recording/ReactButton';
 import { RecordingPreview } from '@/components/recording/RecordingPreview';
+import { ShareButton } from '@/components/share/ShareButton';
 import { useRecordingController } from '@/lib/recording/recording-controller';
 import { isReactCaptureEnabled } from '@/components/recording/react-button-state';
 
@@ -743,6 +744,29 @@ export function HookPanel({
         onDismiss={recording.dismissPreview}
         onDiscard={recording.discardByUser}
       />
+
+      {/* Share (WS7) — pulsating right-rail. Targets the creator PROFILE, which
+          is always resolvable for a feed creator (the feed only serves published
+          creators). We deliberately do NOT deep-link /v/<id> here: the feed's
+          long_form_available flag omits the mux_status='ready' check the /v page
+          requires, so a post-publish Mux error would make a /v share 404 (audit
+          C2 — pre-existing feed-gate drift; tracked for the feed/RAG track). The
+          /v page's own Share pill is safe because that page already rendered. */}
+      <div
+        style={{
+          position: 'absolute',
+          right: 16,
+          bottom: hook.long_form_available ? 264 : 220,
+          zIndex: 2,
+        }}
+      >
+        <ShareButton
+          variant="fab"
+          path={`/@${group.creator.handle}`}
+          title={`@${group.creator.handle} on OakLeague`}
+          text={`Talk to @${group.creator.handle} on OakLeague`}
+        />
+      </div>
 
 
       <div

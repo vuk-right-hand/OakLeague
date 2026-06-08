@@ -608,3 +608,42 @@ eventual swap frictionless. Sources: [fish-speech repo](https://github.com/fisha
 [voice clone](https://fish.audio/voice-clone/),
 [pricing](https://fish.audio/blog/cheapest-text-to-speech-api-developers/),
 [self-host](https://www.spheron.network/blog/deploy-open-source-tts-gpu-cloud-2026/).
+
+---
+
+## 9. BUILD LOG (branch `feat/creator-journey-spine`)
+
+**WS0→WS2 (request→invite→email spine)** — BUILT, auditor-reviewed (3C/6M/smalls
+applied), db:test 1088 green, build green. Committed `977717b`.
+
+**WS7 (share + OG)** — BUILT. Pulsating right-rail share fab on feed hooks
+(targets `/@handle` — always resolvable; deliberately NOT `/v/<id>`, see C2 below),
+share pills on `/v/[id]` + `/@handle`, `navigator.share` + copy/prompt fallback.
+Text-only OG cards (SSRF-safe) for `/v/[id]` + `/@handle`, published-gated with
+generic fallback; `generateMetadata` on both; `metadataBase` set on root.
+Auditor-reviewed; fixes applied: C3 metadataBase, C2 share targets profile,
+M5 visible clipboard fallback, OG name clamps, path invariant.
+
+**WS3 (knowledge inputs)** — BUILT (transcript scope). Creator add path locked to
+**transcript paste + .txt** (client byte cap + text-MIME check + live char
+counter; M1). Cross-field require: transcript needs text (M2). Auto-ingest via the
+existing on-`sample_content` trigger (no new button needed).
+
+### Owed follow-ups (flagged, NOT built this branch)
+- **YouTube-link ingestion** (audit C1): dropped from the add path — a URL-only
+  sample has no transcript-fetch worker, so the embedding trigger (fires on
+  `raw_text NOT NULL`) would silently ingest nothing. Needs a YouTube→transcript
+  fetch worker before re-enabling. (Vuk wanted YouTube links; this is the gap.)
+- **v3-default for new creators** (audit S4): written then REVERTED — flipping
+  `creators.retrieval_version` default 1→3 broke ~10 RAG-suite tests that encode
+  the v1 default + v1 routing. Needs a coordinated change with the RAG track
+  (fixtures + assertions + routing tests) AND the verify-first v3 e2e for a
+  brand-new single-creator corpus. New creators currently ingest at v1 (works).
+- **COGS spend kill-switch on ingest** (audit S3): not built (worker infra,
+  shared with v3/Fish tracks). Bounded for now by per-creator caps (100 samples ×
+  256KB) — no unbounded path, but no 150%-quota kill-switch yet.
+- **Feed `long_form_available` gate drift** (audit C2): the feed RPCs omit the
+  `mux_status='ready'` check that `/v/[id]` requires, so a post-publish Mux error
+  makes a `/v` deep-link 404. Pre-existing feed bug (also affects the "Chat"
+  pill). WS7 routes share to `/@handle` to avoid amplifying it; the real fix
+  (unify the 3 feed RPC predicates) belongs to the feed/RAG track.
