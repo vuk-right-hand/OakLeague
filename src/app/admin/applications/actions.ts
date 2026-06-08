@@ -4,6 +4,33 @@ import { z } from 'zod';
 import { revalidatePath } from 'next/cache';
 import { assertAdminFromSession } from '@/lib/auth-guards';
 import { supabaseServer } from '@/lib/supabase/server';
+import { supabaseAdmin } from '@/lib/supabase/admin';
+import { sendEmail } from '@/lib/email/send-email';
+import {
+  renderApplicationApprovedEmail,
+  renderApplicationRejectedEmail,
+} from '@/lib/email/templates';
+
+// Look up an applicant's verified email + display name from the application id.
+// Uses the service-role client (auth.admin.getUserById). Best-effort: returns
+// nulls on any failure so a missing email never blocks approve/reject.
+async function applicantContact(
+  applicationId: string,
+): Promise<{ email: string | null; displayName: string | null }> {
+  try {
+    const sb = supabaseAdmin();
+    const { data: app } = await sb
+      .from('creator_applications')
+      .select('user_id, display_name')
+      .eq('id', applicationId)
+      .maybeSingle<{ user_id: string; display_name: string | null }>();
+    if (!app?.user_id) return { email: null, displayName: app?.display_name ?? null };
+    const { data: u } = await sb.auth.admin.getUserById(app.user_id);
+    return { email: u?.user?.email ?? null, displayName: app.display_name ?? null };
+  } catch {
+    return { email: null, displayName: null };
+  }
+}
 
 const IdSchema = z.string().uuid();
 
@@ -26,6 +53,13 @@ export async function approveApplication(
       return { ok: false, error: 'application_already_approved' };
     }
     return { ok: false, error: 'approve_failed' };
+  }
+
+  // Approval email — best effort (never blocks the approval).
+  const { email, displayName } = await applicantContact(parsed.data);
+  if (email) {
+    const { subject, html } = renderApplicationApprovedEmail({ displayName: displayName ?? '' });
+    await sendEmail({ to: email, subject, html });
   }
 
   revalidatePath('/admin/applications');
@@ -61,6 +95,13 @@ export async function rejectApplication(
       return { ok: false, error: 'application_already_reviewed' };
     }
     return { ok: false, error: 'reject_failed' };
+  }
+
+  // Rejection email with the admin-written reason — best effort.
+  const { email } = await applicantContact(id);
+  if (email) {
+    const { subject, html } = renderApplicationRejectedEmail({ reason: parsed.data.reason });
+    await sendEmail({ to: email, subject, html });
   }
 
   revalidatePath('/admin/applications');

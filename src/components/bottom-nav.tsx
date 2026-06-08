@@ -9,7 +9,7 @@ import { usePathname } from 'next/navigation';
 // shell). The middle button is a 5-state machine driven by /api/me/creator-status.
 
 type Status = {
-  state: 'guest' | 'not_invited' | 'invited' | 'in_review' | 'creator';
+  state: 'guest' | 'not_invited' | 'requested' | 'invited' | 'in_review' | 'creator';
   handle: string | null;
 };
 
@@ -30,10 +30,13 @@ function Icon({ d }: { d: string }) {
 }
 
 const MIDDLE_COPY: Record<Status['state'], { label: string; href: string }> = {
-  // C1: non-invited users go to the waitlist (which carries the creator CTA),
-  // NEVER to /apply — that page hard-fails without an invite_nonce.
-  guest: { label: 'Become a Creator', href: '/waitlist' },
-  not_invited: { label: 'Become a Creator', href: '/waitlist' },
+  // Non-invited users go to /request (the public creator-request form), NEVER to
+  // /apply — that page hard-fails without an invite_nonce (audit C1). WS1: the
+  // request form replaces the old waitlist mailto as the single creator entry.
+  guest: { label: 'Become a Creator', href: '/request' },
+  not_invited: { label: 'Become a Creator', href: '/request' },
+  // U1: a logged-in user who already requested sees their status, not a loop.
+  requested: { label: 'Request sent', href: '/request' },
   invited: { label: 'Apply now', href: '/apply' },
   in_review: { label: 'In review', href: '/apply/submitted' },
   creator: { label: 'Studio', href: '/creator' },

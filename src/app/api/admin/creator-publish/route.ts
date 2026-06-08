@@ -123,9 +123,36 @@ export async function POST(req: NextRequest) {
   const sb = supabaseAdmin();
   const { data: row } = await sb
     .from('creators')
-    .select('published_at, brain_status')
+    .select('published_at, brain_status, user_id, handle, display_name')
     .eq('id', creatorId)
-    .maybeSingle<{ published_at: string | null; brain_status: string }>();
+    .maybeSingle<{
+      published_at: string | null;
+      brain_status: string;
+      user_id: string;
+      handle: string | null;
+      display_name: string | null;
+    }>();
+
+  // "You're live" email — best effort, only on a real publish transition.
+  // Failure here never affects the publish response (audit C2: surfaced via
+  // Sentry inside sendEmail, not swallowed silently).
+  if (publish && row?.published_at && row.handle && row.user_id) {
+    try {
+      const { data: u } = await sb.auth.admin.getUserById(row.user_id);
+      const email = u?.user?.email;
+      if (email) {
+        const { sendEmail } = await import('@/lib/email/send-email');
+        const { renderCreatorLiveEmail } = await import('@/lib/email/templates');
+        const { subject, html } = renderCreatorLiveEmail({
+          handle: row.handle,
+          displayName: row.display_name ?? '',
+        });
+        await sendEmail({ to: email, subject, html });
+      }
+    } catch (e) {
+      Sentry.captureException(e, { extra: { op: 'creator_live_email', creator_id: creatorId } });
+    }
+  }
 
   return json(200, {
     ok: true,

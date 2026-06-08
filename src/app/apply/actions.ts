@@ -6,6 +6,8 @@ import { revalidatePath } from 'next/cache';
 import { getCallerUserId } from '@/lib/auth-guards';
 import { supabaseServer } from '@/lib/supabase/server';
 import { buildApplyConsents } from '@/lib/consent';
+import { sendEmail } from '@/lib/email/send-email';
+import { renderApplicationReceivedEmail } from '@/lib/email/templates';
 
 const TopicSchema = z.object({
   slug: z.string().regex(/^[a-z0-9_-]{2,40}$/),
@@ -131,6 +133,15 @@ export async function submitCreatorApplication(
   }
 
   jar.delete('invite_nonce');
+
+  // Application-received ack — best effort. The applicant is authenticated, so
+  // their verified email is the trustworthy address (never a client-supplied one).
+  const { data: { user } } = await supabase.auth.getUser();
+  if (user?.email) {
+    const { subject, html } = renderApplicationReceivedEmail();
+    await sendEmail({ to: user.email, subject, html });
+  }
+
   revalidatePath('/admin/applications');
   return { ok: true };
 }

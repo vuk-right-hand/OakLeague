@@ -3,6 +3,7 @@
 import { z } from 'zod';
 import { headers } from 'next/headers';
 import { supabaseAdmin } from '@/lib/supabase/admin';
+import { verifyTurnstile } from '@/lib/turnstile';
 
 // Source enum mirrored at the boundary. waitlist.source is plain text;
 // keeping the allow-list here means the upgrade-from-cap-hit route can't
@@ -14,23 +15,6 @@ const Input = z.object({
   turnstile_token: z.string().max(2048).optional().default(''),
   source: z.enum(SOURCES).optional().default('landing'),
 });
-
-async function verifyTurnstile(token: string, remoteIp: string): Promise<boolean> {
-  const secret = process.env.TURNSTILE_SECRET_KEY;
-  if (!secret) return true; // captcha disabled in dev
-  if (!token) return false;
-  try {
-    const body = new URLSearchParams({ secret, response: token, remoteip: remoteIp });
-    const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-      method: 'POST',
-      body,
-    });
-    const json = (await res.json()) as { success?: boolean };
-    return Boolean(json.success);
-  } catch {
-    return false;
-  }
-}
 
 export async function joinWaitlist(
   input: unknown,
