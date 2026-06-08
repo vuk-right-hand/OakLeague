@@ -242,6 +242,20 @@ async function provisionPricing() {
       process.exit(1);
     }
     _fishPricingPrimeForBoot({ mustValidate: true });
+    // FISH_AUDIO_PHASE_1 dispatchFish audit M7 — surface that Phase 0.5
+    // #8 (manual DELETE-idempotency verification) is still unstamped.
+    // Worker treats 200/204/404 as success on assumption; if Fish ever
+    // ships 410 for "already deleted" we'd start treating success as
+    // failure. Until the stamp lands, log loud at every fleet boot so the
+    // status is visible. Hard-exit-gated in prod via FISH_PHASE_0_5_8_STAMPED.
+    if (process.env.FISH_PHASE_0_5_8_STAMPED !== '1') {
+      const msg = '[boot] WARN: FISH_PHASE_0_5_8_STAMPED!=1 — Fish DELETE idempotency (200/204/404 success contract) is ASSUMED, not stamped. See docs/_planning/FISH_AUDIO_PHASE_1.md §3 claim 8. Required for prod cutover.';
+      if (process.env.VERCEL_ENV === 'production' && process.env.FISH_PHASE_0_5_8_PROD_OVERRIDE !== '1') {
+        console.error(`FATAL: ${msg}`);
+        process.exit(1);
+      }
+      console.warn(msg);
+    }
   } else if (fishProbeFailed) {
     // Asymmetry vs Hume (intentional, audit M6): Hume's warn-defer path only
     // console.warn's and leaves _humePricing=null — getHumePricing() at first
@@ -3074,11 +3088,20 @@ server.listen(PORT, '0.0.0.0', () => {
   // Reaper: 20s cadence + 60s threshold (RPC default). Fires once at boot for
   // proxy-crash recovery, then every 20s. See plan §1B.
   reaperHandle = installReaper({ supabase }).handle;
-  // R4-M3 — voice-delete worker (Cartesia DELETE /voices deferred queue).
-  // Only when α' is enabled; otherwise no rows are ever enqueued.
-  if (VOICE_TTS_LAYER_ENABLED && CARTESIA_API_KEY) {
-    voiceDeleteHandle = makeVoiceDeleteWorker({ supabase, cartesiaApiKey: CARTESIA_API_KEY })
-      .install().handle;
+  // R4-M3 + HUME_TTS_PLAN §5.4 + FISH_AUDIO_PHASE_1 §4 M4 — voice-delete
+  // worker (deferred provider DELETE queue). Install whenever α' is on +
+  // ANY provider key is set (per-row dispatch checks the right key by
+  // `tts_provider`; a missing key for a given provider leaves those rows
+  // in skip-bump until the 24h orphan window catches them). HUME_API_KEY
+  // and FISH_API_KEY also forwarded so hume/fish queue rows can dispatch
+  // without a separate worker boot.
+  if (VOICE_TTS_LAYER_ENABLED && (CARTESIA_API_KEY || HUME_API_KEY || FISH_API_KEY)) {
+    voiceDeleteHandle = makeVoiceDeleteWorker({
+      supabase,
+      cartesiaApiKey: CARTESIA_API_KEY || null,
+      humeApiKey:     HUME_API_KEY     || null,
+      fishApiKey:     FISH_API_KEY     || null,
+    }).install().handle;
   }
   // SIMLI_WIREUP §12a.3 / R3-Missing-3 — Simli face-delete worker.
   // Drains simli_face_delete_queue rows (creator deletion + force-retrain).

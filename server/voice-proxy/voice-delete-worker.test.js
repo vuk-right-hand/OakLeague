@@ -285,6 +285,250 @@ test('mixed batch — cartesia + hume in one tick, each routes to its provider',
   assert.equal(completed[1].p_tts_provider, 'hume');
 });
 
+// ── FISH_AUDIO_PHASE_1 §6 M4 — fish dispatch tests ─────────────────────
+// Test fixture id is INTENTIONALLY synthetic (not the real spike voice id)
+// so test traces never leak Fish's prod resource ids into log aggregators.
+const FISH_TEST_VOICE_ID = 'fishtest32hexffffffffffffffffffff';
+
+test('fish row → DELETE /model/{id} with Bearer auth (no GET-verify, no name pair)', async () => {
+  const supabase = makeFakeSupabase({
+    claimRows: [{ tts_provider: 'fish', voice_id: FISH_TEST_VOICE_ID, voice_name: null, attempts: 1, due_at: new Date().toISOString() }],
+  });
+  let completed = null;
+  supabase.rpc = (orig => async (name, args) => {
+    if (name === 'voice_delete_queue_complete_v2') { completed = args; return { data: null, error: null }; }
+    return orig(name, args);
+  })(supabase.rpc);
+  const fetchCalls = stubFetch(() => ({ status: 204 }));
+  const w = makeVoiceDeleteWorker({ supabase, cartesiaApiKey: null, humeApiKey: null, fishApiKey: 'fk' });
+  await w.tick();
+  assert.equal(fetchCalls.length, 1, 'fish DELETE is single-shot (no GET-verify pre-flight)');
+  assert.ok(fetchCalls[0].url.startsWith(`https://api.fish.audio/model/${FISH_TEST_VOICE_ID}`));
+  assert.equal(fetchCalls[0].opts.method, 'DELETE');
+  // Audit M2: header name is capitalized 'Authorization'.
+  assert.equal(fetchCalls[0].opts.headers.Authorization, 'Bearer fk');
+  // Audit M3: User-Agent for Fish-side identification.
+  assert.ok(fetchCalls[0].opts.headers['User-Agent']?.startsWith('oakleague-voice-delete-worker'));
+  assert.deepEqual(completed, { p_tts_provider: 'fish', p_voice_id: FISH_TEST_VOICE_ID });
+});
+
+test('fish row + status 200 → success (dequeue)', async () => {
+  const supabase = makeFakeSupabase({
+    claimRows: [{ tts_provider: 'fish', voice_id: 'vid-f', voice_name: null, attempts: 1, due_at: new Date().toISOString() }],
+  });
+  let completed = null;
+  supabase.rpc = (orig => async (name, args) => {
+    if (name === 'voice_delete_queue_complete_v2') { completed = args; return { data: null, error: null }; }
+    return orig(name, args);
+  })(supabase.rpc);
+  stubFetch(() => ({ status: 200 }));
+  const w = makeVoiceDeleteWorker({ supabase, fishApiKey: 'fk' });
+  await w.tick();
+  assert.deepEqual(completed, { p_tts_provider: 'fish', p_voice_id: 'vid-f' });
+});
+
+test('fish row + status 404 → success (idempotent — already deleted)', async () => {
+  const supabase = makeFakeSupabase({
+    claimRows: [{ tts_provider: 'fish', voice_id: 'vid-f', voice_name: null, attempts: 2, due_at: new Date().toISOString() }],
+  });
+  let completed = null;
+  supabase.rpc = (orig => async (name, args) => {
+    if (name === 'voice_delete_queue_complete_v2') { completed = args; return { data: null, error: null }; }
+    return orig(name, args);
+  })(supabase.rpc);
+  stubFetch(() => ({ status: 404 }));
+  const w = makeVoiceDeleteWorker({ supabase, fishApiKey: 'fk' });
+  await w.tick();
+  assert.deepEqual(completed, { p_tts_provider: 'fish', p_voice_id: 'vid-f' });
+});
+
+test('fish row + status 500 → record_failure (retry per existing semantics)', async () => {
+  let recorded = null;
+  const supabase = makeFakeSupabase({
+    claimRows: [{ tts_provider: 'fish', voice_id: 'vid-f', voice_name: null, attempts: 1, due_at: new Date().toISOString() }],
+  });
+  supabase.rpc = (orig => async (name, args) => {
+    if (name === 'voice_delete_queue_record_failure_v2') { recorded = args; return { data: null, error: null }; }
+    return orig(name, args);
+  })(supabase.rpc);
+  stubFetch(() => ({ status: 500 }));
+  const w = makeVoiceDeleteWorker({ supabase, fishApiKey: 'fk' });
+  await w.tick();
+  assert.equal(recorded?.p_last_error, 'status=500');
+});
+
+test('fish row + fishApiKey missing → skipBump (no record_failure, no dispatch)', async () => {
+  let recorded = null;
+  const supabase = makeFakeSupabase({
+    claimRows: [{ tts_provider: 'fish', voice_id: 'vid-f', voice_name: null, attempts: 1, due_at: new Date().toISOString() }],
+  });
+  supabase.rpc = (orig => async (name, args) => {
+    if (name === 'voice_delete_queue_record_failure_v2') { recorded = args; return { data: null, error: null }; }
+    return orig(name, args);
+  })(supabase.rpc);
+  const fetchCalls = stubFetch(() => { throw new Error('should not fetch'); });
+  const w = makeVoiceDeleteWorker({ supabase, fishApiKey: null });
+  await w.tick();
+  assert.equal(fetchCalls.length, 0, 'no dispatch attempted when fishApiKey missing');
+  assert.equal(recorded, null, 'no record_failure — sit-orphan path catches it after 24h');
+});
+
+test('fish row + stale orphan (due_at >24h ago + no key) → burns attempt so 10-cutoff catches it', async () => {
+  let recorded = null;
+  const dueAtOld = new Date(Date.now() - 25 * 3600 * 1000).toISOString();
+  const supabase = makeFakeSupabase({
+    claimRows: [{ tts_provider: 'fish', voice_id: 'vid-f', voice_name: null, attempts: 1, due_at: dueAtOld }],
+  });
+  supabase.rpc = (orig => async (name, args) => {
+    if (name === 'voice_delete_queue_record_failure_v2') { recorded = args; return { data: null, error: null }; }
+    return orig(name, args);
+  })(supabase.rpc);
+  stubFetch(() => { throw new Error('should not fetch'); });
+  const w = makeVoiceDeleteWorker({ supabase, fishApiKey: null });
+  await w.tick();
+  assert.equal(recorded?.p_last_error, 'no_fish_key', 'stale orphan transitions skipBump → record_failure');
+});
+
+test('fish row + fetch AbortError → record_failure with last_error=timeout', async () => {
+  let recorded = null;
+  const supabase = makeFakeSupabase({
+    claimRows: [{ tts_provider: 'fish', voice_id: 'vid-f', voice_name: null, attempts: 1, due_at: new Date().toISOString() }],
+  });
+  supabase.rpc = (orig => async (name, args) => {
+    if (name === 'voice_delete_queue_record_failure_v2') { recorded = args; return { data: null, error: null }; }
+    return orig(name, args);
+  })(supabase.rpc);
+  stubFetch(() => { const e = new Error('aborted'); e.name = 'AbortError'; throw e; });
+  const w = makeVoiceDeleteWorker({ supabase, fishApiKey: 'fk' });
+  await w.tick();
+  assert.equal(recorded?.p_last_error, 'timeout');
+});
+
+// Audit C2 + M6 — non-200 status codes routed correctly:
+//   429 / 503 → skipBump (transient — retry without burning attempts)
+//   401 / 403 → skipBump + Sentry (auth — retrying won't fix; orphan-bump after 24h)
+
+test('fish row + status 429 → skipBump (rate-limited, no record_failure)', async () => {
+  let recorded = null;
+  const supabase = makeFakeSupabase({
+    claimRows: [{ tts_provider: 'fish', voice_id: 'vid-f', voice_name: null, attempts: 1, due_at: new Date().toISOString() }],
+  });
+  supabase.rpc = (orig => async (name, args) => {
+    if (name === 'voice_delete_queue_record_failure_v2') { recorded = args; return { data: null, error: null }; }
+    return orig(name, args);
+  })(supabase.rpc);
+  stubFetch(() => ({ status: 429 }));
+  const w = makeVoiceDeleteWorker({ supabase, fishApiKey: 'fk' });
+  await w.tick();
+  assert.equal(recorded, null, '429 must NOT burn attempts — sit-orphan path catches it after 24h if persistent');
+});
+
+test('fish row + status 503 → skipBump', async () => {
+  let recorded = null;
+  const supabase = makeFakeSupabase({
+    claimRows: [{ tts_provider: 'fish', voice_id: 'vid-f', voice_name: null, attempts: 1, due_at: new Date().toISOString() }],
+  });
+  supabase.rpc = (orig => async (name, args) => {
+    if (name === 'voice_delete_queue_record_failure_v2') { recorded = args; return { data: null, error: null }; }
+    return orig(name, args);
+  })(supabase.rpc);
+  stubFetch(() => ({ status: 503 }));
+  const w = makeVoiceDeleteWorker({ supabase, fishApiKey: 'fk' });
+  await w.tick();
+  assert.equal(recorded, null, '503 transient → skipBump');
+});
+
+test('fish row + status 401 → skipBump (bad key — retrying won\'t help)', async () => {
+  let recorded = null;
+  const supabase = makeFakeSupabase({
+    claimRows: [{ tts_provider: 'fish', voice_id: 'vid-f', voice_name: null, attempts: 1, due_at: new Date().toISOString() }],
+  });
+  supabase.rpc = (orig => async (name, args) => {
+    if (name === 'voice_delete_queue_record_failure_v2') { recorded = args; return { data: null, error: null }; }
+    return orig(name, args);
+  })(supabase.rpc);
+  stubFetch(() => ({ status: 401 }));
+  const w = makeVoiceDeleteWorker({ supabase, fishApiKey: 'fk' });
+  await w.tick();
+  assert.equal(recorded, null, '401 auth-failure must NOT burn attempts');
+});
+
+test('fish row + status 403 → skipBump', async () => {
+  let recorded = null;
+  const supabase = makeFakeSupabase({
+    claimRows: [{ tts_provider: 'fish', voice_id: 'vid-f', voice_name: null, attempts: 1, due_at: new Date().toISOString() }],
+  });
+  supabase.rpc = (orig => async (name, args) => {
+    if (name === 'voice_delete_queue_record_failure_v2') { recorded = args; return { data: null, error: null }; }
+    return orig(name, args);
+  })(supabase.rpc);
+  stubFetch(() => ({ status: 403 }));
+  const w = makeVoiceDeleteWorker({ supabase, fishApiKey: 'fk' });
+  await w.tick();
+  assert.equal(recorded, null, '403 account-suspended must NOT burn attempts');
+});
+
+// Audit C1 defense-in-depth — malformed voice_id at the worker boundary.
+test('fish row + voice_id with path traversal → refuses dispatch (no fetch)', async () => {
+  let recorded = null;
+  const supabase = makeFakeSupabase({
+    claimRows: [{ tts_provider: 'fish', voice_id: '../../../admin/keys', voice_name: null, attempts: 1, due_at: new Date().toISOString() }],
+  });
+  supabase.rpc = (orig => async (name, args) => {
+    if (name === 'voice_delete_queue_record_failure_v2') { recorded = args; return { data: null, error: null }; }
+    return orig(name, args);
+  })(supabase.rpc);
+  const fetchCalls = stubFetch(() => { throw new Error('should not fetch'); });
+  const w = makeVoiceDeleteWorker({ supabase, fishApiKey: 'fk' });
+  await w.tick();
+  assert.equal(fetchCalls.length, 0, 'malformed voice_id must NOT reach Fish');
+  assert.equal(recorded, null, 'skipBump:true — no record_failure (surfaces as orphan after 24h)');
+});
+
+test('fish row + empty voice_id → refuses dispatch', async () => {
+  const supabase = makeFakeSupabase({
+    claimRows: [{ tts_provider: 'fish', voice_id: '', voice_name: null, attempts: 1, due_at: new Date().toISOString() }],
+  });
+  const fetchCalls = stubFetch(() => { throw new Error('should not fetch'); });
+  const w = makeVoiceDeleteWorker({ supabase, fishApiKey: 'fk' });
+  await w.tick();
+  assert.equal(fetchCalls.length, 0);
+});
+
+test('mixed batch — cartesia + hume + fish in one tick, each routes to its provider', async () => {
+  const completed = [];
+  const supabase = makeFakeSupabase({
+    claimRows: [
+      { tts_provider: 'cartesia', voice_id: 'c1',   voice_name: null,           attempts: 1, due_at: new Date().toISOString() },
+      { tts_provider: 'hume',     voice_id: 'h1',   voice_name: 'Hume Voice',   attempts: 1, due_at: new Date().toISOString() },
+      { tts_provider: 'fish',     voice_id: 'fid1', voice_name: null,           attempts: 1, due_at: new Date().toISOString() },
+    ],
+  });
+  supabase.rpc = (orig => async (name, args) => {
+    if (name === 'voice_delete_queue_complete_v2') { completed.push(args); return { data: null, error: null }; }
+    return orig(name, args);
+  })(supabase.rpc);
+  // Cartesia + Fish are 1 fetch each; Hume is GET-verify + DELETE = 2 fetches.
+  // Total = 4.
+  const fetchCalls = stubFetch((url, opts) => {
+    if (url.includes('api.hume.ai') && opts?.method === 'GET') {
+      return { status: 200, ok: true, json: async () => ({ voices: [{ id: 'h1', name: 'Hume Voice' }] }) };
+    }
+    return { status: 200, ok: true };
+  });
+  const w = makeVoiceDeleteWorker({ supabase, cartesiaApiKey: 'ck', humeApiKey: 'hk', fishApiKey: 'fk' });
+  await w.tick();
+  assert.equal(fetchCalls.length, 4, 'cartesia DELETE + hume GET-verify + hume DELETE + fish DELETE');
+  // Audit Small: claim-order from SKIP LOCKED isn't guaranteed across PG
+  // versions; assert by URL-shape, not index.
+  const urls = fetchCalls.map((c) => c.url);
+  assert.ok(urls.some((u) => u.includes('api.cartesia.ai')), 'cartesia DELETE present');
+  assert.ok(urls.some((u) => u.includes('api.fish.audio')), 'fish DELETE present');
+  assert.equal(urls.filter((u) => u.includes('api.hume.ai')).length, 2, 'hume GET+DELETE present');
+  assert.equal(completed.length, 3);
+  assert.deepEqual(completed.map((c) => c.p_tts_provider).sort(), ['cartesia', 'fish', 'hume']);
+});
+
 test('Sentry: composite dedup key prevents cross-provider collision at threshold 5', async () => {
   // Two rows with the SAME voice_id but DIFFERENT providers, both at
   // attempts=5. The dedup key is ${provider}:${voice_id}:5 so BOTH must
