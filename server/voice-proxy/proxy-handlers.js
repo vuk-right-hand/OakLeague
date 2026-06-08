@@ -7,6 +7,7 @@
 
 import { captureException } from './sentry.js';
 import { validateHumePricingOrExit, assertHumePricing } from './hume-bridge.js';
+import { validateFishPricingOrExit, assertFishPricing } from './fish-bridge.js';
 
 // ── Pricing constants (Pipeline α' COGS) ────────────────────────────────────
 //
@@ -98,6 +99,104 @@ export function _humePricingPrimeForBoot() {
 // Test-only — reset the singleton so per-test env tweaks take effect.
 export function _humePricingResetForTests() {
   _humePricing = null;
+}
+
+// ── Fish pricing (FISH_AUDIO_PHASE_1 §5 #5 / audit round 1 C4) ───────────
+//
+// Same dual-path pattern as Hume:
+//   * `getFishPricing()` — LAZY path, called from logTurnCogs per-turn.
+//     Throws on misconfig (catchable). The caller's cogsPromise.catch maps
+//     to a clean per-session 1011 close, NEVER crashes the fleet.
+//   * `_fishPricingPrimeForBoot()` — BOOT path, called from index.js
+//     provisionPricing(). When `mustValidate` is true (any creator in this
+//     fleet may route to fish), validates and process.exits on failure so
+//     a broken config crash-loops loudly at start. When `mustValidate` is
+//     false (no fish creators), sets a probeFailed flag without exiting —
+//     subsequent getFishPricing() calls throw locally to fail one session
+//     instead of the whole fleet. Round 2 Small + round 3 S6 conditional.
+let _fishPricing = null;
+let _fishProbeFailed = false;
+
+export function getFishPricing() {
+  if (_fishPricing != null) {
+    // Audit round 3 M-R2-5 — once-cached forever (matches Hume / Cartesia
+    // house style). But if the env's FISH_QUOTED_AT differs from the
+    // cached value, log a one-line warn so a rotation-typo / stale-cache
+    // condition surfaces in Fly logs. We do NOT re-read the env (that
+    // would break audit trail consistency mid-session); rotation requires
+    // a VM restart.
+    const envQuoted = process.env.FISH_QUOTED_AT;
+    if (envQuoted && envQuoted !== _fishPricing.quotedAt) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[fish-bridge] cached pricing quotedAt=${_fishPricing.quotedAt} differs from env=${envQuoted} — rotation requires VM restart`,
+      );
+    }
+    return _fishPricing;
+  }
+  // Audit round 3 M6 — when the boot probe deferred, RETRY the assertion
+  // here rather than caching the failure state. If an admin sets
+  // FISH_USD_PER_CHAR via `flyctl secrets set` (which restarts the VM
+  // anyway) OR flips a creator to fish via the admin UI (which does NOT
+  // restart), a subsequent getFishPricing() call now picks up the fresh
+  // env on success. On continued failure, the per-session catch in
+  // logTurnCogs still maps to a clean 1011 cogs_misconfig close — only
+  // the one offending session fails, never the fleet.
+  if (_fishProbeFailed) {
+    const r = assertFishPricing(); // throws cleanly on bad env
+    _fishPricing = r;
+    _fishProbeFailed = false; // recovery point
+    return r;
+  }
+  _fishPricing = assertFishPricing();
+  return _fishPricing;
+}
+
+/**
+ * Boot-time pricing primer. `mustValidate` controls fail-mode:
+ *
+ *   mustValidate=true  → hard process.exit on misconfig (like Hume). Used
+ *     when the fleet's env or any creator's tts_provider says fish is
+ *     active. Broken config crash-loops loudly at start.
+ *
+ *   mustValidate=false → warn-don't-exit. The fleet may not have any fish
+ *     creators today; we don't want to crash the whole VM on a missing
+ *     env var that no session will ever read. Sets _fishProbeFailed so
+ *     subsequent getFishPricing() calls throw a per-session error if a
+ *     fish creator suddenly appears.
+ *
+ * @param {object} opts
+ * @param {boolean} opts.mustValidate
+ * @returns {{usdPerChar:number, quotedAt:string} | null}
+ */
+export function _fishPricingPrimeForBoot({ mustValidate = false } = {}) {
+  if (mustValidate) {
+    _fishPricing = validateFishPricingOrExit();
+    _fishProbeFailed = false;
+    return _fishPricing;
+  }
+  try {
+    _fishPricing = assertFishPricing();
+    _fishProbeFailed = false;
+    return _fishPricing;
+  } catch (e) {
+    _fishPricing = null;
+    _fishProbeFailed = true;
+    // Audit round 3 S10 — wording: the prime didn't actually probe the
+    // creator set, only the env. State that plainly so a future on-caller
+    // doesn't conflate "no fish creators" with "FISH_USD_PER_CHAR unset."
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[fish-bridge] WARN at boot: ${e.message} FISH_USD_PER_CHAR was missing/invalid at boot — continuing without fish pricing primed. The next getFishPricing() call retries the assertion (audit M6 in-process recovery); on continued failure the per-session catch maps to a 1011 cogs_misconfig close.`,
+    );
+    return null;
+  }
+}
+
+// Test-only — reset the singleton + probeFailed flag.
+export function _fishPricingResetForTests() {
+  _fishPricing = null;
+  _fishProbeFailed = false;
 }
 
 let _cartesiaUsdPerChar = null;
