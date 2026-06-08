@@ -120,37 +120,51 @@ export async function submitCreatorRequest(
   const emailLower = parsed.data.email.toLowerCase().trim();
   const rateKey = rateLimitEmailKey(parsed.data.email);
 
-  // BLOCKING limits: per-IP (hourly) + per-email (daily). These are scoped to a
-  // single actor, so blocking them can't take the funnel down for everyone.
-  const limits: Array<{ scope: string; key: string; window: string; limit: number }> = [
-    { scope: 'creator_request_ip', key: ipKey, window: '1 hour', limit: 5 },
-    { scope: 'creator_request_email', key: rateKey, window: '24 hours', limit: 3 },
-  ];
-  for (const l of limits) {
-    const { data: allowed, error: rlErr } = await sb.rpc('rate_limit_hit', {
-      p_scope: l.scope,
-      p_key: l.key,
-      p_window: l.window,
-      p_limit: l.limit,
+  // BLOCKING limits, both single-actor scoped (blocking them can't take the
+  // funnel down for everyone). NOTE: rate_limit_hit only supports a '1 minute'
+  // window — it RAISES 22023 on anything else (mig 20260503000009). For the
+  // daily per-email cap we use the purpose-built rate_limit_hit_day (midnight-UTC
+  // bucket). Getting this wrong silently returns rate_check_failed on every
+  // request (caught in audit — was '1 hour'/'24 hours' here, which broke the
+  // whole funnel at runtime).
+
+  // Per-IP flood throttle: 5/min/IP (mirrors the waitlist pattern).
+  {
+    const { data: ipOk, error: ipErr } = await sb.rpc('rate_limit_hit', {
+      p_scope: 'creator_request_ip',
+      p_key: ipKey,
+      p_window: '1 minute',
+      p_limit: 5,
     });
-    if (rlErr) return { ok: false, error: 'rate_check_failed' };
-    if (allowed === false) return { ok: false, error: 'rate_limited' };
+    if (ipErr) return { ok: false, error: 'rate_check_failed' };
+    if (ipOk === false) return { ok: false, error: 'rate_limited' };
+  }
+
+  // Per-email daily cap: 3/day per plus-stripped address.
+  {
+    const { data: emailOk, error: emailErr } = await sb.rpc('rate_limit_hit_day', {
+      p_scope: 'creator_request_email',
+      p_key: rateKey,
+      p_limit: 3,
+    });
+    if (emailErr) return { ok: false, error: 'rate_check_failed' };
+    if (emailOk === false) return { ok: false, error: 'rate_limited' };
   }
 
   // GLOBAL ceiling is a TRIPWIRE, not a gate (audit C2). A blocking counter
   // keyed to a constant string is a single shared kill-switch: one attacker who
-  // trips it locks out every legitimate creator request for the window — exactly
-  // what we don't want during a launch/demo. So we observe + alert and NEVER
-  // block on it. If this fires we investigate; we don't deny real users.
+  // trips it locks out every legitimate creator request — exactly what we don't
+  // want during a launch/demo. So we observe + alert and NEVER block on it.
+  // Minute-bucketed (the only window rate_limit_hit supports).
   {
     const { data: globalOk } = await sb.rpc('rate_limit_hit', {
       p_scope: 'creator_request_global',
       p_key: 'global',
-      p_window: '1 hour',
-      p_limit: 500,
+      p_window: '1 minute',
+      p_limit: 120,
     });
     if (globalOk === false) {
-      Sentry.captureMessage('creator_request global hourly ceiling exceeded — possible flood', {
+      Sentry.captureMessage('creator_request global per-minute ceiling exceeded — possible flood', {
         level: 'warning',
       });
     }
