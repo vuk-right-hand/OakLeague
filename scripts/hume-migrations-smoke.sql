@@ -35,8 +35,13 @@ BEGIN
   VALUES (v_creator_id, v_user_id, 'human', 'Smoke Test', 'smoke_test_' || substr(md5(random()::text),1,6))
   ON CONFLICT (id) DO NOTHING;
 
-  INSERT INTO public.sessions (id, user_id, creator_id, model_used, tier_at_session, status, ended_at)
-  VALUES (v_session_id, v_user_id, v_creator_id, 'gemini_3_1_flash_live_preview', 'free', 'ended', now())
+  -- FISH_AUDIO_PHASE_1 M3 audit (round 2 M1) — v3 + rewritten v1 both
+  -- RAISE 22023 when sessions.tts_provider_at_session is NULL. Set the
+  -- snapshot column explicitly so TEST 9 (v1 forwarding) keeps working
+  -- post-M3. 'cartesia' preserves the test's pre-existing assertion that
+  -- legs land with service='cartesia'.
+  INSERT INTO public.sessions (id, user_id, creator_id, model_used, tier_at_session, tts_provider_at_session, status, ended_at)
+  VALUES (v_session_id, v_user_id, v_creator_id, 'gemini_3_1_flash_live_preview', 'free', 'cartesia', 'ended', now())
   ON CONFLICT (id) DO NOTHING;
 
   RAISE NOTICE '🔧 fixture: user=%, creator=%, session=% ready', v_user_id, v_creator_id, v_session_id;
