@@ -321,6 +321,15 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
       // dashboard can surface the (should-be-near-zero) frequency without
       // a second cogs writer racing this one.
       humeCapExceeded = false,
+      // FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit M1) — optional cogs-meta
+      // additions for the auto-fallback path. Proxy passes
+      // { tts_fallback_invoked: true, fallback_reason: '<code>' } when the
+      // Fish→Cartesia sidecar swap fires mid-turn. Merged into `meta` so
+      // downstream dashboards can count fallback frequency without joining
+      // sessions. Shape kept open-ended so future flags (turn_complete_timeout
+      // recoveries, sidecar replay metrics) ride the same channel without
+      // a signature change. NULL/undefined → no-op.
+      extraMetadata = null,
     } = payload;
     // Audit C5 — validate ttsProvider is one of the allowlisted values when
     // present. The default 'cartesia' covers cogs-rpc.test.js's 23 fixtures
@@ -413,6 +422,16 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
       if (Number.isFinite(usageMetadata.responseTokenCount)) u.responseTokenCount = usageMetadata.responseTokenCount;
       if (Number.isFinite(usageMetadata.totalTokenCount))    u.totalTokenCount    = usageMetadata.totalTokenCount;
       if (Object.keys(u).length > 0) meta.usage = u;
+    }
+
+    // FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit M1) — merge caller-supplied
+    // extra metadata last so it overrides nothing important (the keys it
+    // carries — `tts_fallback_invoked`, `fallback_reason` — don't collide
+    // with the existing tts_provider / tts_quoted_at / fallback shape).
+    // Plain object spread; non-object payloads ignored defensively so a
+    // future caller passing an array can't corrupt the row.
+    if (extraMetadata && typeof extraMetadata === 'object' && !Array.isArray(extraMetadata)) {
+      Object.assign(meta, extraMetadata);
     }
 
     const inputCost = (inputSeconds || 0) * GEMINI_INPUT_USD_PER_SEC;

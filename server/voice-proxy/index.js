@@ -1076,6 +1076,34 @@ wss.on('connection', async (ws, req) => {
   // CartesiaTTSBridge and HumeTTSBridge expose the same interface (open /
   // turnStart / sendText / turnEnd / cancel / close / on / getMetrics).
   let ttsBridge = null;
+  // FISH_AUDIO_PHASE_1 §6 round-3 C4 — auto-fallback state. `ttsBridgeProvider`
+  // mirrors the LIVE bridge's provider (mutated on sidecar swap); `ttsProvider`
+  // stays the session SNAPSHOT (immutable across the session) so cogs/Sentry
+  // can still report "session was billed as fish but fell back". Audit C2 fix.
+  let ttsBridgeProvider = null;
+  // Capability for Fish→Cartesia auto-fallback. Resolved at session-open from
+  // the same `creators` row read used to look up the active voice id. Null →
+  // fallback handler closes 1011 fish_fallback_required_no_sidecar.
+  let cartesiaSidecarVoiceId = null;
+  let fallbackUsed = false;            // per-session latch, set SYNCHRONOUSLY before await (audit C3)
+  let cancelDuringFallback = false;    // user barge-in during sidecar.open() (audit M3)
+  let currentTurnTextBuffer = '';      // per-turn text accumulator for replay
+  // Unsubscribe handle for the current ttsBridge listener — captured at
+  // registration so the fallback handler can detach the dead-bridge listener
+  // synchronously before constructing the sidecar (audit C4).
+  let offTtsBridge = null;
+  // Session-level mirror of the bridge's sample-rate so the auto-fallback
+  // handler can construct the Cartesia sidecar with the right rate. The
+  // existing `ttsSampleRate` declaration inside the bridge-construct try{}
+  // is block-scoped and not in scope at the handler.
+  let ttsBridgeSampleRate = null;
+  // Per-turn fallback markers — set in the fallback_required handler; read
+  // by logTurnCogs at turn_end so the marker lands on the exact turn that
+  // fell back (audit M1). Subsequent turns on the same session are billed
+  // as normal cartesia (the swap is session-permanent but the FALLBACK
+  // EVENT was per-turn).
+  let fallbackInvokedTurn = null;
+  let fallbackInvokedReason = null;
   let closed = false;
   let lastHeartbeatAt = Date.now();
   let heartbeatInterval = null;
@@ -1383,7 +1411,21 @@ wss.on('connection', async (ws, req) => {
           : env === 'preview'    ? 'hume_voice_name_preview'
           :                        'hume_voice_name_dev')
         : null;
-      const selectList = nameCol ? `${voiceCol}, ${nameCol}` : voiceCol;
+      // FISH_AUDIO_PHASE_1 §6 round-3 C4 — Fish sessions ALSO pull the
+      // env-scoped Cartesia voice_id from the same row read so the auto-
+      // fallback handler has a sidecar voice ready without a second DB hit.
+      // Cartesia is the universal fallback target; creators flipped to Fish
+      // are expected to KEEP their Cartesia voice populated as the safety net
+      // (per FISH_AUDIO_PHASE_1.md §11 Rollback runbook).
+      const cartesiaCol = ttsProvider === 'fish'
+        ? (env === 'production' ? 'voice_id'
+          : env === 'preview'    ? 'voice_id_preview'
+          :                        'voice_id_dev')
+        : null;
+      const selectFields = [voiceCol];
+      if (nameCol) selectFields.push(nameCol);
+      if (cartesiaCol) selectFields.push(cartesiaCol);
+      const selectList = selectFields.join(', ');
       const { data, error } = await supabase
         .from('creators')
         .select(selectList)
@@ -1392,6 +1434,7 @@ wss.on('connection', async (ws, req) => {
       if (error) throw error;
       creatorVoiceId = data?.[voiceCol] || null;
       if (nameCol) creatorHumeVoiceName = data?.[nameCol] || null;
+      if (cartesiaCol) cartesiaSidecarVoiceId = data?.[cartesiaCol] || null;
     } catch (e) {
       console.error(`[ws ${connId}] voice-id-lookup`, e);
       captureException(e, { op: 'voice-id-lookup', sessionId, creatorId, ttsProvider });
@@ -1596,6 +1639,14 @@ wss.on('connection', async (ws, req) => {
       }
       const t0 = Date.now();
       await ttsBridge.open();
+      // FISH_AUDIO_PHASE_1 §6 round-3 C4 — mirror the live bridge's provider
+      // for post-fallback observability gates (audit C2: prewarm-next-turn
+      // gate, listener wiring). Mutates on sidecar swap; ttsProvider stays
+      // the session snapshot.
+      ttsBridgeProvider = ttsProvider;
+      // Pin the sample-rate at the session level so the auto-fallback
+      // handler can re-use it when constructing the Cartesia sidecar.
+      ttsBridgeSampleRate = ttsSampleRate;
       console.log(`[ws ${connId}] tts.open ok provider=${ttsProvider} in ${Date.now() - t0}ms`);
       // FISH_AUDIO_PHASE_1 §3 Phase 0.5 #2 + wiring audit M5 — speculative
       // pre-open for turn 1. Phase 0.5 measured Fish cold TTFA p99 ≈ 1229ms
@@ -2056,6 +2107,39 @@ wss.on('connection', async (ws, req) => {
       generateDeepAnswer,
       retrieve: retrieveEnvelopeForDecoupled,
       ttsSendText: (t) => {
+        // FISH_AUDIO_PHASE_1 §6 round-3 C4 (code audit C1) — accumulate
+        // per-turn text for auto-fallback replay. Bounded at 4200 chars
+        // (OUTPUT_CHAR_CEILING + OUTPUT_CHAR_SLACK from
+        // decoupled-orchestrator.js) — decoupled mode bypasses gemini-bridge's
+        // OUTPUT_TRANSCRIPT_MAX_CHARS cap because text comes from
+        // generateDeepAnswer not the transcript pipe. Two-mode gate:
+        //   (a) pre-fallback Fish session — accumulate so we can replay
+        //       on a fallback. Stop on first audio (handler clears the
+        //       buffer there).
+        //   (b) in-flight fallback (latch flipped, sidecar opening) —
+        //       KEEP accumulating so chunks streaming during the
+        //       ~200-1000ms cartesia cold-open are not lost. The IIFE
+        //       replays the FULL buffer after the swap.
+        // After the IIFE swaps `ttsBridge` to the sidecar, subsequent chunks
+        // land directly via the lex-rebound `ttsBridge.sendText` below — no
+        // need to buffer further.
+        const accumulating =
+          (ttsBridgeProvider === 'fish' && !fallbackUsed) ||
+          (fallbackUsed && !ttsBridgeProvider); // open-window detector
+        if (accumulating && t) {
+          let room = 4200 - currentTurnTextBuffer.length;
+          if (room > 0) {
+            let chunk = room >= t.length ? t : t.slice(0, room);
+            // Code audit M5 — avoid splitting a UTF-16 surrogate pair at the
+            // slice boundary. An orphan high surrogate would surface as
+            // "Invalid transcript" at Cartesia. Trim back one code unit when
+            // the last char is a high surrogate.
+            if (chunk.length > 0 && (chunk.charCodeAt(chunk.length - 1) & 0xFC00) === 0xD800) {
+              chunk = chunk.slice(0, -1);
+            }
+            currentTurnTextBuffer += chunk;
+          }
+        }
         if (useTts && ttsBridge) {
           try { ttsBridge.sendText(t); } catch (err) {
             captureException(err, { op: 'tts.sendText', sessionId, ttsProvider });
@@ -2339,6 +2423,13 @@ wss.on('connection', async (ws, req) => {
         // generator's next iteration).
         if (useTts && ttsBridge) {
           try { ttsBridge.cancel(); } catch {}
+        } else if (fallbackUsed && !ttsBridge) {
+          // FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit M3) — user barged
+          // DURING the auto-fallback's await sidecar.open(). The bridge
+          // ref is null between the dead-fish-close and sidecar-wire; flag
+          // it so the IIFE skips the post-open replay and closes the
+          // sidecar quietly.
+          cancelDuringFallback = true;
         }
         // Day-13 audit-build C1 — cancel in-flight v2 retrieval on barge-in.
         if (pendingInjection && typeof pendingInjection.abort === 'function') {
@@ -2420,22 +2511,31 @@ wss.on('connection', async (ws, req) => {
   let humeCapExceededLatch = false;
 
   // Audit S13 (unit-wide) — the ttsBridge.on() handler registered below
-  // captures closures over `ws`, `sessionId`, `humeCapExceededLatch`,
-  // etc. The bridge's close() detaches all listeners (both bridges are
-  // EventEmitters; close() ultimately calls removeAllListeners or lets
-  // the EventEmitter GC), so teardown → bridge.close() frees the closure
-  // graph. If you ever swap bridge implementations, ensure close() still
-  // drops listeners or capture+invoke `off()` from the registration site.
+  // captures closures over `ws`, `sessionId`, `humeCapExceededLatch`, etc.
+  // FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit C4) — bridge .close() does NOT
+  // call removeAllListeners on either provider; the auto-fallback swap MUST
+  // capture the unsubscribe handle returned by .on() so the dead-bridge
+  // listener can be detached synchronously before constructing the sidecar.
+  // Without offTtsBridge(), the dead Fish bridge's `closed` event (which
+  // fires synchronously AFTER fallback_required per fish-bridge.js:937→945)
+  // would re-enter the same handler closure and leak references.
 
-  // ── TTS bridge events (provider-neutral) ──────────────────────────────
-  // HUME_TTS_PLAN §6.4 — both CartesiaTTSBridge and HumeTTSBridge emit the
-  // same event envelope. Provider-specific error codes (cartesia: Invalid
-  // transcript et al; hume: protocol_violation, bad_voice_id) are handled
-  // by inspecting `e.code` — the handler is otherwise identical.
-  if (useTts && ttsBridge) {
-    ttsBridge.on((e) => {
+  // ── TTS bridge event wiring (provider-neutral, swappable) ─────────────
+  // Factored into wireTtsBridgeListeners so the same handler body serves
+  // both initial bridge construction AND the post-fallback sidecar.
+  function wireTtsBridgeListeners(bridge) {
+    if (offTtsBridge) {
+      try { offTtsBridge(); } catch {}
+      offTtsBridge = null;
+    }
+    offTtsBridge = bridge.on((e) => {
       if (closed) return;
       if (e.kind === 'audio_out') {
+        // FISH_AUDIO_PHASE_1 §6 round-3 C4 — first audio for this turn means
+        // fallback is no longer possible (voice-mid-switch is worse UX than
+        // the error). Drop the buffer; spare allocations for the rest of the
+        // turn.
+        if (currentTurnTextBuffer.length > 0) currentTurnTextBuffer = '';
         // R3-M1 / R4-S1 — relay-loop gate, in addition to the bridge's
         // own _turnDead check. Belt-and-suspenders against late chunks
         // from the WS receive buffer at cancel time.
@@ -2458,7 +2558,15 @@ wss.on('connection', async (ws, req) => {
         // the NEXT turn. Fire-and-forget; bridge's prewarmIdleTimeoutMs
         // (25s default) auto-closes the warm WS if the user doesn't speak.
         // Limited to fish — cartesia/hume share a session-long WS.
-        if (e.contextId === liveCtx && ttsProvider === 'fish' && ttsBridge && typeof ttsBridge.prewarmTurn === 'function') {
+        //
+        // FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit C2) — gate on the LIVE
+        // bridge's provider (`ttsBridgeProvider`), NOT the session snapshot
+        // (`ttsProvider`). Post-fallback the sidecar is Cartesia but
+        // ttsProvider stays 'fish'; without this fix the handler would try
+        // to call prewarmTurn() on a Cartesia bridge that has no such
+        // method (the typeof guard would catch it, but it's noise + a sign
+        // of stale assumption).
+        if (e.contextId === liveCtx && ttsBridgeProvider === 'fish' && ttsBridge && typeof ttsBridge.prewarmTurn === 'function') {
           const nextCtx = `${sessionId}:${turnNumber + 1}`;
           try { ttsBridge.prewarmTurn(nextCtx); }
           catch (err) { captureException(err, { op: 'fish_prewarm_next_turn', sessionId, contextId: nextCtx }); }
@@ -2529,26 +2637,197 @@ wss.on('connection', async (ws, req) => {
         // Idle-window close handled by the bridge's auto-reconnect
         // (R3-M2 / R4-M2). No action required here.
       } else if (e.kind === 'fallback_required') {
-        // FISH_AUDIO_PHASE_1 §6 wiring audit C3 — Fish bridge emits this
-        // on pre-first-audio failures (WS open error, finish:error,
-        // protocol violation, prewarm open failure). Auto-fallback to
-        // Cartesia re-dispatch is DEFERRED to a follow-up slice — for now
-        // we surface the event LOUDLY so the user doesn't sit in silence
-        // and operators can see the failure rate.
-        console.error(`[ws ${connId}] fish.fallback_required code=${e.code} contextId=${e.contextId} reason=${e.reason}`);
-        captureException(new Error(`fish.fallback_required.${e.code || 'unknown'}`), {
-          op: 'fish.fallback_required',
-          sessionId,
-          ttsProvider,
-          code: e.code,
-          contextId: e.contextId,
-          reason: e.reason,
-        });
-        if (ws.readyState === ws.OPEN) {
-          try { ws.send(JSON.stringify({ type: 'error', code: 'tts_failed', at: Date.now(), detail: e.code || 'fish_fallback_required' })); } catch {}
+        // FISH_AUDIO_PHASE_1 §6 round-3 C4 — auto-fallback re-dispatch.
+        // Fish bridge emits this on pre-first-audio failures (prewarm WS
+        // open, turnStart WS open, finish:error pre-first-audio, WS close
+        // pre-first-audio). Re-dispatch the same turn's text to a Cartesia
+        // sidecar inline. Once first audio has played, the bridge no
+        // longer emits fallback_required (voice-mid-switch worse than
+        // silence). Session-permanent swap: subsequent turns use the
+        // sidecar via the lex-rebound `ttsBridge`.
+        //
+        // Audit C3 — set latch SYNCHRONOUSLY before any await so a second
+        // synchronous emission (fish-bridge.js:937 emits fallback_required
+        // then 945 emits `closed` on the same tick) can't race the first
+        // open. Audit C4 — detach this listener from the dead Fish bridge
+        // BEFORE constructing the sidecar so its trailing `closed` event
+        // doesn't re-enter the wired handler graph.
+        if (fallbackUsed) {
+          // Second fallback (Cartesia ALSO failed) → loud-fail.
+          console.error(`[ws ${connId}] fallback.cartesia_sidecar_also_failed code=${e.code}`);
+          captureException(new Error('tts.fallback_double_failure'), {
+            op: 'tts.fallback_double_failure',
+            sessionId,
+            ttsProvider,
+            code: e.code,
+          });
+          if (ws.readyState === ws.OPEN) {
+            try { ws.send(JSON.stringify({ type: 'error', code: 'tts_failed', at: Date.now(), detail: 'fallback_double_failure' })); } catch {}
+          }
+          teardown('fallback_double_failure').catch(() => {});
+          closeWs(ws, 1011, 'cartesia_sidecar_also_failed');
+          return;
         }
-        teardown('fish_fallback_required').catch(() => {});
-        closeWs(ws, 1011, 'fish_fallback_required');
+        // Capability check: no Cartesia voice id → no sidecar possible.
+        if (!cartesiaSidecarVoiceId || !CARTESIA_API_KEY) {
+          fallbackUsed = true;
+          console.error(`[ws ${connId}] fish.fallback_required NO SIDECAR code=${e.code} reason=missing_cartesia_voice_id_or_key`);
+          captureException(new Error('fish.fallback_required.no_sidecar'), {
+            op: 'fish.fallback_required.no_sidecar',
+            sessionId,
+            ttsProvider,
+            code: e.code,
+            hasVoiceId: !!cartesiaSidecarVoiceId,
+            hasApiKey: !!CARTESIA_API_KEY,
+          });
+          if (ws.readyState === ws.OPEN) {
+            try { ws.send(JSON.stringify({ type: 'error', code: 'tts_failed', at: Date.now(), detail: 'fish_fallback_required_no_sidecar' })); } catch {}
+          }
+          teardown('fish_fallback_required_no_sidecar').catch(() => {});
+          closeWs(ws, 1011, 'fish_fallback_required_no_sidecar');
+          return;
+        }
+        // Latch BEFORE any await — synchronous re-entry from fish-bridge's
+        // trailing `closed` event must short-circuit at the top of this
+        // branch on the next call (audit C3).
+        fallbackUsed = true;
+        const fallbackReason = e.code || 'unknown';
+        const fallbackContextId = e.contextId;
+        const liveTurnContextId = `${sessionId}:${turnNumber}`;
+        // Code audit C3 — the fallback contextId may NOT match the current
+        // live turn (prewarmTurn for the NEXT turn can fire fallback_required
+        // while turn N's buffer still has content). Replay text ONLY if the
+        // failure was for the current live turn; for next-turn prewarm
+        // failure, the buffer is irrelevant — that turn will own its own text.
+        const replayForLiveTurn = fallbackContextId === liveTurnContextId;
+        // Audit M1 — record which turn fell back so logTurnCogs marks the
+        // correct cogs row. Reset only at this latch — subsequent turns
+        // bypass the gate (turnNumber !== fallbackInvokedTurn).
+        fallbackInvokedTurn = turnNumber;
+        fallbackInvokedReason = fallbackReason;
+        console.error(`[ws ${connId}] fish.fallback_required code=${fallbackReason} contextId=${fallbackContextId} live_ctx=${liveTurnContextId} replay_chars=${currentTurnTextBuffer.length} cartesia_voice=${(cartesiaSidecarVoiceId || 'null').slice(0,8)}`);
+
+        // Detach listener from the dead Fish bridge synchronously (audit C4).
+        if (offTtsBridge) {
+          try { offTtsBridge(); } catch {}
+          offTtsBridge = null;
+        }
+        // Fire-and-forget close on the dead fish bridge; teardown will also
+        // call ttsBridge.close() after we swap, but the dead bridge needs
+        // its WS torn down regardless. Catch + swallow — close() failure on
+        // a dying bridge is not actionable.
+        const deadFishBridge = ttsBridge;
+        ttsBridge = null;
+        ttsBridgeProvider = null;
+        // Audit S2 — capture dead-bridge close errors instead of swallowing
+        // (CLAUDE.md "no silent voice exception" rule). Idempotent on
+        // already-closed bridges; warnings only.
+        try { deadFishBridge?.close(); }
+        catch (closeErr) {
+          captureException(closeErr, {
+            level: 'warning',
+            op: 'fish.fallback.dead_bridge_close',
+            sessionId,
+          });
+        }
+
+        // Construct + open the Cartesia sidecar. Async; track barge-in
+        // during the await (audit M3 — cancelDuringFallback).
+        (async () => {
+          let sidecar;
+          try {
+            sidecar = new CartesiaTTSBridge({
+              apiKey: CARTESIA_API_KEY,
+              voiceId: cartesiaSidecarVoiceId,
+              sampleRate: ttsBridgeSampleRate,
+              ttsSpeed: consumed.ttsSpeed,
+            });
+            await sidecar.open();
+          } catch (openErr) {
+            console.error(`[ws ${connId}] fish.fallback sidecar.open FAILED:`, openErr?.message || openErr);
+            captureException(openErr, {
+              op: 'tts.fallback.sidecar_open_failed',
+              sessionId,
+              ttsProvider,
+              fallback_reason: fallbackReason,
+            });
+            if (ws.readyState === ws.OPEN) {
+              try { ws.send(JSON.stringify({ type: 'error', code: 'tts_failed', at: Date.now(), detail: 'fish_fallback_open_failed' })); } catch {}
+            }
+            await teardown('fish_fallback_open_failed').catch(() => {});
+            return closeWs(ws, 1011, 'fish_fallback_open_failed');
+          }
+
+          // Swap the lex-rebound bridge AFTER successful open so the
+          // decoupledOrch ttsSendText closure routes subsequent chunks
+          // here. `ttsBridge` is the `let` at the top of this scope; the
+          // closures at ttsSendText (line ~2058) read it lexically.
+          // Code audit C1 — captures the FINAL buffer (pre-latch + in-flight
+          // chunks accumulated during the open await window). Read AFTER
+          // the swap so any chunks landing in the microtask between
+          // ttsBridge=sidecar and wireTtsBridgeListeners reach the buffer
+          // via the open-window accumulator gate.
+          ttsBridge = sidecar;
+          ttsBridgeProvider = 'cartesia';
+          // Re-wire the listener on the sidecar — same handler body, captures
+          // the new `offTtsBridge`. From this point on the handler reads
+          // ttsBridge as the cartesia sidecar.
+          wireTtsBridgeListeners(sidecar);
+
+          // If barge-in fired during await, close the sidecar quietly and
+          // do not replay. The user already cancelled (audit M3).
+          if (cancelDuringFallback || closed || ws.readyState !== ws.OPEN) {
+            try { sidecar.cancel?.(); } catch {}
+            return;
+          }
+
+          // Read buffer AFTER swap (code audit C1). Any chunks streamed
+          // during the open window were appended via the open-window gate.
+          const replayText = currentTurnTextBuffer;
+          // Replay the buffered turn text. Skip when the buffer is empty
+          // OR the failure was for a non-live context (audit C3, C5): the
+          // orchestrator's normal turnStart at the user's next mic-tap
+          // will own the sidecar's first context. Otherwise queue
+          // turnStart + sendText + flush so the answer-so-far is
+          // synthesized; remaining Gemini chunks land via the lex-rebound
+          // `ttsBridge.sendText`.
+          if (replayText.length > 0 && replayForLiveTurn) {
+            try {
+              await sidecar.turnStart(fallbackContextId);
+              sidecar.sendText(replayText);
+              if (typeof sidecar.flush === 'function') sidecar.flush(fallbackContextId);
+              // Drop the buffer — replay is in cartesia's queue now.
+              currentTurnTextBuffer = '';
+            } catch (replayErr) {
+              console.error(`[ws ${connId}] fish.fallback sidecar replay FAILED:`, replayErr?.message || replayErr);
+              captureException(replayErr, {
+                op: 'tts.fallback.replay_failed',
+                sessionId,
+                ttsProvider,
+                fallback_reason: fallbackReason,
+              });
+              // Audit M7 — sidecar is in a half-open state after a failed
+              // replay (turnStart took, sendText/flush didn't). Subsequent
+              // chunks via lex-rebound would throw `sendText before
+              // turnStart` on a fresh context. Mark the turn dead so the
+              // relay-loop gate drops further audio, and the orchestrator
+              // recovers on the next user turn.
+              ttsTurnDead = true;
+            }
+          }
+
+          // Sentry breadcrumb (audit M6) — captureMessage (NOT
+          // captureException) so Sentry classifies as a warning event,
+          // not an error-grouped issue.
+          captureMessage('tts.fallback_invoked', 'warning', {
+            op: 'tts.fallback_invoked',
+            sessionId,
+            ttsProvider,
+            fallback_reason: fallbackReason,
+            replay_chars: replayText.length,
+            replay_for_live_turn: replayForLiveTurn,
+          });
+        })();
       } else if (e.kind === 'prewarm_ok') {
         // FISH_AUDIO_PHASE_1 §3 Phase 0.5 #2 — speculative pre-open
         // success. Lifecycle observability only; the prewarmTurn call
@@ -2556,6 +2835,11 @@ wss.on('connection', async (ws, req) => {
         console.log(`[ws ${connId}] fish.prewarm_ok contextId=${e.contextId} ttfaSetupMs=${e.ttfaSetupMs ?? 'na'}`);
       }
     });
+  }
+  // Initial registration — wires the active bridge. Sidecar re-wires from
+  // inside the fallback_required handler via the same helper.
+  if (useTts && ttsBridge) {
+    wireTtsBridgeListeners(ttsBridge);
   }
 
 
@@ -2628,6 +2912,13 @@ wss.on('connection', async (ws, req) => {
         // turnStart so any race with a stale chunk in the WS receive
         // buffer drops cleanly. (Was post-turnStart; moved per audit C3.)
         ttsTurnDead = false;
+        // FISH_AUDIO_PHASE_1 §6 round-3 C4 (code audit C3) — clear the
+        // accumulated turn-text buffer at every turn boundary so a previous
+        // turn that ended WITHOUT firing audio_out (finalize_timeout, etc.)
+        // can't leak its text into a next-turn prewarm-fallback replay. The
+        // audio_out clear at line ~2528 covers the happy path; this is the
+        // exhaustive boundary.
+        currentTurnTextBuffer = '';
         // §6.9 latch reset per-turn — see protocol_violation handler.
         humeCapExceededLatch = false;
         // pgvector RAG plan — barge-in / new-turn reset of the audio gate.
@@ -2683,7 +2974,15 @@ wss.on('connection', async (ws, req) => {
           let attempt = 0;
           while (attempt < 2) {
             try {
-              ttsBridge.turnStart(`${sessionId}:${turnNumber}`);
+              // FISH_AUDIO_PHASE_1 §6 round-3 C4 (code audit C4) — Fish's
+              // turnStart is async (per-turn WS open round-trip); cartesia +
+              // hume are sync (session-long WS). The await accepts both: a
+              // sync throw becomes a rejected promise, the existing
+              // `e?.code === 'tts_reconnecting'` branch still works because
+              // both throw an Error with `.code`. Without the await, fish's
+              // promise rejection escapes as an unhandled rejection and the
+              // try/catch matches nothing.
+              await ttsBridge.turnStart(`${sessionId}:${turnNumber}`);
               break; // success
             } catch (e) {
               if (e?.code === 'tts_reconnecting' && attempt === 0) {
@@ -2915,6 +3214,19 @@ wss.on('connection', async (ws, req) => {
           ws.send(JSON.stringify({ type: 'turn_complete', at: Date.now() }));
         }
         ws.send(JSON.stringify({ type: 'turn_end_ack', metrics, cartesia: ttsMetrics, tts: ttsMetrics, ttsProvider }));
+        // FISH_AUDIO_PHASE_1 §6 round-3 C4 (code audit C2) — POST-fallback
+        // the live bridge is cartesia. Bill chars/cost at cartesia's rate
+        // (the actual provider that synthesized) so the cogs row isn't
+        // 3.5x underbilled at Fish's price. The session snapshot
+        // (`ttsProvider`) stays 'fish' for session attribution, but the
+        // turn cogs row reflects who actually did the work.
+        const cogsProvider = ttsBridgeProvider || ttsProvider;
+        // Audit M3 — every post-fallback turn carries `tts_fallback_session`
+        // so dashboards can find ALL turns of a degraded session, not just
+        // the one turn the swap happened on. `tts_fallback_invoked` is the
+        // narrower per-turn marker.
+        const isPostFallbackTurn = fallbackUsed;
+        const isFallbackTurnSelf = fallbackInvokedTurn === turnNumber;
         const cogsPromise = logTurnCogs({
           userId, sessionId, turnNumber,
           inputSeconds: metrics.inputSeconds,
@@ -2923,12 +3235,23 @@ wss.on('connection', async (ws, req) => {
           // logTurnCogs ignores `tts` if undefined (back-compat). The
           // factory keeps the `cartesia` key as a legacy alias and the new
           // `tts` carries the provider tag.
-          ttsProvider,
+          ttsProvider: cogsProvider,
           tts: ttsMetrics,
           // §6.9 / audit-C1 — the per-turn cap signal lands as metadata
           // on the normal turn_end cogs row. Single writer, no race with
           // a separate cap-flush. 4006 close fires AFTER cogs resolve.
           humeCapExceeded: humeCapExceededLatch,
+          // FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit M1 + M3) — turn-level
+          // + session-level fallback markers.
+          extraMetadata: isPostFallbackTurn
+            ? {
+                tts_fallback_session: true,
+                session_snapshot_provider: ttsProvider, // 'fish' even after swap
+                ...(isFallbackTurnSelf
+                  ? { tts_fallback_invoked: true, fallback_reason: fallbackInvokedReason }
+                  : {}),
+              }
+            : null,
         });
         cogsPromise.catch((e) => {
           // R4-S3 fail-closed: getCartesiaPricing/getHumePricing throws if
@@ -3028,7 +3351,14 @@ wss.on('connection', async (ws, req) => {
         // also sets its own flag synchronously.
         ttsTurnDead = true;
         bridge.cancel();
-        if (useTts && ttsBridge) ttsBridge.cancel();
+        if (useTts && ttsBridge) {
+          ttsBridge.cancel();
+        } else if (fallbackUsed && !ttsBridge) {
+          // FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit M3) — client cancel
+          // arrived DURING the auto-fallback's await sidecar.open(). The
+          // IIFE checks this flag post-open and skips replay.
+          cancelDuringFallback = true;
+        }
         // Re-audit M1 — a CLIENT mic-tap barge sends `cancel`. In decoupled mode
         // (2026-05-27) the proxy now ALWAYS suppresses Gemini's `interrupted`, so
         // this client `cancel` is the SOLE barge signal that reaches the

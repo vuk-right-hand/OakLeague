@@ -67,6 +67,14 @@ export const FATAL_END_REASONS = Object.freeze([
   // deferred to a follow-up slice; today this teardown is the loud-failure
   // signal so users don't sit in silence.
   'fish_fallback_required',
+  // FISH_AUDIO_PHASE_1 §6 round-3 C4 — auto-fallback re-dispatch teardown
+  // reasons. All three are loud-failure signals (Cartesia sidecar was
+  // unavailable or also failed). A burn-in spike here means the safety
+  // net itself broke — operator must check Cartesia health AND that Fish
+  // creators retain a populated cartesia voice_id column.
+  'fallback_double_failure',
+  'fish_fallback_required_no_sidecar',
+  'fish_fallback_open_failed',
 ]);
 
 export const FATAL_END_REASONS_SET = new Set(FATAL_END_REASONS);

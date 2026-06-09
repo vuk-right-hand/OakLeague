@@ -476,3 +476,55 @@ test('back-compat: legacy `cartesia` envelope still accepted (defaults provider 
   assert.equal(p.p_tts_provider, 'cartesia');
   assert.equal(p.p_tts_characters, 200);
 });
+
+// FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit M1) — extraMetadata channel for
+// per-turn flags the proxy raises (today: tts_fallback_invoked + fallback_reason
+// when the Fish→Cartesia sidecar swap fired this turn). Plain Object.assign
+// merge into `meta` so dashboards can count fallback frequency without joining
+// sessions. Non-object payloads ignored defensively.
+
+test('extraMetadata: object payload merges into p_metadata', async () => {
+  const sb = mkSupabase();
+  const { logTurnCogs } = makeLogTurnCogs({ supabase: sb });
+  await logTurnCogs({
+    userId: 'u', sessionId: 's-extra', turnNumber: 2,
+    inputSeconds: 1, outputSeconds: 2,
+    usageMetadata: { responseTokenCount: 50 },
+    extraMetadata: { tts_fallback_invoked: true, fallback_reason: 'ws_closed_pre_first_audio' },
+  });
+  const p = sb.calls[0].payload;
+  assert.equal(p.p_metadata.tts_fallback_invoked, true);
+  assert.equal(p.p_metadata.fallback_reason, 'ws_closed_pre_first_audio');
+  // Existing metadata keys are still present (no overwrite of provider/quoted_at).
+  assert.equal(p.p_metadata.tts_provider, 'cartesia');
+});
+
+test('extraMetadata: null/undefined → no-op (existing meta unchanged)', async () => {
+  const sb = mkSupabase();
+  const { logTurnCogs } = makeLogTurnCogs({ supabase: sb });
+  await logTurnCogs({
+    userId: 'u', sessionId: 's-extra-null', turnNumber: 1,
+    inputSeconds: 1, outputSeconds: 2,
+    usageMetadata: { responseTokenCount: 50 },
+    extraMetadata: null,
+  });
+  const p = sb.calls[0].payload;
+  assert.equal(p.p_metadata.tts_fallback_invoked, undefined);
+  assert.equal(p.p_metadata.fallback_reason, undefined);
+});
+
+test('extraMetadata: array/non-object payload ignored (defense against bad caller)', async () => {
+  const sb = mkSupabase();
+  const { logTurnCogs } = makeLogTurnCogs({ supabase: sb });
+  await logTurnCogs({
+    userId: 'u', sessionId: 's-extra-bad', turnNumber: 1,
+    inputSeconds: 1, outputSeconds: 2,
+    usageMetadata: { responseTokenCount: 50 },
+    // @ts-ignore — intentional misuse
+    extraMetadata: ['tts_fallback_invoked', true],
+  });
+  const p = sb.calls[0].payload;
+  // No numeric keys leaked from the array onto p_metadata.
+  assert.equal(p.p_metadata['0'], undefined);
+  assert.equal(p.p_metadata.length, undefined);
+});

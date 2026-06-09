@@ -191,6 +191,45 @@ Phase 0.5 probe covering all 8 claims. Output: results document at `tmp/fish-pha
 - `onDeepAnswerDone` provider branch: Fish path = no flush; orchestrator awaits natural `stop`.
 - `turnEnd` finalize timeout: for Fish, **TBD post-Phase-0.5 #6** (round 3 C1). DO NOT ship at 5s without measurement.
 - **NEW (round 3 C4): `fallback_required` event handler.** When fish-bridge emits, dispatch SAME turn to cartesia-bridge inline. Single retry per turn (no infinite loop if Cartesia also fails). Increments a cogs_log entry `tts_fallback_invoked` for monitoring.
+
+  **Implementation specifics — pre-code audit 2026-06-09 (5 critical findings):**
+
+  **Decision: session-permanent swap on first fallback.** "Single retry per turn" = no double-Cartesia for the same turn. Subsequent turns keep using the sidecar (no per-turn Fish-retry alternation). One-way swap; Vuk flips the creator back via admin RPC if sustained.
+
+  1. **Buffer cap — match orchestrator, not gemini-bridge** (audit C1). In decoupled mode the TTS text comes from `generateDeepAnswer`, not the gemini-bridge transcript pipe. Cap `currentTurnTextBuffer` at `OUTPUT_CHAR_CEILING + OUTPUT_CHAR_SLACK` from [decoupled-orchestrator.js:269](../../server/voice-proxy/decoupled-orchestrator.js), NOT `OUTPUT_TRANSCRIPT_MAX_CHARS`. Wrap accumulation at the `ttsSendText` callback ([index.js:2058](../../server/voice-proxy/index.js)); do NOT wrap the gemini-event handler at [index.js:2163](../../server/voice-proxy/index.js) (decoupled path is gated `!decoupled` there).
+
+  2. **Prewarm-next-turn must gate on the LIVE bridge, not the snapshot enum** (audit C2). [index.js:2461](../../server/voice-proxy/index.js) currently reads `ttsProvider === 'fish'` (session snapshot). Post-fallback the sidecar is Cartesia but the snapshot stays 'fish' → `turn_done` would try to prewarm a dead Fish bridge. Introduce `ttsBridgeProvider` (mutable mirror of the LIVE bridge's provider) and switch the prewarm guard to read it.
+
+  3. **Latch BEFORE await** (audit C3). `fallbackUsed = true` must be set **synchronously at the top** of the `fallback_required` branch, before any `await sidecar.open()`. Fish's `_onClose` emits `fallback_required` THEN `closed` synchronously ([fish-bridge.js:937→945](../../server/voice-proxy/fish-bridge.js)) — without an early latch, a second re-entry into the handler races the first open and spawns two sidecars. Add an `if (fallbackUsed) return;` guard at branch entry.
+
+  4. **Capture the `off` unsubscribe at `.on()` registration** (audit C4). [index.js:2436](../../server/voice-proxy/index.js) discards the return value of `ttsBridge.on(...)`. `cartesia-bridge.close()` does not call `removeAllListeners`, so the listener leaks across the dead Fish bridge. Refactor to `const offTts = ttsBridge.on(...)`; call `offTts()` synchronously inside the fallback handler before constructing the sidecar. Extract the listener body into `wireTtsBridgeListeners(bridge)` so the same wiring serves both initial + sidecar registration.
+
+  5. **Pull Cartesia voice_id for Fish sessions at proxy boot of session** (audit S4 — load-bearing). The proxy's existing `voice-id-lookup` block ([index.js:1358-1412](../../server/voice-proxy/index.js)) selects ONLY the active provider's column from `creators`. When `ttsProvider === 'fish'`, additionally select the env-scoped Cartesia column from the SAME row read and store as `cartesiaSidecarVoiceId`. No mint/ticket schema change required — `sessions/open` and `sessions/rollover` already SELECT all three providers' columns for the kill-switch gate; the proxy just needs to read one more field from its own creators-row query. If null AT FALLBACK TIME → closeWs 1011 `fish_fallback_required_no_sidecar` (no session-open warn — only log when fallback actually fires).
+
+  **Edge case clarification (audit C5):** in the prewarm-fail-pre-text path (Fish prewarm fails before orchestrator has sent any text), do NOT call `sidecar.turnStart(contextId)` from the fallback handler. The orchestrator's normal turn-start flow at [index.js:2686](../../server/voice-proxy/index.js) will call `turnStart` on the lex-rebound `ttsBridge`. Only replay turnStart + sendText + flush when `currentTurnTextBuffer.length > 0`.
+
+  **Cancel-during-await guard (audit M3):** set a `cancelDuringFallback` flag in `ws.on('message')` cancel handlers; if set when the await resolves, close the sidecar quietly without replay.
+
+  **Cogs metadata wiring (audit M1):** `logTurnCogs` has no `extraMetadata` parameter today. Add one (merge into `meta` alongside `meta.fish_partial`). Pass `{ tts_fallback_invoked: true, fallback_reason: e.code }` from the fallback handler. `e.code` enumerates: `prewarm_open_failed | open_failed | finish_error_pre_first_audio | ws_closed_pre_first_audio`.
+
+  **Sentry breadcrumb (audit M7):** also emit `captureMessage('tts.fallback_invoked', 'warning', { sessionId, ttsProvider, fallback_reason })` in the success branch — cogs alone isn't enough for ops triage.
+
+  **Client signaling:** silent fallback (S3). No `tts_fallback_invoked` frame to the client — voice subtly shifts in ~500ms; a toast would be more jarring than the shift itself.
+
+  **Post-build audit (2026-06-09) — applied + deferred:**
+  - **C1** (text drop during open window): buffer accumulator gate widened to `(ttsBridgeProvider === 'fish' && !fallbackUsed) || (fallbackUsed && !ttsBridgeProvider)` so chunks arriving during the cartesia cold-open are still captured. IIFE reads `currentTurnTextBuffer` AFTER the swap (not the pre-await snapshot) so in-flight chunks reach the replay.
+  - **C2** (cogs mis-billing at fish rate post-fallback): `logTurnCogs` is called with `ttsProvider: ttsBridgeProvider || ttsProvider` so post-fallback turns bill at cartesia rate. Session snapshot stays 'fish' for attribution via `extraMetadata.session_snapshot_provider`.
+  - **C3** (cross-turn replay): cleared `currentTurnTextBuffer` at every `turn_start` (was: only on `audio_out`). Added `replayForLiveTurn` guard so a prewarm-fallback for a NEXT-turn context never replays the CURRENT turn's buffer.
+  - **C4** (async turnStart unhandled rejection): `await ttsBridge.turnStart(...)` at index.js:2922 so Fish's async rejection lands in the try/catch instead of escaping as an unhandled rejection.
+  - **C5** (turnStart-twice on prewarm-fail-pre-text): replay gated on `replayText.length > 0 && replayForLiveTurn` — covers both buffer-empty and wrong-context cases.
+  - **M3** (session-level cogs marker): every post-fallback turn carries `tts_fallback_session: true`; the originating turn additionally carries `tts_fallback_invoked: true`. Dashboards can find all degraded-session turns.
+  - **M5** (UTF-16 surrogate split): buffer slice trims a trailing high surrogate before append.
+  - **M6** (Sentry severity): swapped `captureException` → `captureMessage('tts.fallback_invoked', 'warning', ...)` so Sentry classifies as warning, not error.
+  - **M7** (sidecar half-open after replay failure): `ttsTurnDead = true` on replay catch so subsequent chunks don't throw `sendText before turnStart` on a fresh context.
+
+  **Deferred to next slice (mobile error-toast.tsx + tts_provider_switching client hint):**
+  - **M4** (avatar freeze + voice shift during ~200-1000ms open window): client-side coordination — send a `tts_provider_switching` info-level frame at the latch so the avatar suppresses tail-flush and shows a subtle "..." instead of freezing mid-mouth. Wired into the same error-toast.tsx work since both are degraded-mode client UX. Tracked in [[FISH_AUDIO_PHASE_1]] §6 round-3 M3.
+
 - Backpressure unchanged (USER WS, not fish-bridge WS).
 - **NEW (round 3 S2): verify `awaitTurnSpoken` in [decoupled-orchestrator.js:794](../../server/voice-proxy/decoupled-orchestrator.js) fires `onDeepAnswerDone` regardless of provider.** Add assertion test.
 
