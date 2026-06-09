@@ -346,6 +346,11 @@ export async function POST(req: NextRequest) {
       const result = await mintSimliSessionToken({
         faceId: providerAvatarId!,
         maxSessionLength: maxAvatarSeconds,
+        // Parity with sessions/open route (2026-06-09 fix) — override
+        // Simli's 120s default maxIdleTime to maxSessionLength so the
+        // LiveKit room doesn't tear down mid-conversation during normal
+        // turn-pause silences.
+        maxIdleTime: maxAvatarSeconds,
         audit: {
           userId: callerUserId,
           sessionId: newSessionId,

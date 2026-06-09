@@ -683,6 +683,14 @@ export async function POST(req: NextRequest) {
       const result = await mintSimliSessionToken({
         faceId: providerAvatarId!,
         maxSessionLength: maxAvatarSeconds,
+        // 2026-06-09 — Simli's default maxIdleTime is 120s (2 min), which
+        // tears down the LiveKit room mid-conversation when the user
+        // listens to a long avatar answer and then thinks for a moment
+        // before the next question (observed twice on prod with Fish +
+        // 1.1x speed: avatar keeps talking briefly from WebRTC buffer,
+        // UI flips to "reconnect"). Match maxSessionLength so the only
+        // cap is the total session length, not arbitrary turn-silence.
+        maxIdleTime: maxAvatarSeconds,
         audit: {
           userId: callerUserId,
           sessionId,
