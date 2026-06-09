@@ -115,6 +115,29 @@ function sanitizeMessage(s) {
 // reconciliation when Fish rotates their rate card stays trivial.
 const FISH_QUOTED_AT_RE = /^\d{4}-\d{2}-\d{2}$/;
 
+// Per-creator playback speed via prosody.speed in the start envelope.
+//
+// Range: `[0.6, 1.5]` — IDENTICAL to cartesia-bridge's window AND to the
+// `creators.tts_speed` DB CHECK in migration 20260511000006. Fish wire
+// actually accepts [0.5, 2.0], but the bridge is pinned to the DB range so
+// a future column widening forces BOTH bridges to update together
+// (CLAUDE.md schema-blast-radius rule). Audit M1 (2026-06-09): the
+// previous version of this guard accepted the wider Fish range as
+// "defense-in-depth," which was actually drift waiting to happen —
+// same creator speed would work on Fish but null-out on cartesia fallback.
+//
+// Omit policy mirrors cartesia-bridge's shouldSendSpeed(): 1.0 (or null) →
+// omit the `prosody` field entirely. Sending speed:1.0 is functionally
+// equivalent to omitting but couples us to Fish's exact param naming —
+// keep wire payloads minimal so a future Fish rename is a one-line bridge
+// change, not a behavior change for the no-op default.
+//
+// Exported so tests assert the predicate directly (parity with
+// assertFishPricing / sanitizeForTts).
+export function shouldSendSpeed(v) {
+  return typeof v === 'number' && Number.isFinite(v) && v !== 1.0 && v >= 0.6 && v <= 1.5;
+}
+
 /**
  * Per-turn / lazy path. THROWS on misconfig — proxy-handlers catches per
  * session and maps to a clean 1011 cogs_misconfig close. NEVER process.exit
@@ -173,6 +196,54 @@ function decodeMsgpackFrame(buf) {
   return decode(view);
 }
 
+// Strip markdown syntax characters before handing text to TTS.
+//
+// Why this exists: fish s2-pro VOCALIZES asterisks. A brain answer
+// containing `**important**` or `*disastrous*` was rendered with the
+// asterisks audibly mispronounced as something like "asterous" during
+// localhost dogfood (2026-06-09). Cartesia silently swallows the same
+// characters today; running the sanitizer in the cartesia path is a
+// no-op for plain text and prevents a future provider-tolerance
+// regression — and saves the asterisk-chars from being billed.
+//
+// PRIMARY CALL SITE IS UPSTREAM (`ttsSendText` in proxy index.js), not
+// inside the bridge. The bridge keeps its own idempotent sanitize pass
+// as defense-in-depth for any future direct caller, but the orchestrator
+// already filters chunks before they reach the wire — that's where the
+// chunk → buffer-append → fallback-replay invariants live.
+//
+// Audit C2/C4 (2026-06-09): the previous version of this sanitizer
+// stripped `^#{1,6}\s+` headers and all `[...]` content. Headers were
+// dropped because a brain answer like "# is the comment character in
+// Python" had its `#` silently eaten. Bare-bracket strip was dropped
+// because per-chunk regex on Gemini's 1-5-char transcript chunks can't
+// reliably match `[text](url)` link spans, AND legitimate parentheticals
+// like "the formula is [x squared + y squared]" lose semantics. We
+// accept the rare `[1]` citation getting vocalized — a far smaller bug
+// than mid-sentence content loss.
+//
+// Streaming limitation that REMAINS: a `[text](url)` markdown link split
+// across chunks (`[text](htt` + `p://...)`) won't match the link regex.
+// Cross-chunk markdown links are vanishingly rare in voice-mode brain
+// output (Gemini knows it's speaking aloud) — ACCEPTED for v1.
+//
+// Order matters: link-rewrite BEFORE asterisk-strip so the link's
+// inner text survives. Asterisks BEFORE backticks BEFORE strikethrough
+// so a malformed `**\`code\`**` collapses to `code` cleanly. The order
+// is invariant — if you reorder, run all sanitizer tests.
+const MARKDOWN_LINK_RE = /\[([^\]]+)\]\([^)]+\)/g;
+const MARKDOWN_ASTERISK_RE = /\*+/g;
+const MARKDOWN_BACKTICK_RE = /`+/g;
+const MARKDOWN_STRIKE_RE = /~~/g;
+export function sanitizeForTts(text) {
+  if (typeof text !== 'string') return text;
+  return text
+    .replace(MARKDOWN_LINK_RE, '$1')
+    .replace(MARKDOWN_ASTERISK_RE, '')
+    .replace(MARKDOWN_BACKTICK_RE, '')
+    .replace(MARKDOWN_STRIKE_RE, '');
+}
+
 export class FishTTSBridge extends EventEmitter {
   /**
    * @param {object} opts
@@ -193,6 +264,9 @@ export class FishTTSBridge extends EventEmitter {
     sampleRate = DEFAULT_SAMPLE_RATE,
     temperature = DEFAULT_TEMPERATURE,
     topP = DEFAULT_TOP_P,
+    // Per-creator playback speed. NULL/1.0 → omit `prosody` entirely
+    // (Fish default). See shouldSendSpeed() above for omit policy.
+    ttsSpeed = null,
     openTimeoutMs = DEFAULT_OPEN_TIMEOUT_MS,
     finalizeTimeoutMs = DEFAULT_FINALIZE_TIMEOUT_MS,
     // Audit round 3 C1 — Phase 0.5 #4 measured "audio bytes BEFORE flush = 0":
@@ -238,6 +312,16 @@ export class FishTTSBridge extends EventEmitter {
     this._sampleRate = sampleRate;
     this._temperature = temperature;
     this._topP = topP;
+    // Coerce strings (supabase-js returns numeric columns as strings; the
+    // proxy already coerces at the boundary but defense-in-depth here so a
+    // future direct caller can't bypass the omit policy). Range pinned to
+    // `creators.tts_speed` DB CHECK [0.6, 1.5] (cartesia parity, audit M1).
+    const speedNum = typeof ttsSpeed === 'number'
+      ? ttsSpeed
+      : (ttsSpeed != null ? Number(ttsSpeed) : NaN);
+    this._ttsSpeed = (Number.isFinite(speedNum) && speedNum >= 0.6 && speedNum <= 1.5)
+      ? speedNum
+      : null;
     this._openTimeoutMs = openTimeoutMs;
     this._finalizeTimeoutMs = finalizeTimeoutMs;
     // Coerce to a strict boolean — accept any truthy/falsy input but the
@@ -537,17 +621,37 @@ export class FishTTSBridge extends EventEmitter {
    * streamed text immediately after start (no setup_complete equivalent).
    */
   _sendStart() {
-    this._sendEvent({
-      event: 'start',
-      request: {
-        reference_id: this._voiceId,
-        format: 'pcm',
-        sample_rate: this._sampleRate,
-        latency: 'low',
-        temperature: this._temperature,
-        top_p: this._topP,
-      },
+    // Field-shape verified against fish-audio-ws-spike.mjs Phase 0.5 #1 which
+    // confirmed PCM @ 16k accepted by Fish. The spike INCLUDES `text: ''` in
+    // the start envelope; omitting it caused Fish to close the WS pre-first-
+    // audio (observed 2026-06-09 during localhost dogfood). The empty string
+    // is a no-op synthesis trigger; actual text streams via subsequent
+    // `text` events.
+    //
+    // Audit M5 (2026-06-09): build the request via a single object literal
+    // with conditional spread, so a future optional field (e.g. `controls:
+    // {...}`) lands as its OWN spread and never accidentally co-mounts on
+    // the `prosody` predicate.
+    const sendSpeed = shouldSendSpeed(this._ttsSpeed);
+    const request = {
+      text: '',
+      reference_id: this._voiceId,
+      format: 'pcm',
+      sample_rate: this._sampleRate,
+      latency: 'low',
+      temperature: this._temperature,
+      top_p: this._topP,
+      ...(sendSpeed ? { prosody: { speed: this._ttsSpeed } } : {}),
+    };
+    // Audit M7 — observability for a "creator set speed=1.15 but doesn't
+    // sound different" triage call. One line so a future Sentry/grep
+    // confirms the bridge actually sent the prosody field.
+    this.emit('event', {
+      kind: 'tts_config',
+      prosody: sendSpeed ? { speed: this._ttsSpeed } : null,
+      contextId: this._currentContextId,
     });
+    this._sendEvent({ event: 'start', request });
   }
 
   /**
@@ -571,14 +675,26 @@ export class FishTTSBridge extends EventEmitter {
     if (!this._currentContextId) throw new Error('sendText before turnStart');
     if (!this._sentStart) throw new Error('sendText before start');
 
+    // Markdown sanitize before billing chars or sending on the wire. See
+    // sanitizeForTts comment for rationale (asterisks/brackets get vocalized
+    // by s2-pro otherwise — observed "asterous" mispronunciation on
+    // localhost dogfood 2026-06-09). A chunk that's PURELY markdown
+    // syntax (e.g. a lone `**`) sanitizes to empty string; bail without
+    // billing or sending — no-op msgpack frames are wasted bandwidth.
+    const sanitized = sanitizeForTts(text);
+    if (!sanitized) return;
+
     // Audit round 3 S6 — set `_sentFirstChunkOfTurn` AFTER the send so a
     // ws.send throw (caught in _sendEvent and re-emitted as connection_lost)
     // doesn't leave the flag set with no text actually on the wire.
     if (this._currentTurnTextSample.length < 500) {
-      this._currentTurnTextSample = (this._currentTurnTextSample + text).slice(0, 500);
+      this._currentTurnTextSample = (this._currentTurnTextSample + sanitized).slice(0, 500);
     }
-    this._sendEvent({ event: 'text', text });
-    this._charsThisTurn += text.length;
+    this._sendEvent({ event: 'text', text: sanitized });
+    // Bill SANITIZED length, not raw — markdown chars Fish never sees
+    // shouldn't show up as billable in cogs (we're not paying for an
+    // asterisk we stripped).
+    this._charsThisTurn += sanitized.length;
     this._sentFirstChunkOfTurn = true;
     if (!this._flushPerChunk) return;
     this._scheduleFlush();
@@ -739,6 +855,29 @@ export class FishTTSBridge extends EventEmitter {
    *   * _cancelled is set so finish:error / _onClose paths also skip fallback.
    */
   cancel() {
+    // FISH_AUDIO_PHASE_1 §6 round-3 C4 — Fish localhost-dogfood findings
+    // (2026-06-09). The browser session-pipe sends `{type:'cancel'}` BEFORE
+    // every `{type:'turn_start'}` as a defensive "stop any prior synth"
+    // pattern. That's harmless for cartesia/hume (session-long WS; cancel
+    // just emits a cancel-context message). It's CATASTROPHIC for Fish
+    // (per-turn WS) — the original cancel() unconditionally closed the
+    // prewarmed-but-unused WS, then the racing turn_start handler set
+    // _currentContextId AND reset _cancelled, so the WS's async `close`
+    // event then read _cancelled=false + _currentContextId=set and wrongly
+    // emitted fallback_required.
+    //
+    // Fix: cancel is a NO-OP when there is no active synth (no `start`
+    // envelope has been sent on the current WS). The prewarmed WS stays
+    // warm for the upcoming turn_start. An active turn (sentStart=true)
+    // still closes the WS — that's the actual barge-in case where the
+    // user wants synth to stop.
+    if (!this._sentStart) {
+      // No active synth — nothing to cancel. Leave _cancelled false so
+      // turn_start doesn't have to flip it back; leave _currentContextId
+      // null (already is). Leave prewarm state intact. Idempotent for
+      // multiple consecutive cancels during prewarm.
+      return;
+    }
     this._cancelled = true;
     this._turnDead = true;
     this._currentContextId = null;

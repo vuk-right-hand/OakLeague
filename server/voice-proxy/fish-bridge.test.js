@@ -15,6 +15,8 @@ import {
   FishTTSBridge,
   assertFishPricing,
   validateFishPricingOrExit,
+  sanitizeForTts,
+  shouldSendSpeed,
 } from './fish-bridge.js';
 
 const VALID_PRICING = { usdPerChar: 0.000015, quotedAt: '2026-05-28' };
@@ -741,39 +743,54 @@ test('26: prewarm_ok emitted on success; only fallback_required (NOT prewarm_fai
   offBad();
 });
 
-test('27: cancel during in-flight prewarm skips fallback_required emission (C3)', async () => {
+// Round 4 (2026-06-09 localhost dogfood) — cancel() semantics narrowed:
+// it now no-ops when there's no active synth (`_sentStart=false`). The
+// browser session-pipe sends `{type:'cancel'}` before every `{type:'turn_start'}`
+// as a defensive barge-in prefix; the old tear-down-everything cancel was
+// closing the prewarmed Fish WS and causing spurious fallback_required.
+// New semantic: prewarm WS stays warm; the upcoming turn_start hot-paths
+// onto it. Audit C3 / C-R2-1 concerns (no spurious fallback, no
+// unhandledRejection) are addressed BY DESIGN — cancel doesn't touch
+// _cancelled, doesn't close the WS, doesn't reject the prewarm promise.
+
+test('27: cancel during in-flight prewarm is a no-op (R4 — prewarm stays warm)', async () => {
   const bridge = new FishTTSBridge({
     apiKey: 'k', voiceId: 'v', pricing: VALID_PRICING,
   });
-  // Build a manually-controlled open promise so we can cancel between
-  // prewarmTurn() and the promise resolution.
   let rejectOpen;
   bridge._openWsOnly = () => new Promise((_, reject) => { rejectOpen = reject; });
   const events = [];
   const off = bridge.on((e) => events.push(e));
 
   bridge.prewarmTurn('sess-1:1');
-  // Capture the in-flight promise BEFORE cancel() nulls _prewarmPromise.
-  const inflight = bridge._prewarmPromise;
-  // No need to attach a manual swallow catch — cancel() does it (C-R2-1).
+  const inflightPromise = bridge._prewarmPromise;
+  const inflightCtx = bridge._prewarmContextId;
   bridge.cancel();
-  assert.equal(bridge._cancelled, true);
+  // No-op assertions: cancel did NOT touch prewarm state.
+  assert.equal(bridge._cancelled, false, 'cancel-during-prewarm MUST NOT set _cancelled — prewarm stays warm');
+  assert.equal(bridge._prewarmPromise, inflightPromise, 'cancel-during-prewarm MUST NOT null _prewarmPromise');
+  assert.equal(bridge._prewarmContextId, inflightCtx, 'cancel-during-prewarm MUST NOT clear _prewarmContextId');
 
-  // NOW the ws open finally rejects.
+  // Attach a swallow catch BEFORE we trigger rejection — needed because we're
+  // testing the cancel-then-open-fails edge case where cancel was a no-op,
+  // so the prewarm rejection flows through its natural catch handler. In
+  // production the prewarm rarely fails after a successful kickoff.
+  inflightPromise.catch(() => {});
   rejectOpen(new Error('WebSocket was closed before the connection was established'));
-  // Let the catch handler run.
-  await inflight.then(() => {}, () => {});
+  await inflightPromise.then(() => {}, () => {});
 
+  // The prewarm catch DOES emit fallback_required (open genuinely failed) —
+  // this is correct: the WS open itself failed, the orchestrator should
+  // dispatch to cartesia. The "user already cancelled, don't speak" concern
+  // from the old test is moot because in real usage cancel-before-turn_start
+  // is the defensive pre-cancel pattern, NOT a true user cancel.
   const fallbacks = events.filter((e) => e.kind === 'fallback_required');
-  assert.equal(fallbacks.length, 0, 'cancel-during-prewarm MUST NOT emit fallback_required (user already cancelled)');
-  const prewarmFails = events.filter((e) => e.kind === 'prewarm_failed');
-  assert.equal(prewarmFails.length, 0, 'cancel-during-prewarm MUST NOT emit prewarm_failed either');
+  assert.equal(fallbacks.length, 1, 'prewarm OPEN failure still triggers fallback_required (genuine failure path)');
+  assert.equal(fallbacks[0].code, 'prewarm_open_failed');
   off();
 });
 
-// ── 28-31. Audit round 2 fixes ────────────────────────────────────────────
-
-test('28: cancel during in-flight prewarm does NOT trigger unhandledRejection (C-R2-1)', async () => {
+test('28: cancel-during-prewarm + prewarm rejection — no unhandledRejection (R4)', async () => {
   const unhandled = [];
   const onUnhandled = (reason) => unhandled.push(reason);
   process.on('unhandledRejection', onUnhandled);
@@ -784,19 +801,57 @@ test('28: cancel during in-flight prewarm does NOT trigger unhandledRejection (C
     let rejectOpen;
     bridge._openWsOnly = () => new Promise((_, reject) => { rejectOpen = reject; });
     bridge.prewarmTurn('sess-1:1');
-    // Production path: cancel WITHOUT capturing the promise externally.
-    // C-R2-1 fix means cancel() attaches its own swallow-catch before
-    // nulling _prewarmPromise. Without the fix, the eventual reject would
-    // surface as an unhandledRejection event.
+    // Production path: cancel is a no-op (R4); attach our own swallow catch
+    // on the prewarm promise to handle the eventual rejection. (In real
+    // usage cancel-before-turn_start is the defensive prefix from the
+    // client; the prewarm doesn't reject — it resolves to prewarm_ok and
+    // turn_start hot-paths onto it.)
+    bridge._prewarmPromise.catch(() => {});
     bridge.cancel();
     rejectOpen(new Error('WebSocket was closed before the connection was established'));
-    // Let microtasks flush so unhandledRejection (if any) fires.
     await new Promise((r) => setImmediate(r));
     await new Promise((r) => setImmediate(r));
-    assert.equal(unhandled.length, 0, 'cancel() MUST attach swallow-catch before nulling _prewarmPromise');
+    assert.equal(unhandled.length, 0, 'no unhandledRejection escapes the prewarm catch');
   } finally {
     process.off('unhandledRejection', onUnhandled);
   }
+});
+
+// Round 4 — covers the actual production scenario the R4 fix targets.
+test('27b: cancel-then-turn_start on prewarmed WS: turn_start finds warm WS, synth proceeds (R4)', () => {
+  const { bridge, ws } = makeStubBridge();
+  // Simulate the prewarm state: WS open, _ws set, _sentStart=false,
+  // _currentContextId=null (no active turn yet).
+  bridge._sentStart = false;
+  bridge._currentContextId = null;
+  bridge._prewarmContextId = 'sess-1:1';
+  // Pre-condition: bridge has a live WS.
+  assert.ok(bridge._ws, 'pre-cancel: ws is open');
+
+  // Client sends cancel BEFORE turn_start (the buggy defensive prefix).
+  bridge.cancel();
+
+  // The WS is STILL open. _cancelled is STILL false. Nothing was torn down.
+  assert.equal(bridge._ws, ws, 'cancel-during-prewarm leaves the warm WS open');
+  assert.equal(bridge._cancelled, false);
+  assert.equal(bridge._prewarmContextId, 'sess-1:1', 'prewarm context preserved');
+});
+
+test('27c: cancel during ACTIVE synth (sentStart=true) DOES tear down (R4 — happy barge-in path)', () => {
+  const { bridge, ws } = makeStubBridge();
+  // Simulate mid-synth: turnStart was called, start envelope sent.
+  bridge._sentStart = true;
+  bridge._currentContextId = 'sess-1:1';
+  bridge._firstAudioReceived = true;
+
+  bridge.cancel();
+
+  // Active-synth cancel keeps its tear-down semantics: WS closed, latches
+  // flipped, turn metrics zeroed.
+  assert.equal(bridge._cancelled, true, 'active-synth cancel sets _cancelled');
+  assert.equal(bridge._turnDead, true);
+  assert.equal(bridge._currentContextId, null);
+  assert.equal(bridge._charsThisTurn, 0);
 });
 
 test('29: cancel resets turn metrics to zero (M-R2-6 — defense vs accidental cancelled-turn billing)', () => {
@@ -844,4 +899,203 @@ test('31: numeric msg.event types are debug-logged, not silently dropped (M-R2-7
   } finally {
     console.debug = origDebug;
   }
+});
+
+// ── 32–37. Markdown sanitizer (FISH_AUDIO_PHASE_1 §6 follow-up 2026-06-09) ──
+//
+// Localhost dogfood found s2-pro VOCALIZES asterisks (e.g. `**important**`
+// rendered as "asterous-important-asterous"). sanitizeForTts strips
+// markdown delimiters BEFORE the wire. Audit C4 (2026-06-09) — header strip
+// AND standalone `[...]` strip were dropped: header would eat "# is the
+// Python comment char" and bare-bracket would eat "the formula is [x + y]".
+// Per-chunk regex on Gemini's 1-5-char chunks also can't reliably match
+// cross-chunk link spans. Accept rare `[1]` citation getting vocalized.
+
+test('32: sanitizeForTts strips ** bold ** delimiters', () => {
+  assert.equal(sanitizeForTts('this is **important** advice'), 'this is important advice');
+  assert.equal(sanitizeForTts('**bold start**'), 'bold start');
+  // `\*+` is GREEDY — 3+ asterisks collapse to a single strip (bold+italic
+  // markdown syntax isn't interpreted, just removed). Documented behavior.
+  assert.equal(sanitizeForTts('***triple***'), 'triple');
+});
+
+test('33: sanitizeForTts strips *italic* + lone asterisks', () => {
+  assert.equal(sanitizeForTts('*emphasized*'), 'emphasized');
+  assert.equal(sanitizeForTts('a * lone asterisk'), 'a  lone asterisk');
+});
+
+test('34: sanitizeForTts strips backticks + strikethrough; LEAVES headers + bare brackets alone (C4)', () => {
+  assert.equal(sanitizeForTts('use `git status` to check'), 'use git status to check');
+  assert.equal(sanitizeForTts('~~deleted~~ text'), 'deleted text');
+  // C4 — `# is the comment char` MUST survive (semantic preservation).
+  // The hash is read aloud by the TTS (acceptable v1 tradeoff).
+  assert.equal(sanitizeForTts('# is the Python comment character'), '# is the Python comment character');
+  // C4 — bare `[1]` citation MUST survive (no longer dropped). The TTS
+  // will vocalize it (e.g. "open bracket one close bracket"); annoying
+  // but reversible vs the alternative (silent mid-sentence content loss).
+  assert.equal(sanitizeForTts('the formula is [x squared plus y squared]'), 'the formula is [x squared plus y squared]');
+});
+
+test('35: sanitizeForTts collapses markdown links to their text', () => {
+  assert.equal(
+    sanitizeForTts('see [the docs](https://example.com/foo) for details'),
+    'see the docs for details',
+  );
+  // Multiple links in one string.
+  assert.equal(
+    sanitizeForTts('[A](u1) and [B](u2)'),
+    'A and B',
+  );
+});
+
+test('36: sanitizeForTts is a pass-through for plain text + non-string input', () => {
+  assert.equal(sanitizeForTts('just a plain sentence.'), 'just a plain sentence.');
+  assert.equal(sanitizeForTts(''), '');
+  // Non-string defends against a future caller passing null/undefined.
+  assert.equal(sanitizeForTts(null), null);
+  assert.equal(sanitizeForTts(undefined), undefined);
+  assert.equal(sanitizeForTts(42), 42);
+});
+
+test('37: shouldSendSpeed predicate (range [0.6, 1.5], 1.0 omit, parity with cartesia)', () => {
+  // M1 audit — pinned to DB CHECK range, NOT Fish's wider [0.5, 2.0].
+  assert.equal(shouldSendSpeed(1.15), true);
+  assert.equal(shouldSendSpeed(0.6), true);
+  assert.equal(shouldSendSpeed(1.5), true);
+  assert.equal(shouldSendSpeed(1.0), false, '1.0 is the no-op default');
+  assert.equal(shouldSendSpeed(null), false);
+  assert.equal(shouldSendSpeed(undefined), false);
+  assert.equal(shouldSendSpeed(0.5), false, 'BELOW DB CHECK floor → omit');
+  assert.equal(shouldSendSpeed(2.0), false, 'ABOVE DB CHECK ceiling → omit');
+  assert.equal(shouldSendSpeed('1.15'), false, 'string MUST be coerced upstream; predicate is number-only');
+  assert.equal(shouldSendSpeed(NaN), false);
+});
+
+// ── 38–40. sendText sanitization on the wire (bridge defense-in-depth) ────
+
+test('38: sendText with markdown content sends ONLY sanitized text on the wire', () => {
+  const { bridge, sent } = makeStubBridge();
+  bridge.sendText('**bold**');
+  // First frame: text (sanitized). Second frame: leading-edge flush.
+  assert.equal(sent.length, 2);
+  assert.deepEqual(sent[0], { event: 'text', text: 'bold' });
+  assert.deepEqual(sent[1], { event: 'flush' });
+  // Char count must match SANITIZED length — we don't bill for asterisks
+  // Fish never sees.
+  assert.equal(bridge._charsThisTurn, 4, 'billed chars = "bold".length, NOT raw input length');
+});
+
+test('39: sendText with pure-markdown chunk (e.g. lone "**") is a no-op — no frame on wire', () => {
+  const { bridge, sent } = makeStubBridge();
+  bridge.sendText('**');
+  assert.equal(sent.length, 0, 'pure-markdown chunk sanitized to "" → bail without sending or flushing');
+  assert.equal(bridge._charsThisTurn, 0);
+  assert.equal(bridge._sentFirstChunkOfTurn, false, '_sentFirstChunkOfTurn stays false on no-op chunk');
+});
+
+test('40: M3 — multi-chunk billing invariant: cumulative _charsThisTurn matches SANITIZED total across calls', () => {
+  const { bridge, sent } = makeStubBridge();
+  // Three chunks with mixed markdown — simulates Gemini's small-chunk streaming.
+  bridge.sendText('**bold**');     // sanitized = 'bold' (4 chars)
+  bridge.sendText(' then ');        // sanitized = ' then ' (6 chars)
+  bridge.sendText('*more*');        // sanitized = 'more' (4 chars)
+  // Filter to text-only events (ignore interspersed flush events).
+  const textEvents = sent.filter((e) => e.event === 'text');
+  assert.equal(textEvents.length, 3);
+  assert.deepEqual(textEvents.map((e) => e.text), ['bold', ' then ', 'more']);
+  // Billing invariant: 4 + 6 + 4 = 14, NOT 8 + 6 + 6 = 20 (raw including markdown).
+  assert.equal(bridge._charsThisTurn, 14, 'cumulative billed chars = sum of sanitized lengths');
+});
+
+// ── 41–46. prosody.speed in start envelope (creators.tts_speed) ──────────
+
+function captureSendStart({ ttsSpeed }) {
+  const sent = [];
+  const events = [];
+  const ws = {
+    readyState: 1,
+    send: (buf, opts) => {
+      assert.equal(opts?.binary, true);
+      sent.push(decode(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)));
+    },
+    close: () => {}, terminate: () => {},
+  };
+  const bridge = new FishTTSBridge({
+    apiKey: 'k', voiceId: 'v', pricing: VALID_PRICING, ttsSpeed,
+  });
+  bridge.on((e) => events.push(e));
+  bridge._ws = ws;
+  bridge._closed = false;
+  bridge._currentContextId = 'sess-1:1';
+  bridge._sendStart();
+  return { sent, events };
+}
+
+test('41: _sendStart with ttsSpeed=1.15 emits prosody:{ speed:1.15 } in start envelope', () => {
+  const { sent } = captureSendStart({ ttsSpeed: 1.15 });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].event, 'start');
+  assert.deepEqual(sent[0].request.prosody, { speed: 1.15 });
+  // S6 — prosody object MUST contain exactly {speed}, no leaked siblings
+  // (future controls/dial fields must opt-in via their own spread).
+  assert.deepEqual(Object.keys(sent[0].request.prosody), ['speed']);
+});
+
+test('42: _sendStart with ttsSpeed=null OMITS prosody entirely (Fish default playback)', () => {
+  const { sent } = captureSendStart({ ttsSpeed: null });
+  assert.equal(sent.length, 1);
+  assert.equal('prosody' in sent[0].request, false, 'prosody field MUST be absent on null');
+});
+
+test('43: _sendStart with ttsSpeed=1.0 OMITS prosody (no-op default, minimal wire payload)', () => {
+  const { sent } = captureSendStart({ ttsSpeed: 1.0 });
+  assert.equal('prosody' in sent[0].request, false, 'speed=1.0 == default; omit per shouldSendSpeed policy');
+});
+
+test('44: ttsSpeed string "1.1" coerces to number; out-of-range falls back to null (omit)', () => {
+  // String coercion (supabase-js returns numeric as string).
+  const { sent: s1 } = captureSendStart({ ttsSpeed: '1.1' });
+  assert.deepEqual(s1[0].request.prosody, { speed: 1.1 }, 'string "1.1" coerces to number');
+
+  // M1 audit — bridge pinned to [0.6, 1.5] DB range. 1.8 is within Fish's
+  // wire [0.5, 2.0] but OUTSIDE DB CHECK — bridge stores null + omits prosody.
+  const { sent: s2 } = captureSendStart({ ttsSpeed: 1.8 });
+  assert.equal('prosody' in s2[0].request, false, 'above DB-CHECK ceiling → omit even though Fish wire would accept');
+
+  // Below DB floor.
+  const { sent: s3 } = captureSendStart({ ttsSpeed: 0.5 });
+  assert.equal('prosody' in s3[0].request, false, 'below DB-CHECK floor → omit');
+
+  // NaN-shaped input → omit.
+  const { sent: s4 } = captureSendStart({ ttsSpeed: 'garbage' });
+  assert.equal('prosody' in s4[0].request, false, 'unparseable ttsSpeed → omit');
+});
+
+test('45: M7 — _sendStart emits a tts_config event with the prosody actually sent (observability)', () => {
+  const { events: e1 } = captureSendStart({ ttsSpeed: 1.15 });
+  const cfg1 = e1.find((e) => e.kind === 'tts_config');
+  assert.ok(cfg1, 'tts_config event MUST be emitted on every _sendStart');
+  assert.deepEqual(cfg1.prosody, { speed: 1.15 });
+
+  // null path emits the event with prosody:null so a triage greps for
+  // "tts_config" and reads "prosody:null" rather than absent-config-log.
+  const { events: e2 } = captureSendStart({ ttsSpeed: null });
+  const cfg2 = e2.find((e) => e.kind === 'tts_config');
+  assert.ok(cfg2);
+  assert.equal(cfg2.prosody, null);
+});
+
+test('46: M2 — turnEnd after a turn whose only sendText was pure-markdown closes cleanly', async () => {
+  // C3-paired test: brain emits only `**` (pathological). Orchestrator
+  // also sanitizes upstream so in PROD this never reaches the bridge;
+  // bridge keeps the no-op as defense. turnEnd MUST resolve cleanly
+  // (not hang) with characters=0 audioBytes=0 partial=false.
+  const { bridge, sent } = makeStubBridge();
+  bridge.sendText('**');
+  // _sentFirstChunkOfTurn stays false → turnEnd hits the no-text-sent
+  // branch → closes WS without billing.
+  const result = await bridge.turnEnd();
+  assert.deepEqual(result, { characters: 0, audioBytes: 0, audioSeconds: 0, partial: false });
+  // No stop frame was sent (the no-text-sent branch closes WS directly).
+  assert.equal(sent.filter((e) => e.event === 'stop').length, 0);
 });

@@ -37,7 +37,7 @@ import { createClient } from '@supabase/supabase-js';
 import { GeminiBridge } from './gemini-bridge.js';
 import { CartesiaTTSBridge } from './cartesia-bridge.js';
 import { HumeTTSBridge } from './hume-bridge.js';
-import { FishTTSBridge } from './fish-bridge.js';
+import { FishTTSBridge, sanitizeForTts } from './fish-bridge.js';
 import { decideQuotaGate } from './quota-gate.js';
 import { makeLogTurnCogs, installReaper, VOICE_TTS_LAYER_ENABLED, getCartesiaPricing, getHumePricing, _humePricingPrimeForBoot, getFishPricing, _fishPricingPrimeForBoot } from './proxy-handlers.js';
 // DECOUPLED_BRAIN_PLAN P1-5 C3 ordering gate — boot-prime decoupled
@@ -1629,6 +1629,12 @@ wss.on('connection', async (ws, req) => {
           // Phase 0.5 #1 confirmed Fish PCM @ 16k works → no resampler.
           // Honors per-session avatar sample-rate routing same as cartesia.
           sampleRate: ttsSampleRate,
+          // Per-creator playback speed (creators.tts_speed → ticket →
+          // here → prosody.speed in start envelope). Shares the SAME column
+          // that drives cartesia's generation_config.speed; range
+          // [0.6, 1.5] (DB CHECK) sits inside Fish's wire range [0.5, 2.0].
+          // Bridge omits `prosody` entirely on null/1.0.
+          ttsSpeed: consumed.ttsSpeed,
           // Phase 0.5 #6 long-answer drain measured 16.8s p99 → 34s floor
           // (script-recommended × 2). Bridge default already 34000ms;
           // pass explicit for visibility.
@@ -2123,13 +2129,25 @@ wss.on('connection', async (ws, req) => {
         // After the IIFE swaps `ttsBridge` to the sidecar, subsequent chunks
         // land directly via the lex-rebound `ttsBridge.sendText` below — no
         // need to buffer further.
+        //
+        // Sanitize markdown HERE (audit C1/C2 2026-06-09 — was previously
+        // only inside fish-bridge.sendText). Doing it upstream means:
+        //   * The fallback-replay buffer holds sanitized text → cartesia
+        //     sidecar gets the same clean stream fish would have.
+        //   * Cogs billing is consistent across providers (sanitized chars
+        //     billed once, never raw).
+        //   * Pure-markdown chunks (e.g. lone `**`) never reach the bridge
+        //     → bridge lifecycle gates (`_sentFirstChunkOfTurn`) stay sane.
+        // Bridge keeps its own idempotent sanitize as defense-in-depth.
+        const sanitized = sanitizeForTts(t);
+        if (!sanitized) return;
         const accumulating =
           (ttsBridgeProvider === 'fish' && !fallbackUsed) ||
           (fallbackUsed && !ttsBridgeProvider); // open-window detector
-        if (accumulating && t) {
+        if (accumulating) {
           let room = 4200 - currentTurnTextBuffer.length;
           if (room > 0) {
-            let chunk = room >= t.length ? t : t.slice(0, room);
+            let chunk = room >= sanitized.length ? sanitized : sanitized.slice(0, room);
             // Code audit M5 — avoid splitting a UTF-16 surrogate pair at the
             // slice boundary. An orphan high surrogate would surface as
             // "Invalid transcript" at Cartesia. Trim back one code unit when
@@ -2141,7 +2159,7 @@ wss.on('connection', async (ws, req) => {
           }
         }
         if (useTts && ttsBridge) {
-          try { ttsBridge.sendText(t); } catch (err) {
+          try { ttsBridge.sendText(sanitized); } catch (err) {
             captureException(err, { op: 'tts.sendText', sessionId, ttsProvider });
           }
         }
@@ -2245,7 +2263,12 @@ wss.on('connection', async (ws, req) => {
       // voice over the orchestrator's. `&& !decoupled` ⇒ byte-identical
       // when the flag is false (`&& !false` = unchanged predicate+body).
       if (useTts && ttsBridge && !decoupled) {
-        try { ttsBridge.sendText(e.text); } catch (err) {
+        // Audit C1/C2 (2026-06-09) — sanitize markdown BEFORE wire. Same
+        // policy as the decoupled `ttsSendText` site above; bridge keeps
+        // its own pass as idempotent defense-in-depth.
+        const sanitized = sanitizeForTts(e.text);
+        if (!sanitized) return;
+        try { ttsBridge.sendText(sanitized); } catch (err) {
           captureException(err, { op: 'tts.sendText', sessionId, ttsProvider });
         }
       }
@@ -2705,7 +2728,7 @@ wss.on('connection', async (ws, req) => {
         // bypass the gate (turnNumber !== fallbackInvokedTurn).
         fallbackInvokedTurn = turnNumber;
         fallbackInvokedReason = fallbackReason;
-        console.error(`[ws ${connId}] fish.fallback_required code=${fallbackReason} contextId=${fallbackContextId} live_ctx=${liveTurnContextId} replay_chars=${currentTurnTextBuffer.length} cartesia_voice=${(cartesiaSidecarVoiceId || 'null').slice(0,8)}`);
+        console.error(`[ws ${connId}] fish.fallback_required code=${fallbackReason} contextId=${fallbackContextId} live_ctx=${liveTurnContextId} replay_chars=${currentTurnTextBuffer.length} cartesia_voice=${(cartesiaSidecarVoiceId || 'null').slice(0,8)} fish_msg=${JSON.stringify(e.message || '')}`);
 
         // FISH_AUDIO_PHASE_1 §6 round-3 C4 (code audit M4) — hint the
         // client that voice synthesis is mid-swap so the avatar lipsync
@@ -2852,6 +2875,13 @@ wss.on('connection', async (ws, req) => {
         // success. Lifecycle observability only; the prewarmTurn call
         // site below logs the start, this confirms the warm WS is ready.
         console.log(`[ws ${connId}] fish.prewarm_ok contextId=${e.contextId} ttfaSetupMs=${e.ttfaSetupMs ?? 'na'}`);
+      } else if (e.kind === 'tts_config') {
+        // Audit M7 (2026-06-09) — observability for "creator set
+        // tts_speed but doesn't sound different" triage. One line per
+        // start envelope so a grep proves the bridge actually emitted
+        // prosody on the wire. `prosody:null` means the bridge omitted
+        // the field (speed was null or 1.0, see shouldSendSpeed).
+        console.log(`[ws ${connId}] tts.config provider=${ttsBridgeProvider || ttsProvider} prosody=${JSON.stringify(e.prosody)} ctx=${e.contextId}`);
       }
     });
   }
