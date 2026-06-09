@@ -48,6 +48,7 @@ COPY index.js \
      embed-client.js \
      embed-worker.js \
      face-upload-reaper.js \
+     fish-bridge.js \
      gemini-bridge.js \
      hume-bridge.js \
      internal-request-signature.js \
