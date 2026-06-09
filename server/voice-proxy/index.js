@@ -2816,6 +2816,30 @@ wss.on('connection', async (ws, req) => {
           // ttsBridge as the cartesia sidecar.
           wireTtsBridgeListeners(sidecar);
 
+          // Final-audit C1 (2026-06-09) — update sessions.tts_provider_at_session
+          // to 'cartesia' so subsequent logTurnCogs calls don't fail the v3 RPC
+          // cross-check (`p_tts_provider != session_snapshot` raises 22023).
+          // Without this, every post-fallback turn's cogs row is silently
+          // dropped AND the proxy closes WS 1011 cogs_rpc_failed after 3
+          // consecutive RPC failures — i.e., every fallback session terminates
+          // within ~3 turns of the fallback firing. Fire-and-forget: a failed
+          // UPDATE here just means the cogs hole persists; we still want the
+          // user to hear cartesia, so don't gate on the result.
+          supabase
+            .from('sessions')
+            .update({ tts_provider_at_session: 'cartesia' })
+            .eq('id', sessionId)
+            .then(({ error: snapErr }) => {
+              if (snapErr) {
+                captureException(snapErr, {
+                  level: 'warning',
+                  op: 'fish.fallback.snapshot_update_failed',
+                  sessionId,
+                  fallback_reason: fallbackReason,
+                });
+              }
+            });
+
           // If barge-in fired during await, close the sidecar quietly and
           // do not replay. The user already cancelled (audit M3).
           if (cancelDuringFallback || closed || ws.readyState !== ws.OPEN) {
