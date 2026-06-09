@@ -28,6 +28,18 @@ export const VoicePipelineEvents = {
   proxy_warning:         'proxy_warning',
   cartesia_reconnecting: 'cartesia_reconnecting',
   cartesia_reconnected:  'cartesia_reconnected',
+  // FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit M4) — Fish→Cartesia auto-
+  // fallback mid-session swap. Distinct event from cartesia_reconnecting
+  // because the dashboards count them differently (this is "Fish failed
+  // pre-first-audio, we degraded to Cartesia"; the other is "Cartesia WS
+  // blip recovered"). A spike here means Fish capacity / network issues;
+  // a spike there is Cartesia's problem.
+  tts_provider_switching: 'tts_provider_switching',
+  // Audit M3 — terminal counter for the fallback funnel. Fires on the
+  // sidecar's first tts_audio_done. Pair this with tts_provider_switching
+  // to count "swap initiated but never completed" sessions (sidecar
+  // open() failed → fatal close, no terminal event).
+  tts_provider_switched: 'tts_provider_switched',
 } as const;
 
 // Avatar (Simli) lipsync + RTC health -----------------------------------------

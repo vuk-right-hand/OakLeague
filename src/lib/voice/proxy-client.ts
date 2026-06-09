@@ -29,6 +29,14 @@ export type ProxyClientHandlers = {
   onWarning?: (code: string) => void;
   onTtsReconnecting?: () => void;
   onTtsReconnected?: () => void;
+  // FISH_AUDIO_PHASE_1 §6 round-3 C4 (code audit M4) — Fish→Cartesia
+  // auto-fallback mid-session swap. Info-level event; no toast or error
+  // overlay. The session-client surfaces a subtle "Switching voice…"
+  // badge so the avatar lipsync doesn't freeze mid-mouth-open during the
+  // ~200-1000ms cartesia cold-open. No reciprocal "switched" event today
+  // — the next `audio_out` from the sidecar IS the resumed-synthesis
+  // signal; the banner clears on the next `tts_audio_done`.
+  onTtsProviderSwitching?: (from: string, to: string) => void;
   onClose?: (code: number, reason: string, wasClean: boolean) => void;
   // Server-emitted brain turn boundary. Used by the HeyGen bridge path
   // to dispatch commitUtterance() at end-of-turn — without it the
@@ -122,6 +130,29 @@ export function createProxyClient(handlers: ProxyClientHandlers): ProxyClient {
           handlers.onTtsReconnecting?.();
         } else if (type === 'tts_reconnected') {
           handlers.onTtsReconnected?.();
+        } else if (type === 'tts_provider_switching') {
+          // FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit M4) — auto-fallback
+          // mid-session swap hint. Defensive on payload shape: missing
+          // from/to coerce to 'unknown' so a future proxy variant can't
+          // crash the client by omitting either field. Audit M4 (code) —
+          // if the proxy ever sends a payload with non-string from/to,
+          // surface a Sentry warning so the dashboards see "unknown" as
+          // a regression, not a legitimate data point.
+          const rawFrom = msg.from;
+          const rawTo = msg.to;
+          if (typeof rawFrom !== 'string' || typeof rawTo !== 'string') {
+            // Lazy-load Sentry to avoid an import cycle in this lib.
+            import('@sentry/nextjs').then((Sentry) => {
+              Sentry.captureMessage('tts_provider_switching_malformed_payload', {
+                level: 'warning',
+                extra: { rawFrom: String(rawFrom), rawTo: String(rawTo) },
+              });
+            }).catch(() => { /* never crash the WS on telemetry import */ });
+          }
+          handlers.onTtsProviderSwitching?.(
+            typeof rawFrom === 'string' ? rawFrom : 'unknown',
+            typeof rawTo === 'string' ? rawTo : 'unknown',
+          );
         } else if (type === 'turn_complete') {
           handlers.onTurnComplete?.();
         } else if (type === 'deep_answer_done') {

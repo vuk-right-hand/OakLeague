@@ -272,6 +272,14 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   const closedRef = useRef<boolean>(false);
   const rollingOverRef = useRef<boolean>(false);
   const lipsyncLatencyRef = useRef<number | null>(null);
+  // FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit M3) — ref-mirror of the
+  // ttsProviderSwitching reducer flag. We can't read reducer state inside
+  // the WS callback (closure captures the snapshot at hook-render time,
+  // not the live value). The ref is set true at the proxy's hint frame
+  // and cleared in onTtsAudioDone, gating the symmetric PostHog
+  // 'tts_provider_switched' capture so it doesn't fire on every turn for
+  // non-fallback sessions.
+  const ttsFallbackActiveRef = useRef<boolean>(false);
   // Phase C B1.2: enrich session_close with last close code + duration so
   // post-deploy regressions can be split by reason (AC #5: ±10% baseline
   // is meaningless without per-reason breakdown). Stamped at brain_ready
@@ -782,6 +790,18 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
         // context-gated to the live turn). Flush the Simli tail-carry ONCE.
         onTtsAudioDone: () => {
           if (cancelled) return;
+          // FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit M3+M4) — first audio_done
+          // after a fallback signals the swap is complete from the proxy's
+          // perspective (played fully OR barged — both close the turn).
+          // Clear the "Switching voice…" badge AND fire the symmetric
+          // PostHog event so the fallback funnel has a terminal counter.
+          // Gated on the ref-mirror so this branch is a noop for the
+          // 99%+ of sessions that never fell back.
+          if (ttsFallbackActiveRef.current) {
+            ttsFallbackActiveRef.current = false;
+            dispatchRef({ kind: 'tts_provider_switched' });
+            captureSafe('tts_provider_switched', { session_id: sessionIdRef.current });
+          }
           if (micActiveRef.current) return; // user already barged/talking — owns teardown
           flushTail();
         },
@@ -807,6 +827,19 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
         onTtsReconnected: () => {
           captureSafe('cartesia_reconnected', { session_id: sessionIdRef.current });
           dispatchRef({ kind: 'cartesia_reconnected' });
+        },
+        onTtsProviderSwitching: (from, to) => {
+          // FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit M4). Auto-fallback hint
+          // from the proxy at the fallback latch. Subtle badge + telemetry;
+          // no toast or error overlay. Clears on the sidecar's first
+          // tts_audio_done.
+          ttsFallbackActiveRef.current = true;
+          captureSafe('tts_provider_switching', {
+            session_id: sessionIdRef.current,
+            from,
+            to,
+          });
+          dispatchRef({ kind: 'tts_provider_switching', from, to });
         },
         onClose: (code, reason, wasClean) => {
           if (cancelled) return;

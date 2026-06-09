@@ -419,6 +419,27 @@ function LiveSession(props: LiveProps) {
             Voice catching up…
           </div>
         )}
+        {/* FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit M4) — Fish→Cartesia auto-
+            fallback mid-session swap. Avatar pipe stays warm; subtle badge
+            during the ~200-1000ms cartesia cold-open. Cleared on the
+            sidecar's first tts_audio_done. Same visual treatment as
+            cartesia_reconnecting (above) so the user sees one consistent
+            "voice is doing something briefly" cue regardless of cause.
+            Audit S1 — precedence: cartesia_reconnecting wins when both
+            flags are true (rare: fallback happened, then cartesia itself
+            blips). Keeps a single banner on-screen at a time. */}
+        {pipe.state.ttsProviderSwitching && !pipe.state.cartesiaReconnecting && (
+          <div
+            style={{
+              position: 'absolute', top: 60, left: '50%', transform: 'translateX(-50%)',
+              background: 'rgba(0,0,0,0.65)', color: '#fff',
+              padding: '6px 12px', borderRadius: 16, fontSize: 12,
+              pointerEvents: 'none',
+            }}
+          >
+            Switching voice…
+          </div>
+        )}
         {/* P0-1 — pre-answer thinking indicator. Shown only while the brain is
             working (mic stopped, no audio yet). Clears the instant the first
             audio_out flips phase → speaking, or turn_complete → ready. */}

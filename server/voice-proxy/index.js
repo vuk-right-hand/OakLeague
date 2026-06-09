@@ -2707,6 +2707,25 @@ wss.on('connection', async (ws, req) => {
         fallbackInvokedReason = fallbackReason;
         console.error(`[ws ${connId}] fish.fallback_required code=${fallbackReason} contextId=${fallbackContextId} live_ctx=${liveTurnContextId} replay_chars=${currentTurnTextBuffer.length} cartesia_voice=${(cartesiaSidecarVoiceId || 'null').slice(0,8)}`);
 
+        // FISH_AUDIO_PHASE_1 §6 round-3 C4 (code audit M4) — hint the
+        // client that voice synthesis is mid-swap so the avatar lipsync
+        // can suppress its tail-flush during the ~200-1000ms cartesia
+        // cold-open. Without this the avatar freezes mid-mouth-open then
+        // resumes with the cartesia voice. Info-level frame; no toast,
+        // no error overlay. Silent UX with a tiny "Switching voice…"
+        // badge in session-client.tsx. Audit M4 deferred from the
+        // previous slice — applied here.
+        if (ws.readyState === ws.OPEN) {
+          try {
+            ws.send(JSON.stringify({
+              type: 'tts_provider_switching',
+              from: ttsProvider,        // 'fish' (the session snapshot)
+              to: 'cartesia',           // always the fallback target
+              at: Date.now(),
+            }));
+          } catch {}
+        }
+
         // Detach listener from the dead Fish bridge synchronously (audit C4).
         if (offTtsBridge) {
           try { offTtsBridge(); } catch {}

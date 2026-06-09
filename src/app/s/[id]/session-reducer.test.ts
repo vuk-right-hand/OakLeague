@@ -315,6 +315,33 @@ describe('cartesia reconnecting (R3-Missing-6)', () => {
     expect(s.cartesiaReconnecting).toBe(false);
     expect(s.phase).toBe('ready');
   });
+
+  // FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit M4) — auto-fallback mid-session
+  // swap badge. Subtle banner only; phase unchanged.
+  it('sets ttsProviderSwitching flag without changing phase', () => {
+    let s = ready();
+    expect(s.phase).toBe('ready');
+    s = reduce(s, { kind: 'tts_provider_switching', from: 'fish', to: 'cartesia' });
+    expect(s.ttsProviderSwitching).toBe(true);
+    expect(s.phase).toBe('ready'); // audit S3 — phase preserved through switching
+    expect(s.cartesiaReconnecting).toBe(false);
+    s = reduce(s, { kind: 'tts_provider_switched' });
+    expect(s.ttsProviderSwitching).toBe(false);
+    expect(s.phase).toBe('ready'); // audit S3 — phase preserved through switched
+  });
+
+  // Audit M1 — short-circuit when flag already false. Dispatch on every
+  // tts_audio_done in non-fallback sessions; reducer must return the SAME
+  // state reference (no new object allocation) to avoid per-turn re-renders.
+  it('tts_provider_switched returns same reference when flag already false (M1)', () => {
+    const s = ready();
+    expect(s.ttsProviderSwitching).toBe(false);
+    const s2 = reduce(s, { kind: 'tts_provider_switched' });
+    // identity check — reducer must short-circuit, not spread.
+    expect(s2).toBe(s);
+    expect(s2.phase).toBe('ready');
+    expect(s2.cartesiaReconnecting).toBe(false);
+  });
 });
 
 describe('video_autoplay_lost (R4-M5)', () => {

@@ -56,6 +56,16 @@ export type SessionState = {
   // warm; UI surfaces a "Voice catching up…" banner. Cleared on
   // cartesia_reconnected.
   cartesiaReconnecting: boolean;
+  // FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit M4) — Fish→Cartesia auto-
+  // fallback is mid-swap. Distinct from cartesiaReconnecting because the
+  // semantic differs: cartesia_reconnecting = "the cartesia bridge is
+  // catching up after a network blip on the SAME provider"; this =
+  // "the proxy is swapping FROM fish TO cartesia mid-session". Subtle
+  // banner only — avatar pipe stays warm. Cleared on the next
+  // tts_audio_done (which signals the sidecar's first turn played
+  // through). Session-permanent swap; if this fires it stays cleared
+  // for the rest of the session unless rare future events re-arm.
+  ttsProviderSwitching: boolean;
 };
 
 export type Action =
@@ -94,6 +104,13 @@ export type Action =
   // auto-reconnects. Avatar stays visible muted; UI shows a banner.
   | { kind: 'cartesia_reconnecting' }
   | { kind: 'cartesia_reconnected' }
+  // FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit M4). Fired by proxy at the
+  // fallback latch — voice will resume in ~200-1000ms via cartesia.
+  | { kind: 'tts_provider_switching'; from: string; to: string }
+  // Cleared when the sidecar's first turn finishes (tts_audio_done) or
+  // on the next mic_started (whichever fires first — user-initiated
+  // action implies they noticed the silence and moved on).
+  | { kind: 'tts_provider_switched' }
   // R4-M5 — silent <video>.play() rejection on iOS WebKit after a track
   // rebind without a fresh user activation. UX shows tap-to-resume overlay.
   | { kind: 'video_autoplay_lost' };
@@ -111,6 +128,7 @@ export const initialState: SessionState = {
   openedAtMs: null,
   pausedAtMs: null,
   cartesiaReconnecting: false,
+  ttsProviderSwitching: false,
 };
 
 function bothPipesReady(s: SessionState): boolean {
@@ -284,6 +302,25 @@ export function reduce(state: SessionState, action: Action): SessionState {
 
     case 'cartesia_reconnected':
       return { ...state, cartesiaReconnecting: false };
+
+    case 'tts_provider_switching':
+      // FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit M4). Mid-session swap.
+      // Avatar pipe stays warm (Simli RTC unaffected); subtle badge.
+      // Phase unchanged — forcing 'reconnecting' would show a full-screen
+      // tap-to-reconnect overlay for what's actually a ~500ms cosmetic
+      // shift. action.from/.to currently unused in state — kept on the
+      // action for telemetry callers (PostHog/Sentry) and to leave room
+      // for a future "from X to Y" copy without a reducer signature
+      // change.
+      return { ...state, ttsProviderSwitching: true };
+
+    case 'tts_provider_switched':
+      // Audit M1 — short-circuit to skip the per-turn re-render. This action
+      // fires on EVERY tts_audio_done (cheap badge-clear hook); without the
+      // guard the spread allocates a new state object per turn for the 99%+
+      // of sessions that never fell back.
+      if (!state.ttsProviderSwitching) return state;
+      return { ...state, ttsProviderSwitching: false };
 
     case 'video_autoplay_lost':
       // R4-M5 — silent <video>.play() rejection on iOS WebKit after a
