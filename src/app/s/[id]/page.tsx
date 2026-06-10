@@ -46,23 +46,29 @@ export default async function SessionPage({ params }: Params) {
   if (!session) notFound();
   if (session.user_id !== callerUserId) notFound();
 
-  const { data: creator } = await sb
-    .from('creators')
-    .select('id, handle, display_name, simli_face_id')
-    .eq('id', session.creator_id)
-    .maybeSingle<{ id: string; handle: string; display_name: string; simli_face_id: string | null }>();
+  // Latency plan 2026-06-10: creator + hook selects depend only on the
+  // session row — run them in parallel (one DB roundtrip saved on the
+  // tap→avatar critical path). notFound() stays creator-only: a missing
+  // hook is a VALID state (hook_id is ON DELETE SET NULL) and must render
+  // with a null title, not 404.
+  const [{ data: creator }, { data: hook }] = await Promise.all([
+    sb
+      .from('creators')
+      .select('id, handle, display_name, simli_face_id')
+      .eq('id', session.creator_id)
+      .maybeSingle<{ id: string; handle: string; display_name: string; simli_face_id: string | null }>(),
+    sb
+      .from('hooks')
+      .select('id, caption, video_id, videos!inner(title)')
+      .eq('id', session.hook_id)
+      .maybeSingle<{
+        id: string;
+        caption: string | null;
+        video_id: string;
+        videos: { title: string } | { title: string }[];
+      }>(),
+  ]);
   if (!creator) notFound();
-
-  const { data: hook } = await sb
-    .from('hooks')
-    .select('id, caption, video_id, videos!inner(title)')
-    .eq('id', session.hook_id)
-    .maybeSingle<{
-      id: string;
-      caption: string | null;
-      video_id: string;
-      videos: { title: string } | { title: string }[];
-    }>();
 
   const videoTitle = hook
     ? Array.isArray(hook.videos)

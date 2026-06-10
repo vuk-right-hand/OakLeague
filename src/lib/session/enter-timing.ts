@@ -6,8 +6,17 @@
 // envelope are both ready, the caller navigates to /s/[id], where the black
 // "Starting the call…" stage takes over until the avatar is live.
 
-/** Minimum time the room overlay is shown, even if /open returns faster. */
-export const MIN_ENTER_ROOM_MS = 3500;
+/**
+ * Minimum time the room overlay is shown, even if /open returns faster.
+ * 2026-06-10 latency plan: 3500 → 2000. The original 3500 masked a
+ * strictly-serial /open (~3.0-3.2s measured); after the route's Phase A/C
+ * parallelization /open lands ~1.5-2s, so 2000 still fully masks it while
+ * cutting ~1.5s off the user-visible stage-1 wait (route nav adds ~1.2s on
+ * top before the "Starting the call…" stage takes over). Shortening the
+ * hold also INCREASES voice-ticket TTL headroom (ticket minted in /open,
+ * consumed at WS-open on /s/[id]).
+ */
+export const MIN_ENTER_ROOM_MS = 2000;
 
 /**
  * Await whatever remains of MIN_ENTER_ROOM_MS given when the overlay was first

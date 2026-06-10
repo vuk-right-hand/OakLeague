@@ -9,7 +9,8 @@
 // Bumped TTL = 125s. Slow-LTE mint+WS-open round-trips can approach 60s on a
 // cold mobile network; this leaves buffer without becoming a hoarding window.
 // (R4-S set 120; +5s added for the Feature-A "private room" enter-mask, which on
-// a FAST network can hold ~3.5s on the source page before /s/[id] consumes the
+// a FAST network can hold up to MIN_ENTER_ROOM_MS — 2000ms since the 2026-06-10
+// latency plan, was 3500 — on the source page before /s/[id] consumes the
 // ticket. On a slow network the hold ≈ 0 — see enter-timing.ts — so this cushion
 // only ever pads the fast-network case where the budget was already ample.)
 //

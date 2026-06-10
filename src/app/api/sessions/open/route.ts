@@ -1,24 +1,32 @@
 // POST /api/sessions/open — production session lifecycle entry point.
 //
-// Flow:
-//   1. Same-origin + getCallerUserId (NOT admin — regular user cookie).
-//   2. Per-user rate-limit: 10/min on scope='sessions_open' (R5-M4). Blocks
-//      open→close churn that would burn Simli/Gemini mint budget.
-//   3. Parse body (creator_id, hook_id, model wire-form). Translate model
-//      wire → enum via WIRE_TO_ENUM BEFORE calling the RPC (R3-C3).
-//   4. Call session_open RPC. Tier snapshot + kill-switch check + quota
-//      upsert happen in the BEFORE trigger.
-//   5. Mint Simli FIRST (R3-M2). If FORCE_AVATAR_REQUIRED=1 and mint fails,
-//      close the freshly-created session row via session_close(…,
-//      'force_required_mint_failed') BEFORE returning 503 (R4-C2) — otherwise
-//      the one-active-per-user partial-unique index blocks the user's
-//      immediate retry until the reaper runs 60s later.
-//   6. Mint Gemini ephemeral token via mintEphemeral() lib (NOT the
-//      admin-gated Spike-A route — R3-C1). mintEphemeral writes the COGS
-//      audit row internally (R4-M1). mintSimli writes its own audit row
-//      symmetrically (R5-S4).
-//   7. Return envelope with avatar.session_token (consumed client-side via
-//      SimliBridge.preMintedSessionToken option — R3-C2/P0-5).
+// Flow (re-phased 2026-06-10 latency plan — tap→avatar was ~10s, /open was
+// a ~3s strictly-serial chain; phases cut it to ~1.5-2s with identical
+// gate semantics):
+//   1. Same-origin + getCallerUserId (NOT admin — regular user cookie),
+//      then parse body (creator_id, hook_id, model wire-form). Translate
+//      model wire → enum via WIRE_TO_ENUM BEFORE calling the RPC (R3-C3).
+//   2. PHASE A — six independent pure reads in ONE Promise.all (rate-limit
+//      RPC, hook binding, creator row, proxy config probe, cookie client,
+//      cap check), then gates evaluated SERIALLY in the legacy order:
+//      rate-limit 429 (R5-M4) → hook mismatch 400 → creator 404 →
+//      brain/published 409 → proxy-unreachable 503 → cap 429.
+//   3. PHASE B (serial) — session_open RPC (tier snapshot + kill-switch +
+//      quota upsert in the BEFORE trigger; 23505 → takeover branch) →
+//      tts_provider_at_session snapshot UPDATE → voice-trained gate →
+//      avatar provider resolution.
+//   4. PHASE C — avatar mint ∥ brain-payload assembly (Promise.all). If
+//      FORCE_AVATAR_REQUIRED=1 and mint fails, close the freshly-created
+//      session row via session_close(…, 'force_required_mint_failed')
+//      BEFORE returning 503 (R4-C2) — otherwise the one-active-per-user
+//      partial-unique index blocks the user's immediate retry until the
+//      reaper runs 60s later. Gemini ephemeral mint stays SERIAL behind
+//      that gate (mintEphemeral writes the COGS audit row internally
+//      R4-M1; mintSimli writes its own symmetrically R5-S4).
+//   5. PHASE D (serial) — voice ticket mint (strictly after the Phase-B
+//      snapshot UPDATE — Audit M4) → envelope with avatar.session_token
+//      (consumed client-side via SimliBridge.preMintedSessionToken —
+//      R3-C2/P0-5).
 
 import 'server-only';
 import { type NextRequest, after } from 'next/server';
@@ -61,6 +69,92 @@ type Body = {
   model?: unknown;
 };
 
+// Resolve the creator's simli_face_id + env-scoped voice_id + brain
+// payload before opening the session. No row → 404 (at the consuming
+// gate). We read with the service-role client because `creators` public
+// SELECT is "published only" — drafts still need to route (admin preview).
+//
+// R3-Missing-1 / R4-M6 — three voice_id columns scoped by VERCEL_ENV.
+// resolveVoiceId() picks the env-appropriate value.
+//
+// Brain wire-up (PR-2): SELECT system_prompt + brain_status alongside
+// existing columns so the route can hard-fail unready creators with
+// 409 brain_not_ready (R3 audit M1).
+// HUME_TTS_PLAN §6.2 — creators carries env-scoped voice-id columns for
+// both providers PLUS per-creator override + Hume prosody dials. SELECT
+// them all so resolveVoiceId(row, env, provider) can route on the result.
+type CreatorRow = {
+  id: string;
+  simli_face_id: string | null;
+  heygen_avatar_id: string | null;
+  voice_id: string | null;
+  voice_id_preview: string | null;
+  voice_id_dev: string | null;
+  hume_voice_id: string | null;
+  hume_voice_id_preview: string | null;
+  hume_voice_id_dev: string | null;
+  hume_voice_name: string | null;
+  hume_voice_name_preview: string | null;
+  hume_voice_name_dev: string | null;
+  hume_tts_speed: number | string | null;
+  hume_tts_speed_preview: number | string | null;
+  hume_tts_speed_dev: number | string | null;
+  hume_trailing_silence: number | string | null;
+  hume_trailing_silence_preview: number | string | null;
+  hume_trailing_silence_dev: number | string | null;
+  hume_voice_description: string | null;
+  hume_voice_description_preview: string | null;
+  hume_voice_description_dev: string | null;
+  hume_model_version: string | null;
+  hume_model_version_preview: string | null;
+  hume_model_version_dev: string | null;
+  // FISH_AUDIO_PHASE_1 §6 — env-scoped Fish reference_id columns.
+  // Audit C1: must be in BOTH the SELECT list AND the row type or
+  // resolveVoiceId(row, env, 'fish') sees undefined → null → every
+  // Fish session 409s creator_voice_not_trained.
+  fish_voice_id: string | null;
+  fish_voice_id_preview: string | null;
+  fish_voice_id_dev: string | null;
+  // Per-creator override. NULL = inherit env (proxyCfg.ttsProvider).
+  // FISH_AUDIO_PHASE_1 §6 — 3-arm union; mint helper widened in lockstep.
+  tts_provider: 'cartesia' | 'hume' | 'fish' | null;
+  published_at: string | null;
+  system_prompt: string | null;
+  brain_status: 'pending' | 'queued' | 'training' | 'ready' | 'errored';
+  // numeric arrives as string from supabase-js — coerce at boundary
+  // (R2 audit C3). DB CHECK is [0.6, 1.5]; mint helper drops to NULL
+  // on non-finite values as defense in depth.
+  tts_speed: number | string | null;
+  // pgvector RAG plan (M2). 'drawer' | 'vector'. Default 'drawer'.
+  brain_mode: 'drawer' | 'vector';
+  // DECOUPLED_BRAIN_PLAN P1-10. Snapshot of creators.decoupled at
+  // session-open. Forwarded to mintVoiceTicket so the voice_tickets row
+  // is in sync with the creator's current flag. Pre-P1-10 this was
+  // provably inert at the route layer (whole-build audit "route writer
+  // cannot reach decoupled today").
+  decoupled: boolean;
+};
+
+function creatorSelect(admin: ReturnType<typeof supabaseAdmin>, creatorId: string) {
+  return admin
+    .from('creators')
+    .select(`
+      id, simli_face_id, heygen_avatar_id,
+      voice_id, voice_id_preview, voice_id_dev,
+      hume_voice_id, hume_voice_id_preview, hume_voice_id_dev,
+      hume_voice_name, hume_voice_name_preview, hume_voice_name_dev,
+      hume_tts_speed, hume_tts_speed_preview, hume_tts_speed_dev,
+      hume_trailing_silence, hume_trailing_silence_preview, hume_trailing_silence_dev,
+      hume_voice_description, hume_voice_description_preview, hume_voice_description_dev,
+      hume_model_version, hume_model_version_preview, hume_model_version_dev,
+      fish_voice_id, fish_voice_id_preview, fish_voice_id_dev,
+      tts_provider,
+      published_at, system_prompt, brain_status, tts_speed, brain_mode, decoupled
+    `)
+    .eq('id', creatorId)
+    .maybeSingle<CreatorRow>();
+}
+
 export async function POST(req: NextRequest) {
   if (!isSameOrigin(req)) return json(403, { error: 'bad_origin' });
 
@@ -73,18 +167,7 @@ export async function POST(req: NextRequest) {
   // calls in the handler without per-call extras edits.
   Sentry.setUser({ id: callerUserId });
 
-  // R5-M4: per-user rate-limit BEFORE the paid provider mints. Normal use is
-  // <1 open per 5min (session length). 10/min is >10× headroom but caps a
-  // run-away client loop at ~$0.05/min of Simli mint spend per attacker.
   const admin = supabaseAdmin();
-  const { data: allowed, error: rlErr } = await admin.rpc('rate_limit_hit', {
-    p_scope: 'sessions_open',
-    p_key: callerUserId,
-    p_window: '1 minute',
-    p_limit: 10,
-  });
-  if (rlErr) return json(500, { error: 'rate_limit_failed' });
-  if (allowed === false) return json(429, { error: 'rate_limited' });
 
   let body: Body;
   try {
@@ -106,7 +189,57 @@ export async function POST(req: NextRequest) {
   if (!isAllowedWireModel(wireModel)) return json(400, { error: 'model_not_allowed' });
   const enumModel = WIRE_TO_ENUM[wireModel];
 
-  // R3 audit C1 (brain wire-up): hook ↔ creator binding pre-check.
+  // ── Phase A — independent reads in parallel (latency plan 2026-06-10) ──
+  // Previously a strictly-serial chain of ~6 roundtrips — the bulk of /open's
+  // measured ~3.0-3.2s (PostHog prod timeline). Every member is a pure read
+  // (voice_usage_ticket_check verified read-only — zero INSERT/UPDATE in
+  // 20260510000001) and none consumes another's output, so they run
+  // concurrently. Results are evaluated SERIALLY below in the exact order of
+  // the old chain, preserving every error status, body, and precedence.
+  // One deliberate shift: body-shape 400s (bad_json/bad_creator_id/
+  // bad_hook_id) now fire before the rate-limit check — parsing is local,
+  // zero I/O, strictly cheaper than the old RPC-before-parse order.
+  // NO paid mint happens in Phase A or B — mints stay behind the rate-limit,
+  // cap, brain-readiness, and proxy-health gates exactly as before.
+  type EmbedShape = { creator_id?: string };
+  const [rlRes, hookBindingRes, creatorRes, proxyCfg, sb, capRes] = await Promise.all([
+    // R5-M4: per-user rate-limit gates the paid provider mints (Phase C).
+    // Normal use is <1 open per 5min (session length). 10/min is >10×
+    // headroom but caps a run-away client loop at ~$0.05/min of Simli mint
+    // spend per attacker.
+    admin.rpc('rate_limit_hit', {
+      p_scope: 'sessions_open',
+      p_key: callerUserId,
+      p_window: '1 minute',
+      p_limit: 10,
+    }),
+    // Hook ↔ creator binding pre-check (R3 audit C1) — full rationale at the
+    // gate that consumes this result below.
+    admin
+      .from('hooks')
+      .select('id, video:videos!inner(creator_id)')
+      .eq('id', hookId)
+      .maybeSingle<{ id: string; video: EmbedShape | EmbedShape[] | null }>(),
+    // Creator row — columns + rationale documented at the consuming gate.
+    creatorSelect(admin, creatorId),
+    // HUME_TTS_PLAN §6.2 (Vuk-M5 fix) — freeze the proxy config ONCE per
+    // handler invocation; the frozen local is the single source of truth
+    // through mintVoiceTicket. (60s cache; cold probe has a 2s timeout, so
+    // a cache-miss request pays up to +2s here — same as the old chain.)
+    getProxyVoiceConfig(),
+    supabaseServer(),
+    // Pre-mint daily/weekly/monthly cap check (use-session-pipe rewire
+    // R2-C1) — consumed below, BEFORE session_open, so a capped user never
+    // creates a session row.
+    admin.rpc('voice_usage_ticket_check', { p_user_id: callerUserId }),
+  ]);
+
+  // Gate 1 — rate-limit (R5-M4).
+  const { data: allowed, error: rlErr } = rlRes;
+  if (rlErr) return json(500, { error: 'rate_limit_failed' });
+  if (allowed === false) return json(429, { error: 'rate_limited' });
+
+  // Gate 2 — hook ↔ creator binding pre-check.
   // session_open RPC also enforces this at migration 20260511000000;
   // doing it here as well returns a clean 400 typed error before the
   // RPC round-trip.
@@ -117,14 +250,9 @@ export async function POST(req: NextRequest) {
   // an object today, but normalize defensively. Wrapped in try/catch so
   // a future schema regression surfaces as 500 with Sentry context, not
   // a TypeError leaking through.
-  type EmbedShape = { creator_id?: string };
   let hookBindingCreatorId: string | null = null;
   try {
-    const { data: hookBinding, error: bindingErr } = await admin
-      .from('hooks')
-      .select('id, video:videos!inner(creator_id)')
-      .eq('id', hookId)
-      .maybeSingle<{ id: string; video: EmbedShape | EmbedShape[] | null }>();
+    const { data: hookBinding, error: bindingErr } = hookBindingRes;
     if (bindingErr) {
       Sentry.captureException(bindingErr, { extra: { op: 'sessions_open_hook_binding', hook_id: hookId } });
       return json(500, { error: 'hook_lookup_failed' });
@@ -142,87 +270,8 @@ export async function POST(req: NextRequest) {
     return json(400, { error: 'hook_creator_mismatch' });
   }
 
-  // Resolve the creator's simli_face_id + env-scoped voice_id + brain
-  // payload before opening the session. No row → 404 early. We read with
-  // the service-role client because `creators` public SELECT is
-  // "published only" — drafts still need to route (admin preview).
-  //
-  // R3-Missing-1 / R4-M6 — three voice_id columns scoped by VERCEL_ENV.
-  // resolveVoiceId() picks the env-appropriate value.
-  //
-  // Brain wire-up (PR-2): SELECT system_prompt + brain_status alongside
-  // existing columns so the route can hard-fail unready creators with
-  // 409 brain_not_ready (R3 audit M1).
-  // HUME_TTS_PLAN §6.2 — creators carries env-scoped voice-id columns for
-  // both providers PLUS per-creator override + Hume prosody dials. SELECT
-  // them all so resolveVoiceId(row, env, provider) can route on the result.
-  const { data: creatorRow, error: creatorErr } = await admin
-    .from('creators')
-    .select(`
-      id, simli_face_id, heygen_avatar_id,
-      voice_id, voice_id_preview, voice_id_dev,
-      hume_voice_id, hume_voice_id_preview, hume_voice_id_dev,
-      hume_voice_name, hume_voice_name_preview, hume_voice_name_dev,
-      hume_tts_speed, hume_tts_speed_preview, hume_tts_speed_dev,
-      hume_trailing_silence, hume_trailing_silence_preview, hume_trailing_silence_dev,
-      hume_voice_description, hume_voice_description_preview, hume_voice_description_dev,
-      hume_model_version, hume_model_version_preview, hume_model_version_dev,
-      fish_voice_id, fish_voice_id_preview, fish_voice_id_dev,
-      tts_provider,
-      published_at, system_prompt, brain_status, tts_speed, brain_mode, decoupled
-    `)
-    .eq('id', creatorId)
-    .maybeSingle<{
-      id: string;
-      simli_face_id: string | null;
-      heygen_avatar_id: string | null;
-      voice_id: string | null;
-      voice_id_preview: string | null;
-      voice_id_dev: string | null;
-      hume_voice_id: string | null;
-      hume_voice_id_preview: string | null;
-      hume_voice_id_dev: string | null;
-      hume_voice_name: string | null;
-      hume_voice_name_preview: string | null;
-      hume_voice_name_dev: string | null;
-      hume_tts_speed: number | string | null;
-      hume_tts_speed_preview: number | string | null;
-      hume_tts_speed_dev: number | string | null;
-      hume_trailing_silence: number | string | null;
-      hume_trailing_silence_preview: number | string | null;
-      hume_trailing_silence_dev: number | string | null;
-      hume_voice_description: string | null;
-      hume_voice_description_preview: string | null;
-      hume_voice_description_dev: string | null;
-      hume_model_version: string | null;
-      hume_model_version_preview: string | null;
-      hume_model_version_dev: string | null;
-      // FISH_AUDIO_PHASE_1 §6 — env-scoped Fish reference_id columns.
-      // Audit C1: must be in BOTH the SELECT list AND the row type or
-      // resolveVoiceId(row, env, 'fish') sees undefined → null → every
-      // Fish session 409s creator_voice_not_trained.
-      fish_voice_id: string | null;
-      fish_voice_id_preview: string | null;
-      fish_voice_id_dev: string | null;
-      // Per-creator override. NULL = inherit env (proxyCfg.ttsProvider).
-      // FISH_AUDIO_PHASE_1 §6 — 3-arm union; mint helper widened in lockstep.
-      tts_provider: 'cartesia' | 'hume' | 'fish' | null;
-      published_at: string | null;
-      system_prompt: string | null;
-      brain_status: 'pending' | 'queued' | 'training' | 'ready' | 'errored';
-      // numeric arrives as string from supabase-js — coerce at boundary
-      // (R2 audit C3). DB CHECK is [0.6, 1.5]; mint helper drops to NULL
-      // on non-finite values as defense in depth.
-      tts_speed: number | string | null;
-      // pgvector RAG plan (M2). 'drawer' | 'vector'. Default 'drawer'.
-      brain_mode: 'drawer' | 'vector';
-      // DECOUPLED_BRAIN_PLAN P1-10. Snapshot of creators.decoupled at
-      // session-open. Forwarded to mintVoiceTicket (line ~930) so the
-      // voice_tickets row is in sync with the creator's current flag.
-      // Pre-P1-10 this was provably inert at the route layer (whole-
-      // build audit "route writer cannot reach decoupled today").
-      decoupled: boolean;
-    }>();
+  // Gate 3 — creator row. No row → 404. Full rationale on creatorSelect().
+  const { data: creatorRow, error: creatorErr } = creatorRes;
   if (creatorErr) return json(500, { error: 'creator_lookup_failed' });
   if (!creatorRow) return json(404, { error: 'creator_not_found' });
 
@@ -311,13 +360,11 @@ export async function POST(req: NextRequest) {
   // a free-tier user routed through Simli needs simli_face_id; a heygen
   // user needs heygen_avatar_id. Don't block here on a missing simli id
   // when the user might be on heygen.
-  // HUME_TTS_PLAN §6.2 (Vuk-M5 fix) — freeze the proxy config ONCE per
-  // handler invocation. Without the freeze, a 60s-cache refresh OR a
-  // parallel Fly env flip between reads can race: creator.tts_provider is
-  // NULL → first read picks 'cartesia' → mint reads again → picks 'hume'.
-  // The frozen local is the single source of truth from here through
-  // mintVoiceTicket(); we never re-read the cache mid-handler.
-  const proxyCfg = await getProxyVoiceConfig();
+  // Gate 5 — proxy health. proxyCfg was frozen ONCE in Phase A (HUME_TTS_PLAN
+  // §6.2 Vuk-M5 fix: without the freeze, a 60s-cache refresh OR a parallel
+  // Fly env flip between reads can race — the frozen local is the single
+  // source of truth from Phase A through mintVoiceTicket(); we never re-read
+  // the cache mid-handler).
   // Audit M5 — proxy unreachable. We can't know whether the env defaults
   // to cartesia or hume, so routing this session on the failOpen fallback
   // would risk a 4009 close at WS-open for a hume-overridden creator
@@ -334,10 +381,10 @@ export async function POST(req: NextRequest) {
   // Audit C4 + FISH_AUDIO_PHASE_1 wiring audit C1 — the proxy activates
   // the TTS bridge when the env layer flag is on OR the session's provider
   // is non-cartesia (per-creator override). The pre-WS voice-trained gate
-  // must use the SAME predicate, else a hume/fish-override creator with
-  // no voice id slips past this optimization and only fails at WS-open
-  // (worse UX, wasted ticket mint). Mirror proxy index.js's `useTts`.
-  const useTts = useTtsLayer || sessionProvider === 'hume' || sessionProvider === 'fish';
+  // must use the SAME predicate (mirror proxy index.js's `useTts`) — it is
+  // computed as `useTtsForGate` against the LOCKED snapshotProvider below.
+  // (Latency-diff audit M3: a sessionProvider-based `useTts` local sat here
+  // dead since the gate moved — deleted, don't reintroduce it.)
 
   // §6.2 — pre-WS gate runs LATER (post-session_open, below the takeover
   // snapshot read) so the takeover path can lock onto the original
@@ -347,22 +394,18 @@ export async function POST(req: NextRequest) {
   // grep `creator_voice_not_trained` to find the relocated gate.
 
 
-  // RPC under the cookie-bound client so auth.uid() resolves to the caller.
-  const sb = await supabaseServer();
-
-  // Pre-mint daily/weekly/monthly cap check (use-session-pipe rewire R2-C1).
-  // voice_usage_ticket_check takes p_user_id only — runs BEFORE session_open
-  // so a capped user never creates a session row we'd then have to close.
-  // Surfaces a structured 429 instead of falling through to the proxy-WS-side
-  // 4006 close after a wasted mint round-trip.
+  // Gate 6 — pre-mint daily/weekly/monthly cap check (use-session-pipe
+  // rewire R2-C1). The RPC ran in Phase A (verified pure-read) but its
+  // result is evaluated HERE, before session_open, so a capped user never
+  // creates a session row we'd then have to close. Surfaces a structured
+  // 429 instead of falling through to the proxy-WS-side 4006 close after a
+  // wasted mint round-trip.
   //
-  // Auditor C1: the migration REVOKEs EXECUTE from `authenticated`. Call
+  // Auditor C1: the migration REVOKEs EXECUTE from `authenticated`. Called
   // via the service-role admin client — the function's SECURITY DEFINER body
   // short-circuits the auth.uid() check when JWT role is service_role, and
   // we already authenticated the caller via getCallerUserId() above.
-  const { data: capRows, error: capErr } = await admin.rpc('voice_usage_ticket_check', {
-    p_user_id: callerUserId,
-  });
+  const { data: capRows, error: capErr } = capRes;
   if (capErr) {
     // Map the function's P0002 'user not found' (raised when no profiles
     // row matches p_user_id) to 409 — a brand-new auth user whose profile
@@ -387,6 +430,10 @@ export async function POST(req: NextRequest) {
   if (!capRowRaw) {
     return json(500, { error: 'cap_check_empty' });
   }
+  // Deliberately distinct from the imported coerceNumericOrNull (diff audit
+  // S1): numOrNull preserves null/undefined as null and Number()s the rest
+  // for the cap-row wire response; coerceNumericOrNull additionally drops
+  // non-finite values for DB-bound numerics. Don't merge them.
   const numOrNull = (v: number | string | null | undefined): number | null =>
     v == null ? null : (typeof v === 'number' ? v : Number(v));
   const remainingSeconds = Math.max(0, Math.floor(Number(capRowRaw.remaining_seconds ?? 0)));
@@ -394,7 +441,7 @@ export async function POST(req: NextRequest) {
     // Whole-build audit C4: emit telemetry so we can compare HTTP-layer
     // pre-mint cap firing rate (PR-1) against the legacy proxy-WS-side
     // 4006 cap close, and correlate to /upgrade?source=cap_hit clicks.
-    captureServerSafe(callerUserId, 'daily_cap_hit_fired', {
+    await captureServerSafe(callerUserId, 'daily_cap_hit_fired', {
       surface:      'sessions_open',
       daily_used:   numOrNull(capRowRaw.daily_used),
       daily_cap:    capRowRaw.daily_cap,
@@ -646,7 +693,11 @@ export async function POST(req: NextRequest) {
   const providerAvatarId: string | null =
     avatarProvider === 'simli'  ? creatorRow.simli_face_id :
     avatarProvider === 'heygen' ? creatorRow.heygen_avatar_id :
-    avatarProvider === 'tavus'  ? creatorRow.simli_face_id : // Tavus deprecated; reuse simli for legacy paths
+    // Tavus deprecated (Spike B). Reusing simli_face_id keeps legacy env
+    // values from 500ing, but the mint switch below has NO tavus arm — it
+    // falls to failed_mint('tavus_scrapped'), so a stray 'tavus' env never
+    // silently routes a session on a Simli id (diff audit S2).
+    avatarProvider === 'tavus'  ? creatorRow.simli_face_id :
     null;
   if (avatarProvider !== null && !providerAvatarId) {
     return json(409, { error: 'creator_not_ready', avatar_provider: avatarProvider });
@@ -668,11 +719,38 @@ export async function POST(req: NextRequest) {
       ))
     : Math.max(60, Math.min(GEMINI_MAX_SESSION_S, dailyLimitRemaining, 600));
 
+  // ── Phase C — avatar mint ∥ brain-payload assembly (latency plan
+  // 2026-06-10). The avatar mint (external API, the longest single leg) and
+  // the brain assembly (DB reads + local substitution) share no data, so
+  // they run concurrently. DELIBERATELY NOT in this Promise.all: the Gemini
+  // ephemeral mint — it must stay BEHIND the FORCE_AVATAR_REQUIRED gate
+  // below (plan audit C1: hoisting it would mint a live Google-side token
+  // on the forced-avatar 503 path that nothing reaps). Each IIFE catches
+  // internally and never rejects; both only mutate their own outer lets.
+  // Order shift vs the old serial chain: brain assembly now runs (reads +
+  // telemetry only, no paid calls) even when the FORCE gate or Gemini mint
+  // later fails the request — acceptable speculative work.
+  // Takeover note (plan audit C4 + diff audit M2): the fire-and-forget
+  // HeyGen stop in the takeover branch races the HeyGen re-mint below
+  // exactly as it did serially — Phase C starts at the same point in the
+  // handler; only the Gemini/brain legs moved relative to it. On takeover
+  // the avatar leg also overwrites sessions.avatar_provider and the
+  // sessions_private HeyGen row that the OTHER tab is heart-beating.
+  // ASSUMPTION this rides on: HeyGen stays dormant in prod (Simli-only —
+  // both tabs resolve 'simli', making the clobber benign). Re-derive this
+  // race before any HeyGen prod flip.
+
   // AvatarEnvelope hoisted to @/lib/avatar/avatar-envelope (final-audit S1).
+  // Both IIFEs RETURN their results (not outer-let mutation) so TS
+  // control-flow analysis sees the post-await values.
+  const avatarMintPromise = (async (): Promise<{
+    avatar: AvatarEnvelope | null;
+    avatarStatus: 'minted' | 'failed_mint';
+    avatarError: string | null;
+  }> => {
   let avatar: AvatarEnvelope | null = null;
   let avatarStatus: 'minted' | 'failed_mint' = 'failed_mint';
   let avatarError: string | null = null;
-
   if (avatarProvider === null) {
     // Voice-only mode (env AVATAR_PROVIDER_<tier>=none / unset). No avatar
     // mint attempt; downstream FORCE_AVATAR_REQUIRED gate decides 503.
@@ -786,6 +864,124 @@ export async function POST(req: NextRequest) {
     avatarStatus = 'failed_mint';
     avatarError = 'tavus_scrapped';
   }
+  return { avatar, avatarStatus, avatarError };
+  })();
+
+  const brainAssemblyPromise = (async (): Promise<{
+    brainPrefix: Awaited<ReturnType<typeof buildBrainPrefix>>;
+    resolvedSystemPrompt: string | null;
+  }> => {
+  let brainPrefix: Awaited<ReturnType<typeof buildBrainPrefix>> = null;
+  let resolvedSystemPrompt: string | null = creatorRow.system_prompt;
+  // ── Brain prefix build (PR-2 + pgvector RAG) ────────────────────────
+  // Drawer mode: pulls sample_content rows whose topic_tags overlap
+  // hook.topic_tags and packages them as a single user-role `prefixTurns`
+  // Content entry (existing behavior).
+  // Vector mode: skips the prefix build entirely — per-turn retrieval
+  // injection runs proxy-side via the audio gate. DB invariant
+  // voice_tickets_brain_mode_prefix_chk enforces prefix_turns IS NULL when
+  // brain_mode='vector' (defense-in-depth — this is the pre-DB gate).
+  if (creatorRow.brain_mode === 'drawer') {
+    try {
+      brainPrefix = await buildBrainPrefix({
+        supabaseAdmin: admin,
+        creatorId,
+        hookId,
+      });
+      // Diff audit M4 — capture calls inside this IIFE are AWAITED: the
+      // shared Promise.all keeps the handler alive until they flush
+      // (~5-20ms, parallel to the much longer avatar mint), where a
+      // floating promise would race the Vercel response-close kill.
+      if (brainPrefix) {
+        await captureServerSafe(callerUserId, 'brain_prefix_built', {
+          creator_id: creatorId,
+          hook_id: hookId,
+          source_count: brainPrefix.sourceCount,
+          total_raw_chars: brainPrefix.totalRawChars,
+          encoded_bytes: brainPrefix.encodedBytes,
+          selected_topic_count: brainPrefix.selectedTopicSlugs.length,
+        });
+      } else {
+        await captureServerSafe(callerUserId, 'brain_prefix_skipped', {
+          creator_id: creatorId,
+          hook_id: hookId,
+          reason: 'no_overlap',
+        });
+        Sentry.addBreadcrumb({
+          category: 'brain',
+          level: 'info',
+          message: 'partial_prefix',
+          data: { creator_id: creatorId, hook_id: hookId },
+        });
+      }
+    } catch (prefixErr) {
+      Sentry.captureException(prefixErr, {
+        extra: { op: 'sessions_open_brain_prefix', creator_id: creatorId, hook_id: hookId },
+      });
+      await captureServerSafe(callerUserId, 'brain_prefix_skipped', {
+        creator_id: creatorId,
+        hook_id: hookId,
+        reason: 'builder_error',
+      });
+      brainPrefix = null;
+    }
+  } else {
+    // Vector mode — no prefix build. Per-turn retrieval runs proxy-side.
+    await captureServerSafe(callerUserId, 'brain_mode_vector_session', {
+      creator_id: creatorId,
+      hook_id: hookId,
+    });
+    // Audit M2: chunk-count guard. A vector-mode creator with zero embedded
+    // chunks looks UX-identical to a healthy session (persona-only fallback),
+    // so the operator never learns the backfill was skipped. One Sentry
+    // warning + one PostHog event makes the misconfiguration visible.
+    try {
+      const { count: chunkCount } = await admin
+        .from('sample_content_chunks')
+        .select('id', { count: 'exact', head: true })
+        .eq('creator_id', creatorId)
+        .not('embedding', 'is', null);
+      if ((chunkCount ?? 0) === 0) {
+        Sentry.captureMessage('vector.no_chunks', {
+          level: 'warning',
+          extra: { creator_id: creatorId, hook_id: hookId },
+        });
+        await captureServerSafe(callerUserId, 'vector_mode_no_chunks', {
+          creator_id: creatorId,
+          hook_id: hookId,
+        });
+      }
+    } catch (chunkCountErr) {
+      // Non-fatal — count is observability, not correctness. Log only.
+      Sentry.captureException(chunkCountErr, {
+        extra: { op: 'sessions_open_chunk_count', creator_id: creatorId },
+      });
+    }
+  }
+
+  // ── {{user_name}} substitution (pgvector plan inline user-name fix) ──
+  // Persona compile (M10) emits a literal {{user_name}} placeholder.
+  // Resolve here using profiles.display_name (collected at signup). Falls
+  // back to 'friend' if null/empty. The substituted string is what lands
+  // on voice_tickets.system_prompt; proxy passes it to Gemini Live verbatim.
+  // Plan audit M2: the profiles read stays gated on the placeholder being
+  // present — no unconditional extra roundtrip for personas without it.
+  if (resolvedSystemPrompt && resolvedSystemPrompt.includes('{{user_name}}')) {
+    const { data: profileRow } = await admin
+      .from('profiles')
+      .select('display_name')
+      .eq('id', callerUserId)
+      .maybeSingle<{ display_name: string | null }>();
+    const userName = (profileRow?.display_name ?? '').trim() || 'friend';
+    resolvedSystemPrompt = resolvedSystemPrompt.replaceAll('{{user_name}}', userName);
+  }
+  return { brainPrefix, resolvedSystemPrompt };
+  })();
+
+  const [
+    { avatar, avatarStatus, avatarError },
+    { brainPrefix, resolvedSystemPrompt },
+  ] = await Promise.all([avatarMintPromise, brainAssemblyPromise]);
 
   // Persist the avatar_status transition. Non-fatal on failure — we prefer
   // to continue with voice-only rather than 500 the user.
@@ -819,7 +1015,10 @@ export async function POST(req: NextRequest) {
     return json(503, { error: 'avatar_unavailable', detail: avatarError ?? 'mint_failed' });
   }
 
-  // ── Mint Gemini ephemeral (after Simli path so cost ordering is clear) ──
+  // ── Mint Gemini ephemeral ──────────────────────────────────────────────
+  // Kept SERIAL, strictly behind the FORCE_AVATAR_REQUIRED gate above (plan
+  // audit C1) — parallelizing it with the avatar mint would mint a live
+  // Google-side token on the forced-avatar 503 path that nothing reaps.
   let token: { token: string; model: string };
   try {
     const result = await mintEphemeral({
@@ -847,106 +1046,13 @@ export async function POST(req: NextRequest) {
     return json(502, { error: 'gemini_mint_failed' });
   }
 
-  // ── Brain prefix build (PR-2 + pgvector RAG) ────────────────────────
-  // Drawer mode: pulls sample_content rows whose topic_tags overlap
-  // hook.topic_tags and packages them as a single user-role `prefixTurns`
-  // Content entry (existing behavior).
-  // Vector mode: skips the prefix build entirely — per-turn retrieval
-  // injection runs proxy-side via the audio gate. DB invariant
-  // voice_tickets_brain_mode_prefix_chk enforces prefix_turns IS NULL when
-  // brain_mode='vector' (defense-in-depth — this is the pre-DB gate).
-  let brainPrefix: Awaited<ReturnType<typeof buildBrainPrefix>> = null;
-  if (creatorRow.brain_mode === 'drawer') {
-    try {
-      brainPrefix = await buildBrainPrefix({
-        supabaseAdmin: admin,
-        creatorId,
-        hookId,
-      });
-      if (brainPrefix) {
-        captureServerSafe(callerUserId, 'brain_prefix_built', {
-          creator_id: creatorId,
-          hook_id: hookId,
-          source_count: brainPrefix.sourceCount,
-          total_raw_chars: brainPrefix.totalRawChars,
-          encoded_bytes: brainPrefix.encodedBytes,
-          selected_topic_count: brainPrefix.selectedTopicSlugs.length,
-        });
-      } else {
-        captureServerSafe(callerUserId, 'brain_prefix_skipped', {
-          creator_id: creatorId,
-          hook_id: hookId,
-          reason: 'no_overlap',
-        });
-        Sentry.addBreadcrumb({
-          category: 'brain',
-          level: 'info',
-          message: 'partial_prefix',
-          data: { creator_id: creatorId, hook_id: hookId },
-        });
-      }
-    } catch (prefixErr) {
-      Sentry.captureException(prefixErr, {
-        extra: { op: 'sessions_open_brain_prefix', creator_id: creatorId, hook_id: hookId },
-      });
-      captureServerSafe(callerUserId, 'brain_prefix_skipped', {
-        creator_id: creatorId,
-        hook_id: hookId,
-        reason: 'builder_error',
-      });
-      brainPrefix = null;
-    }
-  } else {
-    // Vector mode — no prefix build. Per-turn retrieval runs proxy-side.
-    captureServerSafe(callerUserId, 'brain_mode_vector_session', {
-      creator_id: creatorId,
-      hook_id: hookId,
-    });
-    // Audit M2: chunk-count guard. A vector-mode creator with zero embedded
-    // chunks looks UX-identical to a healthy session (persona-only fallback),
-    // so the operator never learns the backfill was skipped. One Sentry
-    // warning + one PostHog event makes the misconfiguration visible.
-    try {
-      const { count: chunkCount } = await admin
-        .from('sample_content_chunks')
-        .select('id', { count: 'exact', head: true })
-        .eq('creator_id', creatorId)
-        .not('embedding', 'is', null);
-      if ((chunkCount ?? 0) === 0) {
-        Sentry.captureMessage('vector.no_chunks', {
-          level: 'warning',
-          extra: { creator_id: creatorId, hook_id: hookId },
-        });
-        captureServerSafe(callerUserId, 'vector_mode_no_chunks', {
-          creator_id: creatorId,
-          hook_id: hookId,
-        });
-      }
-    } catch (chunkCountErr) {
-      // Non-fatal — count is observability, not correctness. Log only.
-      Sentry.captureException(chunkCountErr, {
-        extra: { op: 'sessions_open_chunk_count', creator_id: creatorId },
-      });
-    }
-  }
-
-  // ── {{user_name}} substitution (pgvector plan inline user-name fix) ──
-  // Persona compile (M10) emits a literal {{user_name}} placeholder.
-  // Resolve here using profiles.display_name (collected at signup). Falls
-  // back to 'friend' if null/empty. The substituted string is what lands
-  // on voice_tickets.system_prompt; proxy passes it to Gemini Live verbatim.
-  let resolvedSystemPrompt: string | null = creatorRow.system_prompt;
-  if (resolvedSystemPrompt && resolvedSystemPrompt.includes('{{user_name}}')) {
-    const { data: profileRow } = await admin
-      .from('profiles')
-      .select('display_name')
-      .eq('id', callerUserId)
-      .maybeSingle<{ display_name: string | null }>();
-    const userName = (profileRow?.display_name ?? '').trim() || 'friend';
-    resolvedSystemPrompt = resolvedSystemPrompt.replaceAll('{{user_name}}', userName);
-  }
-
   // ── Mint voice ticket (proxy WS auth — fatal on failure) ─────────────
+  // ORDERING INVARIANT (Audit M4, restated at the phase boundary per the
+  // latency-plan audit): this mint MUST stay strictly AFTER the awaited
+  // tts_provider_at_session snapshot UPDATE in Phase B — the ticket is the
+  // WS's auth, and minting it before the snapshot lands reopens the
+  // NULL-snapshot double-bill window in cogs_insert_turn_voice_v2/v3. Do
+  // not fold this into a parallel phase.
   // SIMLI_WIREUP §2 — pre-mint a UA-bound, session-pinned ticket so the
   // browser can open the proxy WS without a second client RTT.
   //

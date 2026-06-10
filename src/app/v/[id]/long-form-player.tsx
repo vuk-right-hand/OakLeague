@@ -10,6 +10,7 @@ import { useDeviceId } from '@/lib/feed/device-id';
 import { AskErrorPill } from '@/lib/feed/ask-error-pill';
 import { EnterPrivateRoomOverlay } from '@/components/session/EnterPrivateRoomOverlay';
 import { holdEnterRoomBeat } from '@/lib/session/enter-timing';
+import { preloadAvatarSdk } from '@/lib/avatar/simli-bridge';
 import { envelopeStorageKey } from '@/app/s/[id]/session-client';
 import type { OpenEnvelope } from '@/lib/avatar/avatar-envelope';
 import { ReactButton } from '@/components/recording/ReactButton';
@@ -350,6 +351,10 @@ export function LongFormPlayer({
         return;
       }
       const env = (await r.json()) as OpenEnvelope;
+      // Latency plan 2026-06-10 — /open succeeded, navigation is now certain:
+      // warm the simli-client chunk during the remaining beat so the bridge's
+      // dynamic import on /s/[id] resolves instantly.
+      preloadAvatarSdk();
       recordFeedEvent({
         event_name: 'mic_tap',
         hook_id: entryHookId ?? undefined,

@@ -35,6 +35,22 @@ import {
   type AvatarProvider,
 } from './avatar-bridge';
 
+// Latency plan 2026-06-10 (Step 4) — warm webpack's module cache for the
+// simli-client chunk while the user sits in the "Let's go somewhere
+// private…" beat, so the dynamic import inside open() resolves instantly
+// after the client-side router.push to /s/[id]. Call ONLY after
+// /api/sessions/open returns 2xx (plan audit M6 — don't burn mobile bytes
+// for users who hit a pre-mint 409/429 and never navigate). Failures are
+// deliberately swallowed HERE because this is a hint, not the load path:
+// open() performs its own awaited import with full error mapping
+// (connect_timeout) — a preload miss costs latency, never correctness.
+// Verified (audit M6b): simli-client@3.0.1 module scope is requires +
+// function definitions only — no getUserMedia / WebRTC / listener
+// registration at import time; all side effects are constructor-gated.
+export function preloadAvatarSdk(): void {
+  void import('simli-client').catch(() => { /* hint only — see above */ });
+}
+
 // Discriminate "this is one of our AvatarErrors" from "this is a DOMException
 // or other native error that happens to carry a `.code` field" (audit M3 —
 // AbortError.code === 20 would otherwise sneak through the prior `e.code`

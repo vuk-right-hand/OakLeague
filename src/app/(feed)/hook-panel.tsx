@@ -13,6 +13,7 @@ import { useDeviceId } from '@/lib/feed/device-id';
 import { AskErrorPill } from '@/lib/feed/ask-error-pill';
 import { EnterPrivateRoomOverlay } from '@/components/session/EnterPrivateRoomOverlay';
 import { holdEnterRoomBeat } from '@/lib/session/enter-timing';
+import { preloadAvatarSdk } from '@/lib/avatar/simli-bridge';
 import { useFeedImpressionTracker } from './feed-impression-context';
 import { ReactButton } from '@/components/recording/ReactButton';
 import { RecordingPreview } from '@/components/recording/RecordingPreview';
@@ -665,6 +666,10 @@ export function HookPanel({
               return;
             }
             const env = (await r.json()) as OpenEnvelope;
+            // Latency plan 2026-06-10 — /open succeeded, navigation is now
+            // certain: warm the simli-client chunk during the remaining beat
+            // so the bridge's dynamic import on /s/[id] resolves instantly.
+            preloadAvatarSdk();
             recordFeedEvent({
               event_name: 'mic_tap',
               hook_id: hook.hook_id,
