@@ -241,6 +241,12 @@ export function useRecordingController(
   const hiddenAvatarVideoElRef = useRef<HTMLVideoElement | null>(null);
   const hiddenAvatarStreamRef = useRef<MediaStream | null>(null);
   const detachTrackUpdatesRef = useRef<(() => void) | null>(null);
+  // askEnabled-fix audit C1 — avatar video death detection (Ask mode):
+  // detach fn for the currently-bound video track's 'ended' listener, and
+  // the 5s dead-window timer that dispatches TRACK_ENDED if no live
+  // replacement arrives. Both cleared in teardown.
+  const askVideoEndedDetachRef = useRef<(() => void) | null>(null);
+  const askTrackDeadTimerRef = useRef<number | null>(null);
 
   // Day 4 — referral token plaintext, populated by the open-check fetch
   // post-permission-grant. Used by discardByUser to call /api/recording/discard.
@@ -268,6 +274,12 @@ export function useRecordingController(
     detachMicWatcherRef.current = null;
     try { detachTrackUpdatesRef.current?.(); } catch { /* */ }
     detachTrackUpdatesRef.current = null;
+    try { askVideoEndedDetachRef.current?.(); } catch { /* */ }
+    askVideoEndedDetachRef.current = null;
+    if (askTrackDeadTimerRef.current !== null) {
+      window.clearTimeout(askTrackDeadTimerRef.current);
+      askTrackDeadTimerRef.current = null;
+    }
     // Restore avatar audible playback BEFORE closing the mixer (audit M3 Day 3
     // — we silenced it on ARM to prevent double-route echo). Idempotent on
     // bridge side, safe to call after close.
@@ -499,6 +511,19 @@ export function useRecordingController(
       });
 
       const initialTracks = askDepsNow.bridge.getCurrentTracks();
+      // askEnabled-fix audit C2 — refuse to ARM without a live avatar video
+      // track. Arming during a reconnect/rollover window with dead tracks
+      // used to slip past the first-frame wait below (it's gated on
+      // `initialAvatarVideo &&` — null skips it entirely) and produce a
+      // permanently-black recording with no stop signal. ASK_OPEN_TIMEOUT
+      // from 'priming' now returns the reducer to idle so the user can
+      // simply re-tap once the avatar is back.
+      if (!(initialTracks.video && initialTracks.video.readyState === 'live')) {
+        captureSafe('react_capture_error', { mode, code: 'ask_no_live_video', platform });
+        dispatch({ type: 'ASK_OPEN_TIMEOUT', nowMs: performance.now() });
+        teardown();
+        return;
+      }
       // Avatar audio → mixer. Track liveness guard per avatar-bridge.ts §175-182.
       if (initialTracks.audio && initialTracks.audio.readyState === 'live') {
         mixer.connectAvatar(initialTracks.audio);
@@ -563,6 +588,53 @@ export function useRecordingController(
       hiddenAvatarVideoElRef.current = hiddenEl;
       compositorSourceEl = hiddenEl;
 
+      // askEnabled-fix audit C1 — REAL avatar-track-death stop. The session
+      // surface's `enabled` gate no longer kills the recording on transient
+      // phases (that was the founder's every-turn-stop bug), so a recording
+      // whose avatar feed actually DIES (track ends, no live replacement)
+      // needs its own stop signal — the TRACK_ENDED event existed in the
+      // state machine since Day 1 but nothing ever dispatched it. Grace
+      // period: LiveKit renegotiation legitimately ends the old track
+      // moments before the replacement arrives via subscribeTrackUpdates —
+      // firing on raw 'ended' would phantom-kill every renegotiation. A
+      // 5s dead-window (no live video bound) is unambiguous death; the
+      // worst case is 5s of black tail in the blob.
+      const ASK_TRACK_DEAD_GRACE_MS = 5000;
+      const armTrackDeadTimer = (): void => {
+        if (askTrackDeadTimerRef.current !== null) return;
+        askTrackDeadTimerRef.current = window.setTimeout(() => {
+          askTrackDeadTimerRef.current = null;
+          if (seq !== armRequestSeqRef.current) return;
+          dispatch({ type: 'TRACK_ENDED', nowMs: performance.now() });
+        }, ASK_TRACK_DEAD_GRACE_MS);
+      };
+      const cancelTrackDeadTimer = (): void => {
+        if (askTrackDeadTimerRef.current !== null) {
+          window.clearTimeout(askTrackDeadTimerRef.current);
+          askTrackDeadTimerRef.current = null;
+        }
+      };
+      const bindVideoEnded = (track: MediaStreamTrack): void => {
+        askVideoEndedDetachRef.current?.();
+        const onEnded = (): void => { armTrackDeadTimer(); };
+        track.addEventListener('ended', onEnded);
+        askVideoEndedDetachRef.current = () => {
+          try { track.removeEventListener('ended', onEnded); } catch { /* */ }
+          askVideoEndedDetachRef.current = null;
+        };
+      };
+      // Bind the track actually feeding the hidden stream (step-7 refetch).
+      // The C2 gate guaranteed a live video existed microseconds ago; if the
+      // refetch raced a replacement and came back dead/null, there is no
+      // live handle to bind — start the dead-window instead, and the
+      // subscribeTrackUpdates handler below binds the replacement (and
+      // cancels the window) when it lands.
+      if (initialAvatarVideo && initialAvatarVideo.readyState === 'live') {
+        bindVideoEnded(initialAvatarVideo);
+      } else {
+        armTrackDeadTimer();
+      }
+
       // Wait for first-frame readiness. ASK_OPEN_TIMEOUT after 1s if metadata
       // never arrives (audit C2 Day 3 — bound the wait, surface clean stop).
       if (initialAvatarVideo && hiddenEl.readyState < 2 /* HAVE_CURRENT_DATA */) {
@@ -617,6 +689,15 @@ export function useRecordingController(
             if (tracks.video && tracks.video.readyState === 'live') {
               try { stream.addTrack(tracks.video); } catch { /* */ }
             }
+          }
+          // askEnabled-fix audit C1 — track-death bookkeeping: a live
+          // replacement cancels the dead-window and re-binds the 'ended'
+          // listener; an update with NO live video starts it.
+          if (tracks.video && tracks.video.readyState === 'live') {
+            cancelTrackDeadTimer();
+            bindVideoEnded(tracks.video);
+          } else {
+            armTrackDeadTimer();
           }
           // Audio: rebind mixer's avatar branch. bindTrack's M4 reset-on-id-change
           // cancels any in-flight duck-ramp on retrack.

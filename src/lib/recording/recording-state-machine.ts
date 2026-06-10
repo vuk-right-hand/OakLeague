@@ -162,6 +162,14 @@ export function recordingReducer(phase: RecordingPhase, ev: RecordingEvent): Rec
       if (ev.type === 'RECORDER_ERROR') {
         return { kind: 'error', code: 'recorder_init', message: ev.message };
       }
+      // Ask-mode pre-arm failure: the avatar video never became drawable
+      // (first-frame wait timed out, or the askEnabled-fix audit C2 gate
+      // found no live video track at ARM). Pre-fix this event was silently
+      // IGNORED in 'priming' — the controller dispatched it (Day-3 code,
+      // line ~590) but the reducer had no arm, stranding the button at "…"
+      // forever. Back to idle: the user simply re-taps once the avatar is
+      // back.
+      if (ev.type === 'ASK_OPEN_TIMEOUT') return { kind: 'idle' };
       // Plan §20.10: tapping React again during PRIMING is silently dropped
       // (the ReactButton's isTappable() also drops it client-side). The
       // priming window is bounded by getUserMedia — no timeout here; if

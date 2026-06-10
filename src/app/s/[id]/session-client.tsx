@@ -280,15 +280,20 @@ function LiveSession(props: LiveProps) {
   // ENABLED. The controller borrows AudioContext + mic + bridge from the pipe
   // (audit C3/C4/M5 Day 3) — Ask scene owns those lifecycles.
   const reactCaptureOn = isReactCaptureEnabled();
-  // Avatar must be ready before ARM — getCurrentTracks() returns nulls
-  // otherwise. Phase 'ready'/'listening'/'speaking' all imply avatar_ready=true
-  // per session-reducer; 'opening' does not.
   const avatarReady = pipe.state.avatarReady;
   // Build askDeps using the pipe accessors. Stable identity across renders
-  // because each function is useCallback-wrapped inside use-session-pipe.
+  // because each function is useCallback-wrapped inside use-session-pipe
+  // (verified [] deps — stable across rollover too, askEnabled-fix audit M3).
+  // avatarReady is a RECOMPUTE TRIGGER only, not a gate (askEnabled-fix
+  // audit C3): the accessors are identity-stable so without a changing dep
+  // this memo would compute once at mount (getters still null) and stay
+  // undefined forever. It must NOT gate the result — rollover resets
+  // avatarReady to false while the bridge/mic/ctx survive (the pipe REUSES
+  // the bridge across rollover), and gating would kill an armed recording
+  // at every 15-min rollover boundary.
   const askDeps = useMemo<AskDeps | undefined>(() => {
+    void avatarReady; // trigger — see comment above
     if (!reactCaptureOn) return undefined;
-    if (!avatarReady) return undefined;
     const ctx = pipe.getAudioContext();
     const mic = pipe.getMicStream();
     const bridge = pipe.getBridge();
@@ -304,7 +309,33 @@ function LiveSession(props: LiveProps) {
     pipe.getAudioContext, pipe.getMicStream, pipe.getBridge,
     pipe.subscribeBridgeTrackUpdates,
   ]);
-  const askEnabled = !!askDeps && (phase === 'ready' || phase === 'listening' || phase === 'speaking');
+  // Recording survives EVERY in-session phase (founder bug 2026-06-10: the
+  // original ready/listening/speaking list omitted 'thinking' — which is
+  // exactly where the mic-tap RELEASE lands — so ending a talk turn flipped
+  // enabled=false and the controller's permitted-surface effect killed the
+  // recording on every single turn). Contract: the only USER-FACING way to
+  // end a recording is the red dot. The honest survival map:
+  //   thinking/speaking/listening/ready — recording continues (this fix).
+  //   reconnecting — continues; the overlay can be a false positive that
+  //     recovers (2026-06-10 session fix). Real avatar death is caught by
+  //     the controller's track-dead watcher (5s grace → TRACK_ENDED,
+  //     askEnabled-fix audit C1 — wired for real now, it was a phantom
+  //     reference before).
+  //   opening (rollover) — continues; the pipe reuses the bridge so the
+  //     tracks survive the 15-min rollover (askEnabled-fix audit C3). A
+  //     fresh ARM during 'opening' is refused cleanly when no live video
+  //     exists yet (controller C2 gate → back to idle).
+  //   paused (tab hidden) — askEnabled stays true but the recording STOPS
+  //     anyway via the controller's own visibilitychange listener
+  //     (BACKGROUND): a hidden tab cannot composite frames. Keeping the
+  //     phase here is inert by design, not a survival guarantee.
+  //   closing/closed — handleEndSession signals the recording BEFORE pipe
+  //     teardown; the phase==='closed' backstop effect below double-covers.
+  const askEnabled = !!askDeps && (
+    phase === 'opening' || phase === 'ready' || phase === 'listening' ||
+    phase === 'thinking' || phase === 'speaking' || phase === 'paused' ||
+    phase === 'reconnecting'
+  );
   const onAskStop = useCallback((preview: RecordingPreviewBlob) => {
     captureSafe('react_ask_recording_stop', {
       session_id: props.envelope.session_id,
@@ -345,8 +376,14 @@ function LiveSession(props: LiveProps) {
     const t = window.setTimeout(() => setRecordPillReady(true), 1200);
     return () => window.clearTimeout(t);
   }, [reactCaptureOn, askEnabled]);
+  // Pill gates on the CALM conversational phases only (askEnabled-fix audit
+  // M4): askEnabled now spans opening/paused/reconnecting for recording-
+  // survival reasons, but nudging "capture this!" on top of a reconnect
+  // overlay or a rollover spinner is jarring.
+  const pillPhaseOk =
+    phase === 'ready' || phase === 'listening' || phase === 'thinking' || phase === 'speaking';
   const showRecordPill =
-    reactCaptureOn && askEnabled && recordPillReady && !recordPillDismissed &&
+    reactCaptureOn && askEnabled && pillPhaseOk && recordPillReady && !recordPillDismissed &&
     recording.buttonProps.state === 'idle';
   // Audit C1 Day 3 — endSession() is synchronous: it dispatches user_close,
   // closes the bridge, the audio context, the mixer, the gemini WS — all
@@ -531,10 +568,17 @@ function LiveSession(props: LiveProps) {
           </div>
         )}
 
-        {/* React button — Day 3 Ask-mode capture. Mounts only with the
-            kill-switch flag on AND avatar ready (so getCurrentTracks has
-            something to return). Bottom-right matches hook-panel placement. */}
-        {reactCaptureOn && askEnabled && (
+        {/* React button — Day 3 Ask-mode capture. Bottom-right matches
+            hook-panel placement. askEnabled-fix audit M1: once a recording
+            is armed/stopping, the button MUST stay mounted regardless of
+            askEnabled — it is the only red-dot stop affordance, and a phase
+            flicker that unmounts it would leave the user with a recording
+            they cannot stop. */}
+        {reactCaptureOn && (
+          askEnabled ||
+          recording.buttonProps.state === 'armed' ||
+          recording.buttonProps.state === 'stopping'
+        ) && (
           <div style={{ position: 'absolute', right: 16, bottom: 16, zIndex: 2 }}>
             <ReactButton {...recording.buttonProps} />
           </div>

@@ -133,6 +133,13 @@ describe('reducer — PRIMING', () => {
     expect(recordingReducer(priming(), { type: 'RESET', nowMs: 1 })).toEqual(idle);
   });
 
+  it('ASK_OPEN_TIMEOUT returns to IDLE (pre-fix: silently ignored → button stranded at "…" forever)', () => {
+    // The controller dispatches this from priming when the avatar video
+    // never becomes drawable (first-frame timeout, or the C2 no-live-video
+    // ARM gate). User re-taps once the avatar is back.
+    expect(recordingReducer(priming(100), { type: 'ASK_OPEN_TIMEOUT', nowMs: 1 })).toEqual(idle);
+  });
+
   it('ignores TAP while priming (double-tap protection lives at the button too)', () => {
     const p = priming(100);
     expect(recordingReducer(p, { type: 'TAP', nowMs: 200 })).toBe(p);
