@@ -869,6 +869,8 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
             session_id: sessionIdRef.current,
             tier: args.envelope.tier,
           });
+          // eslint-disable-next-line no-console
+          console.warn(`[reconnect-overlay] trigger=ws_closed code=${code} reason=${safeReason ?? ''} clean=${wasClean}`);
           dispatchRef({ kind: 'ws_closed', wasClean });
           if (code === 4002) {
             // session_already_active = R4-C1 eviction by another tab. Fatal.
@@ -960,6 +962,8 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       if (performance.now() - startedAt > TURN_DEAD_MS) {
         turnAwaitingAudioRef.current = null;
         captureSafe('turn_dead_watchdog', { session_id: sessionIdRef.current });
+        // eslint-disable-next-line no-console
+        console.warn('[reconnect-overlay] trigger=turn_dead_watchdog (no audio + no turn_complete for 35s after mic stop)');
         dispatchRef({ kind: 'pc_degraded' });
       }
     }, TURN_DEAD_POLL_MS);
@@ -1033,6 +1037,8 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
           ctx.resume().catch(() => {});
           window.setTimeout(() => {
             if (audioCtxRef.current && audioCtxRef.current.state !== 'running') {
+              // eslint-disable-next-line no-console
+              console.warn('[reconnect-overlay] trigger=audio_context_failed (AudioContext stuck suspended after resume)');
               dispatchRef({ kind: 'audio_context_failed' });
             }
           }, AUDIO_CONTEXT_RESUME_VERIFY_MS);
@@ -1432,10 +1438,28 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
     // autoplay policy. Bridge does srcObject=null; srcObject=stream;
     // await play() inside its rebindMediaSource method.
     try { await bridgeRef.current?.rebindMediaSource(); } catch {}
-    // If WS is dead, user must tap to start a new session — we don't silently
-    // re-open here (avoids phantom double-sessions on flaky networks).
-    // Closing the page and re-opening from the hook invokes the reducer's
-    // close path cleanly.
+    // 2026-06-10 — clear the overlay when the pipes are verifiably warm.
+    // Before this, retryAfterGesture resumed media but NOTHING ever
+    // dispatched out of 'reconnecting' (roach-motel phase) — the overlay
+    // stayed forever even when the retry fully succeeded; observed on prod
+    // as "reconnect button does nothing while the avatar keeps talking."
+    // Two gates (fix-audit M1): the proxy WS must be OPEN AND the
+    // AudioContext must be RUNNING. The overlay can be entered via
+    // audio_context_failed where the WS is healthy but the ctx is wedged
+    // suspended (iOS WebKit) — if the resume() above didn't take, clearing
+    // the overlay would strand the user with silent audio and no recovery
+    // affordance. When either gate fails, the overlay stays so the user
+    // can tap again (a fresh gesture is exactly what a wedged ctx needs).
+    const wsOpen = !!proxyRef.current?.isOpen();
+    const ctxRunning = !audioCtxRef.current || audioCtxRef.current.state === 'running';
+    if (wsOpen && ctxRunning) {
+      // eslint-disable-next-line no-console
+      console.warn('[reconnect-overlay] retry: pipes warm (WS open, ctx running) — clearing overlay');
+      dispatchRef({ kind: 'reconnect_recovered' });
+    } else {
+      // eslint-disable-next-line no-console
+      console.warn(`[reconnect-overlay] retry: overlay stays (wsOpen=${wsOpen} ctxRunning=${ctxRunning})`);
+    }
   }, []);
 
   // Unmount cleanup.

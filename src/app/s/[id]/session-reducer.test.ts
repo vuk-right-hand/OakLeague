@@ -196,6 +196,46 @@ describe('session-reducer — reconnection', () => {
     const s = reduce(ready(), { kind: 'audio_context_failed' });
     expect(s.phase).toBe('reconnecting');
   });
+
+  // 2026-06-10 — exit path. Before reconnect_recovered, 'reconnecting' was a
+  // roach motel (4 ways in, none out): the retry button resumed media but the
+  // overlay stayed forever even when the pipes were verifiably warm.
+  it('reconnect_recovered: reconnecting → ready (overlay clears after successful gesture-retry)', () => {
+    let s = reduce(ready(), { kind: 'pc_degraded' });
+    expect(s.phase).toBe('reconnecting');
+    s = reduce(s, { kind: 'reconnect_recovered' });
+    expect(s.phase).toBe('ready');
+    expect(shouldShowReconnectOverlay(s)).toBe(false);
+    // readiness flags were never reset by the reconnecting entry — still set.
+    expect(s.brainReady).toBe(true);
+    expect(s.avatarReady).toBe(true);
+  });
+
+  it('reconnect_recovered preserves reconnectPromptCount (telemetry of how many overlays user saw)', () => {
+    let s = reduce(ready(), { kind: 'pc_degraded' });
+    s = reduce(s, { kind: 'reconnect_recovered' });
+    expect(s.reconnectPromptCount).toBe(1);
+  });
+
+  it('reconnect_recovered is a no-op outside reconnecting (stale async retry must not resurrect)', () => {
+    // From ready: no-op.
+    const r = ready();
+    expect(reduce(r, { kind: 'reconnect_recovered' })).toBe(r);
+    // From closed: no-op — a retry that resolves after a real close must
+    // not flip a closed session back to ready.
+    let s = reduce(ready(), { kind: 'user_close' });
+    s = reduce(s, { kind: 'closed_ack' });
+    const after = reduce(s, { kind: 'reconnect_recovered' });
+    expect(after.phase).toBe(s.phase);
+  });
+
+  it('reconnect_recovered can cycle: degrade → recover → degrade increments count each entry', () => {
+    let s = reduce(ready(), { kind: 'pc_degraded' });
+    s = reduce(s, { kind: 'reconnect_recovered' });
+    s = reduce(s, { kind: 'video_autoplay_lost' });
+    expect(s.phase).toBe('reconnecting');
+    expect(s.reconnectPromptCount).toBe(2);
+  });
 });
 
 describe('session-reducer — rollover (15-min cap)', () => {

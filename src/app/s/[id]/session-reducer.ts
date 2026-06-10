@@ -91,6 +91,14 @@ export type Action =
   | { kind: 'pc_degraded' }                  // iceConnectionState disconnected|failed
   | { kind: 'ws_closed'; wasClean: boolean }
   | { kind: 'audio_context_failed' }         // 300ms check after resume (R3-M4)
+  // 2026-06-10 — exit path for 'reconnecting'. Prior to this, 'reconnecting'
+  // was a roach motel: four actions route INTO it (pc_degraded, ws_closed,
+  // audio_context_failed, video_autoplay_lost) and NOTHING routed out — the
+  // retry button resumed media but the overlay stayed forever (observed on
+  // prod: avatar kept talking behind a permanent full-screen overlay).
+  // Dispatched by retryAfterGesture AFTER a successful gesture-retry when
+  // the proxy WS is verifiably still open (pipes warm = false positive).
+  | { kind: 'reconnect_recovered' }
   | { kind: 'rollover_requested' }           // hit maxSessionSeconds
   | { kind: 'rollover_complete'; newSessionId: string; tier: 'free' | 'premium' | 'boardroom'; avatarStatus: SessionState['avatarStatus']; maxSessionSeconds: number }
   | { kind: 'rollover_failed'; message: string }
@@ -333,6 +341,16 @@ export function reduce(state: SessionState, action: Action): SessionState {
         phase: 'reconnecting',
         reconnectPromptCount: state.reconnectPromptCount + 1,
       };
+
+    case 'reconnect_recovered':
+      // 2026-06-10 — gesture-retry verified the pipes are warm (proxy WS
+      // open, media rebound + playing). Return to 'ready'; brainReady /
+      // avatarReady were never reset by the reconnecting entry paths, so
+      // 'ready' is immediately correct. ONLY valid from 'reconnecting' —
+      // a stale async retry that resolves after a real close must not
+      // resurrect a closed session.
+      if (state.phase !== 'reconnecting') return state;
+      return { ...state, phase: 'ready' };
   }
 }
 

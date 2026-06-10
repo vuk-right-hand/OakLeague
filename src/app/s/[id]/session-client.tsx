@@ -203,10 +203,49 @@ function LiveSession(props: LiveProps) {
             session_id: props.envelope.session_id,
             elapsed_ms: Date.now() - pausedSinceMs,
           });
-          // R4-M5 — flip reducer to 'reconnecting' so the existing
-          // tap-to-resume overlay surfaces. The retry button calls
-          // pipe.retryAfterGesture → bridge.rebindMediaSource (R3-M2).
-          pipe.notifyVideoAutoplayLost();
+          // 2026-06-10 — try a silent play() FIRST. Mid-session pauses are
+          // usually a LiveKit-internal srcObject swap (track resubscribe /
+          // signal reconnect), and on desktop the user has long since
+          // interacted so play() succeeds without a fresh gesture. Observed
+          // on prod: this watcher fired the full-screen reconnect overlay
+          // while the avatar kept talking (audio element unaffected) —
+          // exactly the false-positive this guard removes. Only when play()
+          // REJECTS (genuine autoplay-policy block, e.g. iOS PWA after
+          // background) do we surface the tap-to-resume overlay, which is
+          // the R4-M5 scenario the watcher was built for.
+          v.play().then(
+            () => {
+              // Fix-audit M2 — play() resolving is NOT proof of liveness:
+              // a frozen last frame on a genuinely-dead room also resolves.
+              // Verify currentTime actually ADVANCES before declaring
+              // recovery; a non-advancing clock after play() = dead room →
+              // surface the overlay (the pre-fix behavior for this case).
+              const t0 = v.currentTime;
+              window.setTimeout(() => {
+                const vNow = pipe.videoRef.current;
+                if (!vNow || !vNow.srcObject) return; // closed/unmounted
+                if (vNow.currentTime > t0) {
+                  // eslint-disable-next-line no-console
+                  console.warn('[reconnect-overlay] video paused-with-track ≥2s; silent play() recovered (frames advancing) — no overlay');
+                  captureSafe('simli_video_silent_play_recovered', {
+                    session_id: props.envelope.session_id,
+                  });
+                } else {
+                  // eslint-disable-next-line no-console
+                  console.warn('[reconnect-overlay] trigger=video_autoplay_lost (play() resolved but frames frozen — dead room?)');
+                  pipe.notifyVideoAutoplayLost();
+                }
+              }, 1200);
+            },
+            (err: unknown) => {
+              // eslint-disable-next-line no-console
+              console.warn('[reconnect-overlay] trigger=video_autoplay_lost (silent play() rejected)', err);
+              // R4-M5 — flip reducer to 'reconnecting' so the existing
+              // tap-to-resume overlay surfaces. The retry button calls
+              // pipe.retryAfterGesture → bridge.rebindMediaSource (R3-M2).
+              pipe.notifyVideoAutoplayLost();
+            },
+          );
         }
       } else {
         pausedSinceMs = 0;

@@ -48,6 +48,12 @@ export const AvatarHealthEvents = {
   simli_clock_drift_ms:          'simli_clock_drift_ms',
   simli_lipsync_latency_ms:      'simli_lipsync_latency_ms',
   simli_video_paused_with_track: 'simli_video_paused_with_track',
+  // 2026-06-10 — paused-with-track recovered by the watcher's silent play()
+  // retry (no overlay shown). Counterpart counter to
+  // simli_video_paused_with_track: the recovered/paused ratio tells us how
+  // often a mid-session pause is a benign srcObject swap vs a genuine
+  // autoplay-policy block that needs the tap-to-resume overlay.
+  simli_video_silent_play_recovered: 'simli_video_silent_play_recovered',
 } as const;
 
 // User-experience signals -----------------------------------------------------
