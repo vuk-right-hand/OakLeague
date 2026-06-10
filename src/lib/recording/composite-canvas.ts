@@ -17,11 +17,18 @@
 // Pure-function layout helpers (computeCoverLayout, crossfadeAlpha) are
 // exported separately for unit testing. The RAF loop integrates them.
 
+import { END_CARD_MS } from './recording-state-machine';
+
 export const COMPOSITE_WIDTH = 540;
 export const COMPOSITE_HEIGHT = 960;
 export const HALF_HEIGHT = COMPOSITE_HEIGHT / 2;
 export const CROSSFADE_MS = 300;
-export const END_CARD_MS = 1500;
+// Canonical END_CARD_MS lives in recording-state-machine.ts (uncapped rework
+// 2026-06-10): the reducer's 'stopping' outro window and this compositor's
+// end-card draw window MUST stay in lockstep — a desync would cut the share
+// CTA mid-fade or stop the recorder before the card finishes. Re-exported
+// so existing importers keep working.
+export { END_CARD_MS };
 // 25% per Plan §25 NM5 (raised from initial 12% in §7 / §20.12 — watermark
 // + end-card are the v1 attribution-funnel teeth after C2PA was cut from v1).
 export const WATERMARK_OPACITY = 0.25;

@@ -60,12 +60,18 @@ export function RecordingPreview({ preview, onDismiss, onDiscard }: Props) {
 
   if (!preview || !blobUrl) return null;
 
+  // Filename id: prefer the referral token plaintext (plan audit M7 — the
+  // duration-only id collided across equal-length recordings and carried
+  // zero attribution on the desktop save→manual-upload path; the token is
+  // public-by-design, it IS the /r/<token> URL burned into the end-card).
+  const fileShortId = preview.shareShortId ?? `${Math.round(preview.durationMs / 1000)}s`;
+
   function onSaveClick(): void {
     if (!preview) return;
     const r = saveOnly({
       blob: preview.blob,
       mimeType: preview.mimeType,
-      shortId: `${Math.round(preview.durationMs / 1000)}s`,
+      shortId: fileShortId,
     });
     setSaveState(r.kind === 'downloaded' ? 'saved' : 'failed');
     captureSafe('react_save_clicked', {
@@ -90,9 +96,7 @@ export function RecordingPreview({ preview, onDismiss, onDiscard }: Props) {
     const result = await shareOrSave({
       blob: preview.blob,
       mimeType: preview.mimeType,
-      // Use first 8 chars of mimeType + duration as the filename short id
-      // until Day 5 wires the real share token plaintext into the preview.
-      shortId: `${Math.round(preview.durationMs / 1000)}s`,
+      shortId: fileShortId,
     });
     setShareState(result.kind);
     captureSafe('react_share_completed', {
@@ -125,9 +129,27 @@ export function RecordingPreview({ preview, onDismiss, onDiscard }: Props) {
         padding: 16,
       }}
     >
+      {/* Viewport-fit fix (uncapped rework, founder bug report: 9:16 video at
+          480px width ≈ 853px tall + button row pushed the buttons below the
+          fold on every laptop). The card is a flex column capped at viewport
+          height; the video letterboxes into whatever remains above the
+          always-visible button row. svh (NOT vh) is the no-dvh fallback —
+          plain 100vh on iOS is the LARGER toolbar-hidden height and would
+          re-introduce the exact cutoff this fixes (plan audit M4). React 19
+          dedupes the <style> via href+precedence across mounts. */}
+      <style href="oakl-recording-preview" precedence="default">{`
+.oakl-preview-card { max-height: calc(100vh - 32px); }
+@supports (height: 100svh) {
+  .oakl-preview-card { max-height: calc(100svh - 32px); }
+}
+@supports (height: 100dvh) {
+  .oakl-preview-card { max-height: calc(100dvh - 32px); }
+}
+`}</style>
       {/* Inner container stops backdrop click from dismissing */}
       <div
         onClick={(e) => e.stopPropagation()}
+        className="oakl-preview-card"
         style={{
           maxWidth: 480,
           width: '100%',
@@ -136,6 +158,12 @@ export function RecordingPreview({ preview, onDismiss, onDiscard }: Props) {
           overflow: 'hidden',
           boxShadow: '0 20px 60px rgba(0,0,0,0.6)',
           position: 'relative',
+          display: 'flex',
+          flexDirection: 'column',
+          // Plan audit M5 — on truly short viewports (landscape PC) the
+          // flex math could starve the video to a sliver; the card scrolls
+          // instead, keeping the 240px video floor meaningful.
+          overflowY: 'auto',
         }}
       >
         <button
@@ -162,14 +190,31 @@ export function RecordingPreview({ preview, onDismiss, onDiscard }: Props) {
           playsInline
           style={{
             width: '100%',
+            // 9:16 is the PREFERRED size; flex shrink (not grow) lets the
+            // viewport-height cap squeeze it, objectFit letterboxes the
+            // frames, and the 240px floor stops short landscape windows
+            // from pinholing the video (plan audit M5).
             aspectRatio: '9 / 16',
+            flex: '0 1 auto',
+            minHeight: 240,
             objectFit: 'contain',
             background: '#000',
             display: 'block',
           }}
         />
 
-        <div style={{ padding: 16, display: 'flex', gap: 8, color: '#fff' }}>
+        <div
+          style={{
+            padding: 16,
+            // iOS home-indicator clearance when the card bottoms out against
+            // the viewport edge.
+            paddingBottom: 'calc(16px + env(safe-area-inset-bottom))',
+            display: 'flex',
+            gap: 8,
+            color: '#fff',
+            flexShrink: 0,
+          }}
+        >
           <button
             type="button"
             onClick={onDiscard}

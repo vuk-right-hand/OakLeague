@@ -45,10 +45,11 @@ import {
 } from './permission';
 import { probeRecording, type RecordingMime } from './recording-mime';
 import {
-  MAX_RECORDING_MS,
+  maxRecordingMsForPlatform,
   type RecordingPhase,
   type StopReason,
   recordingReducer,
+  selectArmedSecondsElapsed,
   selectArmedSecondsRemaining,
   selectButtonState,
 } from './recording-state-machine';
@@ -95,6 +96,14 @@ export type RecordingPreview = {
   mimeType: string;
   durationMs: number;
   stopReason: StopReason;
+  /** Referral token plaintext from the open-check mint (null when the mint
+   *  failed / was skipped). Threaded into the share/save FILENAME (plan
+   *  audit M7, uncapped rework) so the desktop save→manual-upload path
+   *  keeps an attribution breadcrumb beyond the burned-in end-card — and so
+   *  two recordings of equal length stop colliding as `oakleague-42s.mp4`.
+   *  The token is already public-by-design (it IS the /r/<token> URL drawn
+   *  into the video). */
+  shareShortId: string | null;
 };
 
 export type UseRecordingControllerOptions = {
@@ -699,10 +708,21 @@ export function useRecordingController(
         cur.kind === 'stopped' ? cur.stopReason :
         cur.kind === 'preview' ? cur.stopReason : 'recorder_error';
       const durationMs = Math.max(0, stoppedAt - armedAt);
-      previewRef.current = { blob, mimeType: mime.mimeType, durationMs, stopReason };
+      previewRef.current = {
+        blob,
+        mimeType: mime.mimeType,
+        durationMs,
+        stopReason,
+        shareShortId: activeTokenPlaintextRef.current,
+      };
       captureSafe('react_stopped', {
         mode,
+        // duration_ms is wall-clock armed→stopped and now INCLUDES the 1.5s
+        // user-stop outro (it matches the blob's real length). outro_ms makes
+        // the discontinuity explicit so pre/post-rework dashboards can
+        // subtract it instead of seeing a phantom +1.5s shift (plan audit M1).
         duration_ms: durationMs,
+        outro_ms: stopReason === 'user' ? END_CARD_MS : 0,
         stop_reason: stopReason,
         blob_size: blob.size,
         mime_type: mime.mimeType,
@@ -734,25 +754,32 @@ export function useRecordingController(
       return;
     }
     const armedAtMs = performance.now();
+    // Platform-branched SAFETY ceiling (uncapped rework — see the constant's
+    // doc block: this is a client-RAM bound, not a cost bound).
+    const capMs = maxRecordingMsForPlatform(platform);
     captureSafe('react_armed', {
       mode,
       ms_to_arm: Math.round(armedAtMs - tapAtMs),
+      cap_ms: capMs,
       mime_type: mime.mimeType,
       container: mime.container,
       platform,
     });
-    dispatch({ type: 'PERMISSION_GRANTED', nowMs: armedAtMs });
-    // Schedule the end-card rising edge precisely (audit M2): setTimeout
-    // fires within 1-2ms vs the 100ms TIMER_TICK granularity, hitting the
-    // Plan §25.4 "1.5s ± 100ms" gate cleanly. Compositor.enableEndCard is
-    // idempotent so a late ARMED→STOP race is safe.
-    window.setTimeout(() => {
-      if (seq !== armRequestSeqRef.current) return;
-      compositorRef.current?.enableEndCard();
-    }, MAX_RECORDING_MS - END_CARD_MS);
+    dispatch({ type: 'PERMISSION_GRANTED', nowMs: armedAtMs, capMs });
+    // Uncapped rework: no fixed end-card setTimeout anymore. The end-card
+    // now rises from TWO paths: (a) the user-tap 'stopping' outro effect
+    // below, (b) the safety-cap endCardArmed TIMER_TICK backstop in the
+    // reducer (final 1.5s before capDeadlineMs). enableEndCard is idempotent.
   }, [dispatch, enabled, mode, creatorHandle, referralUrl, creatorId, clipId, watermarkBitmap, teardown]);
 
-  // ── ARMED side effects: cap timer + visibility + end-card ────────────
+  // ── ARMED side effects: safety-cap timer (armed ONLY) ────────────────
+  // Plan audit M6 (uncapped rework): the tick interval and the background
+  // listeners have different lifetimes — the interval drives the count-up
+  // label + safety-cap check and must NOT run during the 'stopping' outro
+  // (the reducer ignores TIMER_TICK there; ticking would only waste
+  // renders), while the visibility/pagehide listeners MUST keep covering
+  // 'stopping' so backgrounding mid-outro still stops immediately. Split
+  // into two effects.
   useEffect(() => {
     if (phase.kind !== 'armed') return;
 
@@ -760,6 +787,15 @@ export function useRecordingController(
       dispatch({ type: 'TIMER_TICK', nowMs: performance.now() });
       setTick((n) => n + 1);
     }, TIMER_TICK_MS);
+
+    return () => {
+      window.clearInterval(timerId);
+    };
+  }, [phase.kind, dispatch]);
+
+  // ── ARMED + STOPPING: visibility/pagehide → immediate stop ───────────
+  useEffect(() => {
+    if (phase.kind !== 'armed' && phase.kind !== 'stopping') return;
 
     const onVisibility = (): void => {
       if (document.visibilityState === 'hidden') {
@@ -773,9 +809,30 @@ export function useRecordingController(
     window.addEventListener('pagehide', onPageHide);
 
     return () => {
-      window.clearInterval(timerId);
       document.removeEventListener('visibilitychange', onVisibility);
       window.removeEventListener('pagehide', onPageHide);
+    };
+  }, [phase.kind, dispatch]);
+
+  // ── STOPPING: outro — draw the end-card into the tail, then finalize ──
+  // Uncapped rework: a user-tap stop enters 'stopping' for END_CARD_MS so
+  // the referral end-card (the share CTA) is burned into the recording's
+  // final 1.5s — pre-rework it only rendered on cap-stop, so user-stopped
+  // recordings shipped without it. The compositor RAF loop is still alive
+  // here (compositor.stop() only runs in teardown, after preview), and in
+  // Ask mode the avatar bridge keeps streaming (stopping the RECORDING does
+  // not touch the SESSION — interrupts like ASK_SESSION_ENDED abort the
+  // outro via the reducer if the session dies mid-outro). The timeout is
+  // cleared on phase exit, and the reducer ignores OUTRO_DONE outside
+  // 'stopping', so a stale timer can't corrupt a later phase.
+  useEffect(() => {
+    if (phase.kind !== 'stopping') return;
+    compositorRef.current?.enableEndCard();
+    const outroId = window.setTimeout(() => {
+      dispatch({ type: 'OUTRO_DONE', nowMs: performance.now() });
+    }, END_CARD_MS);
+    return () => {
+      window.clearTimeout(outroId);
     };
   }, [phase.kind, dispatch]);
 
@@ -791,10 +848,11 @@ export function useRecordingController(
   }, [phase]);
 
   // Mid-recording 'enabled' toggle (audit M6): if parent flips the flag
-  // false during ARMED, stop recording immediately. We treat this as a
-  // BACKGROUND-class stop since the surface is no longer permitted.
+  // false during ARMED (or the 'stopping' outro), stop recording immediately.
+  // We treat this as a BACKGROUND-class stop since the surface is no longer
+  // permitted.
   useEffect(() => {
-    if (!enabled && phase.kind === 'armed') {
+    if (!enabled && (phase.kind === 'armed' || phase.kind === 'stopping')) {
       dispatch({ type: 'BACKGROUND', nowMs: performance.now() });
     }
   }, [enabled, phase, dispatch]);
@@ -891,11 +949,14 @@ export function useRecordingController(
   }, [dispatch, teardown]);
 
   const buttonState = selectButtonState(phase);
+  const nowMs = performance.now();
+  const armedSecondsElapsed =
+    phase.kind === 'armed' ? selectArmedSecondsElapsed(phase, nowMs) : undefined;
   const armedSecondsRemaining =
-    phase.kind === 'armed' ? selectArmedSecondsRemaining(phase, performance.now()) : undefined;
+    phase.kind === 'armed' ? selectArmedSecondsRemaining(phase, nowMs) : undefined;
 
   // Build discriminated-union ReactButtonProps. The button enforces the
-  // discriminant at compile time (armed needs armedSecondsRemaining; disabled
+  // discriminant at compile time (armed needs elapsed + remaining; disabled
   // accepts disabledReason).
   const buttonProps: ReactButtonProps = (() => {
     const common = { onTap: () => { void onTap(); }, creatorHandle };
@@ -903,7 +964,13 @@ export function useRecordingController(
       return {
         ...common,
         state: 'armed' as const,
-        armedSecondsRemaining: armedSecondsRemaining ?? MAX_RECORDING_MS / 1000,
+        // Count-UP display (uncapped rework). Fallback 0 — a count-up that
+        // starts at 0:00 is the truthful "just armed" render; the old
+        // full-cap fallback was wrong magnitude AND direction (plan audit M2).
+        armedSecondsElapsed: armedSecondsElapsed ?? 0,
+        // Safety-ceiling heads-up: the button surfaces this only in the
+        // final 30s (plan audit M3). Infinity when unknowable → never warns.
+        armedSecondsRemaining: armedSecondsRemaining ?? Number.POSITIVE_INFINITY,
       };
     }
     if (buttonState.state === 'disabled') {

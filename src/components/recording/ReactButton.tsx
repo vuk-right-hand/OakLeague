@@ -4,9 +4,10 @@
 // from the recording-controller hook the parent owns; the button just
 // renders the right look + dispatches taps.
 //
-// State machine logic, label resolution, and 60s countdown formatting live
-// in ./react-button-state so the helpers are unit-testable in vitest's
-// node env without a React renderer (no testing-library in the repo).
+// State machine logic, label resolution, and the count-up elapsed-clock
+// formatting live in ./react-button-state so the helpers are unit-testable
+// in vitest's node env without a React renderer (no testing-library in the
+// repo).
 //
 // Kill-switch: short-circuits to null when NEXT_PUBLIC_REACT_CAPTURE_ENABLED
 // !== '1'. Same flag gates the crossOrigin attribute on Mux video elements
@@ -18,6 +19,7 @@
 
 import { type JSX } from 'react';
 import {
+  CAP_WARNING_SECONDS,
   type ReactButtonState,
   isReactCaptureEnabled,
   isTappable,
@@ -47,8 +49,16 @@ type CommonProps = {
 };
 
 export type ReactButtonProps =
-  | (CommonProps & { state: 'idle' | 'priming' })
-  | (CommonProps & { state: 'armed'; armedSecondsRemaining: number })
+  | (CommonProps & { state: 'idle' | 'priming' | 'stopping' })
+  | (CommonProps & {
+      state: 'armed';
+      /** Count-UP elapsed seconds (uncapped rework — drives the "0:42" label). */
+      armedSecondsElapsed: number;
+      /** Seconds left before the platform SAFETY ceiling. Only surfaced in
+       *  the final CAP_WARNING_SECONDS ("ends in 0:29" red warning); pass
+       *  Infinity to never warn. */
+      armedSecondsRemaining: number;
+    })
   | (CommonProps & { state: 'disabled'; disabledReason?: string });
 
 // Inlined keyframe + focus styles for the ARMED red-dot pulse and the
@@ -78,16 +88,25 @@ export function ReactButton(props: ReactButtonProps): JSX.Element | null {
   if (!isReactCaptureEnabled()) return null;
 
   const { state, onTap, creatorHandle, className } = props;
+  const armedSecondsElapsed = state === 'armed' ? props.armedSecondsElapsed : undefined;
   const armedSecondsRemaining = state === 'armed' ? props.armedSecondsRemaining : undefined;
   const disabledReason = state === 'disabled' ? props.disabledReason : undefined;
 
-  const label = resolveLabel(state, armedSecondsRemaining);
-  const aria = resolveAriaLabel(state, { creatorHandle, disabledReason, armedSecondsRemaining });
+  const label = resolveLabel(state, armedSecondsElapsed, armedSecondsRemaining);
+  const aria = resolveAriaLabel(state, { creatorHandle, disabledReason, armedSecondsElapsed });
   const tappable = isTappable(state);
 
   const isArmed    = state === 'armed';
   const isPriming  = state === 'priming';
+  const isStopping = state === 'stopping';
   const isDisabled = state === 'disabled';
+  // Final-30s safety-ceiling warning — brighter red + the "ends in m:ss"
+  // label from resolveLabel (plan audit M3).
+  const isCapWarning =
+    isArmed &&
+    armedSecondsRemaining !== undefined &&
+    Number.isFinite(armedSecondsRemaining) &&
+    armedSecondsRemaining <= CAP_WARNING_SECONDS;
 
   function handleClick(e: React.MouseEvent<HTMLButtonElement>): void {
     // ALWAYS stopPropagation so the tap never leaks through to the surface
@@ -135,7 +154,9 @@ export function ReactButton(props: ReactButtonProps): JSX.Element | null {
           gap: 6,
           padding: '8px 14px',
           borderRadius: 16,
-          background: isArmed
+          background: isCapWarning
+            ? 'rgba(239,68,68,1)'
+            : isArmed
             ? 'rgba(220,38,38,0.92)'
             : isDisabled
             ? 'rgba(255,255,255,0.06)'
@@ -146,7 +167,7 @@ export function ReactButton(props: ReactButtonProps): JSX.Element | null {
           fontWeight: 600,
           fontVariantNumeric: 'tabular-nums',
           cursor: tappable ? 'pointer' : 'default',
-          opacity: isPriming ? 0.6 : 1,
+          opacity: isPriming || isStopping ? 0.6 : 1,
           transition: 'background 120ms ease, border-color 120ms ease',
           userSelect: 'none',
           WebkitTapHighlightColor: 'transparent',

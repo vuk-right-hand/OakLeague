@@ -79,21 +79,33 @@ describe('formatCountdown', () => {
 
 // ── resolveLabel ───────────────────────────────────────────────────────
 
-describe('resolveLabel', () => {
+describe('resolveLabel (count-up, uncapped rework)', () => {
   it('idle → "React"', () => {
     expect(resolveLabel('idle', undefined)).toBe('React');
   });
   it('priming → ellipsis (ASCII for tabular-nums width stability)', () => {
     expect(resolveLabel('priming', undefined)).toBe('...');
   });
-  it('armed → countdown', () => {
-    expect(resolveLabel('armed', 30)).toBe('0:30');
+  it('armed → elapsed count-UP', () => {
+    expect(resolveLabel('armed', 42)).toBe('0:42');
+    expect(resolveLabel('armed', 95)).toBe('1:35');
   });
-  it('armed without explicit seconds → ellipsis (do not mask missing parent timer)', () => {
-    // Audit M5: falling back to MAX would render a frozen "1:00" while the
-    // underlying recording is actually further along — an opaque debug
-    // failure. The placeholder makes the missing-prop bug visible.
-    expect(resolveLabel('armed', undefined)).toBe('...');
+  it('armed without explicit seconds → 0:00 (truthful just-armed render, distinct from priming)', () => {
+    expect(resolveLabel('armed', undefined)).toBe('0:00');
+  });
+  it('armed in the final 30s before the safety ceiling → "ends in m:ss" warning', () => {
+    expect(resolveLabel('armed', 280, 20)).toBe('ends in 0:20');
+    expect(resolveLabel('armed', 270, 30)).toBe('ends in 0:30');
+  });
+  it('armed with >30s remaining shows the plain elapsed count-up', () => {
+    expect(resolveLabel('armed', 42, 31)).toBe('0:42');
+    expect(resolveLabel('armed', 42, 258)).toBe('0:42');
+  });
+  it('armed with Infinity remaining never warns', () => {
+    expect(resolveLabel('armed', 42, Number.POSITIVE_INFINITY)).toBe('0:42');
+  });
+  it('stopping → "Saving…" (non-tappable outro, distinct from priming ellipsis)', () => {
+    expect(resolveLabel('stopping', undefined)).toBe('Saving…');
   });
   it('disabled → "React" (rationale lives in the tooltip / aria)', () => {
     expect(resolveLabel('disabled', undefined)).toBe('React');
@@ -112,10 +124,14 @@ describe('resolveAriaLabel', () => {
   it('priming announces preparing state', () => {
     expect(resolveAriaLabel('priming', {})).toMatch(/preparing/i);
   });
-  it('armed announces remaining time and tap-to-stop affordance', () => {
-    const a = resolveAriaLabel('armed', { armedSecondsRemaining: 30 });
+  it('armed announces elapsed time and tap-to-finish affordance', () => {
+    const a = resolveAriaLabel('armed', { armedSecondsElapsed: 30 });
     expect(a).toMatch(/0:30/);
-    expect(a).toMatch(/stop/i);
+    expect(a).toMatch(/elapsed/i);
+    expect(a).toMatch(/finish/i);
+  });
+  it('stopping announces the finalize', () => {
+    expect(resolveAriaLabel('stopping', {})).toMatch(/finishing/i);
   });
   it('disabled surfaces the reason when given', () => {
     const a = resolveAriaLabel('disabled', { disabledReason: 'daily cap reached' });
@@ -139,6 +155,9 @@ describe('isTappable', () => {
     // triggers a STOP on a session that hasn't even ARMED yet. This
     // guard is the central source of truth for that protection.
     expect(isTappable('priming')).toBe(false);
+  });
+  it('false during stopping — the 1.5s outro is finalizing the recording', () => {
+    expect(isTappable('stopping')).toBe(false);
   });
   it('false when disabled', () => {
     expect(isTappable('disabled')).toBe(false);
