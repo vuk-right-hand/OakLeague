@@ -54,7 +54,10 @@ const BASE_ARGS = {
   userId: 'user-uuid',
   creatorId: '11111111-1111-1111-1111-111111111111',
   rawUtterance: 'how do I deal with difficult coworkers',
-  lastAssistantResponse: null,
+  // Non-null so the suite exercises the LLM-rewrite path. The TTFT skip
+  // (2026-06-10: null context + short utterance bypasses BOTH the rewrite
+  // LLM and the semantic cache) has its own dedicated describe block below.
+  lastAssistantResponse: 'Workplace conflict usually starts with unspoken expectations.',
   corpusVersionAtSession: 3,
   sessionId: 'session-uuid',
   geminiApiKey: 'gem-test-key',
@@ -381,6 +384,33 @@ describe('retrieveKnowledgeV2 — rewrite FALLBACK skips cache (cross-cutting C2
     // Cache upsert MUST NOT have fired.
     expect(rpcCalls.some((c) => c.name === 'semantic_query_cache_upsert')).toBe(false);
     // But topk_v2 and rerank DO fire (fresh retrieval).
+    expect(rpcCalls.some((c) => c.name === 'creator_knowledge_topk_v2')).toBe(true);
+    expect(r.parents.length).toBeGreaterThan(0);
+  });
+});
+
+describe('retrieveKnowledgeV2 — TTFT rewrite skip bypasses cache (plan-audit C1, 2026-06-10)', () => {
+  it('null context + short utterance: NO rewrite LLM call, NO cache lookup/upsert, fresh retrieval runs', async () => {
+    // No mockRewriteOk — the skip path must not consume a Gemini mock.
+    mockEmbedOk();
+    const { admin, rpcCalls } = buildAdmin({
+      topkRows: [makeRpcRow(0), makeRpcRow(1)],
+    });
+    const r = await retrieveKnowledgeV2({
+      ...BASE_ARGS,
+      lastAssistantResponse: null, // turn 1 / post-resumption
+      supabaseAdmin: admin,
+    });
+    // Intentional skip — NOT a fallback.
+    expect(r.telemetry.rewrite?.fallback).toBe(false);
+    expect(r.telemetry.rewrite?.skippedNoContext).toBe(true);
+    // Zero rewrite tokens billed (no LLM call).
+    expect(r.telemetry.rewrite?.inputTokens).toBe(0);
+    expect(generateContentMock).not.toHaveBeenCalled();
+    // Cache fully bypassed — the key would be the raw utterance (C2 class).
+    expect(rpcCalls.some((c) => c.name === 'semantic_query_cache_lookup')).toBe(false);
+    expect(rpcCalls.some((c) => c.name === 'semantic_query_cache_upsert')).toBe(false);
+    // Fresh retrieval still runs.
     expect(rpcCalls.some((c) => c.name === 'creator_knowledge_topk_v2')).toBe(true);
     expect(r.parents.length).toBeGreaterThan(0);
   });

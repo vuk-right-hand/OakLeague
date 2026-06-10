@@ -694,6 +694,17 @@ test('P1-10: isTrivialQuestion classifies greetings + hearing checks + mic check
     'bye', 'goodbye', 'see ya', 'see you', 'later', 'peace',
     'ok', 'okay', 'got it', 'gotcha', 'cool', 'nice', 'cheers',
     'alright', 'sounds good',
+    // TTFT optimization (2026-06-10) — how-are-you family, incl. Gemini
+    // STT artifacts: dropped-g, contraction, apostrophe-less, "ya".
+    'how are you', 'how are you?', 'How are you today?',
+    'how are you doing', 'how are you doing today',
+    'how are you doin', "how're you", "how're you doing",
+    'how are ya', 'how ya doing', 'how ya doin',
+    'how you doing', 'how you doing today',
+    "how's it going", 'how is it going', 'hows it going',
+    "how's your day", 'how is your day going', 'hows your day been',
+    "how's everything", 'hows everything', "how's things",
+    "how's life", 'how do you do', 'you good', 'you good?',
   ];
   for (const q of trivial) {
     assert.equal(isTrivialQuestion(q), true, `trivial: "${q}"`);
@@ -724,6 +735,13 @@ test('P1-10: isTrivialQuestion classifies greetings + hearing checks + mic check
     // appending an address turns hearing-check into a conversational opener
     // that DOES warrant a real answer).
     'can you hear me, friend? I have a real question',
+    // TTFT (2026-06-10, plan-audit verified) — how-are-you prefixed
+    // SUBSTANTIVE questions must NOT match (the $ anchor defeats them):
+    'how are you handling pricing for enterprise',
+    'how are you different from other coaches',
+    'how is it going to work',
+    'how are you measuring success',
+    'how is your day structured for deep work',
   ];
   for (const q of substantive) {
     assert.equal(isTrivialQuestion(q), false, `substantive: "${q}"`);

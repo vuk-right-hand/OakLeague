@@ -212,6 +212,19 @@ export type RewriteResult = {
   fallback: boolean;
   /** Specific reason when fallback=true. Undefined on success. */
   fallbackReason?: RewriteFallbackReason;
+  /**
+   * TTFT optimization (2026-06-10, plan-audit C1/C2): true when the LLM call
+   * was deliberately SKIPPED because there is no prior assistant turn to
+   * rewrite against (turn 1 / post-resumption) AND the utterance is short
+   * enough to not need tightening. Distinct from `fallback` (an error path):
+   * a skip is intentional and healthy. CACHE CONTRACT: the orchestrator MUST
+   * bypass BOTH lookupCache and upsertCache when skippedNoContext=true —
+   * the cache key would be the raw utterance, exactly the input the C2
+   * collision rule forbids hashing ("can you give me an example?" from two
+   * sessions carries different intents but identical text). Same gate class
+   * as fallback=true.
+   */
+  skippedNoContext?: boolean;
   modelId: string;
   /** USD per input token. Pair with inputTokens for input-side cost. */
   usdPerInputToken: number;
@@ -221,6 +234,14 @@ export type RewriteResult = {
   outputTokens: number;
   latencyMs: number;
 };
+
+// TTFT optimization (2026-06-10, plan-audit M1): the rewrite's only value
+// with zero context is "possibly tightened" (see buildPrompt) — verbosity
+// trimming of rambling utterances. Short utterances gain nothing from a
+// ~660ms LLM round-trip; long/rambly ones still benefit from tightening
+// before embedding. 80 chars ≈ a direct spoken question; beyond that the
+// utterance is ramble-shaped and tightening materially improves retrieval.
+const SKIP_REWRITE_NO_CONTEXT_MAX_CHARS = 80;
 
 // apiKey-keyed cache (Day-9-final audit C2). Map size is bounded by the
 // number of distinct GEMINI_API_KEYs a single process sees — in practice
@@ -259,6 +280,32 @@ export async function rewriteQuery(input: RewriteInput): Promise<RewriteResult> 
       startedAt,
       fallbackReason: 'empty_utterance',
     });
+  }
+
+  // TTFT optimization (2026-06-10) — skip the LLM entirely when there is no
+  // prior assistant turn to rewrite against (turn 1 / post-resumption) AND
+  // the utterance is short enough to not need tightening (plan-audit M1:
+  // long rambles still go to the model for "possibly tightened"). The
+  // rewriter's purpose is follow-up disambiguation; with `(none)` context
+  // the model can only echo. Saves ~660ms of serial latency on exactly the
+  // first-question turn. NOT a fallback (intentional, healthy path) — but
+  // carries the same cache-bypass contract via skippedNoContext (plan-audit
+  // C1; see RewriteResult field doc). noContextAfterResumption is preserved
+  // (plan-audit C2) so the rag_rewrite_no_context_post_resumption PostHog
+  // event keeps firing for follow-up-shaped no-context turns.
+  if (lastAsst.length === 0 && rawUtterance.length <= SKIP_REWRITE_NO_CONTEXT_MAX_CHARS) {
+    return {
+      rewritten: rawUtterance,
+      noContextAfterResumption: noCtx,
+      fallback: false,
+      skippedNoContext: true,
+      modelId: QUERY_REWRITE_MODEL,
+      usdPerInputToken: QUERY_REWRITE_USD_PER_INPUT_TOKEN,
+      usdPerOutputToken: QUERY_REWRITE_USD_PER_OUTPUT_TOKEN,
+      inputTokens: 0,
+      outputTokens: 0,
+      latencyMs: Date.now() - startedAt,
+    };
   }
 
   // Budget check (M4). If less than MIN_REMAINING_MS remains, skip the call.

@@ -541,6 +541,8 @@ async function runOrchestrator(
     // so the Day-13 proxy's PostHog emitter fires
     // `rag_rewrite_no_context_post_resumption` on Day-15 bucket-2 misses.
     noContextAfterResumption: rewriteResult.noContextAfterResumption,
+    // TTFT optimization (2026-06-10) — intentional LLM skip (no prior turn).
+    skippedNoContext: rewriteResult.skippedNoContext,
   };
   const rewrittenText =
     rewriteResult.rewritten && rewriteResult.rewritten.length > 0
@@ -591,7 +593,11 @@ async function runOrchestrator(
   let parents: RetrievedParent[] = [];
   // CACHE_DISABLED (2026-05-25) forces a fresh retrieve+rerank every turn — see
   // the const. Gates BOTH lookup (below) and upsert (step 7) via this one flag.
-  const canTouchCache = !rewriteResult.fallback && !CACHE_DISABLED;
+  // TTFT plan-audit C1 (2026-06-10): skippedNoContext also bypasses the cache —
+  // a skipped rewrite means the key IS the raw utterance, the exact input the
+  // C2 collision rule forbids hashing (follow-up shapes the narrow patterns
+  // miss would leak cross-session). Same gate class as fallback.
+  const canTouchCache = !rewriteResult.fallback && !rewriteResult.skippedNoContext && !CACHE_DISABLED;
   if (canTouchCache) {
     let hit: Awaited<ReturnType<typeof lookupCache>> | null = null;
     try {
@@ -1203,6 +1209,8 @@ async function runOrchestratorV3(
     quotedAt: QUERY_REWRITE_QUOTED_AT,
     latencyMs: rewriteResult.latencyMs,
     noContextAfterResumption: rewriteResult.noContextAfterResumption,
+    // TTFT optimization (2026-06-10) — intentional LLM skip (no prior turn).
+    skippedNoContext: rewriteResult.skippedNoContext,
   };
   const rewrittenText =
     rewriteResult.rewritten && rewriteResult.rewritten.length > 0
@@ -1238,8 +1246,10 @@ async function runOrchestratorV3(
 
   // 4. Cache lookup (same as v2 — semantic_query_cache is creator+corpus_version-keyed
   // and version-agnostic; a v3 hit returns the same RetrievedParent[] shape).
+  // TTFT plan-audit C1 (2026-06-10): skippedNoContext bypasses cache — see v2
+  // site comment (~line 594) for the cross-session collision rationale.
   let parents: RetrievedParent[] = [];
-  const canTouchCache = !rewriteResult.fallback && !CACHE_DISABLED;
+  const canTouchCache = !rewriteResult.fallback && !rewriteResult.skippedNoContext && !CACHE_DISABLED;
   if (canTouchCache) {
     let hit: Awaited<ReturnType<typeof lookupCache>> | null = null;
     try {

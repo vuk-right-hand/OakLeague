@@ -78,6 +78,21 @@ const TRIVIAL_Q_PATTERNS = [
   /^(thanks?|thank you|ty|tysm|appreciate it|much obliged)[\s,!?.]*$/i,
   /^(bye|goodbye|see ya|see you|later|peace|catch you later)[\s,!?.]*$/i,
   /^(ok|okay|got it|gotcha|cool|nice|sweet|cheers|alright|sounds good)[\s,!?.]*$/i,
+  // TTFT optimization (2026-06-10, plan-audit M2) — how-are-you family.
+  // The single most common FIRST question ("how are you today?") was running
+  // the full rewrite→embed→rerank→deep-answer pipeline (~1.4s of retrieval
+  // for zero gain). All anchored ^…$ like the rest of this list — verified
+  // non-matches: "how are you handling X", "how are you different from
+  // other coaches", "how is it going to work" (the $ anchor defeats all
+  // multi-clause continuations). Variants cover Gemini STT artifacts:
+  // dropped trailing-g ("doin"), contraction ("how're"), apostrophe-less
+  // ("hows"), and "ya".
+  /^(how('?re| are| r) (you|ya)|how you)( doing?| doin'?)?( today| tonight| this (morning|evening|afternoon))?[\s,!?.]*$/i,
+  /^how ya doin'?g?[\s,!?.]*$/i,
+  /^how('s| is|s) it going[\s,!?.]*$/i,
+  /^how('s| is|s) (your day|everything|things|life)( going| been| today)?[\s,!?.]*$/i,
+  /^how do you do[\s,!?.]*$/i,
+  /^you good[\s,!?.]*$/i,
 ];
 export function isTrivialQuestion(text) {
   const t = (text || '').trim();

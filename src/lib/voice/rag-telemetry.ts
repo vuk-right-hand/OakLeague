@@ -59,6 +59,13 @@ export type RewriteLeg = {
    * Day-15 dogfood-gate bucket-2 (follow-up) diagnostics.
    */
   noContextAfterResumption: boolean;
+  /**
+   * TTFT optimization (2026-06-10): true when the rewrite LLM call was
+   * intentionally skipped (no prior assistant turn + short utterance).
+   * Distinct from fallback (error path). Cache was bypassed for this turn
+   * (plan-audit C1). Optional — absent on pre-change telemetry rows.
+   */
+  skippedNoContext?: boolean;
 };
 
 export type EmbedLeg = {

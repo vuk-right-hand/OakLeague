@@ -68,9 +68,13 @@ beforeEach(() => {
   _resetClientForTests();
 });
 
+// Reusable prior-turn context so tests exercise the LLM path now that
+// no-context + short-utterance turns SKIP the model entirely (TTFT
+// optimization 2026-06-10).
+const PRIOR_TURN = 'Stoicism is a school of philosophy focused on resilience and virtue.';
+
 describe('rewriteQuery — happy paths', () => {
-  it('passes through standalone queries', async () => {
-    mockOk('{"rewritten":"how do habits form"}');
+  it('standalone query + NO context: skips the LLM entirely (TTFT skip path)', async () => {
     const r = await rewriteQuery({
       userUtterance: 'how do habits form',
       lastAssistantResponse: null,
@@ -80,13 +84,60 @@ describe('rewriteQuery — happy paths', () => {
     expect(r.rewritten).toBe('how do habits form');
     expect(r.fallback).toBe(false);
     expect(r.fallbackReason).toBeUndefined();
+    expect(r.skippedNoContext).toBe(true);
     expect(r.noContextAfterResumption).toBe(false);
     expect(r.modelId).toBe(QUERY_REWRITE_MODEL);
     expect(r.usdPerInputToken).toBe(QUERY_REWRITE_USD_PER_INPUT_TOKEN);
     expect(r.usdPerOutputToken).toBe(QUERY_REWRITE_USD_PER_OUTPUT_TOKEN);
+    // No LLM call → zero tokens billed.
+    expect(r.inputTokens).toBe(0);
+    expect(r.outputTokens).toBe(0);
+    expect(r.latencyMs).toBeGreaterThanOrEqual(0);
+    expect(generateContentMock).not.toHaveBeenCalled();
+  });
+
+  it('standalone query WITH context: LLM path runs (no skip)', async () => {
+    mockOk('{"rewritten":"how do habits form"}');
+    const r = await rewriteQuery({
+      userUtterance: 'how do habits form',
+      lastAssistantResponse: PRIOR_TURN,
+      geminiApiKey: 'k',
+      deadlineMs: farDeadline(),
+    });
+    expect(r.rewritten).toBe('how do habits form');
+    expect(r.fallback).toBe(false);
+    expect(r.skippedNoContext).toBeUndefined();
     expect(r.inputTokens).toBe(100);
     expect(r.outputTokens).toBe(30);
-    expect(r.latencyMs).toBeGreaterThanOrEqual(0);
+    expect(generateContentMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('long ramble + NO context: LLM still runs for tightening (plan-audit M1, >80 chars)', async () => {
+    mockOk('{"rewritten":"how to price a B2B product"}');
+    const ramble =
+      'so like I have been thinking about, um, how do you actually, you know, go about figuring out pricing for like a B2B thing';
+    expect(ramble.length).toBeGreaterThan(80);
+    const r = await rewriteQuery({
+      userUtterance: ramble,
+      lastAssistantResponse: null,
+      geminiApiKey: 'k',
+      deadlineMs: farDeadline(),
+    });
+    expect(r.skippedNoContext).toBeUndefined();
+    expect(r.rewritten).toBe('how to price a B2B product');
+    expect(generateContentMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('follow-up shape + NO context: skip still fires AND noContextAfterResumption=true (telemetry contract, plan-audit C2)', async () => {
+    const r = await rewriteQuery({
+      userUtterance: 'tell me more about that',
+      lastAssistantResponse: null,
+      geminiApiKey: 'k',
+      deadlineMs: farDeadline(),
+    });
+    expect(r.skippedNoContext).toBe(true);
+    expect(r.noContextAfterResumption).toBe(true);
+    expect(generateContentMock).not.toHaveBeenCalled();
   });
 
   it('rewrites follow-up using prior assistant turn', async () => {
@@ -156,7 +207,8 @@ describe('budget + skip paths', () => {
   it('tight budget fast-fails to fallback without calling model', async () => {
     const r = await rewriteQuery({
       userUtterance: 'how do habits form',
-      lastAssistantResponse: null,
+      // Context present so the TTFT skip path doesn't preempt the budget check.
+      lastAssistantResponse: PRIOR_TURN,
       geminiApiKey: 'k',
       deadlineMs: tightDeadline(),
     });
@@ -172,7 +224,7 @@ describe('error paths fall back to raw utterance', () => {
     mockTimeout();
     const r = await rewriteQuery({
       userUtterance: 'how do habits form',
-      lastAssistantResponse: null,
+      lastAssistantResponse: PRIOR_TURN,
       geminiApiKey: 'k',
       // Tight enough that the inner call timeout fires fast.
       deadlineMs: Date.now() + 600,
@@ -186,7 +238,7 @@ describe('error paths fall back to raw utterance', () => {
     mockReject('connection_reset');
     const r = await rewriteQuery({
       userUtterance: 'q',
-      lastAssistantResponse: null,
+      lastAssistantResponse: PRIOR_TURN,
       geminiApiKey: 'k',
       deadlineMs: farDeadline(),
     });
@@ -199,7 +251,7 @@ describe('error paths fall back to raw utterance', () => {
     mockOk('this is not json');
     const r = await rewriteQuery({
       userUtterance: 'q',
-      lastAssistantResponse: null,
+      lastAssistantResponse: PRIOR_TURN,
       geminiApiKey: 'k',
       deadlineMs: farDeadline(),
     });
@@ -212,7 +264,7 @@ describe('error paths fall back to raw utterance', () => {
     mockOk('{"not_rewritten":"x"}');
     const r = await rewriteQuery({
       userUtterance: 'q',
-      lastAssistantResponse: null,
+      lastAssistantResponse: PRIOR_TURN,
       geminiApiKey: 'k',
       deadlineMs: farDeadline(),
     });
@@ -225,7 +277,7 @@ describe('error paths fall back to raw utterance', () => {
     mockOk('```json\n{"rewritten":"clean"}\n```');
     const r = await rewriteQuery({
       userUtterance: 'q',
-      lastAssistantResponse: null,
+      lastAssistantResponse: PRIOR_TURN,
       geminiApiKey: 'k',
       deadlineMs: farDeadline(),
     });
@@ -287,13 +339,13 @@ describe('apiKey-keyed client cache (Day-9-final C2)', () => {
     mockOk('{"rewritten":"b"}');
     await rewriteQuery({
       userUtterance: 'q1',
-      lastAssistantResponse: null,
+      lastAssistantResponse: PRIOR_TURN,
       geminiApiKey: 'KEY-A',
       deadlineMs: farDeadline(),
     });
     await rewriteQuery({
       userUtterance: 'q2',
-      lastAssistantResponse: null,
+      lastAssistantResponse: PRIOR_TURN,
       geminiApiKey: 'KEY-B',
       deadlineMs: farDeadline(),
     });
