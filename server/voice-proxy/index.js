@@ -44,6 +44,7 @@ import { makeLogTurnCogs, installReaper, VOICE_TTS_LAYER_ENABLED, getCartesiaPri
 // brain/paraphrase pricing FATAL-at-boot (same posture as Cartesia/Hume).
 import { provisionDecoupledBrainPricing } from './decoupled-boot.js';
 import { makeDecoupledOrchestrator } from './decoupled-orchestrator.js';
+import { extractAndStoreMemory } from './memory-extract.js';
 import { generateParaphrase } from './paraphrase.js';
 import { generateDeepAnswer } from './brain-bridge.js';
 import { makeVoiceDeleteWorker } from './voice-delete-worker.js';
@@ -450,6 +451,11 @@ if (RAG_V2_PROXY_ENABLED) {
 } else {
   console.log('[boot] RAG v2 wiring disabled (set RAG_V2_PROXY_ENABLED=1 to enable)');
 }
+// MEMORY_BREADTH_PLAN R1-S1 — the memory flag is a CO-FLIP: the SAME env
+// name gates the read (Vercel, sessions/open) and the write (here, the
+// teardown extraction). Boot-visible so a half-flipped fleet is diagnosable
+// from the prod log without `fly secrets list`.
+console.log(`[boot] user-memory extraction ${process.env.BRAIN_USER_MEMORY_ENABLED === '1' ? 'ENABLED' : 'disabled'} (BRAIN_USER_MEMORY_ENABLED — co-flip with Vercel)`);
 // Boot-visible decoupled depth + injection config. Fly masks secret VALUES in
 // `fly secrets list` (name + digest only), so this is the only way to confirm
 // from prod that BRAIN_DEPTH_MODE actually resolved to 'variable' (anything else
@@ -525,7 +531,10 @@ async function consumeTicket(ticketId, uaHash) {
     // + voice_id_env. The proxy never re-derives provider OR env from its
     // own envvars (Vuk-M5: ticket is the contract). Hume prosody is NULL on
     // cartesia tickets and ignored by the bridge selection.
-    .select('user_id, creator_id, session_id, expected_tier, purpose, avatar_provider, system_prompt, prefix_turns, tts_speed, brain_mode, decoupled, tts_provider, hume_tts_speed, hume_trailing_silence, hume_voice_description, hume_model_version, voice_id_env')
+    // MEMORY_BREADTH_PLAN U1a (R2-S1): user_context must be in BOTH this
+    // select string AND the mapping below — editing only one yields a
+    // silently-undefined userContext.
+    .select('user_id, creator_id, session_id, expected_tier, purpose, avatar_provider, system_prompt, prefix_turns, tts_speed, brain_mode, decoupled, tts_provider, hume_tts_speed, hume_trailing_silence, hume_voice_description, hume_model_version, voice_id_env, user_context')
     .maybeSingle();
   if (error || !data) return null;
   // creator_id is NOT NULL by CHECK on new rows (migration 0041). A null here
@@ -546,6 +555,10 @@ async function consumeTicket(ticketId, uaHash) {
     // persona or the hook had no overlapping sample_content. Bridge
     // falls back to DEFAULT_SYSTEM in that case.
     systemPrompt:   data.system_prompt || null,
+    // MEMORY_BREADTH_PLAN U1a — sanitized user-context string built by the
+    // open route (goals/obstacles + memory). Deep-answer DATA block ONLY;
+    // NEVER passed to bridge.open()'s systemInstruction (resumption cap).
+    userContext:    data.user_context || null,
     prefixTurns:    (() => {
       if (data.prefix_turns == null) return null;
       if (Array.isArray(data.prefix_turns)) return data.prefix_turns;
@@ -998,6 +1011,10 @@ wss.on('connection', async (ws, req) => {
   const consumed = await consumeTicket(ticket, uaHash);
   if (!consumed) { console.log(`[ws ${connId}] invalid_ticket`); return closeWs(ws, 4001, 'invalid_ticket'); }
   const { userId, creatorId, sessionId: ticketSessionId } = consumed;
+  // MEMORY_BREADTH_PLAN U1b — connection start ≈ session start; feeds the
+  // memory RPC's R1-M3 ordering guard (an older concurrent session's
+  // extract must not clobber a newer one's summary).
+  const connStartedAtIso = new Date().toISOString();
   // SIMLI_WIREUP §2 — attach path is the /s/[id] cutover; legacy openSession
   // is the admin spike-a path.
   const isAttachPath = !!ticketSessionId;
@@ -1257,6 +1274,41 @@ wss.on('connection', async (ws, req) => {
   const teardown = async (reason) => {
     if (closed) return;
     closed = true;
+    // MEMORY_BREADTH_PLAN U1b (audit R1-M4) — capture EVERYTHING the
+    // fire-and-forget extraction needs into locals BEFORE any state
+    // cleanup below. transcriptSnapshot() returns a copy, so the
+    // orchestrator can be released while the detached promise runs.
+    if (
+      process.env.BRAIN_USER_MEMORY_ENABLED === '1' &&
+      decoupled && ticketSessionId && decoupledOrch
+    ) {
+      const memTranscript = decoupledOrch.transcriptSnapshot();
+      if (memTranscript.length >= 2) {
+        const memArgs = {
+          supabase,
+          apiKey: GEMINI_API_KEY,
+          userId: ticketUserId,
+          creatorId: ticketCreatorId,
+          sessionId,
+          sessionStartedAt: connStartedAtIso,
+          transcript: memTranscript,
+          userContext: consumed.userContext || null,
+          logBrainLeg,
+          captureException,
+        };
+        // Detached on purpose: teardown's critical path never waits on a
+        // paid call. extractAndStoreMemory never throws; belt-and-braces
+        // catch so an unexpected rejection can't surface as unhandled.
+        // ORDERING INVARIANT (diff-audit M4): if this detached leg's
+        // logBrainLeg FAILS, recordFailure re-creates the session's
+        // failure-count entry post-dropCogsSession; a resulting
+        // onConsecutiveFailure is harmless ONLY because teardown below
+        // clears sessionToWs BEFORE this promise can fail. Don't reorder
+        // teardown cleanup without re-checking that chain.
+        void extractAndStoreMemory(memArgs).catch((e) =>
+          captureException(e, { op: 'memory_extract.detached', sessionId }));
+      }
+    }
     clearInterval(heartbeatInterval);
     if (heygenHeartbeatInterval) clearInterval(heygenHeartbeatInterval);
     quotaCache.delete(sessionId);
@@ -2186,6 +2238,10 @@ wss.on('connection', async (ws, req) => {
       },
       logBrainLeg,
       persona: consumed.systemPrompt || null,
+      // MEMORY_BREADTH_PLAN U1a — user-context DATA block for the deep
+      // answer. Deliberately NOT passed to bridge.open() above (the Live
+      // session's systemInstruction is resumption-bound; this is not).
+      userContext: consumed.userContext || null,
       apiKey: GEMINI_API_KEY,
       userId: ticketUserId,
       sessionId,

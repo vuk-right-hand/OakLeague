@@ -136,6 +136,11 @@ export function makeDecoupledOrchestrator({
   ttsSendText,         // thin closure over ttsBridge.sendText (index.js owns try/catch)
   logBrainLeg,         // ({userId,sessionId,turnNumber,leg}) → {ok}
   persona,
+  // Unit 1a (MEMORY_BREADTH_PLAN) — sanitized user-context string built at
+  // session-open (goals/obstacles + memory summary + optional [OPEN THREAD]).
+  // Threaded to the deep answer as a DATA block in the question turn; never
+  // touches the Gemini Live session. null/absent ⇒ byte-identical behavior.
+  userContext = null,
   apiKey,
   userId,
   sessionId,
@@ -189,6 +194,28 @@ export function makeDecoupledOrchestrator({
 
   let turn = null;            // the latest-created turn
   let lastCompleted = null;   // last turn whose deep answer FINISHED (C4)
+  // Unit 2 (MEMORY_BREADTH_PLAN) — continuity ring: the last ≤3 COMPLETED
+  // substantive turns (same admission rule as lastCompleted — trivial turns
+  // never enter). Oldest first. brain-bridge folds these into the question
+  // turn. lastCompleted stays the single source for lastAssistantResponse()
+  // so the rewriter contract is byte-identical (R2-S2).
+  const COMPLETED_RING_MAX = 3;
+  const completedRing = [];
+  // Unit 1b (R1-M2) — one-shot first-substantive-answer latch. Set when the
+  // first non-trivial deep answer finishes streaming; gates the open-loop
+  // check-in clause so it can fire AT MOST once per WS session and never
+  // re-fires after a Gemini Live reopen (orchestrator state survives those).
+  let firstSubstantiveAnswerDone = false;
+  // Unit 1b — bounded session transcript for the post-teardown memory
+  // extraction. Per COMPLETED substantive turn: question head-capped at 300
+  // chars (the ask is up front), answer HEAD-capped at 600 (diff-audit M3:
+  // commitments/setup are stated early; a tail slice would hand the
+  // extractor only conclusions). Ring of 12 turns ⇒ worst case ~11KB in
+  // memory, freed with the orchestrator.
+  const TRANSCRIPT_RING_MAX = 12;
+  const TRANSCRIPT_Q_MAX = 300;
+  const TRANSCRIPT_A_MAX = 600;
+  const transcriptRing = [];
   let fatal = false;          // C2 — latched on misconfigured; no 2nd paid call
   // C4 — per-session running tally (the teardown log was single-turn,
   // blind to a session that degraded on turns 1-4 but not turn 5).
@@ -690,6 +717,13 @@ export function makeDecoupledOrchestrator({
 
       const gen = generateDeepAnswer({
         persona,
+        // Unit 1a — DATA block for the question turn (brain-bridge wraps it).
+        userContext,
+        // Unit 1b (R1-M2) — one-shot latch, NOT a turn counter: true until the
+        // first non-trivial deep answer completes (superseded turns + Live
+        // reopens don't flip it; a full WS reconnect = new orchestrator =
+        // re-gated by the 20h sessions-table rule at open).
+        isFirstTurn: !firstSubstantiveAnswerDone,
         referenceEnvelopeText: envelopeText || null, // null ⇒ C2 persona-only
         question: t.question,
         apiKey,
@@ -720,10 +754,21 @@ export function makeDecoupledOrchestrator({
         // truncated (we only half-heard it — anchoring to the prior answer would
         // compound the mishear). `truncated` lets the preamble tell the model to
         // resume rather than restart (audit M3).
-        priorTurn:
+        // Unit 2 — the RING (≤3 completed turns, oldest→newest) replaces the
+        // single priorTurn. Same gate as before (follow-up only, never on a
+        // suspected-truncated question); brain-bridge tail-caps each entry
+        // (newest 1500, older 300) and applies the C2 anti-persistence guard
+        // ONCE to the folded block. INVARIANT (diff-audit S5): the gate
+        // checks lastCompleted while the body maps completedRing — sound
+        // ONLY while lastCompleted === completedRing[last] (both assigned at
+        // the same admission site). If a future change ever clears one
+        // without the other, re-derive this gate from the ring itself.
+        priorTurns:
           (!t.truncationSuspected && looksLikeFollowUp(t.question) && lastCompleted &&
             typeof lastCompleted.lastAssistantResponse === 'string')
-            ? { answer: lastCompleted.lastAssistantResponse, truncated: lastCompleted.wasTruncated === true }
+            ? completedRing
+                .filter((c) => typeof c.lastAssistantResponse === 'string')
+                .map((c) => ({ answer: c.lastAssistantResponse, truncated: c.wasTruncated === true }))
             : null,
       });
       const r = await streamToTts(gen, 'brain_deep_answer', t.turnNumber, {
@@ -771,6 +816,17 @@ export function makeDecoupledOrchestrator({
           // continue" resumes from the cut instead of restarting/fabricating.
           t.wasTruncated = (r.final.finishReason === 'MAX_TOKENS') || (r.degraded === 'char_ceiling');
           lastCompleted = t;
+          // Unit 2 — ring admission mirrors lastCompleted exactly.
+          completedRing.push(t);
+          if (completedRing.length > COMPLETED_RING_MAX) completedRing.shift();
+          // Unit 1b — first substantive answer landed; check-in window closes.
+          firstSubstantiveAnswerDone = true;
+          // Unit 1b — transcript ring for post-session memory extraction.
+          transcriptRing.push({
+            q: String(t.question || '').slice(0, TRANSCRIPT_Q_MAX),
+            a: String(r.final.text || '').slice(0, TRANSCRIPT_A_MAX),
+          });
+          if (transcriptRing.length > TRANSCRIPT_RING_MAX) transcriptRing.shift();
         }
       }
       if (r.degraded && r.degraded !== 'misconfigured') {
@@ -872,9 +928,16 @@ export function makeDecoupledOrchestrator({
     session.interruptedSuppressed += 1;
   }
 
+  // Unit 1b — copy of the bounded session transcript (Q/A pairs, oldest
+  // first) for the teardown-time memory extraction. A COPY so the caller
+  // can hold it across teardown's state cleanup (audit R1-M4 capture rule).
+  function transcriptSnapshot() {
+    return transcriptRing.map((e) => ({ q: e.q, a: e.a }));
+  }
+
   return {
     onUserTranscript, onTurnComplete, onInterrupted,
     awaitTurnSpoken, lastAssistantResponse, metricsSnapshot,
-    recordInterruptedSuppressed,
+    recordInterruptedSuppressed, transcriptSnapshot,
   };
 }

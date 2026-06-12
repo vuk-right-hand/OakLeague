@@ -54,6 +54,24 @@ export function EditProfileSheet({
     }
   }
 
+  // MEMORY_BREADTH_PLAN U1b privacy surface — "Forget our conversations".
+  // Deletes ALL of the caller's user_creator_memory rows via their own
+  // RLS-scoped session (the delete-own policy is the boundary). Memory is
+  // an avatar-conversation feature; surfacing the wipe here keeps it one
+  // tap from the profile without a new settings page.
+  const [forgetState, setForgetState] = useState<'idle' | 'confirm' | 'working' | 'done' | 'error'>('idle');
+  async function onForget() {
+    if (forgetState === 'idle') { setForgetState('confirm'); return; }
+    if (forgetState !== 'confirm') return;
+    setForgetState('working');
+    try {
+      const res = await fetch('/api/me/creator-memory', { method: 'DELETE' });
+      setForgetState(res.ok ? 'done' : 'error');
+    } catch {
+      setForgetState('error');
+    }
+  }
+
   function onSave() {
     setErr(null);
     startTransition(async () => {
@@ -104,6 +122,19 @@ export function EditProfileSheet({
         {avatarErr ? <span className="oak-err">{avatarErr}</span> : null}
       </label>
       {err ? <div className="oak-err" role="alert">{friendlyErr(err)}</div> : null}
+      <div style={{ marginTop: 8 }}>
+        <button
+          className="oak-btn-secondary"
+          onClick={onForget}
+          disabled={forgetState === 'working' || forgetState === 'done'}
+        >
+          {forgetState === 'idle' && 'Forget our conversations'}
+          {forgetState === 'confirm' && 'Tap again to confirm — mentors will no longer remember you'}
+          {forgetState === 'working' && 'Forgetting…'}
+          {forgetState === 'done' && 'Forgotten ✓'}
+          {forgetState === 'error' && 'Could not forget — try again'}
+        </button>
+      </div>
       <div className="oak-sheet-actions">
         <button className="oak-btn-secondary" onClick={() => setOpen(false)} disabled={pending}>
           Cancel

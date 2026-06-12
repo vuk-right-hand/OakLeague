@@ -513,6 +513,11 @@ export function makeLogTurnCogs({ supabase, env = 'spike_a', onConsecutiveFailur
     'brain_deep_answer',
     'brain_paraphrase',
     'brain_deep_answer_failover',
+    // MEMORY_BREADTH_PLAN U1b (audit R1-C1) — the once-per-session post-
+    // teardown memory-extraction leg. Writes with the sentinel turn_number
+    // (2147483647 — the RPC rejects <= 0); migration 20260612000003 widened
+    // the RPC's operation allowlist in lockstep with this set.
+    'memory_extract',
   ]);
   async function logBrainLeg(payload) {
     const { userId, sessionId, turnNumber, leg } = payload;

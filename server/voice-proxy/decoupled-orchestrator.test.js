@@ -1037,6 +1037,108 @@ test('re-audit C1: a MAX_TOKENS deep answer increments deepTruncated + marks the
   orch.onUserTranscript('continue', 2);
   await tick();
   await orch.onTurnComplete();
-  assert.ok(deepArgs[1].priorTurn, 'follow-up threads the prior answer');
-  assert.equal(deepArgs[1].priorTurn.truncated, true, 'prior answer flagged truncated → preamble says RESUME');
+  // Unit 2 — the orchestrator now threads the RING (array, oldest→newest).
+  assert.ok(Array.isArray(deepArgs[1].priorTurns), 'follow-up threads the prior-answer ring');
+  assert.equal(deepArgs[1].priorTurns.length, 1, 'one completed turn → one ring entry');
+  assert.equal(deepArgs[1].priorTurns[0].truncated, true, 'prior answer flagged truncated → preamble says RESUME');
+});
+
+// ── Unit 2 (MEMORY_BREADTH_PLAN) — continuity ring 1→3 ─────────────────────
+
+test('U2: ring carries the last 3 completed turns, oldest first, capped at 3', async () => {
+  const deepArgs = [];
+  const { orch } = harness({
+    paraphraseEnabled: false,
+    generateDeepAnswer: (args) => {
+      deepArgs.push(args);
+      const n = deepArgs.length;
+      return genStream([`answer-${n}`], {
+        operation: 'brain_deep_answer', text: `answer-${n}`, firstChunkMs: 7, latencyMs: 9, startedAt: 2,
+        finishReason: 'STOP',
+      });
+    },
+  });
+  // 4 substantive turns, then a follow-up — ring must hold answers 2,3,4.
+  for (let i = 1; i <= 4; i++) {
+    orch.onUserTranscript(`substantive question number ${i} about the work`, i);
+    await tick();
+    await orch.onTurnComplete();
+  }
+  orch.onUserTranscript('tell me more about that', 5);
+  await tick();
+  await orch.onTurnComplete();
+  const ring = deepArgs[4].priorTurns;
+  assert.ok(Array.isArray(ring), 'ring threaded on follow-up');
+  assert.equal(ring.length, 3, 'capped at 3');
+  assert.deepEqual(
+    ring.map((r) => r.answer),
+    ['answer-2', 'answer-3', 'answer-4'],
+    'oldest→newest, turn-1 evicted',
+  );
+});
+
+test('U2: non-follow-up question stays stateless (ring NOT threaded)', async () => {
+  const deepArgs = [];
+  const { orch } = harness({
+    paraphraseEnabled: false,
+    generateDeepAnswer: (args) => {
+      deepArgs.push(args);
+      return genStream(['ans'], {
+        operation: 'brain_deep_answer', text: 'ans', firstChunkMs: 7, latencyMs: 9, startedAt: 2,
+        finishReason: 'STOP',
+      });
+    },
+  });
+  orch.onUserTranscript('substantive question about discipline and identity', 1);
+  await tick();
+  await orch.onTurnComplete();
+  orch.onUserTranscript('what is the best morning routine for energy', 2);
+  await tick();
+  await orch.onTurnComplete();
+  assert.equal(deepArgs[1].priorTurns, null, 'fresh question → no ring');
+});
+
+// ── Unit 1a/1b (MEMORY_BREADTH_PLAN) — userContext + first-turn latch ───────
+
+test('U1a: userContext threads to every deep answer; isFirstTurn true only until the first substantive completion', async () => {
+  const deepArgs = [];
+  const { orch } = harness({
+    paraphraseEnabled: false,
+    userContext: 'Goals: ship it.\n[OPEN THREAD] said he was stuck.',
+    generateDeepAnswer: (args) => {
+      deepArgs.push(args);
+      return genStream(['ans'], {
+        operation: 'brain_deep_answer', text: 'ans', firstChunkMs: 7, latencyMs: 9, startedAt: 2,
+        finishReason: 'STOP',
+      });
+    },
+  });
+  orch.onUserTranscript('substantive question about identity and discipline', 1);
+  await tick();
+  await orch.onTurnComplete();
+  orch.onUserTranscript('another substantive question about feedback loops', 2);
+  await tick();
+  await orch.onTurnComplete();
+  assert.equal(deepArgs[0].userContext, 'Goals: ship it.\n[OPEN THREAD] said he was stuck.');
+  assert.equal(deepArgs[0].isFirstTurn, true, 'turn 1 → check-in window open');
+  assert.equal(deepArgs[1].userContext, deepArgs[0].userContext, 'context rides every turn');
+  assert.equal(deepArgs[1].isFirstTurn, false, 'latch closed after first substantive answer');
+});
+
+test('U1a: omitted userContext defaults to null (byte-identical legacy)', async () => {
+  const deepArgs = [];
+  const { orch } = harness({
+    paraphraseEnabled: false,
+    generateDeepAnswer: (args) => {
+      deepArgs.push(args);
+      return genStream(['ans'], {
+        operation: 'brain_deep_answer', text: 'ans', firstChunkMs: 7, latencyMs: 9, startedAt: 2,
+        finishReason: 'STOP',
+      });
+    },
+  });
+  orch.onUserTranscript('substantive question about goals', 1);
+  await tick();
+  await orch.onTurnComplete();
+  assert.equal(deepArgs[0].userContext, null);
 });

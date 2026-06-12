@@ -550,3 +550,13 @@ Turnstile account exists yet and the waitlist is live. Once
 NEXT_PUBLIC_TURNSTILE_SITE_KEY + TURNSTILE_SECRET_KEY are set in Vercel and
 verified working, restore audit C1 fail-CLOSED (flip the `return true` back to
 `return false` in the missing-secret prod branch).
+
+## Deferred 2026-06-12 — predictive retrieval prefetch ("Slow Thinker") — Vuk decision
+Path-to-stellar item #4, explicitly deferred (Vuk: items 1+2+3 approved, 4 noted). Design when
+picked up: during TTS playback, predict 2-3 likely follow-up questions and pre-warm the SEMANTIC
+CACHE with their retrieval results (embed + topk + rerank). NEVER pre-generate answers — the
+deep answer always generates fresh against the user's actual question; the existing 0.92-cosine
+cache threshold means a partial match is a clean miss (no subpar-answer risk by construction).
+COGS: wasted prefetches ≈ double the brain's retrieval spend (~+4-6% of total turn-path) for a
+~0.5-1s latency win on hits. **TRIGGER:** retrieval latency becomes a felt UX complaint.
+Flag-gated, paid tiers first. (Item #5, the 2.6K Option B persona, is noted separately above.)

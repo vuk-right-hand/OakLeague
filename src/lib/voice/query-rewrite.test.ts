@@ -369,3 +369,82 @@ describe('_resetClientForTests gating (Day-9-final C4)', () => {
     }
   });
 });
+
+describe('breadth classification (MEMORY_BREADTH_PLAN Unit 3)', () => {
+  // NOTE: every test here passes a non-null lastAssistantResponse — the
+  // TTFT skip path (2026-06-10) returns early (breadth:'pointed',
+  // skippedNoContext) on no-context short utterances WITHOUT calling the
+  // model, which is covered by its own tests; these exercise the LLM path.
+  it('returns breadth=synthesis when the model emits it', async () => {
+    mockOk('{"rewritten":"failure bricks vs comfort zone","breadth":"synthesis"}');
+    const r = await rewriteQuery({
+      userUtterance: 'how do failure bricks connect to the comfort zone',
+      lastAssistantResponse: 'We talked about failure bricks earlier.',
+      geminiApiKey: 'k',
+      deadlineMs: farDeadline(),
+    });
+    expect(r.breadth).toBe('synthesis');
+    expect(r.fallback).toBe(false);
+  });
+
+  it('returns breadth=pointed when the model emits pointed', async () => {
+    mockOk('{"rewritten":"the lumberjack story","breadth":"pointed"}');
+    const r = await rewriteQuery({
+      userUtterance: 'tell me the lumberjack story',
+      lastAssistantResponse: 'We talked about failure bricks earlier.',
+      geminiApiKey: 'k',
+      deadlineMs: farDeadline(),
+    });
+    expect(r.breadth).toBe('pointed');
+  });
+
+  it('defaults breadth=pointed when the model omits the field (zod catch)', async () => {
+    mockOk('{"rewritten":"how do habits form"}');
+    const r = await rewriteQuery({
+      userUtterance: 'how do habits form',
+      lastAssistantResponse: 'We talked about failure bricks earlier.',
+      geminiApiKey: 'k',
+      deadlineMs: farDeadline(),
+    });
+    expect(r.breadth).toBe('pointed');
+    expect(r.fallback).toBe(false); // a missing breadth must NOT fall back the rewrite
+  });
+
+  it('defaults breadth=pointed on an invalid enum value', async () => {
+    mockOk('{"rewritten":"q","breadth":"everything"}');
+    const r = await rewriteQuery({
+      userUtterance: 'q',
+      lastAssistantResponse: 'We talked about failure bricks earlier.',
+      geminiApiKey: 'k',
+      deadlineMs: farDeadline(),
+    });
+    expect(r.breadth).toBe('pointed');
+    expect(r.fallback).toBe(false);
+  });
+
+  it('every fallback path carries breadth=pointed (timeout shown)', async () => {
+    mockTimeout();
+    const r = await rewriteQuery({
+      userUtterance: 'slow question',
+      lastAssistantResponse: 'We talked about failure bricks earlier.',
+      geminiApiKey: 'k',
+      deadlineMs: Date.now() + 1200, // enough to pass fast-fail, short enough to time out
+    });
+    expect(r.fallback).toBe(true);
+    expect(r.breadth).toBe('pointed');
+  });
+
+  it('prompt instructs the two-field JSON shape incl. breadth (R2-M3 guard)', async () => {
+    mockOk('{"rewritten":"q","breadth":"pointed"}');
+    await rewriteQuery({
+      userUtterance: 'q',
+      lastAssistantResponse: 'We talked about failure bricks earlier.',
+      geminiApiKey: 'k',
+      deadlineMs: farDeadline(),
+    });
+    const call = generateContentMock.mock.calls[0][0];
+    const promptText = JSON.stringify(call.contents);
+    expect(promptText).toContain('breadth');
+    expect(promptText).toContain('synthesis');
+  });
+});

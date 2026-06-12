@@ -1143,3 +1143,125 @@ describe('retrieveKnowledgeV3 — telemetry shape', () => {
     expect(r.telemetry.retrieve?.candidatesFromScope).toBe(2);
   });
 });
+
+// ───────────────────────────────────────────────────────────────────────
+// MEMORY_BREADTH_PLAN Unit 3 — variable breadth
+// ───────────────────────────────────────────────────────────────────────
+
+function mockRewriteOkBreadth(rewritten: string, breadth: 'pointed' | 'synthesis') {
+  generateContentMock.mockResolvedValueOnce({
+    text: JSON.stringify({ rewritten, breadth }),
+    usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 20 },
+  });
+}
+
+describe('retrieveKnowledgeV3 — breadth flag OFF (default) is byte-identical', () => {
+  it('synthesis classification does NOT widen topK when flag is off', async () => {
+    mockRewriteOkBreadth('failure bricks vs comfort zone', 'synthesis');
+    mockEmbedOk();
+    const { admin } = buildAdminV3({
+      routeRows: [makeRouteRow(0), makeRouteRow(1), makeRouteRow(2)],
+      topkV3Rows: [makeRpcRowV3(0), makeRpcRowV3(1), makeRpcRowV3(2)],
+    });
+    const r = await retrieveKnowledgeV3({ ...BASE_ARGS, supabaseAdmin: admin, topK: 1 });
+    expect(r.parents.length).toBe(1);
+    // Telemetry still records the classification (observability without behavior).
+    expect(r.telemetry.rewrite?.breadth).toBe('synthesis');
+    expect(r.telemetry.rewrite?.effectiveTopK).toBe(1);
+  });
+});
+
+describe('retrieveKnowledgeV3 — breadth flag ON (vi.resetModules + env)', () => {
+  // BRAIN_BREADTH_ENABLED is module-load-bound (repo flag pattern); re-import
+  // the module with the env stubbed to exercise the ON path.
+  async function freshModuleWithFlagOn(synthesisTopK?: string) {
+    vi.resetModules();
+    vi.stubEnv('BRAIN_BREADTH_ENABLED', '1');
+    if (synthesisTopK !== undefined) vi.stubEnv('SYNTHESIS_TOP_K', synthesisTopK);
+    const mod = await import('./retrieve-knowledge');
+    return mod;
+  }
+
+  it('synthesis widens to SYNTHESIS_TOP_K (default 2) and the cache stores WIDE (3)', async () => {
+    const mod = await freshModuleWithFlagOn();
+    mockRewriteOkBreadth('failure bricks vs comfort zone', 'synthesis');
+    mockEmbedOk();
+    const { admin, rpcCalls } = buildAdminV3({
+      routeRows: [makeRouteRow(0), makeRouteRow(1), makeRouteRow(2)],
+      topkV3Rows: [makeRpcRowV3(0), makeRpcRowV3(1), makeRpcRowV3(2)],
+    });
+    const r = await mod.retrieveKnowledgeV3({ ...BASE_ARGS, supabaseAdmin: admin, topK: 1 });
+    // Read NARROW: synthesis returns 2 parents (default SYNTHESIS_TOP_K).
+    expect(r.parents.length).toBe(2);
+    expect(r.telemetry.rewrite?.effectiveTopK).toBe(2);
+    // Store WIDE (R2-C2): the cache upsert carried the CEILING (3) ids, not 2.
+    const upserts = rpcCalls.filter((c) => c.name === 'semantic_query_cache_upsert');
+    expect(upserts.length).toBe(1);
+    const upsertArgs = upserts[0].args as Record<string, unknown>;
+    expect((upsertArgs.p_parent_unit_ids as string[]).length).toBe(3);
+  });
+
+  it('pointed keeps topK=1 on return but STILL stores wide (3) in the cache', async () => {
+    const mod = await freshModuleWithFlagOn();
+    mockRewriteOkBreadth('the lumberjack story', 'pointed');
+    mockEmbedOk();
+    const { admin, rpcCalls } = buildAdminV3({
+      routeRows: [makeRouteRow(0), makeRouteRow(1), makeRouteRow(2)],
+      topkV3Rows: [makeRpcRowV3(0), makeRpcRowV3(1), makeRpcRowV3(2)],
+    });
+    const r = await mod.retrieveKnowledgeV3({ ...BASE_ARGS, supabaseAdmin: admin, topK: 1 });
+    expect(r.parents.length).toBe(1);
+    expect(r.telemetry.rewrite?.effectiveTopK).toBe(1);
+    const upserts = rpcCalls.filter((c) => c.name === 'semantic_query_cache_upsert');
+    expect(upserts.length).toBe(1);
+    expect(((upserts[0].args as Record<string, unknown>).p_parent_unit_ids as string[]).length).toBe(3);
+  });
+
+  it('cache HIT reads NARROW per-turn: synthesis slices 2 from a wide row', async () => {
+    const mod = await freshModuleWithFlagOn();
+    mockRewriteOkBreadth('failure bricks vs comfort zone', 'synthesis');
+    mockEmbedOk();
+    const { admin } = buildAdminV3({
+      cacheLookupHit: {
+        parent_unit_ids: ['pu-0', 'pu-1', 'pu-2'],
+        scores: [0.9, 0.8, 0.7],
+        age_seconds: 60,
+        cached_row_id: 'row-1',
+      },
+      parentFetchRows: [0, 1, 2].map((i) => ({
+        id: `pu-${i}`,
+        text: `Parent ${i}`,
+        title: `T${i}`,
+        sample_content: { source_type: 'transcript' },
+      })),
+    });
+    const r = await mod.retrieveKnowledgeV3({ ...BASE_ARGS, supabaseAdmin: admin, topK: 1 });
+    expect(r.telemetry.cacheHit).toBe(true);
+    expect(r.parents.length).toBe(2);
+  });
+
+  it('rewrite FALLBACK stays pointed (no widen) with flag on', async () => {
+    const mod = await freshModuleWithFlagOn();
+    mockRewriteFallback();
+    mockEmbedOk();
+    const { admin } = buildAdminV3({
+      routeRows: [makeRouteRow(0)],
+      topkV3Rows: [makeRpcRowV3(0), makeRpcRowV3(1), makeRpcRowV3(2)],
+    });
+    const r = await mod.retrieveKnowledgeV3({ ...BASE_ARGS, supabaseAdmin: admin, topK: 1 });
+    expect(r.parents.length).toBe(1);
+    expect(r.telemetry.rewrite?.breadth).toBe('pointed');
+  });
+
+  it('SYNTHESIS_TOP_K env invalid (7 > ceiling) falls back to default 2', async () => {
+    const mod = await freshModuleWithFlagOn('7');
+    mockRewriteOkBreadth('relate a to b', 'synthesis');
+    mockEmbedOk();
+    const { admin } = buildAdminV3({
+      routeRows: [makeRouteRow(0), makeRouteRow(1), makeRouteRow(2)],
+      topkV3Rows: [makeRpcRowV3(0), makeRpcRowV3(1), makeRpcRowV3(2)],
+    });
+    const r = await mod.retrieveKnowledgeV3({ ...BASE_ARGS, supabaseAdmin: admin, topK: 1 });
+    expect(r.parents.length).toBe(2);
+  });
+});

@@ -685,3 +685,173 @@ test('_resetClientsForTests is re-exported and NODE_ENV-guarded', () => {
   assert.equal(typeof _resetClientsForTests, 'function');
   _resetClientsForTests(); // NODE_ENV==='test' set at top — must not throw
 });
+
+// ── Unit 2 (MEMORY_BREADTH_PLAN) — continuity ring 1→3 ─────────────────────
+
+test('U2 — priorTurns array: all ring answers fold in, oldest first, question at the very end', () => {
+  const { contents } = assembleBrainContents({
+    persona: 'p', referenceEnvelopeText: ENV_OK, question: 'how does that tie together?',
+    priorTurns: [
+      { answer: 'FIRST-ANSWER about failure bricks.' },
+      { answer: 'SECOND-ANSWER about the comfort zone.' },
+      { answer: 'THIRD-ANSWER about the pit of despair.' },
+    ],
+  });
+  const qTurn = contents[2].parts[0].text;
+  assert.ok(qTurn.includes('FIRST-ANSWER'), 'oldest ring answer present');
+  assert.ok(qTurn.includes('SECOND-ANSWER'), 'middle ring answer present');
+  assert.ok(qTurn.includes('THIRD-ANSWER'), 'newest ring answer present');
+  assert.ok(
+    qTurn.indexOf('FIRST-ANSWER') < qTurn.indexOf('SECOND-ANSWER') &&
+    qTurn.indexOf('SECOND-ANSWER') < qTurn.indexOf('THIRD-ANSWER'),
+    'ring folds oldest → newest',
+  );
+  assert.ok(qTurn.endsWith('how does that tie together?'), 'question stays LAST (R2-M4)');
+  assert.equal(contents.length, 3, 'no extra turns added — same shape as single-turn B2');
+});
+
+test('U2 — older ring answers tail-capped at 300; newest keeps the full 1500 tail', () => {
+  const oldLong = 'OLDHEAD'.padEnd(2000, 'x') + 'OLD-END';
+  const newLong = 'NEWHEAD'.padEnd(1400, 'y') + 'NEW-END';
+  const { contents } = assembleBrainContents({
+    persona: 'p', referenceEnvelopeText: ENV_OK, question: 'continue',
+    priorTurns: [{ answer: oldLong }, { answer: newLong }],
+  });
+  const qTurn = contents[2].parts[0].text;
+  assert.ok(qTurn.includes('OLD-END'), 'older tail kept');
+  assert.ok(!qTurn.includes('OLDHEAD'), 'older head dropped (300-char tail)');
+  assert.ok(qTurn.includes('NEW-END'), 'newest tail kept');
+  assert.ok(qTurn.includes('NEWHEAD'), 'newest keeps its 1500 tail (audited resume behavior)');
+});
+
+test('U2 — anti-persistence guard appears exactly ONCE for a 3-turn ring', () => {
+  const { contents } = assembleBrainContents({
+    persona: 'p', referenceEnvelopeText: ENV_OK, question: 'continue',
+    priorTurns: [{ answer: 'a1' }, { answer: 'a2' }, { answer: 'a3' }],
+  });
+  const qTurn = contents[2].parts[0].text;
+  const matches = qTurn.match(/not authoritative fact/gi) || [];
+  assert.equal(matches.length, 1, 'guard applied once to the folded block, not per answer');
+});
+
+test('U2 — truncated honored only on the NEWEST ring entry', () => {
+  const { contents } = assembleBrainContents({
+    persona: 'p', referenceEnvelopeText: ENV_OK, question: 'continue',
+    priorTurns: [
+      { answer: 'old turn', truncated: true },  // stale flag on an old turn
+      { answer: 'newest turn', truncated: false },
+    ],
+  });
+  const qTurn = contents[2].parts[0].text;
+  assert.ok(!/cut off mid-answer/i.test(qTurn), 'old truncated flag must NOT trigger resume');
+});
+
+test('U2 — priorTurns [] / null / entries without answers leave the question unchanged', () => {
+  for (const pts of [[], null, [{ answer: '' }, { answer: '   ' }]]) {
+    const { contents } = assembleBrainContents({
+      persona: 'p', referenceEnvelopeText: ENV_OK, question: 'Q?', priorTurns: pts,
+    });
+    assert.equal(contents[2].parts[0].text, 'Q?', `priorTurns=${JSON.stringify(pts)} → no preamble`);
+  }
+});
+
+test('U2 — ring is hard-capped at 3 even if a caller passes more', () => {
+  const { contents } = assembleBrainContents({
+    persona: 'p', referenceEnvelopeText: ENV_OK, question: 'continue',
+    priorTurns: [
+      { answer: 'DROP-ME' }, { answer: 'keep1' }, { answer: 'keep2' }, { answer: 'keep3' },
+    ],
+  });
+  const qTurn = contents[2].parts[0].text;
+  assert.ok(!qTurn.includes('DROP-ME'), 'only the newest 3 survive');
+  assert.ok(qTurn.includes('keep1') && qTurn.includes('keep3'));
+});
+
+// ── Unit 1a (MEMORY_BREADTH_PLAN) — USER CONTEXT in the question turn ───────
+
+test('U1a — userContext folds into the QUESTION turn wrapped in BEGIN/END USER CONTEXT, question stays LAST', () => {
+  const { contents, systemInstruction } = assembleBrainContents({
+    persona: 'p', referenceEnvelopeText: ENV_OK, question: 'what should I do?',
+    userContext: 'Goals: ship the app. Obstacles: procrastination.',
+  });
+  assert.equal(contents.length, 3, 'no extra turns added');
+  const qTurn = contents[2].parts[0].text;
+  assert.match(qTurn, /--- BEGIN USER CONTEXT ---/);
+  assert.match(qTurn, /--- END USER CONTEXT ---/);
+  assert.ok(qTurn.includes('ship the app'), 'context body present in the user turn');
+  assert.ok(qTurn.endsWith('what should I do?'), 'question LAST (R2-M4)');
+  // The user-derived TEXT must never ride the trusted systemInstruction (R1-C4).
+  assert.ok(!systemInstruction.includes('ship the app'), 'user-derived text NOT in systemInstruction');
+});
+
+test('U1a — userContext block precedes the continuity preamble inside the question turn', () => {
+  const { contents } = assembleBrainContents({
+    persona: 'p', referenceEnvelopeText: ENV_OK, question: 'continue',
+    userContext: 'Goals: UC-MARKER.',
+    priorTurns: [{ answer: 'RING-MARKER answer' }],
+  });
+  const qTurn = contents[2].parts[0].text;
+  assert.ok(
+    qTurn.indexOf('UC-MARKER') < qTurn.indexOf('RING-MARKER'),
+    'order pinned: [user context][continuity][question]',
+  );
+  assert.ok(qTurn.endsWith('continue'));
+});
+
+test('U1a — static system clause appears ONLY when userContext present; absent → byte-identical', () => {
+  const withCtx = assembleBrainContents({
+    persona: 'p', referenceEnvelopeText: ENV_OK, question: 'Q?',
+    userContext: 'Goals: x.',
+  });
+  assert.match(withCtx.systemInstruction, /USER CONTEXT block/i, 'static descriptor clause present');
+  for (const uc of [undefined, null, '', '   ']) {
+    const without = assembleBrainContents({
+      persona: 'p', referenceEnvelopeText: ENV_OK, question: 'Q?', userContext: uc,
+    });
+    assert.ok(!/USER CONTEXT block/i.test(without.systemInstruction), 'no clause when absent');
+    assert.equal(without.contents[2].parts[0].text, 'Q?', 'question turn unchanged');
+  }
+});
+
+test('U1a — check-in clause: STATIC, first-turn-gated, requires an open thread marker', () => {
+  const ucWithLoop = 'Goals: x.\n[OPEN THREAD] Last time the user said they were struggling with the job decision.';
+  // first turn + open thread → clause present (and still static/template-only).
+  const a = assembleBrainContents({
+    persona: 'p', referenceEnvelopeText: ENV_OK, question: 'Q?',
+    userContext: ucWithLoop, isFirstTurn: true,
+  });
+  assert.match(a.systemInstruction, /FIRST sentence/i, 'check-in instruction present');
+  assert.ok(!a.systemInstruction.includes('job decision'), 'check-in clause never interpolates user text');
+  // later turn → no check-in clause.
+  const b = assembleBrainContents({
+    persona: 'p', referenceEnvelopeText: ENV_OK, question: 'Q?',
+    userContext: ucWithLoop, isFirstTurn: false,
+  });
+  assert.ok(!/FIRST sentence/i.test(b.systemInstruction), 'no check-in after the first turn');
+  // first turn but NO open thread → no check-in clause.
+  const c = assembleBrainContents({
+    persona: 'p', referenceEnvelopeText: ENV_OK, question: 'Q?',
+    userContext: 'Goals: x.', isFirstTurn: true,
+  });
+  assert.ok(!/FIRST sentence/i.test(c.systemInstruction), 'no check-in without an open thread');
+});
+
+test('U1a — userContext carries the defer-to-reference guard (anti-persistence posture)', () => {
+  const { contents } = assembleBrainContents({
+    persona: 'p', referenceEnvelopeText: ENV_OK, question: 'Q?',
+    userContext: 'Goals: x.',
+  });
+  const qTurn = contents[2].parts[0].text;
+  assert.match(qTurn, /not instructions/i);
+  assert.match(qTurn, /never recite/i);
+});
+
+test('U1a — persona-only path (no envelope): userContext still folds, single user turn', () => {
+  const { contents } = assembleBrainContents({
+    persona: 'p', referenceEnvelopeText: null, question: 'Q?',
+    userContext: 'Goals: y.',
+  });
+  assert.equal(contents.length, 1);
+  assert.ok(contents[0].parts[0].text.includes('Goals: y.'));
+  assert.ok(contents[0].parts[0].text.endsWith('Q?'));
+});

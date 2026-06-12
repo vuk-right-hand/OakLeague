@@ -44,6 +44,7 @@ import type { AvatarProvider } from '@/lib/avatar/avatar-bridge';
 import type { AvatarEnvelope } from '@/lib/avatar/avatar-envelope';
 import { mintVoiceTicket, VoiceTicketMintError } from '@/lib/voice/mint-voice-ticket';
 import { buildBrainPrefix } from '@/lib/voice/brain-prefix';
+import { buildUserContext } from '@/lib/voice/user-context';
 import { shouldEmitBrainNotReady } from '@/lib/voice/brain-not-ready-dedupe';
 import { resolveVoiceId, pickEnvScoped, coerceNumericOrNull } from '@/lib/voice/env-scoped-voice-id';
 import { createHash, randomUUID } from 'node:crypto';
@@ -870,9 +871,11 @@ export async function POST(req: NextRequest) {
   const brainAssemblyPromise = (async (): Promise<{
     brainPrefix: Awaited<ReturnType<typeof buildBrainPrefix>>;
     resolvedSystemPrompt: string | null;
+    userContext: string | null;
   }> => {
   let brainPrefix: Awaited<ReturnType<typeof buildBrainPrefix>> = null;
   let resolvedSystemPrompt: string | null = creatorRow.system_prompt;
+  let userContext: string | null = null;
   // ── Brain prefix build (PR-2 + pgvector RAG) ────────────────────────
   // Drawer mode: pulls sample_content rows whose topic_tags overlap
   // hook.topic_tags and packages them as a single user-role `prefixTurns`
@@ -959,28 +962,93 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // ── {{user_name}} substitution (pgvector plan inline user-name fix) ──
+  // ── profiles read: {{user_name}} + user-context inputs (Unit 1a) ─────
   // Persona compile (M10) emits a literal {{user_name}} placeholder.
-  // Resolve here using profiles.display_name (collected at signup). Falls
-  // back to 'friend' if null/empty. The substituted string is what lands
-  // on voice_tickets.system_prompt; proxy passes it to Gemini Live verbatim.
-  // Plan audit M2: the profiles read stays gated on the placeholder being
-  // present — no unconditional extra roundtrip for personas without it.
-  if (resolvedSystemPrompt && resolvedSystemPrompt.includes('{{user_name}}')) {
+  // Resolve using profiles.display_name (collected at signup); falls back
+  // to 'friend' if null/empty. The substituted string lands on
+  // voice_tickets.system_prompt; proxy passes it to Gemini Live verbatim.
+  // Latency-plan audit M2 + MEMORY_BREADTH R1-M1 reconciled: the read is
+  // gated on (placeholder present OR user-context flag on) — flag-off
+  // sessions keep main's no-extra-roundtrip behavior, flag-on sessions get
+  // goals/obstacles from the SAME read. Runs inside this Phase-C IIFE, in
+  // parallel with the avatar mint → zero wall-time either way.
+  const wantsUserName =
+    !!resolvedSystemPrompt && resolvedSystemPrompt.includes('{{user_name}}');
+  const wantsUserContext = process.env.BRAIN_USER_CONTEXT_ENABLED === '1';
+  if (wantsUserName || wantsUserContext) {
     const { data: profileRow } = await admin
       .from('profiles')
-      .select('display_name')
+      .select('display_name, goals, obstacles')
       .eq('id', callerUserId)
-      .maybeSingle<{ display_name: string | null }>();
-    const userName = (profileRow?.display_name ?? '').trim() || 'friend';
-    resolvedSystemPrompt = resolvedSystemPrompt.replaceAll('{{user_name}}', userName);
+      .maybeSingle<{ display_name: string | null; goals: string[] | null; obstacles: string[] | null }>();
+    if (wantsUserName && resolvedSystemPrompt) {
+      const userName = (profileRow?.display_name ?? '').trim() || 'friend';
+      resolvedSystemPrompt = resolvedSystemPrompt.replaceAll('{{user_name}}', userName);
+    }
+
+    // ── user_context build (Units 1a + 1b, both flag-gated) ────────────
+    // BRAIN_USER_CONTEXT_ENABLED gates goals/obstacles injection;
+    // BRAIN_USER_MEMORY_ENABLED gates the memory read + open loop (the
+    // SAME env name is also read on the Fly side to gate extraction —
+    // co-flip, audit R1-S1). All inputs are user-derived/untrusted:
+    // buildUserContext sanitizes + octet-caps; the proxy folds the result
+    // into the deep-answer QUESTION turn as a DATA block. It NEVER reaches
+    // the Gemini Live systemInstruction (resumption-bound).
+    if (wantsUserContext) {
+      let memorySummary: string | null = null;
+      let openLoop: string | null = null;
+      let includeOpenLoop = false;
+      if (process.env.BRAIN_USER_MEMORY_ENABLED === '1') {
+        try {
+          const { data: memRow } = await admin
+            .from('user_creator_memory')
+            .select('summary, open_loop')
+            .eq('user_id', callerUserId)
+            .eq('creator_id', creatorId)
+            .maybeSingle<{ summary: string; open_loop: string | null }>();
+          memorySummary = memRow?.summary ?? null;
+          openLoop = memRow?.open_loop ?? null;
+          // R1-S5 — the 20h check-in gate reads the SESSIONS table (robust
+          // even when the last extraction died): only check in when the
+          // user's last ENDED session with this creator is > 20h old.
+          // Covered by sessions_user_creator_ended_idx (R2-M2, partial).
+          if (openLoop) {
+            const { data: lastSess } = await admin
+              .from('sessions')
+              .select('ended_at')
+              .eq('user_id', callerUserId)
+              .eq('creator_id', creatorId)
+              .not('ended_at', 'is', null)
+              .order('ended_at', { ascending: false })
+              .limit(1)
+              .maybeSingle<{ ended_at: string }>();
+            const lastEnded = lastSess?.ended_at ? Date.parse(lastSess.ended_at) : NaN;
+            includeOpenLoop = Number.isFinite(lastEnded)
+              ? Date.now() - lastEnded > 20 * 3600 * 1000
+              : false;
+          }
+        } catch (memErr) {
+          // Memory is an enhancement, never a session-open blocker.
+          Sentry.captureException(memErr, {
+            extra: { op: 'sessions_open_memory_read', creator_id: creatorId },
+          });
+        }
+      }
+      userContext = buildUserContext({
+        goals: profileRow?.goals ?? null,
+        obstacles: profileRow?.obstacles ?? null,
+        memorySummary,
+        openLoop,
+        includeOpenLoop,
+      });
+    }
   }
-  return { brainPrefix, resolvedSystemPrompt };
+  return { brainPrefix, resolvedSystemPrompt, userContext };
   })();
 
   const [
     { avatar, avatarStatus, avatarError },
-    { brainPrefix, resolvedSystemPrompt },
+    { brainPrefix, resolvedSystemPrompt, userContext },
   ] = await Promise.all([avatarMintPromise, brainAssemblyPromise]);
 
   // Persist the avatar_status transition. Non-fatal on failure — we prefer
@@ -1082,6 +1150,10 @@ export async function POST(req: NextRequest) {
       //     before return
       // The DB CHECKs on voice_tickets are defense-in-depth.
       systemPrompt: resolvedSystemPrompt,
+      // MEMORY_BREADTH_PLAN U1a — sanitized + octet-capped by
+      // buildUserContext (the route owns the cap, R1-S2); DB CHECK is
+      // defense-in-depth. NULL when flags off or nothing to say.
+      userContext,
       prefixTurns:  brainPrefix?.prefixTurns ?? null,
       brainMode:    creatorRow.brain_mode,
       // DECOUPLED_BRAIN_PLAN P1-10. Forward the creator's decoupled

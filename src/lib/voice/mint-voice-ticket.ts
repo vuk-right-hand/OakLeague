@@ -71,6 +71,11 @@ export type MintVoiceTicketArgs = {
   // are within bounds (≤2000 octets / encodedBytes < 60KB) when set,
   // so the DB CHECKs are defense-in-depth and won't fire.
   systemPrompt?: string | null;
+  // MEMORY_BREADTH_PLAN U1a — sanitized user-context string composed by the
+  // open route (buildUserContext owns sanitation + the ≤2400-octet cap;
+  // R1-S2). Mint passes it through OPAQUELY; the DB CHECK
+  // voice_tickets_user_context_len_chk is defense-in-depth.
+  userContext?: string | null;
   prefixTurns?: PrefixTurn[] | null;
   // Creator voice-speed knob (migration 20260511000006). Cartesia
   // Sonic 3 generation_config.speed multiplier in [0.6, 1.5]. NULL
@@ -248,6 +253,8 @@ export async function mintVoiceTicket(args: MintVoiceTicketArgs): Promise<MintVo
       // route emits brain_not_ready 409 before reaching mint when the
       // creator is unready, so this NULL path is rare).
       system_prompt:   args.systemPrompt ?? null,
+      // U1a — opaque pass-through (route-sanitized; see type comment).
+      user_context:    args.userContext  ?? null,
       prefix_turns:    args.prefixTurns  ?? null,
       // Creator voice-speed (migration 20260511000006). DB CHECK is
       // [0.6, 1.5]; route already pulls from creators.tts_speed which
