@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { assertAdminFromSession } from '@/lib/auth-guards';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import { deleteMuxAsset } from '@/lib/mux/upload';
+import { publishLongFormGated, setVideoPublishedGated } from '@/lib/videos/publish-gates';
 
 type ActionResult = { ok: true } | { ok: false; error: string };
 
@@ -78,13 +79,10 @@ export async function setVideoPublished(input: unknown): Promise<ActionResult> {
   const parsed = PublishVideo.safeParse(input);
   if (!parsed.success) return { ok: false, error: 'invalid_input' };
 
-  const admin = supabaseAdmin();
-  const { error } = await admin
-    .from('videos')
-    .update({ published_at: parsed.data.publish ? new Date().toISOString() : null })
-    .eq('id', parsed.data.videoId);
-
-  if (error) return { ok: false, error: error.message };
+  // Shared gates (CREATOR_STUDIO audit C4) — same code path as the creator
+  // studio action so the two can never drift. admin_removed_at lock included.
+  const res = await setVideoPublishedGated(supabaseAdmin(), parsed.data.videoId, parsed.data.publish);
+  if (!res.ok) return res;
   revalidatePath(`/admin/content/videos/${parsed.data.videoId}`);
   return { ok: true };
 }
@@ -233,57 +231,12 @@ export async function publishLongForm(
   const parsed = PublishLongForm.safeParse(input);
   if (!parsed.success) return { ok: false, error: 'invalid_input' };
 
-  const admin = supabaseAdmin();
-  const { data: row, error: readErr } = await admin
-    .from('videos')
-    .select(
-      'id, long_form_mux_status, long_form_mux_aspect_ratio, long_form_mux_duration_ms',
-    )
-    .eq('id', parsed.data.videoId)
-    .maybeSingle<{
-      id: string;
-      long_form_mux_status: string;
-      long_form_mux_aspect_ratio: string | null;
-      long_form_mux_duration_ms: number | null;
-    }>();
-  if (readErr || !row) return { ok: false, error: 'not_found' };
-
-  if (row.long_form_mux_status !== 'ready') {
-    return { ok: false, error: 'not_ready' };
-  }
-
-  // Audit M9: aspect-ratio enforcement at publish, not at webhook. We let
-  // the asset reach 'ready' so the creator can preview before re-uploading.
-  // Differentiate missing (Mux didn't send it) vs unsupported (≠ '16:9') so
-  // the UI can show a more accurate error.
-  if (row.long_form_mux_aspect_ratio === null) {
-    return { ok: false, error: 'aspect_ratio_missing' };
-  }
-  if (row.long_form_mux_aspect_ratio !== '16:9') {
-    return { ok: false, error: 'aspect_ratio_unsupported' };
-  }
-
-  // Audit M10: float-compare duration. long_form_mux_duration_ms is
-  // authoritative (Mux reports float seconds; we store ms). The strict
-  // 5–55 min user-facing rule is enforced here, not in the DB CHECK
-  // which is loose 60–3600.
-  if (row.long_form_mux_duration_ms === null) {
-    return { ok: false, error: 'not_ready' };
-  }
-  const seconds = row.long_form_mux_duration_ms / 1000.0;
-  if (seconds < 300 || seconds > 3300) {
-    return { ok: false, error: 'duration_out_of_range' };
-  }
-
-  // First-publish-wins idempotency (audit M4). The .is('long_form_published_at', null)
-  // filter means a re-run on an already-published row matches zero rows
-  // and is a silent no-op. UI re-fetches and sees the original timestamp.
-  const { error: updErr } = await admin
-    .from('videos')
-    .update({ long_form_published_at: new Date().toISOString() })
-    .eq('id', parsed.data.videoId)
-    .is('long_form_published_at', null);
-  if (updErr) return { ok: false, error: updErr.message };
+  // Gates moved VERBATIM into publishLongFormGated (CREATOR_STUDIO audit C4):
+  // ready + aspect 16:9 (M9 missing/unsupported split) + 300–3300s (M10) +
+  // first-publish-wins (.is null, M4) + admin_removed_at lock. Shared with the
+  // creator studio publish action so the two paths can never drift.
+  const res = await publishLongFormGated(supabaseAdmin(), parsed.data.videoId);
+  if (!res.ok) return res;
 
   revalidatePath(`/admin/content/videos/${parsed.data.videoId}`);
   return { ok: true };
