@@ -6,7 +6,7 @@ import { usePathname } from 'next/navigation';
 // TikTok-style persistent bottom nav (PROFILE_SYSTEM_PLAN U5 / §3.6).
 // Rendered once in the root layout; hides itself on auth/onboarding/admin
 // surfaces (audit S2: a shared-link visitor should not get the full authed
-// shell). The middle button is a 5-state machine driven by /api/me/creator-status.
+// shell). The middle button is a 6-state machine driven by /api/me/creator-status.
 
 type Status = {
   state: 'guest' | 'not_invited' | 'requested' | 'invited' | 'in_review' | 'creator';
