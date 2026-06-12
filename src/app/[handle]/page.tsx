@@ -1,8 +1,10 @@
+import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
 import { supabaseServer } from '@/lib/supabase/server';
 import { HANDLE_RE } from '@/lib/profile/handle';
 import { HandshakeButton } from './handshake-button';
 import { EditProfileSheet } from './edit-profile-sheet';
+import { ShareButton } from '@/components/share/ShareButton';
 
 export const dynamic = 'force-dynamic'; // per-viewer state (handshaked / self); never CDN-cache (audit M5)
 
@@ -23,6 +25,39 @@ function fmt(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return String(n);
+}
+
+// WS7: unfurl metadata for shared profile links. Published creators get a real
+// title/description; everything else falls back to a generic title (no leak).
+// The opengraph-image.tsx in this segment is auto-attached as og:image by Next.
+export async function generateMetadata({
+  params,
+}: {
+  params: Promise<{ handle: string }>;
+}): Promise<Metadata> {
+  const { handle: raw } = await params;
+  if (!raw?.startsWith('@')) return { title: 'OakLeague' };
+  const handle = raw.slice(1).toLowerCase();
+  if (!HANDLE_RE.test(handle)) return { title: 'OakLeague' };
+
+  const supabase = await supabaseServer();
+  const { data } = await supabase
+    .from('creators')
+    .select('display_name, handle, bio')
+    .eq('handle', handle)
+    .not('published_at', 'is', null)
+    .maybeSingle<{ display_name: string | null; handle: string; bio: string | null }>();
+  if (!data) return { title: 'OakLeague' };
+
+  const name = data.display_name || `@${data.handle}`;
+  const title = `${name} — OakLeague`;
+  const description = (data.bio ?? `Talk to ${name} on OakLeague.`).slice(0, 200);
+  return {
+    title,
+    description,
+    openGraph: { title, description, type: 'profile', url: `/@${data.handle}` },
+    twitter: { card: 'summary_large_image', title, description },
+  };
 }
 
 export default async function ProfilePage({
@@ -181,6 +216,13 @@ export default async function ProfilePage({
               ) : null}
             </>
           )}
+          {/* Share works for everyone — the creator shares their own profile,
+              visitors share one they like. (WS7) */}
+          <ShareButton
+            path={`/@${profile.handle}`}
+            title={`${name} on OakLeague`}
+            text={`Talk to ${name} on OakLeague`}
+          />
         </div>
       </header>
 

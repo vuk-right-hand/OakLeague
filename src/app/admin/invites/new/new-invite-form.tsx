@@ -7,7 +7,10 @@ export function NewInviteForm() {
   const [email, setEmail] = useState('');
   const [notes, setNotes] = useState('');
   const [expiresInDays, setExpiresInDays] = useState(7);
-  const [result, setResult] = useState<{ url: string } | null>(null);
+  const [result, setResult] = useState<{
+    url: string;
+    emailStatus: 'sent' | 'sent_sandbox' | 'skipped' | 'failed';
+  } | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
 
@@ -21,7 +24,7 @@ export function NewInviteForm() {
         startTransition(async () => {
           const res = await mintCreatorInvite({ email, notes, expires_in_days: expiresInDays });
           if (!res.ok) setErr(res.error);
-          else setResult({ url: res.url });
+          else setResult({ url: res.url, emailStatus: res.emailStatus });
         });
       }}
     >
@@ -62,6 +65,21 @@ export function NewInviteForm() {
       {err && <div role="alert" style={{ color: 'salmon' }}>{err}</div>}
       {result && (
         <div style={{ background: '#111', padding: 12, borderRadius: 6, wordBreak: 'break-all' }}>
+          <div
+            style={{
+              fontSize: 13,
+              marginBottom: 8,
+              color: result.emailStatus === 'sent' ? '#4ad07a' : '#f0b13a',
+            }}
+          >
+            {result.emailStatus === 'sent'
+              ? '✓ Invite email sent.'
+              : result.emailStatus === 'sent_sandbox'
+                ? '⚠ Sent from the Resend SANDBOX — only the Resend account owner receives it, NOT the creator. Send this link manually:'
+                : result.emailStatus === 'skipped'
+                  ? '⚠ Email is disabled (no RESEND keys) — send this link manually:'
+                  : '⚠ Email failed to send — send this link manually:'}
+          </div>
           <div style={{ fontSize: 12, opacity: 0.7 }}>Copy-fallback URL (shown once):</div>
           <code>{result.url}</code>
         </div>

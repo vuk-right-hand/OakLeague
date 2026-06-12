@@ -170,10 +170,10 @@ export default async function WaitlistPage() {
         </div>
         <div style={{ fontSize: 14, opacity: 0.74, marginBottom: 16 }}>
           We&apos;re invite-only for v1. If you have published content and an audience,
-          reach out.
+          request a spot — we review every one by hand.
         </div>
         <Link
-          href="mailto:creators@oakleague.com"
+          href="/request"
           style={{
             display: 'inline-block',
             background: '#fff',
@@ -185,7 +185,7 @@ export default async function WaitlistPage() {
             textDecoration: 'none',
           }}
         >
-          creators@oakleague.com
+          Request to become a creator
         </Link>
       </section>
 

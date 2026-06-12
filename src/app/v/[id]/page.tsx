@@ -1,9 +1,11 @@
+import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
 import { z } from 'zod';
 import { supabaseServer } from '@/lib/supabase/server';
 import { LongFormPlayer } from './long-form-player';
 import { LikeButton } from './like-button';
 import { CommentsPanel } from './comments-panel';
+import { ShareButton } from '@/components/share/ShareButton';
 import type { CommentRow } from '@/lib/video/comment-actions';
 
 export const dynamic = 'force-dynamic';
@@ -35,6 +37,44 @@ type VideoRow = z.infer<typeof videoRowSchema>;
 type CreatorRow = z.infer<typeof creatorRowSchema>;
 
 const fromUuidSchema = z.string().uuid();
+
+// WS7: unfurl metadata for shared long-form links. Same publish + long-form-ready
+// gate as the page; unpublished/pending → generic title (no leak). The
+// opengraph-image.tsx in this segment is auto-attached as og:image by Next.
+export async function generateMetadata({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}): Promise<Metadata> {
+  const { id } = await params;
+  if (!fromUuidSchema.safeParse(id).success) return { title: 'OakLeague' };
+
+  const sb = await supabaseServer();
+  const { data } = await sb
+    .from('videos')
+    .select('title, description, creator_id')
+    .eq('id', id)
+    .not('published_at', 'is', null)
+    .not('long_form_published_at', 'is', null)
+    .eq('long_form_mux_status', 'ready')
+    .maybeSingle<{ title: string; description: string | null; creator_id: string }>();
+  if (!data) return { title: 'OakLeague' };
+
+  const { data: c } = await sb
+    .from('creators')
+    .select('display_name, handle')
+    .eq('id', data.creator_id)
+    .maybeSingle<{ display_name: string | null; handle: string }>();
+  const who = c?.display_name || (c ? `@${c.handle}` : 'OakLeague');
+  const title = `${data.title} — ${who} on OakLeague`;
+  const description = (data.description ?? `Watch ${who} on OakLeague.`).slice(0, 200);
+  return {
+    title,
+    description,
+    openGraph: { title, description, type: 'video.other', url: `/v/${id}` },
+    twitter: { card: 'summary_large_image', title, description },
+  };
+}
 
 export default async function LongFormPage({
   params,
@@ -167,6 +207,11 @@ export default async function LongFormPage({
           initialCount={video.like_count}
           isAuthenticated={!!user}
           autoFire={autoLike}
+        />
+        <ShareButton
+          path={`/v/${video.id}`}
+          title={`${video.title} — ${creator.display_name} on OakLeague`}
+          text={`Watch ${creator.display_name} on OakLeague`}
         />
         <CommentsPanel
           videoId={video.id}
