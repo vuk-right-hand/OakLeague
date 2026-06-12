@@ -588,6 +588,30 @@ export function HookPanel({
         onClick={async (e) => {
           e.stopPropagation();
           if (asking) return;
+          // Recording-first Ask tap (2026-06-12, founder-verified in
+          // PostHog: armed feed recording + Ask → navigation unmounts the
+          // controller and the clip is silently destroyed, no
+          // react_stopped ever fires). If a duet recording is live, this
+          // tap STOPS it instead (outro → preview with Share/Save/
+          // Discard); the user keeps the clip, dismisses, and taps Ask
+          // again to enter the session. Full record-across-surfaces
+          // continuity is deliberately NOT built on web — it's nearly
+          // free on native (app-level recording service), ~85% throwaway
+          // here.
+          if (recording.buttonProps.state === 'armed' || recording.buttonProps.state === 'stopping') {
+            // Audit M5 — distinct event so the Ask↔recording collision rate
+            // is measurable (this bug was only found via the ABSENCE of a
+            // react_stopped event; don't recreate that blind spot) and the
+            // Ask-tap funnel doesn't silently lose this tap.
+            captureSafe('ask_tap_stopped_recording', {
+              surface: 'hook',
+              hook_id: hook.hook_id,
+              creator_id: hook.creator_id,
+              recording_state: recording.buttonProps.state,
+            });
+            recording.buttonProps.onTap();
+            return;
+          }
           captureSafe('hook_ask_clicked', {
             hook_id: hook.hook_id,
             creator_id: hook.creator_id,

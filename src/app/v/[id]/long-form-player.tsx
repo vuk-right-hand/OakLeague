@@ -276,6 +276,22 @@ export function LongFormPlayer({
   //     non-2xx (audit M7).
   const onAsk = useCallback(async () => {
     if (asking) return;
+    // Recording-first Ask tap — same contract as hook-panel (2026-06-12):
+    // a live duet recording is stopped (outro → preview) instead of being
+    // silently destroyed by the navigation unmount. User saves, then taps
+    // Ask again.
+    if (recording.buttonProps.state === 'armed' || recording.buttonProps.state === 'stopping') {
+      // Audit M5 — distinct event so the Ask↔recording collision rate is
+      // measurable and the Ask-tap funnel doesn't silently lose this tap.
+      captureSafe('ask_tap_stopped_recording', {
+        surface: 'long_form',
+        video_id: videoId,
+        creator_id: creatorId,
+        recording_state: recording.buttonProps.state,
+      });
+      recording.buttonProps.onTap();
+      return;
+    }
     captureSafe('long_form_ask_clicked', {
       video_id: videoId,
       creator_id: creatorId,
@@ -378,7 +394,12 @@ export function LongFormPlayer({
     } finally {
       setAsking(false);
     }
-  }, [asking, isAuthenticated, entryHookId, videoId, creatorId, router]);
+  // Audit M4 — depend on the two consumed fields, not the whole buttonProps
+  // object (fresh literal every render; the narrower deps avoid implying the
+  // whole object is load-bearing). onTap itself is re-created per render
+  // too, so onAsk still churns during armed count-up — harmless: it's only
+  // consumed by a plain onClick, no memo child re-renders off it.
+  }, [asking, isAuthenticated, entryHookId, videoId, creatorId, router, recording.buttonProps.state, recording.buttonProps.onTap]);
 
   const onBack = useCallback(() => {
     if (typeof document !== 'undefined' && document.referrer) {

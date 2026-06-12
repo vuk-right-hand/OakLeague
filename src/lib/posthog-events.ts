@@ -91,6 +91,11 @@ export const RecordingEvents = {
   react_share_opened:              'react_share_opened',
   react_share_completed:           'react_share_completed',
   react_ask_recording_stop:        'react_ask_recording_stop',
+  // 2026-06-12 — Ask tap landed while a duet recording was armed/stopping;
+  // the tap STOPPED the recording (preview) instead of opening a session.
+  // Distinct event so the collision rate is measurable and the Ask funnel
+  // doesn't silently lose these taps (audit M5).
+  ask_tap_stopped_recording:       'ask_tap_stopped_recording',
 } as const;
 
 // Server-only events (fired via captureServerSafe) ----------------------------

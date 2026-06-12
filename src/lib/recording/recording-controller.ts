@@ -932,6 +932,13 @@ export function useRecordingController(
   // false during ARMED (or the 'stopping' outro), stop recording immediately.
   // We treat this as a BACKGROUND-class stop since the surface is no longer
   // permitted.
+  // NAMING DEBT (audit S3, 2026-06-12): the feed swipe-away stops
+  // recordings through THIS path (hook-panel flips `enabled` when the
+  // panel deactivates), so stop_reason telemetry reads 'background' for
+  // swipes — the state machine's dedicated SWIPE event / 'swipe' reason
+  // is never dispatched by any surface today. If swipe-vs-background
+  // attribution ever matters in PostHog, wire SWIPE here instead of
+  // renaming the analytics.
   useEffect(() => {
     if (!enabled && (phase.kind === 'armed' || phase.kind === 'stopping')) {
       dispatch({ type: 'BACKGROUND', nowMs: performance.now() });

@@ -2014,6 +2014,26 @@ wss.on('connection', async (ws, req) => {
   let decoupledOrch = null;
   let decoupledFatalFired = false; // audit C2 — onFatal idempotency latch
   let goAwayReopenFailedFired = false; // audit NEW-M5 — fail teardown one-shot
+  // 2026-06-12 prod incident — budget for UNEXPECTED Gemini upstream closes
+  // (non-1000, non-goAway). Each one is recovered via the same lazy-reopen-
+  // on-next-turn_start path as the audited 1000-close quirk; the budget
+  // keeps a hard upstream failure (auth/quota/model gone) failing loud
+  // instead of looping silent recoveries forever.
+  // Budget derivation (audit S4): 1 covers the observed single-drop
+  // incident; 3 tolerates a flappy Google-side window across a long
+  // session while still bounding a hard failure (auth/model-gone, which
+  // would close on every reopen) to ~3 wasted user turns before the loud
+  // teardown. The 1000-close quirk stays UNbudgeted — it's a documented
+  // benign SDK behavior (js-genai#707), not a failure signal.
+  let upstreamCloseRecoveries = 0;
+  const UPSTREAM_CLOSE_RECOVERY_BUDGET = 3;
+  // Audit M3 — set when we relay a response_truncated warning; correlated
+  // into the recovered-close Sentry context (incident precursor signal).
+  let lastResponseTruncatedAt = null;
+  // Audit M2 — one log per closed-bridge window, not one per 32ms audio
+  // frame (a half-second of mic audio between close and reopen is ~15
+  // frames; per-frame console.error buries the line that matters).
+  let sendAudioFailLogged = false;
   if (decoupled) {
     // Audit M5 — decoupled REQUIRES the α' TTS layer (the deep answer is
     // spoken in the creator's cloned voice; CLAUDE.md hard rule). The
@@ -2515,6 +2535,37 @@ wss.on('connection', async (ws, req) => {
         console.log(`[ws ${connId}] gemini upstream 1000-close — staying open for lazy reopen on next turn_start`);
         return;
       }
+      // 2026-06-12 prod incident — Google dropped the Gemini WS with a
+      // non-1000 code (~4:40 into a session, preceded by a truncation
+      // warning). The old rule ("anything else = real upstream failure →
+      // tear down") killed a session whose avatar/LiveKit + TTS legs were
+      // perfectly healthy: the browser showed a dead reconnect overlay
+      // while the avatar kept working. In decoupled mode Gemini is ONLY
+      // the STT leg — it sits idle for minutes during long answers, which
+      // makes sporadic upstream drops likely, and the next turn_start's
+      // lazy bridge.reopen() (resumption handle + brain re-seed, the same
+      // audited path the 1000-quirk uses) fully recovers it. Budgeted:
+      // past the budget we fall through to the loud teardown so a hard
+      // upstream failure still fails fast. Worst case for a recovered
+      // close: one mid-speech turn is swallowed (client turn-dead
+      // watchdog surfaces it; the following tap reopens).
+      if (upstreamCloseRecoveries < UPSTREAM_CLOSE_RECOVERY_BUDGET) {
+        upstreamCloseRecoveries += 1;
+        console.warn(`[ws ${connId}] gemini upstream UNEXPECTED close code=${e.code} reason="${e.reason || ''}" — deferred reopen on next turn_start (recovery ${upstreamCloseRecoveries}/${UPSTREAM_CLOSE_RECOVERY_BUDGET}) session=${sessionId.slice(0, 8)}`);
+        // 'info' level (audit M1) — sporadic drops during long idle answers
+        // are EXPECTED in decoupled mode; warning-level would bury real
+        // signal fleet-wide. Matches the 'gemini.reopen ok' precedent.
+        // lastResponseTruncatedAt (audit M3): the 2026-06-12 incident close
+        // was preceded 14s by a response_truncated warning — correlating
+        // the two in Sentry tells us whether truncation predicts the drop.
+        captureMessage('gemini.upstream_unexpected_close_recovered', 'info', {
+          op: 'gemini.upstream_close', connId, sessionId, userId,
+          code: e.code, reason: e.reason, recoveries: upstreamCloseRecoveries,
+          msSinceResponseTruncated: lastResponseTruncatedAt ? (Date.now() - lastResponseTruncatedAt) : null,
+        });
+        return;
+      }
+      console.error(`[ws ${connId}] gemini upstream close code=${e.code} reason="${e.reason || ''}" — recovery budget exhausted (${UPSTREAM_CLOSE_RECOVERY_BUDGET}), tearing down session=${sessionId.slice(0, 8)}`);
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'upstream_closed', at: e.at, code: e.code, reason: e.reason }));
       teardown('upstream_closed').catch(() => {});
       closeWs(ws, 1011, 'upstream_closed');
@@ -2958,13 +3009,20 @@ wss.on('connection', async (ws, req) => {
           return;
         }
       }
-      try { bridge.sendAudio({ bytes: data, mimeType: 'audio/pcm;rate=16000' }); }
+      try {
+        bridge.sendAudio({ bytes: data, mimeType: 'audio/pcm;rate=16000' });
+        sendAudioFailLogged = false; // healthy frame — re-arm the one-shot log
+      }
       catch (e) {
         // Send-audio failures are usually a closed-mid-frame race (1000-close
-        // workaround handles via lazy reopen on next turn_start). Keep the
-        // error log: a sustained burst here means bridge_not_open in steady
-        // state, which is a real bug.
-        console.error(`[ws ${connId}] [send-audio] FAIL:`, e?.message || e);
+        // / unexpected-close recovery both reopen lazily on next turn_start).
+        // Audit M2 — log ONCE per failure window, not per 32ms frame: a
+        // sustained burst still surfaces (the one-shot re-arms on the next
+        // healthy frame, so each distinct window logs exactly once).
+        if (!sendAudioFailLogged) {
+          sendAudioFailLogged = true;
+          console.error(`[ws ${connId}] [send-audio] FAIL (further frames in this window suppressed):`, e?.message || e);
+        }
       }
       return;
     }
@@ -3129,6 +3187,31 @@ wss.on('connection', async (ws, req) => {
             // toward the wedge streak.
             const inS = (typeof metrics.inputSeconds === 'number') ? metrics.inputSeconds.toFixed(1) : '?';
             console.warn(`[ws ${connId}] turn_complete_timeout (turn ${endingTurn}, streak ${consecutiveTurnCompleteTimeouts}, inputS=${inS}) — decoupled non-fatal; finalizing + keeping session`);
+          } else if (
+            // Upstream-close-recovery audit C1 (2026-06-12 incident): the
+            // mid-answer Gemini close rejects THIS await with
+            // 'ws_closed_mid_turn …' — the stay-open decision was already
+            // made by the bridge 'closed' handler (it runs FIRST: it was
+            // registered at session open, before turnEnd's temporary
+            // listener, and emit() calls listeners in registration order).
+            // If that handler chose recovery (`closed` latch still false),
+            // absorb the rejection exactly like the timeout path: finalize
+            // with partial metrics, keep the session, let the next
+            // turn_start lazy-reopen. If it chose teardown (budget
+            // exhausted → `closed` latch true), throw through as before.
+            // Audit C2: the budget is incremented ONLY in the 'closed'
+            // handler — this catch never mutates it. Deliberately does NOT
+            // touch consecutiveTurnCompleteTimeouts (different failure
+            // class: the bridge reopens next turn; the wedge streak is for
+            // a live-but-mute Gemini).
+            decoupled && e && typeof e.message === 'string'
+              && e.message.startsWith('ws_closed_mid_turn')
+              && !closed
+              && typeof bridge.getPartialTurnMetrics === 'function'
+          ) {
+            metrics = bridge.getPartialTurnMetrics();
+            recoveredFromTimeout = true;
+            console.warn(`[ws ${connId}] ${e.message} (turn ${endingTurn}) — decoupled non-fatal; finalizing + deferred reopen on next turn_start (recovery ${upstreamCloseRecoveries}/${UPSTREAM_CLOSE_RECOVERY_BUDGET})`);
           } else {
             throw e;
           }
@@ -3208,6 +3291,7 @@ wss.on('connection', async (ws, req) => {
         // reconciliation; this lets the client UI show "(this response was
         // cut off — ask again)" instead of failing silent.
         if (ttsMetrics?.partial) {
+          lastResponseTruncatedAt = Date.now(); // audit M3 — close-precursor signal
           try {
             ws.send(JSON.stringify({
               type: 'warning',
@@ -3457,9 +3541,11 @@ wss.on('connection', async (ws, req) => {
       // isn't invisible beyond the Fly log line.
       captureException(e, { op: 'control', msgType: msg?.type, sessionId });
       // Audit M-NEW-5 — clamp: e.message can be an upstream-derived string
-      // (e.g. `ws_closed_mid_turn code=… reason=<google text>`). This is the one
-      // client-facing frame in this branch that forwards a non-taxonomy string;
-      // bound it so unexpected upstream text can't bloat/poison the payload.
+      // (e.g. `ws_closed_mid_turn code=… reason=<google text>`). Bound it so
+      // unexpected upstream text can't bloat/poison the payload. NOTE (audit
+      // S1, 2026-06-12): today's proxy-client reads only `msg.code` from
+      // error frames and DROPS `message` — this string reaches Sentry/logs,
+      // not the user; the clamp is defense for a future client that renders it.
       const safeMsg = typeof e?.message === 'string' ? e.message.slice(0, 120) : 'control_error';
       ws.send(JSON.stringify({ type: 'error', message: safeMsg, op: msg?.type }));
     }
