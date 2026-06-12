@@ -542,3 +542,11 @@ caused by the flip, not blocking) — logged here:
   can) and would silently drop a `3` response. **Fix:** widen the panel's union + state-sync to
   include 3. **TRIGGER:** when v3 flips should be self-serve from the admin console (post first
   manual flips). UI/RPC range now disagree.
+
+## 2026-06-12 — Turnstile fail-open (TEMPORARY)
+`src/lib/turnstile.ts`: missing TURNSTILE_SECRET_KEY in prod currently fails
+OPEN (with Sentry alarm `turnstile_missing_secret_prod_failopen`) because no
+Turnstile account exists yet and the waitlist is live. Once
+NEXT_PUBLIC_TURNSTILE_SITE_KEY + TURNSTILE_SECRET_KEY are set in Vercel and
+verified working, restore audit C1 fail-CLOSED (flip the `return true` back to
+`return false` in the missing-secret prod branch).
