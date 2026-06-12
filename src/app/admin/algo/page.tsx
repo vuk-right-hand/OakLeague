@@ -44,8 +44,13 @@ export default async function AdminAlgoPage({
   return (
     <main>
       <h1 style={{ fontSize: 24, fontWeight: 600, marginBottom: 8 }}>Algo Inspector</h1>
-      <p style={{ fontSize: 13, opacity: 0.7, marginBottom: 16 }}>
+      <p style={{ fontSize: 13, opacity: 0.7, marginBottom: 8 }}>
         Pick a user → see their feed signals, funnel, and explain any hook.
+      </p>
+      <p style={{ fontSize: 13, marginBottom: 16 }}>
+        <a href="/admin/algo/weights" style={{ color: '#60a5fa' }}>
+          Edit live scorer weights →
+        </a>
       </p>
 
       <form method="get" style={{ marginBottom: 16 }}>

@@ -560,3 +560,27 @@ cache threshold means a partial match is a clean miss (no subpar-answer risk by 
 COGS: wasted prefetches ≈ double the brain's retrieval spend (~+4-6% of total turn-path) for a
 ~0.5-1s latency win on hits. **TRIGGER:** retrieval latency becomes a felt UX complaint.
 Flag-gated, paid tiers first. (Item #5, the 2.6K Option B persona, is noted separately above.)
+
+## Feed pre-traffic fixes (2026-06-12): three deferred follow-ups
+
+Logged while shipping FEED_PRETRAFFIC_FIXES (migs 20260613000001-3: feed_algo_weights +
+hook_global_stats decay/slot-buckets + retrieval pool blend + slate diversity):
+
+- **Position-bias correction.** `hook_global_stats.impressions_top3 / impressions_rest` now
+  accumulate per-slot impression counts (rank 0-2 vs rest) but are NOT consumed by scoring.
+  **Fix:** inverse-propensity-weight the open-through quality once slot propensities are
+  measurable. **TRIGGER:** any hook crossing ~1k impressions, or before training the first
+  learned ranker (the counters are its debiasing input).
+- **avg_completion_pct stays all-time while global_quality decays (30d half-life).** Two
+  time-bases on one row, intentional (completion = content-health diagnostic). **Fix:** decide
+  decayed-vs-raw completion when the position-bias correction lands. **TRIGGER:** same as above.
+- **Retrieval-pool divergence window 120-200 hooks.** pool_quality(120)+pool_recent(50)+
+  pool_random(30) only provably equals the old recency-200 pool while catalog <= 120; between
+  120 and 200 the composition differs (by design - quality arm wins). No test covers 120-200.
+  **Fix:** widen pool caps or add a window test if ranking anomalies appear in that band.
+  **TRIGGER:** catalog crossing ~120 published hooks.
+- **hook_global_stats_decay() expression duplication.** The decay UPDATE repeats the
+  pow(0.5,1/30) floor CASE four times (column SETs + quality formula) so the quality inputs
+  provably match the column values; a future hand-edit can desync them. **Fix:** refactor to a
+  FROM-clause LATERAL precompute when next touching the function. **TRIGGER:** next edit to
+  hook_global_stats_decay().
