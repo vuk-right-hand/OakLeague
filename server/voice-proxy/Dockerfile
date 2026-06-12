@@ -52,6 +52,7 @@ COPY index.js \
      gemini-bridge.js \
      hume-bridge.js \
      internal-request-signature.js \
+     memory-extract.js \
      paraphrase.js \
      posthog-client.js \
      proxy-handlers.js \
