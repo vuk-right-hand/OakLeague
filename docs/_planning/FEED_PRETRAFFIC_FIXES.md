@@ -468,6 +468,32 @@ Any other red ⇒ stale-test vs regression decision BEFORE editing (green ≠ co
 - `NOTIFY pgrst, 'reload schema'` at the end of each migration.
 - Docs: ALGO_IMPLEMENTATION_PLAN.md §5.3 weight-source note; CLEANUP_BACKLOG entries: position-bias correction (uses impressions_top3/rest), avg_completion_pct decay decision, 120–200 catalog divergence window note.
 
+## 5b. Performance verification (2026-06-12, before prod)
+
+`scripts/feed_ranked_page_bench.sql` — seeds 100→2000 hooks across 5 creators,
+times 25 warm `feed_ranked_page(10)` calls per scale under `SET LOCAL ROLE
+authenticated` (so the `hooks_public` security_invoker RLS is in the plan,
+matching prod). Fresh regime-A caller ⇒ both exploit + explore scoring passes
+run per candidate (per-page worst case). Local Docker-on-Windows:
+
+| catalog | avg ms | p95 ms |
+|--------:|-------:|-------:|
+|     100 |    9.2 |   10.9 |
+|     300 |   14.7 |   15.2 |
+|     600 |   20.8 |   22.2 |
+|    1000 |   31.6 |   32.1 |
+|    2000 |   68.4 |   71.9 |
+
+**Sub-linear** (20× catalog → ~7.5× latency): the candidate pool is capped at
+~200 before the 2× `compute_hook_score` scoring, so the only catalog-linear
+term is the `hooks_public` RLS `EXISTS`-join over the filtered base. At any
+near-term v1 catalog (tens of hooks) this is ~9 ms; 2000 hooks is still <75 ms
+p95 on slow local hardware (prod is faster). If the catalog ever reaches many
+thousands, the lever is a partial/covering index backing the visibility EXISTS
+— a future optimization, not a launch gate. Deterministic at-scale correctness
+(full distinct page, gapless slots, page-2 fill) is locked by
+`algo_feed_ranked_page_scale_500_hooks.test.sql` in the always-run suite.
+
 ## 6. Out of scope (unchanged deferrals)
 
 Learned ranker, collaborative filtering, pgvector retrieval, interleaving
