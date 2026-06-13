@@ -57,6 +57,26 @@ export async function POST(req: NextRequest) {
 
   const reporterUserId = await getCallerUserId(); // null for anon — allowed
 
+  // Dedupe (audit M6): one reporter (by user-id, or by IP when anon) gets one
+  // OPEN report per target. Without this, a handful of IPs can flood the queue
+  // and bury real reports past the admin page's display cap — defeating the
+  // whole no-per-video-approval counterweight. Silent success on a dup (don't
+  // leak that a prior report exists).
+  let dupQuery = sb
+    .from('content_reports')
+    .select('id', { head: true, count: 'exact' })
+    .eq('target_kind', parsed.data.target_kind)
+    .eq('target_id', parsed.data.target_id)
+    .is('resolved_at', null);
+  dupQuery = reporterUserId
+    ? dupQuery.eq('reporter_user_id', reporterUserId)
+    : ip
+      ? dupQuery.eq('created_ip', ip)
+      : dupQuery.is('reporter_user_id', null); // no user + no ip: collapse to one bucket
+  const { count: dupCount, error: dupErr } = await dupQuery;
+  if (dupErr) return json(500, { error: 'insert_failed' });
+  if ((dupCount ?? 0) > 0) return json(200, { ok: true });
+
   const { error } = await sb.from('content_reports').insert({
     target_kind: parsed.data.target_kind,
     target_id: parsed.data.target_id,

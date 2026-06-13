@@ -1,4 +1,6 @@
--- 20260612000001 — Creator Studio (WS4/5/6): creator self-serve voice/face/video.
+-- 20260612100001 — Creator Studio (WS4/5/6): creator self-serve voice/face/video.
+-- (Renamed from ...000001 to ...100001 to sort after the memory-package
+--  migrations 20260612000001/2/3 that land on main from feat/memory-breadth-package.)
 -- CREATOR_STUDIO_WS456_PLAN + audit round-1 resolutions (C1-C5, M1-M7).
 --
 -- 1. voice_clone_uploads + face_clone_uploads: admin_user_id → nullable,

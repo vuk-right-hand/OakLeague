@@ -21,6 +21,7 @@ const bodySchema = z.object({
 
 const MINTABLE_STATES = new Set(['pending', 'failed']);
 const MAX_LONG_FORM_MINUTES = 600; // audit M7: minutes, not asset count, bound Mux COGS
+const MAX_LONG_FORM_PER_ASSET_MS = 3_300_000; // 55 min publish ceiling — in-flight estimate
 
 export async function POST(req: Request): Promise<Response> {
   let creator: { userId: string; creatorId: string };
@@ -90,16 +91,23 @@ export async function POST(req: Request): Promise<Response> {
     status = row.long_form_mux_status;
     table = 'videos'; statusCol = 'long_form_mux_status'; uploadIdCol = 'long_form_mux_upload_id';
 
-    // Minutes cap (audit M7): sum of existing ready/processing long-form for
-    // this creator. A fresh mint that could push past the cap is refused.
-    const { data: durs } = await sb
+    // Minutes cap (audit M7). Duration lands only on the Mux webhook AFTER an
+    // upload completes, so summing only durationed rows let a creator burst
+    // many mints (20/min) before any duration resolved and blow past 600 min.
+    // Fix: count in-flight long-forms (uploading/processing) at the per-asset
+    // ceiling (55 min, the publish gate) so the cap holds during a burst.
+    const { data: lfRows } = await sb
       .from('videos')
-      .select('long_form_mux_duration_ms')
-      .eq('creator_id', creator.creatorId)
-      .not('long_form_mux_duration_ms', 'is', null);
-    const usedMin =
-      (durs ?? []).reduce((a, r) => a + (Number(r.long_form_mux_duration_ms) || 0), 0) / 60000;
-    if (usedMin >= MAX_LONG_FORM_MINUTES) {
+      .select('long_form_mux_duration_ms, long_form_mux_status')
+      .eq('creator_id', creator.creatorId);
+    const usedMs = (lfRows ?? []).reduce((a, r) => {
+      if (r.long_form_mux_duration_ms != null) return a + (Number(r.long_form_mux_duration_ms) || 0);
+      if (r.long_form_mux_status === 'uploading' || r.long_form_mux_status === 'processing') {
+        return a + MAX_LONG_FORM_PER_ASSET_MS;
+      }
+      return a;
+    }, 0);
+    if (usedMs / 60000 >= MAX_LONG_FORM_MINUTES) {
       return NextResponse.json({ error: 'long_form_minutes_quota' }, { status: 429 });
     }
   }
@@ -114,10 +122,15 @@ export async function POST(req: Request): Promise<Response> {
   const origin = process.env.NEXT_PUBLIC_SITE_URL ?? 'http://localhost:3000';
   const upload = await createDirectUpload({ passthrough, corsOrigin: origin });
 
+  // Audit M4: optimistic-concurrency guard. A concurrent reset/replace between
+  // the ownership read and this write could have flipped the row to a new
+  // passthrough; only stamp our upload id while the row is still in the state
+  // we minted against, otherwise we'd wedge it in 'uploading' on a stale id.
   await sb
     .from(table)
     .update({ [uploadIdCol]: upload.uploadId, [statusCol]: 'uploading' })
-    .eq('id', id);
+    .eq('id', id)
+    .eq(statusCol, status);
 
   return NextResponse.json({ uploadUrl: upload.uploadUrl, uploadId: upload.uploadId });
 }

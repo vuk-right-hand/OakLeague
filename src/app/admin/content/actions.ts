@@ -321,6 +321,26 @@ export async function resetLongForm(input: unknown): Promise<ActionResult> {
   return { ok: true };
 }
 
+// ── Content reports (CREATOR_STUDIO audit C3 triage) ─────────────────────────
+
+const ResolveReport = z.object({ reportId: z.string().uuid() });
+
+export async function resolveContentReport(input: unknown): Promise<ActionResult> {
+  const admin = await assertAdminFromSession();
+  const parsed = ResolveReport.safeParse(input);
+  if (!parsed.success) return { ok: false, error: 'invalid_input' };
+
+  const sb = supabaseAdmin();
+  const { error } = await sb
+    .from('content_reports')
+    .update({ resolved_at: new Date().toISOString(), resolved_by: admin.userId })
+    .eq('id', parsed.data.reportId)
+    .is('resolved_at', null);
+  if (error) return { ok: false, error: error.message };
+  revalidatePath('/admin/content/reports');
+  return { ok: true };
+}
+
 const ActivateWelcome = z.object({ welcomeHookId: z.string().uuid() });
 
 export async function activateWelcomeHook(input: unknown): Promise<ActionResult> {

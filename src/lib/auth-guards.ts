@@ -2,6 +2,7 @@
 // VibeCoders §2, §20. OakLeague CLAUDE.md §Hard Rules / Auth & RLS.
 
 import 'server-only';
+import { cache } from 'react';
 import { supabaseServer } from './supabase/server';
 import { supabaseAdmin } from './supabase/admin';
 
@@ -64,8 +65,12 @@ export type CreatorSession = {
 /**
  * Creator check: SSR cookie → creators WHERE user_id = auth.uid().
  * Throws if the caller is not a creator.
+ *
+ * Audit S6: wrapped in react/cache so an RSC page + its layout (or a page that
+ * also calls getCreatorForCaller) dedupe the cookie+creators round-trip within
+ * one request. Outside a request scope (route handlers) cache() is a passthrough.
  */
-export async function assertCreatorFromSession(): Promise<CreatorSession> {
+export const assertCreatorFromSession = cache(async (): Promise<CreatorSession> => {
   const userId = await getCallerUserId();
   if (!userId) throw new AuthGuardError('Unauthorized', 401);
 
@@ -80,7 +85,7 @@ export async function assertCreatorFromSession(): Promise<CreatorSession> {
   if (!row) throw new AuthGuardError('Forbidden', 403);
 
   return { userId, creatorId: row.id };
-}
+});
 
 export class AuthGuardError extends Error {
   readonly status: number;

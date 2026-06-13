@@ -10,16 +10,35 @@ export default async function CreatorDashboardPage() {
   const { creatorId, creator } = await getCreatorForCaller();
 
   const sb = supabaseAdmin();
-  const { data: topicsRaw } = await sb
-    .from('creator_topics')
-    .select('id, creator_id, slug, title, description, sort_order, created_at')
-    .eq('creator_id', creatorId)
-    .order('sort_order', { ascending: true })
-    .order('created_at', { ascending: true });
+  const [{ data: topicsRaw }, { data: identity }, { count: publishedVideoCount }] = await Promise.all([
+    sb
+      .from('creator_topics')
+      .select('id, creator_id, slug, title, description, sort_order, created_at')
+      .eq('creator_id', creatorId)
+      .order('sort_order', { ascending: true })
+      .order('created_at', { ascending: true }),
+    sb.from('creators').select('voice_id, simli_face_id').eq('id', creatorId).maybeSingle<{
+      voice_id: string | null;
+      simli_face_id: string | null;
+    }>(),
+    sb
+      .from('videos')
+      .select('id', { count: 'exact', head: true })
+      .eq('creator_id', creatorId)
+      .not('published_at', 'is', null),
+  ]);
 
   const topics = (topicsRaw ?? []) as CreatorTopicRow[];
   const bio = creator.bio ?? '';
   const bioTruncated = bio.length > 300 ? bio.slice(0, 300).trimEnd() + '…' : bio;
+
+  const readiness = [
+    { label: 'Voice cloned', done: identity?.voice_id != null },
+    { label: 'Face trained', done: identity?.simli_face_id != null },
+    { label: 'Knowledge added', done: topics.length > 0 },
+    { label: 'A published video', done: (publishedVideoCount ?? 0) > 0 },
+  ];
+  const allReady = readiness.every((r) => r.done);
 
   return (
     <main style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
@@ -55,6 +74,37 @@ export default async function CreatorDashboardPage() {
             </a>
           </>
         )}
+      </section>
+
+      <section style={card}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+          <h2 style={sectionTitle}>Go-live checklist</h2>
+          <a href="/creator/studio" style={{ fontSize: 14 }}>
+            Open Studio →
+          </a>
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 12 }}>
+          {readiness.map((r) => (
+            <span
+              key={r.label}
+              style={{
+                padding: '4px 10px',
+                borderRadius: 999,
+                fontSize: 13,
+                background: r.done ? '#103a1e' : '#2a1a1a',
+                color: r.done ? '#4ad07a' : '#d08a8a',
+                border: `1px solid ${r.done ? '#1d5a30' : '#5a2020'}`,
+              }}
+            >
+              {r.done ? '✓' : '○'} {r.label}
+            </span>
+          ))}
+        </div>
+        <p style={{ marginTop: 12, fontSize: 13, opacity: 0.7 }}>
+          {allReady
+            ? 'Everything’s set up. An OakLeague admin publishes your profile to go live.'
+            : 'Finish these in the Studio. Once your profile is published, your videos appear in the feed.'}
+        </p>
       </section>
 
       <DeepBrainPanel

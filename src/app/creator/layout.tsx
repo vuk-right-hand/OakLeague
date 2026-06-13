@@ -22,6 +22,7 @@ export default async function CreatorLayout({ children }: { children: React.Reac
         <strong>OakLeague Creator</strong>
         <nav style={{ display: 'flex', gap: 16, fontSize: 14 }}>
           <a href="/creator">Dashboard</a>
+          <a href="/creator/studio">Studio</a>
           <a href="/creator/brain">Knowledge</a>
         </nav>
       </header>

@@ -41,6 +41,7 @@ import { supabaseAdmin } from '@/lib/supabase/admin';
 import { probeWav } from '@/lib/voice/wav-probe';
 import { isVoiceCloneMime } from '@/lib/voice/voice-clone-mimes';
 import { currentVoiceIdEnv, voiceIdColumn } from '@/lib/voice/env-scoped-voice-id';
+import { CARTESIA_VERSION, CARTESIA_CLONE_URL } from '@/lib/voice/cartesia-clone';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -50,8 +51,6 @@ const MIN_DURATION_S = 3.0;
 const MAX_DURATION_S = 120.0;
 const RATE_LIMIT_PER_24H = 3;
 const RATE_LIMIT_ATTEMPTS_PER_24H = 20;
-const CARTESIA_VERSION = '2026-03-01';
-const CARTESIA_CLONE_URL = 'https://api.cartesia.ai/voices/clone';
 const CARTESIA_DELETE_DEFER_MS = 60_000;
 
 function jsonError(status: number, code: string, detail?: string) {

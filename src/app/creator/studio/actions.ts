@@ -136,7 +136,9 @@ const PublishVideo = z.object({
   publish: z.boolean(),
 });
 
-export async function creatorSetVideoPublished(input: unknown): Promise<ActionResult> {
+export async function creatorSetVideoPublished(
+  input: unknown,
+): Promise<ActionResult & { longFormWarning?: string }> {
   const caller = await getCreatorOrError();
   if (!caller.ok) return caller;
   const parsed = PublishVideo.safeParse(input);
@@ -160,14 +162,18 @@ export async function creatorSetVideoPublished(input: unknown): Promise<ActionRe
   const res = await setVideoPublishedGated(sb, parsed.data.videoId, parsed.data.publish);
   if (!res.ok) return res;
 
-  // Auto-publish the long-form alongside when it passes the shared gates —
-  // best-effort: a hook-only video simply skips (not_ready is fine).
+  // Auto-publish the long-form alongside when it passes the shared gates.
+  // Audit M3: surface a non-fatal warning so the creator knows the hook is
+  // live but the full lesson isn't. 'not_ready' is the expected hook-only /
+  // still-processing case → stay silent; anything else is worth telling them.
+  let longFormWarning: string | undefined;
   if (parsed.data.publish) {
-    await publishLongFormGated(sb, parsed.data.videoId);
+    const lf = await publishLongFormGated(sb, parsed.data.videoId);
+    if (!lf.ok && lf.error !== 'not_ready') longFormWarning = lf.error;
   }
   revalidatePath(`/creator/studio/${parsed.data.videoId}`);
   revalidatePath('/creator/studio');
-  return { ok: true };
+  return { ok: true, longFormWarning };
 }
 
 export async function creatorPublishLongForm(input: unknown): Promise<ActionResult> {
@@ -180,8 +186,41 @@ export async function creatorPublishLongForm(input: unknown): Promise<ActionResu
   const video = await assertOwnVideo(sb, parsed.data.videoId, caller.creatorId);
   if (!video) return { ok: false, error: 'not_found' };
 
+  // Audit C4: a suspended/unpublished creator must not be able to flip
+  // long_form_published_at on. publishLongFormGated only checks the video's
+  // admin_removed_at (shared with admin, who may publish regardless), so the
+  // creator-live gate lives here — mirrors creatorSetVideoPublished.
+  const { data: c } = await sb
+    .from('creators')
+    .select('published_at')
+    .eq('id', caller.creatorId)
+    .maybeSingle<{ published_at: string | null }>();
+  if (!c?.published_at) return { ok: false, error: 'creator_not_live' };
+
   const res = await publishLongFormGated(sb, parsed.data.videoId);
   if (!res.ok) return res;
+  revalidatePath(`/creator/studio/${parsed.data.videoId}`);
+  return { ok: true };
+}
+
+export async function creatorUnpublishLongForm(input: unknown): Promise<ActionResult> {
+  const caller = await getCreatorOrError();
+  if (!caller.ok) return caller;
+  const parsed = z.object({ videoId: z.string().uuid() }).safeParse(input);
+  if (!parsed.success) return { ok: false, error: 'invalid_input' };
+
+  const sb = supabaseAdmin();
+  const video = await assertOwnVideo(sb, parsed.data.videoId, caller.creatorId);
+  if (!video) return { ok: false, error: 'not_found' };
+  // Unpublish is allowed even under an admin takedown — it only ever hides
+  // content further, never re-exposes it.
+
+  const { error } = await sb
+    .from('videos')
+    .update({ long_form_published_at: null })
+    .eq('id', parsed.data.videoId)
+    .eq('creator_id', caller.creatorId);
+  if (error) return { ok: false, error: 'update_failed' };
   revalidatePath(`/creator/studio/${parsed.data.videoId}`);
   return { ok: true };
 }
