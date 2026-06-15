@@ -1091,6 +1091,32 @@ const FLAT_FALLBACK_MAX_SECTIONS = 50;
 // can't blow the §7 3500ms LIVE decoupled ceiling on long-route turns.
 const FLAT_FALLBACK_BUDGET_MS = 800;
 
+// MEMORY_BREADTH_PLAN Unit 3 — variable breadth (flag-gated, v3-only).
+// When ON and the rewrite classifies the question 'synthesis' (relate/
+// compare 2+ ideas), inject up to SYNTHESIS_TOP_K units instead of the
+// pointed topK (=1 from the proxy). Store-WIDE/read-NARROW (R1-C2/R2-C2):
+// rerank is called with the CEILING so the semantic cache always stores
+// the wide parent set; the per-turn slice to effectiveTopK happens at the
+// return sites (after the RPC min_sim floor, which gates every candidate
+// individually). Flag OFF => byte-identical to pre-breadth behavior.
+const BRAIN_BREADTH_ENABLED = process.env.BRAIN_BREADTH_ENABLED === '1';
+// R2-S4: ceiling declared HERE, next to the env parse, so the rerank-K
+// widen and the read-slice agree on one number.
+const SYNTHESIS_TOP_K_CEILING = 3;
+const SYNTHESIS_TOP_K = (() => {
+  const raw = process.env.SYNTHESIS_TOP_K;
+  if (raw == null || raw === '') return 2;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > SYNTHESIS_TOP_K_CEILING) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[retrieve-knowledge-v3] SYNTHESIS_TOP_K invalid (${raw}); falling back to default 2 (allowed 1..${SYNTHESIS_TOP_K_CEILING})`,
+    );
+    return 2;
+  }
+  return n;
+})();
+
 export async function retrieveKnowledgeV3(
   args: RetrieveKnowledgeV3Args,
 ): Promise<RetrieveKnowledgeV3Result> {
@@ -1198,6 +1224,13 @@ async function runOrchestratorV3(
     geminiApiKey: args.geminiApiKey,
     deadlineMs,
   });
+  // Unit 3 — effectiveTopK decided ONCE here (after rewrite, before cache),
+  // applied at every parent-returning site below. Flag OFF or breadth
+  // 'pointed' => effectiveTopK === topK (identity; byte-identical behavior).
+  const effectiveTopK =
+    BRAIN_BREADTH_ENABLED && rewriteResult.breadth === 'synthesis'
+      ? Math.max(topK, Math.min(SYNTHESIS_TOP_K, SYNTHESIS_TOP_K_CEILING))
+      : topK;
   telemetry.rewrite = {
     modelId: rewriteResult.modelId,
     fallback: rewriteResult.fallback,
@@ -1211,6 +1244,8 @@ async function runOrchestratorV3(
     noContextAfterResumption: rewriteResult.noContextAfterResumption,
     // TTFT optimization (2026-06-10) — intentional LLM skip (no prior turn).
     skippedNoContext: rewriteResult.skippedNoContext,
+    breadth: rewriteResult.breadth,
+    effectiveTopK,
   };
   const rewrittenText =
     rewriteResult.rewritten && rewriteResult.rewritten.length > 0
@@ -1294,7 +1329,11 @@ async function runOrchestratorV3(
             scoreSource: 'cache' as const,
           }))
           .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
-          .slice(0, topK);
+          // Unit 3 read-NARROW: a synthesis turn reads up to effectiveTopK
+          // from the (wide-stored) cache row. Rows written pre-breadth hold
+          // only 1 id — a synthesis hit then degrades to 1 (acceptable;
+          // ages out within the 7-day TTL as wide writers refresh).
+          .slice(0, effectiveTopK);
         // Cache hit: routePhaseRan=false (the route + scoped topk never executed).
         return done(parents, false, rewriteResult.fallback, 0, false, false);
       }
@@ -1527,11 +1566,17 @@ async function runOrchestratorV3(
   const rowsById = new Map<string, RpcRowV3>();
   rows.forEach((r) => rowsById.set(r.parent_unit_id, r));
   const bridge = getRerankBridge();
+  // Unit 3 store-WIDE (R2-C2): the rerank bridge truncates its OUTPUT to
+  // `topK` (rerank.ts), and the cache upsert below stores whatever
+  // `parents` holds — so when breadth is ON we always rerank to the
+  // CEILING and slice per-turn at the return site. Voyage bills on INPUT
+  // tokens (the candidate list, unchanged), so widening output 1→3 adds
+  // no rerank cost. Flag OFF keeps the caller's topK exactly.
   const rerankResult = await bridge.rerank({
     voyageApiKey: args.voyageApiKey,
     query: rewrittenText,
     candidates,
-    topK,
+    topK: BRAIN_BREADTH_ENABLED ? Math.max(topK, SYNTHESIS_TOP_K_CEILING) : topK,
     deadlineMs,
   });
   telemetry.rerank = {
@@ -1610,5 +1655,11 @@ async function runOrchestratorV3(
     }
   }
 
-  return done(parents, false, rewriteResult.fallback, routeRows.length, flatFallbackFired, true);
+  // Unit 3 read-NARROW: the upsert above stored the WIDE parent set; the
+  // caller gets only effectiveTopK (identity slice when the flag is off —
+  // rerank already truncated to topK in that case).
+  return done(
+    parents.slice(0, effectiveTopK),
+    false, rewriteResult.fallback, routeRows.length, flatFallbackFired, true,
+  );
 }

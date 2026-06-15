@@ -183,7 +183,14 @@ function isFollowUpUtterance(s: string): boolean {
 
 const RewriteSchema = z.object({
   rewritten: z.string().min(1).max(800),
+  // MEMORY_BREADTH_PLAN Unit 3 — breadth classification rides the SAME call
+  // (zero new latency/COGS). `.catch` (not `.default`) so a missing field,
+  // an invalid enum, or any junk on `breadth` degrades to today's behavior
+  // ('pointed' → topK unchanged) WITHOUT failing the whole rewrite parse.
+  breadth: z.enum(['pointed', 'synthesis']).catch('pointed'),
 });
+
+export type RewriteBreadth = 'pointed' | 'synthesis';
 
 export type RewriteInput = {
   userUtterance: string;
@@ -207,6 +214,13 @@ export type RewriteFallbackReason =
 
 export type RewriteResult = {
   rewritten: string;
+  /**
+   * MEMORY_BREADTH_PLAN Unit 3. 'synthesis' = the question asks to relate /
+   * compare / combine multiple ideas (wants 2+ injected units); 'pointed' =
+   * a single story/fact/concept (today's top-1). EVERY fallback path emits
+   * 'pointed' so a degraded rewrite is byte-identical to pre-breadth behavior.
+   */
+  breadth: RewriteBreadth;
   noContextAfterResumption: boolean;
   /** True when the LLM call was skipped / failed and we returned the raw utterance. */
   fallback: boolean;
@@ -296,6 +310,9 @@ export async function rewriteQuery(input: RewriteInput): Promise<RewriteResult> 
   if (lastAsst.length === 0 && rawUtterance.length <= SKIP_REWRITE_NO_CONTEXT_MAX_CHARS) {
     return {
       rewritten: rawUtterance,
+      // Unit 3 — no LLM ran, so no classification: 'pointed' = pre-breadth
+      // behavior (a short first question is pointed-shaped anyway).
+      breadth: 'pointed',
       noContextAfterResumption: noCtx,
       fallback: false,
       skippedNoContext: true,
@@ -442,6 +459,7 @@ export async function rewriteQuery(input: RewriteInput): Promise<RewriteResult> 
 
   return {
     rewritten: parsed.rewritten,
+    breadth: parsed.breadth,
     noContextAfterResumption: noCtx,
     fallback: false,
     modelId: QUERY_REWRITE_MODEL,
@@ -463,6 +481,7 @@ function mkFallback(args: {
 }): RewriteResult {
   return {
     rewritten: args.rewritten,
+    breadth: 'pointed', // fallback = pre-breadth behavior, always (Unit 3)
     noContextAfterResumption: args.noContextAfterResumption,
     fallback: true,
     fallbackReason: args.fallbackReason,
@@ -486,7 +505,8 @@ function buildPrompt(args: { utterance: string; lastAsst: string }): string {
     'You rewrite a user utterance into a standalone search query for a knowledge-retrieval system.',
     'If the utterance references the prior assistant turn ("tell me more", "what about that"), expand it using the topic of the prior turn.',
     'Otherwise return the utterance unchanged, possibly tightened.',
-    'Return exactly: {"rewritten":"<query>"}. No prose. Keep <100 words.',
+    'Also classify breadth: "synthesis" ONLY when the question explicitly asks to relate, compare, combine, or contrast two or more distinct ideas/stories/concepts; otherwise "pointed" (a single story, fact, or concept — the default; when unsure, "pointed").',
+    'Return exactly: {"rewritten":"<query>","breadth":"pointed"|"synthesis"}. No prose. Keep <100 words.',
     '',
     'Prior assistant turn:',
     args.lastAsst.length > 0 ? args.lastAsst : '(none — start of conversation or post-resumption)',

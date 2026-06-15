@@ -66,6 +66,17 @@ export type RewriteLeg = {
    * (plan-audit C1). Optional — absent on pre-change telemetry rows.
    */
   skippedNoContext?: boolean;
+  /**
+   * MEMORY_BREADTH_PLAN Unit 3. Breadth classification from the rewrite
+   * call ('pointed' default; 'synthesis' = relate/compare 2+ ideas).
+   * Optional so pre-breadth callers (v1/v2 paths) stay type-compatible.
+   */
+  breadth?: 'pointed' | 'synthesis';
+  /**
+   * The topK actually applied to the returned parents after the breadth
+   * decision (flag-gated). Optional; v3-only.
+   */
+  effectiveTopK?: number;
 };
 
 export type EmbedLeg = {
@@ -503,6 +514,15 @@ export function toPostHogEventBatch(t: RagTurnTelemetry): PostHogEvent[] {
     events.push({
       name: 'rag_budget_exceeded',
       properties: { ...base },
+    });
+  }
+
+  // MEMORY_BREADTH_PLAN Unit 3 — synthesis turns get their own event so
+  // dashboards can track fire rate + injected width without parsing logs.
+  if (t.rewrite?.breadth === 'synthesis') {
+    events.push({
+      name: 'rag_breadth_synthesis',
+      properties: { ...base, effective_top_k: t.rewrite.effectiveTopK ?? null },
     });
   }
 
