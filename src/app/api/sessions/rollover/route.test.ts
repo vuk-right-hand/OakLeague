@@ -118,8 +118,29 @@ function makeSb() {
   };
 }
 
+// Growth & Minutes Economy Phase 1: rollover now reads admin.rpc('voice_balance_check')
+// (unified balance → max_duration + fuse anchor) and admin.rpc('voice_fuse_anchor_apply').
+let balanceRemaining = 600;
 function makeAdmin() {
   return {
+    rpc: vi.fn(async (name: string, args: unknown) => {
+      rpcCalls.push({ name, args });
+      if (name === 'voice_balance_check') {
+        return {
+          data: [{
+            effective_remaining: balanceRemaining, remaining_seconds: balanceRemaining,
+            allowance_remaining: balanceRemaining, wallet_remaining: 0, recruiter_bonus: 0,
+            daily_used: 0, daily_cap: 300, daily_cap_eff: 300,
+            weekly_used: 0, weekly_cap: 900, monthly_used: 0, monthly_cap: null,
+            wallet_active_seconds: 0, wallet_spent_seconds: 0,
+            cap_period: 'daily', supporter_active: false,
+          }],
+          error: null,
+        };
+      }
+      if (name === 'voice_fuse_anchor_apply') return { data: null, error: null };
+      return { data: null, error: null };
+    }),
     from: vi.fn((table: string) => {
       if (table === 'creators') {
         return {

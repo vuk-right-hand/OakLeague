@@ -170,11 +170,19 @@ function makeSb() {
 function makeAdmin() {
   return {
     rpc: vi.fn(async (name: string, args: unknown) => {
-      // voice_usage_ticket_check is called via admin (service-role) because
-      // the migration REVOKEs EXECUTE from `authenticated` (auditor C1).
-      if (name === 'voice_usage_ticket_check') {
+      // Growth & Minutes Economy Phase 1: the pre-mint gate now calls the UNIFIED
+      // voice_balance_check (free allowance + wallet) via admin (service-role) —
+      // it REVOKEs EXECUTE from `authenticated` (R1-S3). The route reads
+      // remaining_seconds (= effective_remaining) plus wallet_remaining /
+      // daily_cap_eff / cap_period (all default to 0/undefined when absent).
+      if (name === 'voice_balance_check') {
         rpcCalls.push({ name, args });
         return capRpcResult;
+      }
+      // Fuse-anchor write (R2-C1) after session_open — non-fatal no-op in tests.
+      if (name === 'voice_fuse_anchor_apply') {
+        rpcCalls.push({ name, args });
+        return { data: null, error: null };
       }
       if (name === 'rate_limit_hit') return rateLimitResult;
       return { data: null, error: null };
@@ -317,7 +325,7 @@ describe('/api/sessions/open — pre-mint cap RPC (use-session-pipe rewire R2-C1
     expect(body.weekly_used).toBe(800);
     // session_open MUST NOT have been called — Vuk's nit: avoid orphan-row.
     const names = rpcCalls.map((c) => c.name);
-    expect(names).toContain('voice_usage_ticket_check');
+    expect(names).toContain('voice_balance_check');
     expect(names).not.toContain('session_open');
     expect(names).not.toContain('session_close');
     // Whole-build audit C4: telemetry fires so we can measure conversion.
@@ -378,7 +386,7 @@ describe('/api/sessions/open — pre-mint cap RPC (use-session-pipe rewire R2-C1
     // Whatever the downstream outcome, the cap gate let the request through.
     expect(res.status).not.toBe(429);
     const names = rpcCalls.map((c) => c.name);
-    expect(names).toContain('voice_usage_ticket_check');
+    expect(names).toContain('voice_balance_check');
     expect(names).toContain('session_open');
   });
 });

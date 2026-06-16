@@ -229,10 +229,12 @@ export async function POST(req: NextRequest) {
     // a cache-miss request pays up to +2s here — same as the old chain.)
     getProxyVoiceConfig(),
     supabaseServer(),
-    // Pre-mint daily/weekly/monthly cap check (use-session-pipe rewire
-    // R2-C1) — consumed below, BEFORE session_open, so a capped user never
-    // creates a session row.
-    admin.rpc('voice_usage_ticket_check', { p_user_id: callerUserId }),
+    // Pre-mint UNIFIED balance check (Growth & Minutes Economy Phase 1) —
+    // consumed below, BEFORE session_open, so a capped user never creates a
+    // session row. effective_remaining = free allowance + durable wallet, so a
+    // user at free-cap=0 with bought/earned minutes now PASSES the gate (R1-C1).
+    // Also feeds the max_duration_s clamp and the 150%-fuse anchor (R2-C1).
+    admin.rpc('voice_balance_check', { p_user_id: callerUserId }),
   ]);
 
   // Gate 1 — rate-limit (R5-M4).
@@ -402,10 +404,10 @@ export async function POST(req: NextRequest) {
   // 429 instead of falling through to the proxy-WS-side 4006 close after a
   // wasted mint round-trip.
   //
-  // Auditor C1: the migration REVOKEs EXECUTE from `authenticated`. Called
-  // via the service-role admin client — the function's SECURITY DEFINER body
-  // short-circuits the auth.uid() check when JWT role is service_role, and
-  // we already authenticated the caller via getCallerUserId() above.
+  // R1-S3: voice_balance_check REVOKEs EXECUTE from `authenticated`. Called via
+  // the service-role admin client — the SECURITY DEFINER body short-circuits the
+  // auth.uid() self-check when JWT role is service_role, and we already
+  // authenticated the caller via getCallerUserId() above.
   const { data: capRows, error: capErr } = capRes;
   if (capErr) {
     // Map the function's P0002 'user not found' (raised when no profiles
@@ -415,14 +417,18 @@ export async function POST(req: NextRequest) {
     if (pgCode === 'P0002') {
       return json(409, { error: 'profile_not_ready' });
     }
-    Sentry.captureException(capErr, { extra: { op: 'sessions_open_cap_check', user_id: callerUserId } });
+    Sentry.captureException(capErr, { extra: { op: 'sessions_open_balance_check', user_id: callerUserId } });
     return json(500, { error: 'cap_check_failed' });
   }
   // Auditor S1: numeric columns deserialise as string in supabase-js. Coerce
   // every numeric so the wire response is consistent and client comparisons
   // don't fail string-vs-number.
   type CapRowRaw = {
-    remaining_seconds: number | string | null;
+    remaining_seconds:   number | string | null;    // = effective_remaining (free allowance + wallet)
+    allowance_remaining: number | string | null;    // free pool only (no wallet)
+    wallet_remaining:    number | string | null;
+    daily_cap_eff:       number | string | null;    // daily_cap + recruiter bonus (fuse anchor)
+    cap_period:          string | null;             // 'daily'|'weekly'|'monthly' (binding free cap)
     daily_used:   number | string | null; daily_cap:   number | null;
     weekly_used:  number | string | null; weekly_cap:  number | null;
     monthly_used: number | string | null; monthly_cap: number | null;
@@ -437,13 +443,30 @@ export async function POST(req: NextRequest) {
   // non-finite values for DB-bound numerics. Don't merge them.
   const numOrNull = (v: number | string | null | undefined): number | null =>
     v == null ? null : (typeof v === 'number' ? v : Number(v));
-  const remainingSeconds = Math.max(0, Math.floor(Number(capRowRaw.remaining_seconds ?? 0)));
+  // C1 — co-gate wallet-awareness with the proxy's wallet DRAW (also behind
+  // GROWTH_LEDGER_ENABLED). If the route extended entitlement using wallet minutes
+  // while the proxy (flag off / not yet redeployed) did NOT draw them down, the
+  // user would get free unbounded minutes. When the ledger is OFF we admit on the
+  // FREE allowance only and the fuse anchor never includes the wallet — identical
+  // to pre-Phase-1 behavior. When ON, effective_remaining (allowance + wallet) is
+  // used and a user at free-cap=0 with wallet minutes PASSES (R1-C1). Co-flip the
+  // Vercel env with the Fly secret; flip the proxy ON before the route.
+  const ledgerOn = process.env.GROWTH_LEDGER_ENABLED === '1';
+  const remainingSeconds = Math.max(0, Math.floor(Number(
+    (ledgerOn ? capRowRaw.remaining_seconds : capRowRaw.allowance_remaining)
+      ?? capRowRaw.remaining_seconds ?? 0,
+  )));
+  const walletRemaining = ledgerOn
+    ? Math.max(0, Math.floor(Number(capRowRaw.wallet_remaining ?? 0)))
+    : 0;
   if (remainingSeconds <= 0) {
     // Whole-build audit C4: emit telemetry so we can compare HTTP-layer
     // pre-mint cap firing rate (PR-1) against the legacy proxy-WS-side
     // 4006 cap close, and correlate to /upgrade?source=cap_hit clicks.
     await captureServerSafe(callerUserId, 'daily_cap_hit_fired', {
       surface:      'sessions_open',
+      cap_period:   capRowRaw.cap_period,
+      wallet_remaining: walletRemaining,
       daily_used:   numOrNull(capRowRaw.daily_used),
       daily_cap:    capRowRaw.daily_cap,
       weekly_used:  numOrNull(capRowRaw.weekly_used),
@@ -454,6 +477,10 @@ export async function POST(req: NextRequest) {
     return json(429, {
       error: 'daily_cap_hit',
       remaining_seconds: 0,
+      wallet_remaining: 0,
+      // R4-M5: which free cap bound — client renders period-correct reset copy
+      // ("resets in 24h" daily vs "~27 days" monthly) instead of always-daily.
+      cap_period:   capRowRaw.cap_period,
       daily_used:   numOrNull(capRowRaw.daily_used),
       daily_cap:    capRowRaw.daily_cap,
       weekly_used:  numOrNull(capRowRaw.weekly_used),
@@ -555,7 +582,33 @@ export async function POST(req: NextRequest) {
     if (!openRow?.session_id) return json(500, { error: 'session_open_empty' });
     sessionId = openRow.session_id as string;
     tier = openRow.tier as 'free' | 'premium' | 'boardroom';
-    dailyLimitRemaining = (openRow.daily_limit_remaining_s as number) ?? 0;
+    // Use the UNIFIED effective_remaining (free allowance + durable wallet) for
+    // the session's max_duration, not session_open's System-A daily_limit_remaining_s.
+    dailyLimitRemaining = remainingSeconds;
+  }
+
+  // R2-C1 — raise today's 150%-fuse anchor (daily_quotas.daily_limit_s) to this
+  // session's real entitlement so a wallet/paid user isn't hard-killed at 150%
+  // of the base free cap (free = 450s). min(daily_cap_eff + wallet, absolute
+  // runaway ceiling); GREATEST-only in the RPC, never retro-latches. Runs for
+  // BOTH the fresh and takeover paths (sessionId resolved above). Non-fatal —
+  // the base-cap fuse still protects COGS if this write fails.
+  {
+    const absoluteCeiling = Math.max(
+      60,
+      Math.floor(Number(process.env.ABSOLUTE_DAILY_COGS_CEILING_SECONDS ?? 14400)),
+    );
+    const fuseAnchorSeconds = Math.min(
+      Math.floor(Number(capRowRaw.daily_cap_eff ?? 0)) + walletRemaining,
+      absoluteCeiling,
+    );
+    const { error: anchorErr } = await admin.rpc('voice_fuse_anchor_apply', {
+      p_user_id: callerUserId,
+      p_anchor_seconds: fuseAnchorSeconds,
+    });
+    if (anchorErr) {
+      Sentry.captureException(anchorErr, { extra: { op: 'sessions_open_fuse_anchor', user_id: callerUserId } });
+    }
   }
 
   // HUME_TTS_PLAN §6.2 — snapshot the resolved TTS provider onto the session
@@ -704,21 +757,24 @@ export async function POST(req: NextRequest) {
     return json(409, { error: 'creator_not_ready', avatar_provider: avatarProvider });
   }
 
-  // Session length clamp. Provider-aware:
-  //   simli/tavus: min(15min Gemini cap, dailyLimitRemaining, 600s).
-  //   heygen:      min(LIVEAVATAR_MAX_SESSION_S env or 300s default,
-  //                    Gemini cap, dailyLimitRemaining).
-  // Heygen Lite docs cap at 1200s; we keep the per-session clamp tighter.
-  // (Audit-r2 C4 — kill-switch must use clamped seconds, not the
-  // provider's max — and r2 S1 — heygen default 300 to keep one runaway
-  // session from burning ~7 of 10 free-tier credits.)
+  // Session length clamp. Provider-aware. dailyLimitRemaining is now the UNIFIED
+  // effective_remaining (free allowance + durable wallet), so the session is
+  // bounded by what the user can actually afford this session.
+  //   simli/tavus: min(15min Gemini cap, effective_remaining).
+  //   heygen:      min(LIVEAVATAR_MAX_SESSION_S env or 300s default, Gemini cap,
+  //                    effective_remaining).
+  // R2-C2: the old hardcoded 600s (10-min) ceiling is REMOVED — once minutes are
+  // purchasable/earnable, capping every session at 10 min broke the whole payoff
+  // (a 3600s wallet user got a 600s session). The kill-switch/Gemini-cap still
+  // backstop runaway. (Audit-r2 C4 — kill-switch uses clamped seconds, not the
+  // provider's max — and r2 S1 — heygen default 300.)
   const maxAvatarSeconds = avatarProvider === 'heygen'
     ? Math.max(60, Math.min(
         GEMINI_MAX_SESSION_S,
         dailyLimitRemaining,
         Number(process.env.LIVEAVATAR_MAX_SESSION_S ?? 300),
       ))
-    : Math.max(60, Math.min(GEMINI_MAX_SESSION_S, dailyLimitRemaining, 600));
+    : Math.max(60, Math.min(GEMINI_MAX_SESSION_S, dailyLimitRemaining));
 
   // ── Phase C — avatar mint ∥ brain-payload assembly (latency plan
   // 2026-06-10). The avatar mint (external API, the longest single leg) and

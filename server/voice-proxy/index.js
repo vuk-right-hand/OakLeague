@@ -906,7 +906,16 @@ async function checkQuotaOk(sessionId) {
 async function recordVoiceUsage({ userId, sessionId, turnNumber, seconds, turnStartedAt }) {
   if (!Number.isFinite(seconds) || seconds < 0) return;
   if (!turnNumber || turnNumber <= 0) return;
-  const { error } = await supabase.rpc('voice_usage_record', {
+  // Growth & Minutes Economy Phase 1: voice_usage_record_v2 ALSO writes the
+  // monthly counter (voice_usage_monthly) and draws the durable wallet for the
+  // slice of this turn beyond the free allowance. Drop-in — identical args.
+  // Gated behind GROWTH_LEDGER_ENABLED so the proxy can deploy before the
+  // migration lands / the flag flips; v1 is byte-identical for the daily+weekly
+  // counters. Behavior is neutral until grants exist (empty wallet ⇒ zero draw).
+  const recordRpc = process.env.GROWTH_LEDGER_ENABLED === '1'
+    ? 'voice_usage_record_v2'
+    : 'voice_usage_record';
+  const { error } = await supabase.rpc(recordRpc, {
     p_user_id: userId,
     p_session_id: sessionId,
     p_turn_number: turnNumber,

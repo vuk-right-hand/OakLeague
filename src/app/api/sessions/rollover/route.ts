@@ -284,7 +284,52 @@ export async function POST(req: NextRequest) {
   if (!row?.new_session_id) return json(500, { error: 'rollover_empty' });
   const newSessionId = row.new_session_id as string;
   const tier = row.tier as 'free' | 'premium' | 'boardroom';
-  const dailyLimitRemaining = (row.daily_limit_remaining_s as number) ?? 0;
+
+  // Growth & Minutes Economy Phase 1 (R2-C3 — rollover was unthreaded): the
+  // UNIFIED effective_remaining (free allowance + durable wallet), NOT
+  // session_rollover's System-A daily_limit_remaining_s, drives the rolled
+  // session's max_duration AND its 150%-fuse anchor — else a 15-min rollover
+  // silently reverts the user to System-A limits and drops their earned minutes
+  // mid-conversation.
+  const { data: balRows, error: balErr } = await admin.rpc('voice_balance_check', {
+    p_user_id: callerUserId,
+  });
+  if (balErr) {
+    Sentry.captureException(balErr, { extra: { op: 'sessions_rollover_balance_check', user_id: callerUserId } });
+  }
+  const balRow = (Array.isArray(balRows) ? balRows[0] : balRows) as {
+    remaining_seconds:   number | string | null;
+    allowance_remaining: number | string | null;
+    wallet_remaining:    number | string | null;
+    daily_cap_eff:       number | string | null;
+  } | null;
+  // C1 — co-gate wallet-awareness with the proxy's wallet draw (GROWTH_LEDGER_ENABLED).
+  // Ledger OFF → roll on the free allowance only, fuse anchor excludes the wallet.
+  const ledgerOn = process.env.GROWTH_LEDGER_ENABLED === '1';
+  const dailyLimitRemaining = Math.max(0, Math.floor(Number(
+    (ledgerOn ? balRow?.remaining_seconds : balRow?.allowance_remaining)
+      ?? balRow?.remaining_seconds ?? 0,
+  )));
+  const walletRemaining = ledgerOn
+    ? Math.max(0, Math.floor(Number(balRow?.wallet_remaining ?? 0)))
+    : 0;
+  {
+    const absoluteCeiling = Math.max(
+      60,
+      Math.floor(Number(process.env.ABSOLUTE_DAILY_COGS_CEILING_SECONDS ?? 14400)),
+    );
+    const fuseAnchorSeconds = Math.min(
+      Math.floor(Number(balRow?.daily_cap_eff ?? 0)) + walletRemaining,
+      absoluteCeiling,
+    );
+    const { error: anchorErr } = await admin.rpc('voice_fuse_anchor_apply', {
+      p_user_id: callerUserId,
+      p_anchor_seconds: fuseAnchorSeconds,
+    });
+    if (anchorErr) {
+      Sentry.captureException(anchorErr, { extra: { op: 'sessions_rollover_fuse_anchor', user_id: callerUserId } });
+    }
+  }
 
   // HUME_TTS_PLAN §6.2 — propagate the OLD session's provider snapshot onto
   // the NEW session row. session_rollover RPC doesn't write this column;
@@ -328,14 +373,15 @@ export async function POST(req: NextRequest) {
     return json(409, { error: 'creator_not_ready', avatar_provider: avatarProvider });
   }
 
-  // Per-provider session-length clamp (heygen tighter default).
+  // Per-provider session-length clamp (heygen tighter default). dailyLimitRemaining
+  // is the UNIFIED effective_remaining; R2-C2 removed the hardcoded 600s ceiling.
   const maxAvatarSeconds = avatarProvider === 'heygen'
     ? Math.max(60, Math.min(
         GEMINI_MAX_SESSION_S,
         dailyLimitRemaining,
         Number(process.env.LIVEAVATAR_MAX_SESSION_S ?? 300),
       ))
-    : Math.max(60, Math.min(GEMINI_MAX_SESSION_S, dailyLimitRemaining, 600));
+    : Math.max(60, Math.min(GEMINI_MAX_SESSION_S, dailyLimitRemaining));
 
   // AvatarEnvelope hoisted to @/lib/avatar/avatar-envelope (final-audit S1).
   let avatar: AvatarEnvelope | null = null;
