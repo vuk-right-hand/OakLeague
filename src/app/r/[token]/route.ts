@@ -25,12 +25,12 @@
 
 import 'server-only';
 import { type NextRequest, NextResponse, after } from 'next/server';
-import { createHash } from 'node:crypto';
 import * as Sentry from '@sentry/nextjs';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import {
   candidateTokenHashes,
   isValidTokenPlaintext,
+  deriveDeviceFingerprint,
 } from '@/lib/recording/referral-token';
 import { captureServerSafe } from '@/lib/posthog-server';
 
@@ -66,12 +66,12 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ toke
   // Device fingerprint + IP prefix (first 3 octets only — privacy + dorm-room
   // false positive avoidance per plan §8a). UA + accept-language + the IP
   // /24 are signal-only; not enforced.
-  const ua = req.headers.get('user-agent') ?? '';
-  const accept = req.headers.get('accept-language') ?? '';
-  const xff = req.headers.get('x-forwarded-for') ?? '';
-  const ip = xff.split(',')[0]?.trim() ?? '';
-  const ipPrefix = ip.includes('.') ? ip.split('.').slice(0, 3).join('.') : ip.split(':').slice(0, 4).join(':');
-  const deviceFp = createHash('sha256').update(`${ua}|${accept}|${ipPrefix}`).digest('hex').slice(0, 32);
+  // SHARED derivation (M4) — same fingerprint the mint + credit paths use.
+  const { deviceFp, ipPrefix } = deriveDeviceFingerprint(
+    req.headers.get('user-agent') ?? '',
+    req.headers.get('accept-language') ?? '',
+    req.headers.get('x-forwarded-for') ?? '',
+  );
 
   const admin = supabaseAdmin();
   let creatorId: string | null = null;

@@ -47,8 +47,8 @@ import { buildBrainPrefix } from '@/lib/voice/brain-prefix';
 import { buildUserContext } from '@/lib/voice/user-context';
 import { shouldEmitBrainNotReady } from '@/lib/voice/brain-not-ready-dedupe';
 import { resolveVoiceId, pickEnvScoped, coerceNumericOrNull } from '@/lib/voice/env-scoped-voice-id';
-import { createHash, randomUUID } from 'node:crypto';
-import { candidateTokenHashes, isValidTokenPlaintext } from '@/lib/recording/referral-token';
+import { randomUUID } from 'node:crypto';
+import { candidateTokenHashes, isValidTokenPlaintext, deriveDeviceFingerprint } from '@/lib/recording/referral-token';
 import { captureServerSafe } from '@/lib/posthog-server';
 import { getProxyVoiceConfig } from '@/lib/voice/voice-config';
 
@@ -1403,33 +1403,63 @@ async function creditFirstSessionFireForget(
   if (hashes.length === 0) return;
 
   const { ua, accept, xff } = reqMeta;
-  const ip = xff.split(',')[0]?.trim() ?? '';
-  const ipPrefix = ip.includes('.') ? ip.split('.').slice(0, 3).join('.') : ip.split(':').slice(0, 4).join(':');
-  const deviceFp = createHash('sha256').update(`${ua}|${accept}|${ipPrefix}`).digest('hex').slice(0, 32);
+  // SHARED derivation (M4) — must equal the mint path's (open-check) exactly.
+  const { deviceFp, ipPrefix } = deriveDeviceFingerprint(ua, accept, xff);
+
+  // Phase 4 (R1-M4) — ONE RPC does the credit + referrer grant + new-user welcome
+  // + recruiter bump atomically, and returns a structured result so the PostHog
+  // event reflects what actually happened (not just a boolean). Bonus/cap bounds
+  // are env-driven (R3-#3) with SQL defaults that mirror these.
+  const envInt = (k: string, d: number): number => {
+    const n = Number(process.env[k]);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : d;
+  };
+  const creditParams = {
+    p_referrer_bonus_seconds: envInt('REFERRAL_VERIFIED_BONUS_SECONDS', 900),
+    p_welcome_bonus_seconds:  envInt('SIGNUP_BONUS_SECONDS', 900),
+    p_recruiter_per_signup:   envInt('RECRUITER_BONUS_PER_SIGNUP_SECONDS', 60),
+    p_recruiter_ceiling:      envInt('RECRUITER_BONUS_CEILING_SECONDS', 1800),
+    p_lifetime_cap_seconds:   envInt('REFERRAL_LIFETIME_CAP_SECONDS', 18000),
+    p_velocity_24h:           envInt('REFERRAL_VELOCITY_24H', 10),
+  };
 
   const admin = supabaseAdmin();
-  let credited = false;
+  let result: {
+    credited: boolean; referrer_granted: boolean; welcome_granted: boolean;
+    recruiter_bumped: boolean; reason: string | null;
+  } | null = null;
   for (const tokenHash of hashes) {
-    const { data, error } = await admin.rpc('recording_referral_credit_first_session', {
+    const { data, error } = await admin.rpc('recording_referral_credit_first_session_v2', {
       p_token_hash: tokenHash,
       p_new_user:   userId,
       p_device_fp:  deviceFp,
       p_ip_prefix:  ipPrefix,
+      ...creditParams,
     });
     if (error) {
       // Surface but don't throw — the user's session opened successfully.
-      Sentry.captureException(error, { extra: { op: 'recording_referral_credit_first_session' } });
+      Sentry.captureException(error, { extra: { op: 'recording_referral_credit_first_session_v2' } });
       continue;
     }
-    if (data === true) { credited = true; break; }
+    // `data` is untyped (this RPC isn't in the generated Database types → `never`);
+    // cast through unknown to the structured row shape.
+    const row = (Array.isArray(data) ? data[0] : data) as unknown as {
+      credited: boolean; referrer_granted: boolean; welcome_granted: boolean;
+      recruiter_bumped: boolean; reason: string | null;
+    } | null;
+    if (row?.credited === true) { result = row; break; }
   }
 
-  // PostHog event (plan §11). Only fires on a *fresh* credit (RPC returns
-  // true) — duplicate calls (idempotent at the RPC level) don't double-count.
-  // distinctId = the new user's UUID so the funnel joins to their other events.
-  if (credited) {
+  // PostHog (plan §11). Fires only on a *fresh* credit (idempotent RPC) and now
+  // carries which grants landed — referrer can hit the lifetime/velocity cap and a
+  // sock-puppet skips the recruiter bump, so a credit ≠ "everyone got minutes".
+  if (result) {
     await captureServerSafe(userId, 'referral_first_session', {
       ref_id_prefix: refPlaintext.slice(0, 6),
+      referrer_granted: result.referrer_granted === true,
+      welcome_granted:  result.welcome_granted === true,
+      recruiter_bumped: result.recruiter_bumped === true,
+      reason: result.reason ?? null,
     });
   }
 }

@@ -17,12 +17,13 @@
 // world knows). Audit Plan §20.10 (kill-switch defense in depth).
 
 import 'server-only';
-import { type NextRequest } from 'next/server';
+import { type NextRequest, after } from 'next/server';
 import * as Sentry from '@sentry/nextjs';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import { getCallerUserId } from '@/lib/auth-guards';
 import { json, isSameOrigin } from '@/lib/session/http-helpers';
-import { mintReferralToken, shareUrlForToken } from '@/lib/recording/referral-token';
+import { mintReferralToken, shareUrlForToken, deriveDeviceFingerprint } from '@/lib/recording/referral-token';
+import { grantShareTap } from '@/lib/minutes/grant';
 
 type Body = {
   creator_id?: unknown;
@@ -53,12 +54,23 @@ export async function POST(req: NextRequest) {
   // Mint plaintext + hash. Plaintext returned to client; hash sent to RPC.
   const { plaintext, tokenHash } = mintReferralToken();
 
+  // Phase 4 (R2-M4) — persist the MINTER's fp/ip on the token so the credit RPC can
+  // later skip the recruiter bump if the new user matches (self-referral behind
+  // incognito/VPN). SHARED derivation (M4) — must equal the credit path's exactly.
+  const { deviceFp, ipPrefix } = deriveDeviceFingerprint(
+    req.headers.get('user-agent') ?? '',
+    req.headers.get('accept-language') ?? '',
+    req.headers.get('x-forwarded-for') ?? '',
+  );
+
   const admin = supabaseAdmin();
   const { data: minted, error } = await admin.rpc('recording_referral_mint', {
     p_user:       callerUserId,
     p_creator:    creatorId,
     p_clip:       clipId,
     p_token_hash: tokenHash,
+    p_device_fp:  deviceFp,
+    p_ip_prefix:  ipPrefix,
   });
 
   if (error) {
@@ -76,6 +88,16 @@ export async function POST(req: NextRequest) {
     // toast and proceeds with a generic end-card (no referral token).
     return json(429, { error: 'daily_share_cap' });
   }
+
+  // Phase 4 §6.1 — +60s share_tap bonus on a real mint (deduped on the token hash,
+  // capped 2/day inside minute_grant_insert). after() so it adds ZERO latency to the
+  // recording-arm onTap path; a cap hit / dedup is a silent no-op (grantShareTap
+  // swallows + Sentry-logs its own errors). Credited on the distribution ACTION (a
+  // tap), not a redemption — bounded to 2 min/day, low fraud value (plan §6.1).
+  after(async () => {
+    try { await grantShareTap(callerUserId, tokenHash); }
+    catch (e) { Sentry.captureException(e, { extra: { op: 'grant_share_tap', user_id: callerUserId } }); }
+  });
 
   return json(200, {
     token: plaintext,

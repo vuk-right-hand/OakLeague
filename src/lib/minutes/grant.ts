@@ -43,8 +43,27 @@ export interface GrantMinutesResult {
   grantId: number | null;
 }
 
+// Non-negative integer env read with a default (matches the Phase-1/2 pattern).
+function envInt(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
+
+// Phase-4 referral caps — passed UNCONDITIONALLY on every grant (cheaper than
+// branching). minute_grant_insert ignores them for non-referral types, so a
+// paid_topup / admin_adjustment carrying these is a harmless no-op. Env-tunable;
+// the SQL defaults mirror these so the SQL-side caller (credit RPC) stays consistent.
+function referralCaps() {
+  return {
+    lifetime: envInt('REFERRAL_LIFETIME_CAP_SECONDS', 18000),
+    velocity: envInt('REFERRAL_VELOCITY_24H', 10),
+    shareTapDaily: envInt('SHARE_TAP_DAILY_CAP', 2),
+  };
+}
+
 export async function grantMinutes(input: GrantMinutesInput): Promise<GrantMinutesResult> {
   const admin = supabaseAdmin();
+  const caps = referralCaps();
   const { data, error } = await admin.rpc('minute_grant_insert', {
     p_user_id: input.userId,
     p_grant_type: input.type,
@@ -54,6 +73,9 @@ export async function grantMinutes(input: GrantMinutesInput): Promise<GrantMinut
     p_metadata: input.metadata ?? null,
     // p_expires_at omitted — v1 grants are non-expiring (the RPC rejects a
     // non-null value to keep profiles.wallet_active_seconds exact).
+    p_lifetime_cap_seconds: caps.lifetime,
+    p_velocity_24h: caps.velocity,
+    p_share_tap_daily_cap: caps.shareTapDaily,
   });
   if (error) {
     Sentry.captureException(error, {
@@ -70,4 +92,31 @@ export async function grantMinutes(input: GrantMinutesInput): Promise<GrantMinut
     reason: (row.reason as GrantDeniedReason | null) ?? null,
     grantId: row.grant_id ?? null,
   };
+}
+
+// ── Phase 4 typed wrappers ────────────────────────────────────────────────
+
+// +60s (SHARE_TAP_BONUS_SECONDS) per token minted, deduped on the token hash, capped
+// 2/day by minute_grant_insert. Called from /api/recording/open-check on mint success.
+export async function grantShareTap(userId: string, tokenHash: string): Promise<GrantMinutesResult> {
+  return grantMinutes({
+    userId,
+    type: 'share_tap',
+    seconds: envInt('SHARE_TAP_BONUS_SECONDS', 60),
+    sourceKind: 'share_token',
+    sourceKey: tokenHash,
+  });
+}
+
+// +900s (SIGNUP_BONUS_SECONDS) universal welcome, deduped on 'signup:'||uid so the
+// referred-user path (credit RPC) and the universal onboarding path never double-grant.
+export async function grantSignupBonus(userId: string): Promise<GrantMinutesResult> {
+  return grantMinutes({
+    userId,
+    type: 'signup_bonus',
+    seconds: envInt('SIGNUP_BONUS_SECONDS', 900),
+    sourceKind: 'signup',
+    sourceKey: `signup:${userId}`,
+    metadata: { source: 'onboarding' },
+  });
 }
