@@ -22,6 +22,10 @@
 //                                    (R4-M6: only 3.1 Live verified for transcription)
 //   4011 tts_reconnecting        — turn_start during Cartesia reconnect window (R4-M2)
 //   4012 backpressure            — user WS bufferedAmount > 2 MB (R3-C2)
+//   4013 brain_unset_with_tts    — useTtsLayer with brain_status unset/errored (decoupled)
+//   4014 tts_no_voice/fish_unprov — TTS layer on but no voice id / Fish env unprovisioned
+//   4015 tier_exhausted          — Phase 2 soft gate: server-owned idle kill after 100%
+//                                   mid-session exhaustion with no rescuing action (R2-C4)
 //   1008 quota_exceeded          — kill-switch or degraded-and-unknown at turn_start
 //   1011 internal_error          — unhandled
 //   1000 normal_closure          — client initiated
@@ -860,12 +864,18 @@ async function endSession(sessionId, reason) {
 const quotaCache = new Map();
 
 async function checkQuotaOk(sessionId) {
+  const softGateEnabled = process.env.GROWTH_SOFT_GATE_ENABLED === '1';
+  const ledgerOn = process.env.GROWTH_LEDGER_ENABLED === '1';
+  // Phase 2: voice_check_quota_v2 returns the unified balance for the soft gate.
+  // Gated so the proxy can deploy before the migration lands / the flag flips; v1
+  // is byte-identical for the System-A fuse fields the hard path reads.
+  const quotaRpc = softGateEnabled ? 'voice_check_quota_v2' : 'voice_check_quota';
   let rpc;
   try {
-    const { data, error } = await supabase.rpc('voice_check_quota', { p_session_id: sessionId });
+    const { data, error } = await supabase.rpc(quotaRpc, { p_session_id: sessionId });
     if (error) throw error;
     const row = Array.isArray(data) ? data[0] : data;
-    if (!row) throw new Error('voice_check_quota returned no row');
+    if (!row) throw new Error(`${quotaRpc} returned no row`);
     rpc = { row, error: null };
   } catch (e) {
     const code = e?.code || '';
@@ -886,7 +896,9 @@ async function checkQuotaOk(sessionId) {
       rpc = { row: null, error: e };
     }
   }
-  const { gate, nextCache } = decideQuotaGate({ rpc, priorCache: quotaCache.get(sessionId) });
+  const { gate, nextCache } = decideQuotaGate({
+    rpc, priorCache: quotaCache.get(sessionId), softGateEnabled, ledgerOn,
+  });
   quotaCache.set(sessionId, nextCache);
   return gate;
 }
@@ -1227,6 +1239,35 @@ wss.on('connection', async (ws, req) => {
   // the same anchor). Reset at every turn_start.
   let turnStartedAt = null;
 
+  // Phase 2 soft gate: SERVER-owned idle teardown on a 100% mid-session
+  // exhaustion. IMPORTANT (audit C1) — the proxy does NOT hold the Simli room:
+  // the avatar RTC is browser↔Simli, established by the CLIENT-side bridge. So
+  // this teardown releases the PROXY-side legs (the Gemini Live WS + the TTS WS)
+  // and writes cogs; it does NOT directly end Simli. Simli is bounded by its own
+  // maxIdleTime/maxSessionLength set at mint (= maxAvatarSeconds). On a responsive
+  // client the 4015 close drives the React unmount that closes the Simli bridge;
+  // on a frozen/backgrounded tab Simli self-ends at its idle timeout. This timer's
+  // job is prompt proxy-side cleanup + nudging a live client to release the
+  // avatar — NOT a server-side Simli kill (which the proxy cannot do here).
+  let softGateIdleTimer = null;
+  const clearSoftGateIdleTimer = () => {
+    if (softGateIdleTimer) { clearTimeout(softGateIdleTimer); softGateIdleTimer = null; }
+  };
+  const armSoftGateIdleKill = () => {
+    clearSoftGateIdleTimer();
+    const ms = _envPosInt('SOFT_GATE_IDLE_KILL_MS', 25000); // S1
+    softGateIdleTimer = setTimeout(() => {
+      softGateIdleTimer = null;
+      if (closed) return; // M5: another path already tore this connection down.
+      Promise.resolve(teardown('tier_exhausted')).catch(() => {}).finally(() => {
+        // M5: closeWs is already a no-op on a closed socket, but guard readyState
+        // so a future close-without-teardown path can't double-close a replaced ws.
+        try { if (ws.readyState === ws.OPEN) closeWs(ws, 4015, 'tier_exhausted'); }
+        catch { /* no-op */ }
+      });
+    }, ms);
+  };
+
   // Post-build audit C3 — HeyGen LiveAvatar Lite heartbeat.
   // Server drops the WS at ~120s of voice silence (Phase 0 §9). The
   // bridge can't fire keep-alive (browser doesn't have the privileged
@@ -1283,6 +1324,7 @@ wss.on('connection', async (ws, req) => {
   const teardown = async (reason) => {
     if (closed) return;
     closed = true;
+    clearSoftGateIdleTimer(); // Phase 2: cancel any pending soft-gate idle kill.
     // MEMORY_BREADTH_PLAN U1b (audit R1-M4) — capture EVERYTHING the
     // fire-and-forget extraction needs into locals BEFORE any state
     // cleanup below. transcriptSnapshot() returns a copy, so the
@@ -3095,7 +3137,31 @@ wss.on('connection', async (ws, req) => {
     try { msg = JSON.parse(data.toString()); } catch { return; }
     try {
       if (msg.type === 'turn_start') {
+        // R2-M6 — clear any pending soft-gate idle kill SYNCHRONOUSLY, before the
+        // awaited gate, so a turn the user just rescued (bought/earned minutes)
+        // can't be torn down by the timer firing during the await.
+        clearSoftGateIdleTimer();
         const gate = await checkQuotaOk(sessionId);
+        // Phase 2 soft gate: exhausted at 100% but NOT hard-killed. Keep the WS +
+        // the warm Simli/Gemini pipes open, tell the client to upsell, arm the
+        // server-owned idle kill. Do NOT teardown, do NOT consume a turn (so the
+        // rescued next turn numbers correctly). Hard kill still trumps (below).
+        if (gate.soft) {
+          // Audit M1 — guard the send (the socket may be CLOSING after a
+          // navigate-away race) and arm the idle kill REGARDLESS of send success:
+          // the timer is the safety net and must not be skipped by a throwing
+          // best-effort notify.
+          if (ws.readyState === ws.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'tier_exhausted',
+              remaining_seconds: gate.remaining_seconds ?? 0,
+              cap_period: gate.cap_period ?? null,
+              op: 'turn_start',
+            }));
+          }
+          armSoftGateIdleKill();
+          return;
+        }
         if (!gate.ok) {
           ws.send(JSON.stringify({ type: 'error', code: gate.reason, op: 'turn_start' }));
           await teardown(gate.reason);

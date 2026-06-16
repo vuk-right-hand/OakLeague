@@ -66,6 +66,13 @@ export type SessionState = {
   // through). Session-permanent swap; if this fires it stays cleared
   // for the rest of the session unless rare future events re-arm.
   ttsProviderSwitching: boolean;
+  // Growth & Minutes Economy Phase 2 — answer-end soft gate. The proxy denied the
+  // NEXT turn because the user hit 100% of their minutes mid-session. NOT an error
+  // and NOT 'closed': pipes stay warm until the server idle-kills (WS 4015) or the
+  // user acts. The session-client renders an in-session upsell overlay off this
+  // flag; capPeriod drives period-correct reset copy (R4-M5).
+  tierExhausted: boolean;
+  tierExhaustedCapPeriod: 'daily' | 'weekly' | 'monthly' | null;
 };
 
 export type Action =
@@ -121,7 +128,10 @@ export type Action =
   | { kind: 'tts_provider_switched' }
   // R4-M5 — silent <video>.play() rejection on iOS WebKit after a track
   // rebind without a fresh user activation. UX shows tap-to-resume overlay.
-  | { kind: 'video_autoplay_lost' };
+  | { kind: 'video_autoplay_lost' }
+  // Growth & Minutes Economy Phase 2 — proxy soft-gated the next turn at 100%
+  // exhaustion. Stop the mic, raise the upsell flag, keep pipes warm.
+  | { kind: 'tier_exhausted'; remainingSeconds: number; capPeriod: string | null };
 
 export const initialState: SessionState = {
   phase: 'idle',
@@ -137,6 +147,8 @@ export const initialState: SessionState = {
   pausedAtMs: null,
   cartesiaReconnecting: false,
   ttsProviderSwitching: false,
+  tierExhausted: false,
+  tierExhaustedCapPeriod: null,
 };
 
 function bothPipesReady(s: SessionState): boolean {
@@ -193,7 +205,9 @@ export function reduce(state: SessionState, action: Action): SessionState {
 
     case 'mic_started':
       if (state.phase !== 'ready' && state.phase !== 'speaking') return state;
-      return { ...state, phase: 'listening' };
+      // Optimistically clear the soft-gate overlay when the user starts a fresh
+      // turn — if they're still exhausted the proxy re-fires tier_exhausted.
+      return { ...state, phase: 'listening', tierExhausted: false, tierExhaustedCapPeriod: null };
 
     case 'mic_stopped':
       // P0-1: user finished talking → brain is now working. Enter 'thinking'
@@ -275,6 +289,9 @@ export function reduce(state: SessionState, action: Action): SessionState {
         brainReady: false,
         avatarReady: action.avatarStatus !== 'minted' && action.avatarStatus !== 'pending',
         phase: 'opening',
+        // Fresh session — clear any soft-gate overlay from the prior segment.
+        tierExhausted: false,
+        tierExhaustedCapPeriod: null,
       };
 
     case 'rollover_failed':
@@ -351,6 +368,18 @@ export function reduce(state: SessionState, action: Action): SessionState {
       // resurrect a closed session.
       if (state.phase !== 'reconnecting') return state;
       return { ...state, phase: 'ready' };
+
+    case 'tier_exhausted': {
+      // Soft gate (Phase 2): out of minutes at 100%. Hold at 'ready' (mic only
+      // streams in 'listening', so this stops it), keep pipes warm, raise the
+      // upsell flag. NOT 'closed'/'reconnecting' — the session resumes the instant
+      // the user re-opens after buying/earning minutes (§12.7), or the server
+      // idle-kills it (WS 4015). Ignored once closing/closed.
+      if (state.phase === 'closed' || state.phase === 'closing') return state;
+      const cap = action.capPeriod;
+      const capPeriod = cap === 'daily' || cap === 'weekly' || cap === 'monthly' ? cap : null;
+      return { ...state, phase: 'ready', tierExhausted: true, tierExhaustedCapPeriod: capPeriod };
+    }
   }
 }
 

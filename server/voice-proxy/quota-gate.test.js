@@ -17,7 +17,9 @@ test('healthy RPC + healthy quota → allow, cache snapshot', () => {
   });
   assert.equal(out.gate.ok, true);
   assert.equal(out.gate.reason, '');
-  assert.deepEqual(out.nextCache.healthy, { fired: false, over150: false });
+  // C3 grew healthy to also carry the soft-exhaustion snapshot; assert the hard fields.
+  assert.equal(out.nextCache.healthy.fired, false);
+  assert.equal(out.nextCache.healthy.over150, false);
   assert.equal(out.nextCache.graceUsed, false);
 });
 
@@ -98,7 +100,8 @@ test('RPC recovers after grace → healthy snapshot overrides graceUsed', () => 
     rpc: { row: { kill_switch_fired_at: null, over_150_pct: false }, error: null },
     priorCache: afterGrace.nextCache,
   });
-  assert.deepEqual(afterRecover.nextCache.healthy, { fired: false, over150: false });
+  assert.equal(afterRecover.nextCache.healthy.fired, false);
+  assert.equal(afterRecover.nextCache.healthy.over150, false);
   assert.equal(afterRecover.nextCache.graceUsed, true, 'graceUsed carries forward (spent once)');
 
   const afterFailAgain = decideQuotaGate({
@@ -148,4 +151,90 @@ test('B1: fatal RPC even when prior snapshot is healthy → still deny + fatal',
   assert.equal(out.gate.ok, false);
   assert.equal(out.gate.fatal, true);
   assert.equal(out.gate.reason, 'quota_state_inconsistent');
+});
+
+// ── Phase 2: answer-end soft gate (Growth & Minutes Economy) ───────────────
+
+const softRow = (over) => ({
+  rpc: { row: { kill_switch_fired_at: null, over_150_pct: false, remaining_seconds: over.eff, allowance_remaining: over.allow, cap_period: over.cap ?? 'daily' }, error: null },
+  priorCache: undefined,
+  softGateEnabled: over.soft ?? true,
+  ledgerOn: over.ledger ?? true,
+});
+
+test('soft gate OFF (flag unset) + exhausted → still allow (inert)', () => {
+  const out = decideQuotaGate(softRow({ eff: 0, allow: 0, soft: false }));
+  assert.equal(out.gate.ok, true);
+  assert.equal(out.gate.soft, undefined);
+});
+
+test('soft gate ON + effective exhausted (ledgerOn) → soft deny, not hard', () => {
+  const out = decideQuotaGate(softRow({ eff: 0, allow: 0, cap: 'weekly' }));
+  assert.equal(out.gate.ok, false);
+  assert.equal(out.gate.soft, true);
+  assert.equal(out.gate.reason, 'tier_exhausted');
+  assert.equal(out.gate.remaining_seconds, 0);
+  assert.equal(out.gate.cap_period, 'weekly');
+});
+
+test('soft gate ON + balance remaining → allow', () => {
+  const out = decideQuotaGate(softRow({ eff: 120, allow: 120 }));
+  assert.equal(out.gate.ok, true);
+  assert.equal(out.gate.soft, undefined);
+});
+
+test('soft gate ON + HARD (over150) trumps soft even at 0 balance', () => {
+  const out = decideQuotaGate({
+    rpc: { row: { kill_switch_fired_at: null, over_150_pct: true, remaining_seconds: 0, allowance_remaining: 0, cap_period: 'daily' }, error: null },
+    priorCache: undefined, softGateEnabled: true, ledgerOn: true,
+  });
+  assert.equal(out.gate.ok, false);
+  assert.equal(out.gate.soft, undefined, 'hard kill is not a soft gate');
+  assert.equal(out.gate.reason, 'kill_switch_fired');
+});
+
+test('C1 co-gate: ledger OFF uses allowance — wallet does NOT rescue', () => {
+  // Free pool exhausted but wallet has 500s. With the ledger flag OFF (proxy
+  // not drawing the wallet), the soft gate must fire on allowance so we never
+  // grant minutes the proxy isn't decrementing.
+  const out = decideQuotaGate(softRow({ eff: 500, allow: 0, ledger: false }));
+  assert.equal(out.gate.ok, false);
+  assert.equal(out.gate.soft, true);
+});
+
+test('C1 co-gate: ledger ON uses effective — wallet rescues', () => {
+  const out = decideQuotaGate(softRow({ eff: 500, allow: 0, ledger: true }));
+  assert.equal(out.gate.ok, true);
+  assert.equal(out.gate.soft, undefined);
+});
+
+test('soft exhaustion IS cached for the degraded fail-closed path (C3)', () => {
+  const out = decideQuotaGate(softRow({ eff: 0, allow: 0, cap: 'daily' }));
+  assert.equal(out.nextCache.healthy.fired, false);
+  assert.equal(out.nextCache.healthy.over150, false);
+  assert.equal(out.nextCache.healthy.softExhausted, true);
+  assert.equal(out.nextCache.healthy.softCapPeriod, 'daily');
+});
+
+test('C3: degraded RPC + cached soft-exhausted → fail CLOSED (re-soft-gate, no free turn)', () => {
+  const healthy = decideQuotaGate(softRow({ eff: 0, allow: 0, cap: 'weekly' }));
+  assert.equal(healthy.gate.soft, true);
+  const degraded = decideQuotaGate({
+    rpc: { row: null, error: new Error('brownout') },
+    priorCache: healthy.nextCache, softGateEnabled: true, ledgerOn: true,
+  });
+  assert.equal(degraded.gate.ok, false);
+  assert.equal(degraded.gate.soft, true);
+  assert.equal(degraded.gate.reason, 'tier_exhausted');
+  assert.equal(degraded.gate.cap_period, 'weekly');
+});
+
+test('C3: degraded RPC + cached NOT-exhausted → allow (degraded), unchanged', () => {
+  const healthy = decideQuotaGate(softRow({ eff: 120, allow: 120 }));
+  const degraded = decideQuotaGate({
+    rpc: { row: null, error: new Error('brownout') },
+    priorCache: healthy.nextCache, softGateEnabled: true, ledgerOn: true,
+  });
+  assert.equal(degraded.gate.ok, true);
+  assert.equal(degraded.gate.reason, 'quota_check_degraded');
 });

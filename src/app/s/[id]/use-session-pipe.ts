@@ -818,6 +818,16 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
           }
         },
         onWarning: (code) => { captureSafe('proxy_warning', { code, session_id: sessionIdRef.current }); },
+        onTierExhausted: (remainingSeconds, capPeriod) => {
+          // Growth & Minutes Economy Phase 2 — out of minutes at 100% mid-session.
+          // NOT an error: the reducer stops the mic + raises the in-session upsell.
+          captureSafe('tier_exhausted', {
+            remaining_seconds: remainingSeconds,
+            cap_period: capPeriod,
+            session_id: sessionIdRef.current,
+          });
+          dispatchRef({ kind: 'tier_exhausted', remainingSeconds, capPeriod });
+        },
         onTtsReconnecting: () => {
           // R3-Missing-6 — Cartesia-down state. Avatar stays visible;
           // session-client overlays a "Voice catching up…" banner.
@@ -871,10 +881,18 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
           });
           // eslint-disable-next-line no-console
           console.warn(`[reconnect-overlay] trigger=ws_closed code=${code} reason=${safeReason ?? ''} clean=${wasClean}`);
-          dispatchRef({ kind: 'ws_closed', wasClean });
-          if (code === 4002) {
-            // session_already_active = R4-C1 eviction by another tab. Fatal.
-            dispatchRef({ kind: 'fatal_error', message: 'session_evicted' });
+          if (code === 4015) {
+            // Phase 2 — server-owned soft-gate idle kill. Session is terminally
+            // out of minutes; the in-session upsell overlay (tierExhausted) stays.
+            // Do NOT route to 'reconnecting' (no tap-to-reconnect — they must buy
+            // or earn minutes), just close gracefully.
+            dispatchRef({ kind: 'closed_ack' });
+          } else {
+            dispatchRef({ kind: 'ws_closed', wasClean });
+            if (code === 4002) {
+              // session_already_active = R4-C1 eviction by another tab. Fatal.
+              dispatchRef({ kind: 'fatal_error', message: 'session_evicted' });
+            }
           }
         },
       });

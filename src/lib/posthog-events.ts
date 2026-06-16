@@ -28,6 +28,9 @@ export const VoicePipelineEvents = {
   proxy_warning:         'proxy_warning',
   cartesia_reconnecting: 'cartesia_reconnecting',
   cartesia_reconnected:  'cartesia_reconnected',
+  // Growth & Minutes Economy Phase 2 — answer-end soft gate fired (user hit 100%
+  // of their minutes mid-session; proxy denied the next turn gracefully).
+  tier_exhausted:        'tier_exhausted',
   // FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit M4) — Fish→Cartesia auto-
   // fallback mid-session swap. Distinct event from cartesia_reconnecting
   // because the dashboards count them differently (this is "Fish failed
