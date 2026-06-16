@@ -31,7 +31,7 @@ export type ProxyClientHandlers = {
   // of their minutes mid-session; the proxy denied the NEXT turn GRACEFULLY (WS
   // stays open) and the server owns the idle kill. NOT an error — the client
   // stops the mic and shows an in-session upsell.
-  onTierExhausted?: (remainingSeconds: number, capPeriod: string | null) => void;
+  onTierExhausted?: (remainingSeconds: number, capPeriod: string | null, walletExhausted: boolean, trip: string | null) => void;
   onTtsReconnecting?: () => void;
   onTtsReconnected?: () => void;
   // FISH_AUDIO_PHASE_1 §6 round-3 C4 (code audit M4) — Fish→Cartesia
@@ -138,6 +138,8 @@ export function createProxyClient(handlers: ProxyClientHandlers): ProxyClient {
           handlers.onTierExhausted?.(
             Number.isFinite(rem) ? Math.max(0, Math.floor(rem)) : 0,
             (msg.cap_period as string | null) ?? null,
+            msg.wallet_exhausted === true, // C4 — buy-vs-wait copy
+            (msg.trip as string | null) ?? null, // M-A — telemetry discriminator
           );
         } else if (type === 'tts_reconnecting') {
           handlers.onTtsReconnecting?.();

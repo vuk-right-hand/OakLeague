@@ -449,12 +449,24 @@ export async function POST(req: NextRequest) {
   // user would get free unbounded minutes. When the ledger is OFF we admit on the
   // FREE allowance only and the fuse anchor never includes the wallet — identical
   // to pre-Phase-1 behavior. When ON, effective_remaining (allowance + wallet) is
-  // used and a user at free-cap=0 with wallet minutes PASSES (R1-C1). Co-flip the
-  // Vercel env with the Fly secret; flip the proxy ON before the route.
+  // used and a user at free-cap=0 with wallet minutes PASSES (R1-C1).
+  //
+  // TANDEM AUDIT C2 — DEPLOY-ORDER IS DIRECTIONAL, both ways (the flag lives in TWO
+  // env stores — this Vercel route + the Fly proxy — and skews during a rolling
+  // deploy):
+  //   ROLL FORWARD (turning the ledger ON): migrations live on prod FIRST, then flip
+  //     the FLY proxy ON (starts drawing the wallet), THEN flip this Vercel route ON.
+  //     The transient "route OFF / proxy ON" state under-delivers (safe); the
+  //     dangerous "route ON / proxy OFF" state (the leak) never occurs.
+  //   ROLL BACK (turning the ledger OFF): reverse order — flip this Vercel route OFF
+  //     FIRST, then the Fly proxy. Rolling the PROXY back first lands in "route ON /
+  //     proxy OFF" = the leak. Never roll the proxy back before the route.
   const ledgerOn = process.env.GROWTH_LEDGER_ENABLED === '1';
+  // S5 — NO `?? remaining_seconds` fallback in the ledger-OFF branch (allowance_
+  // remaining is NOT NULL from the RPC, but a future change must never silently
+  // fall back to the wallet-inclusive figure in a mode that ignores the wallet).
   const remainingSeconds = Math.max(0, Math.floor(Number(
-    (ledgerOn ? capRowRaw.remaining_seconds : capRowRaw.allowance_remaining)
-      ?? capRowRaw.remaining_seconds ?? 0,
+    (ledgerOn ? capRowRaw.remaining_seconds : capRowRaw.allowance_remaining) ?? 0,
   )));
   const walletRemaining = ledgerOn
     ? Math.max(0, Math.floor(Number(capRowRaw.wallet_remaining ?? 0)))
@@ -589,17 +601,41 @@ export async function POST(req: NextRequest) {
 
   // R2-C1 — raise today's 150%-fuse anchor (daily_quotas.daily_limit_s) to this
   // session's real entitlement so a wallet/paid user isn't hard-killed at 150%
-  // of the base free cap (free = 450s). min(daily_cap_eff + wallet, absolute
-  // runaway ceiling); GREATEST-only in the RPC, never retro-latches. Runs for
+  // of the base free cap. GREATEST-only in the RPC, never retro-latches. Runs for
   // BOTH the fresh and takeover paths (sessionId resolved above). Non-fatal —
   // the base-cap fuse still protects COGS if this write fails.
+  //
+  // TANDEM AUDIT M4 — the anchor is a PER-DAY, cross-session HIGH-WATER MARK, not a
+  // per-session value: daily_quotas is keyed by (user, date), and the RPC only ever
+  // GREATEST-raises it. So a 2nd tab (takeover) or a later session the same day can
+  // raise today's anchor using a fresher wallet snapshot than an earlier still-live
+  // session was sized against. That only ever LOOSENS the COGS fuse (never tightens
+  // protection) and stays bounded by the absolute ceiling, so it's acceptable — but
+  // don't read daily_limit_s as "this session's entitlement"; it's the day's max.
+  //
+  // TANDEM AUDIT C1 — UNIT MISMATCH (load-bearing): daily_quotas.daily_limit_s
+  // gates daily_quotas.seconds_used, which the proxy accumulates as
+  // mic-input + assistant-audio seconds (System A, index.js accumulateSeconds).
+  // But daily_cap_eff / wallet are in AVATAR-TALK (assistant-only) seconds
+  // (System B, the soft gate's unit). Anchoring the fuse at exactly
+  // (daily_cap_eff + wallet) puts an assistant-unit value into a mic+assistant-
+  // unit field, so for a chatty free user the 150% HARD fuse (450s) fires BEFORE
+  // the 100% SOFT gate (300s assistant) — a jarring "come back tomorrow" kill
+  // instead of the graceful upsell, defeating Phase 2 for its primary audience.
+  // The pre-2026-05-10 CASE encoded this headroom implicitly (free=600=2×cap);
+  // de-staling it to the raw cap (migration 0003) dropped it. VOICE_FUSE_MIC_
+  // HEADROOM (default 2) restores it: the fuse sits a mic-turn above the soft
+  // gate. The proxy ALSO soft-gates at System-A 100% (decideQuotaGate) so the
+  // graceful-before-hard ordering is GUARANTEED even for >2:1 mic:assistant
+  // ramblers, not merely statistical. Absolute runaway ceiling still caps it.
   {
     const absoluteCeiling = Math.max(
       60,
       Math.floor(Number(process.env.ABSOLUTE_DAILY_COGS_CEILING_SECONDS ?? 14400)),
     );
+    const micHeadroom = Math.max(1, Number(process.env.VOICE_FUSE_MIC_HEADROOM ?? 2));
     const fuseAnchorSeconds = Math.min(
-      Math.floor(Number(capRowRaw.daily_cap_eff ?? 0)) + walletRemaining,
+      Math.ceil((Math.floor(Number(capRowRaw.daily_cap_eff ?? 0)) + walletRemaining) * micHeadroom),
       absoluteCeiling,
     );
     const { error: anchorErr } = await admin.rpc('voice_fuse_anchor_apply', {

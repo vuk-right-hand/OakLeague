@@ -538,6 +538,7 @@ function LiveSession(props: LiveProps) {
         {pipe.state.tierExhausted && (
           <InSessionUpsell
             capPeriod={pipe.state.tierExhaustedCapPeriod}
+            walletExhausted={pipe.state.tierExhaustedWalletExhausted}
             // Audit S4 — router.push to /upgrade is pre-purchase (no tier change
             // yet) so window.location.href isn't required here. It relies on the
             // route change UNMOUNTING /s/[id], which runs use-session-pipe's
@@ -764,10 +765,12 @@ function OverlayCenter({
 // added in Phase 4, when the referral grant is wired — no dead-end CTA before then.
 function InSessionUpsell({
   capPeriod,
+  walletExhausted,
   onGetMore,
   onEnd,
 }: {
   capPeriod: 'daily' | 'weekly' | 'monthly' | null;
+  walletExhausted: boolean;
   onGetMore: () => void;
   onEnd: () => void;
 }) {
@@ -776,11 +779,25 @@ function InSessionUpsell({
     : capPeriod === 'monthly' ? 'this month'
     : capPeriod === 'daily' ? 'today'
     : 'right now';
-  const resets =
-    capPeriod === 'weekly' ? 'Your minutes refresh at the start of next week.'
-    : capPeriod === 'monthly' ? 'Your minutes refresh next month.'
-    : capPeriod === 'daily' ? 'Your minutes refresh tomorrow.'
-    : 'Top up to keep the conversation going.';
+  const refreshWhen =
+    capPeriod === 'weekly' ? 'at the start of next week'
+    : capPeriod === 'monthly' ? 'next month'
+    : capPeriod === 'daily' ? 'tomorrow'
+    : null;
+  // TANDEM AUDIT C4 — the copy must NOT tell a wallet user their minutes "refresh
+  // tomorrow": the soft gate fires only when free AND wallet are BOTH spent, and a
+  // drained durable wallet (purchased/earned) does NOT come back by waiting — only
+  // the free allowance does. So a wallet user is led to buy; a pure free user is
+  // told (truthfully) to wait. The headline drops the period qualifier for wallet
+  // users ("…today" wrongly implies a daily reset of the whole balance).
+  const headline = walletExhausted ? 'You’re out of minutes' : `You’re out of minutes ${period}`;
+  const subline = walletExhausted
+    ? (refreshWhen
+        ? `Top up to keep going — your free minutes refresh ${refreshWhen}.`
+        : 'Top up to keep the conversation going.')
+    : (refreshWhen
+        ? `Your minutes refresh ${refreshWhen}.`
+        : 'Top up to keep the conversation going.');
   return (
     <div
       role="dialog"
@@ -793,10 +810,10 @@ function InSessionUpsell({
       }}
     >
       <div style={{ fontSize: 18, fontWeight: 700, color: '#fff', marginBottom: 8 }}>
-        You&rsquo;re out of minutes {period}
+        {headline}
       </div>
       <div style={{ fontSize: 13.5, color: 'rgba(255,255,255,0.75)', maxWidth: 300, marginBottom: 22 }}>
-        {resets}
+        {subline}
       </div>
       <button
         type="button"

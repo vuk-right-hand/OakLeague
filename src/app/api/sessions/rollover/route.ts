@@ -298,28 +298,82 @@ export async function POST(req: NextRequest) {
     Sentry.captureException(balErr, { extra: { op: 'sessions_rollover_balance_check', user_id: callerUserId } });
   }
   const balRow = (Array.isArray(balRows) ? balRows[0] : balRows) as {
-    remaining_seconds:   number | string | null;
-    allowance_remaining: number | string | null;
-    wallet_remaining:    number | string | null;
-    daily_cap_eff:       number | string | null;
+    remaining_seconds:    number | string | null;
+    allowance_remaining:  number | string | null;
+    wallet_remaining:     number | string | null;
+    daily_cap_eff:        number | string | null;
+    wallet_active_seconds: number | string | null; // M-D — had_wallet for the 409 copy
+    cap_period:           'daily' | 'weekly' | 'monthly' | null; // S — was an inline cast
   } | null;
   // C1 — co-gate wallet-awareness with the proxy's wallet draw (GROWTH_LEDGER_ENABLED).
   // Ledger OFF → roll on the free allowance only, fuse anchor excludes the wallet.
+  // C2 — directional deploy order (see /sessions/open for the full note): roll
+  // FORWARD = proxy ON before route; roll BACK = route OFF before proxy. "route ON /
+  // proxy OFF" is the unmetered-wallet leak — never roll the proxy back first.
+  // S5 — NO `?? remaining_seconds` fallback in the ledger-OFF branch: allowance_
+  // remaining is NOT NULL from the RPC, but if a future change made it null we must
+  // NOT silently fall back to the wallet-inclusive figure in a mode that is supposed
+  // to ignore the wallet (that would leak wallet minutes the proxy isn't drawing).
   const ledgerOn = process.env.GROWTH_LEDGER_ENABLED === '1';
-  const dailyLimitRemaining = Math.max(0, Math.floor(Number(
-    (ledgerOn ? balRow?.remaining_seconds : balRow?.allowance_remaining)
-      ?? balRow?.remaining_seconds ?? 0,
+  // S4 — a transient balance-read failure must NOT silently cap the rolled segment
+  // at the 60s floor (open treats this as fatal 500; rollover is mid-conversation so
+  // we degrade, not fail). Fall back to session_rollover's System-A daily_limit_
+  // remaining_s (the RPC return `row`) — the user's real headroom — not 0.
+  const balReadOk = !balErr && balRow != null;
+  const rpcDailyRemaining = Math.max(0, Math.floor(Number(
+    (row as { daily_limit_remaining_s?: number | string | null }).daily_limit_remaining_s ?? 0,
   )));
-  const walletRemaining = ledgerOn
-    ? Math.max(0, Math.floor(Number(balRow?.wallet_remaining ?? 0)))
+  const dailyLimitRemaining = balReadOk
+    ? Math.max(0, Math.floor(Number(ledgerOn ? balRow!.remaining_seconds : balRow!.allowance_remaining) || 0))
+    : rpcDailyRemaining;
+  const walletRemaining = ledgerOn && balReadOk
+    ? Math.max(0, Math.floor(Number(balRow!.wallet_remaining ?? 0)))
     : 0;
+
+  // M1 — do NOT mint a dead segment. If the unified balance is already exhausted
+  // (soft gate would fire on the new segment's first turn), rolling over burns a
+  // Gemini ephemeral mint + a Simli/avatar mint + a voice ticket for a session that
+  // can never deliver a turn — and shows the user a confusing fresh-then-instantly-
+  // upsold segment. Return a terminal "tier_exhausted" so the client keeps the
+  // existing in-session upsell overlay instead of swapping to a new socket. Only
+  // when the balance read SUCCEEDED (a failed read degrades to the RPC figure above
+  // and rolls — we never strand a paying user on a transient blip). The hard-fuse
+  // latch is still enforced inside session_rollover (raises kill_switch_fired).
+  if (balReadOk && dailyLimitRemaining <= 0) {
+    // M-C — best-effort close of the just-minted (never-run) segment. A raw UPDATE,
+    // not session_close, is sufficient here: active_seconds is 0 (no turn ran) so
+    // there's nothing to accrue, and a fresh rollover row has no open pause to
+    // resolve. Wrapped so a transient write failure still returns the 409 (the
+    // ghost-session reaper backstops a stuck row); the user MUST be told they're out.
+    try {
+      await admin.from('sessions')
+        .update({ ended_at: new Date().toISOString(), status: 'ended', end_reason: 'tier_exhausted' })
+        .eq('id', newSessionId);
+    } catch (e) {
+      Sentry.captureException(e, { extra: { op: 'sessions_rollover_exhausted_close', session_id: newSessionId } });
+    }
+    // M-D — carry the wallet signal so a paid user who exhausts exactly at the
+    // 15-min rollover boundary gets the "top up" copy, not the free "refresh" copy.
+    const hadWallet = ledgerOn && Math.floor(Number(balRow!.wallet_active_seconds ?? 0)) > 0;
+    return json(409, {
+      error: 'tier_exhausted',
+      remaining_seconds: 0,
+      cap_period: balRow!.cap_period ?? null,
+      wallet_exhausted: hadWallet,
+    });
+  }
+
   {
     const absoluteCeiling = Math.max(
       60,
       Math.floor(Number(process.env.ABSOLUTE_DAILY_COGS_CEILING_SECONDS ?? 14400)),
     );
+    // TANDEM AUDIT C1 — same mic-headroom factor as /sessions/open: daily_quotas.
+    // daily_limit_s gates mic+assistant System-A seconds, so anchor a mic-turn above
+    // the assistant-only entitlement (see open/route.ts for the full rationale).
+    const micHeadroom = Math.max(1, Number(process.env.VOICE_FUSE_MIC_HEADROOM ?? 2));
     const fuseAnchorSeconds = Math.min(
-      Math.floor(Number(balRow?.daily_cap_eff ?? 0)) + walletRemaining,
+      Math.ceil((Math.floor(Number(balRow?.daily_cap_eff ?? 0)) + walletRemaining) * micHeadroom),
       absoluteCeiling,
     );
     const { error: anchorErr } = await admin.rpc('voice_fuse_anchor_apply', {

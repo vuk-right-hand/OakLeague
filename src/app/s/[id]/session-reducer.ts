@@ -73,6 +73,10 @@ export type SessionState = {
   // flag; capPeriod drives period-correct reset copy (R4-M5).
   tierExhausted: boolean;
   tierExhaustedCapPeriod: 'daily' | 'weekly' | 'monthly' | null;
+  // C4 — true when the exhausted user drained a durable wallet (purchased/earned
+  // minutes). The overlay leads with "buy" instead of "your minutes refresh …",
+  // which would be FALSE for a wallet (waiting only restores the free allowance).
+  tierExhaustedWalletExhausted: boolean;
 };
 
 export type Action =
@@ -131,7 +135,7 @@ export type Action =
   | { kind: 'video_autoplay_lost' }
   // Growth & Minutes Economy Phase 2 — proxy soft-gated the next turn at 100%
   // exhaustion. Stop the mic, raise the upsell flag, keep pipes warm.
-  | { kind: 'tier_exhausted'; remainingSeconds: number; capPeriod: string | null };
+  | { kind: 'tier_exhausted'; remainingSeconds: number; capPeriod: string | null; walletExhausted: boolean };
 
 export const initialState: SessionState = {
   phase: 'idle',
@@ -149,6 +153,7 @@ export const initialState: SessionState = {
   ttsProviderSwitching: false,
   tierExhausted: false,
   tierExhaustedCapPeriod: null,
+  tierExhaustedWalletExhausted: false,
 };
 
 function bothPipesReady(s: SessionState): boolean {
@@ -207,7 +212,11 @@ export function reduce(state: SessionState, action: Action): SessionState {
       if (state.phase !== 'ready' && state.phase !== 'speaking') return state;
       // Optimistically clear the soft-gate overlay when the user starts a fresh
       // turn — if they're still exhausted the proxy re-fires tier_exhausted.
-      return { ...state, phase: 'listening', tierExhausted: false, tierExhaustedCapPeriod: null };
+      // NOTE (audit S): this clear is currently UNREACHABLE while tierExhausted, since
+      // the mic button is disabled then (session-client). Kept as a correct guard for
+      // a future in-place "resume" affordance; it is NOT load-bearing for the M5 close
+      // path (recovery is re-entry-only → fresh hook instance resets tierExhaustedRef).
+      return { ...state, phase: 'listening', tierExhausted: false, tierExhaustedCapPeriod: null, tierExhaustedWalletExhausted: false };
 
     case 'mic_stopped':
       // P0-1: user finished talking → brain is now working. Enter 'thinking'
@@ -292,6 +301,7 @@ export function reduce(state: SessionState, action: Action): SessionState {
         // Fresh session — clear any soft-gate overlay from the prior segment.
         tierExhausted: false,
         tierExhaustedCapPeriod: null,
+        tierExhaustedWalletExhausted: false,
       };
 
     case 'rollover_failed':
@@ -378,7 +388,7 @@ export function reduce(state: SessionState, action: Action): SessionState {
       if (state.phase === 'closed' || state.phase === 'closing') return state;
       const cap = action.capPeriod;
       const capPeriod = cap === 'daily' || cap === 'weekly' || cap === 'monthly' ? cap : null;
-      return { ...state, phase: 'ready', tierExhausted: true, tierExhaustedCapPeriod: capPeriod };
+      return { ...state, phase: 'ready', tierExhausted: true, tierExhaustedCapPeriod: capPeriod, tierExhaustedWalletExhausted: action.walletExhausted === true };
     }
   }
 }

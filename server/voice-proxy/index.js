@@ -25,6 +25,7 @@
 //   4013 brain_unset_with_tts    — useTtsLayer with brain_status unset/errored (decoupled)
 //   4014 tts_no_voice/fish_unprov — TTS layer on but no voice id / Fish env unprovisioned
 //   4015 tier_exhausted          — Phase 2 soft gate: server-owned idle kill after 100%
+//                                    (delay = SOFT_GATE_IDLE_KILL_MS, default 25000)
 //                                   mid-session exhaustion with no rescuing action (R2-C4)
 //   1008 quota_exceeded          — kill-switch or degraded-and-unknown at turn_start
 //   1011 internal_error          — unhandled
@@ -863,6 +864,28 @@ async function endSession(sessionId, reason) {
 //   graceUsed: true after we've consumed the cold-start free turn.
 const quotaCache = new Map();
 
+// TANDEM AUDIT C3 — distinguish "the RPC function does not exist" (PostgREST
+// PGRST202 / Postgres 42883 / schema-cache miss) from a real runtime error. Used
+// to degrade the soft gate to v1 instead of bricking when GROWTH_SOFT_GATE_ENABLED
+// is flipped before migration 20260615000004 lands (or after it's rolled back).
+// Intentionally CODE-FIRST (PGRST202/42883 are the authoritative signals); the
+// message-substring check is a last-resort backstop. Do NOT loosen it — a column/
+// table "does not exist" (42703/42P01) omits "function" so it won't false-match.
+function isMissingFunction(err) {
+  const code = err?.code || '';
+  if (code === 'PGRST202' || code === '42883') return true;
+  const msg = String(err?.message || '').toLowerCase();
+  return msg.includes('could not find the function')
+    || (msg.includes('function') && msg.includes('does not exist'));
+}
+// TANDEM AUDIT M-B — dedupe the missing-function FATAL. checkQuotaOk runs on every
+// turn_start, so without this a misordered deploy (soft flag on before migration)
+// would emit one fatal Sentry event PER TURN, fleet-wide — a pager storm + quota
+// burn at the worst moment. Emit at most once per 5 min (mirrors the brain-not-
+// ready dedupe). The DEGRADE itself still happens every call; only the noise is throttled.
+let _missingFnLastWarnedMs = 0;
+const MISSING_FN_WARN_TTL_MS = 5 * 60 * 1000;
+
 async function checkQuotaOk(sessionId) {
   const softGateEnabled = process.env.GROWTH_SOFT_GATE_ENABLED === '1';
   const ledgerOn = process.env.GROWTH_LEDGER_ENABLED === '1';
@@ -870,9 +893,33 @@ async function checkQuotaOk(sessionId) {
   // Gated so the proxy can deploy before the migration lands / the flag flips; v1
   // is byte-identical for the System-A fuse fields the hard path reads.
   const quotaRpc = softGateEnabled ? 'voice_check_quota_v2' : 'voice_check_quota';
+  // softActuallyOn tracks whether the soft branch is live for THIS call. It drops
+  // to false if we fall back to v1 (function missing) so decideQuotaGate degrades
+  // cleanly to pre-Phase-2 "hard fuse only" rather than evaluating the soft branch
+  // against a v1 row that lacks the balance fields.
+  let softActuallyOn = softGateEnabled;
   let rpc;
   try {
-    const { data, error } = await supabase.rpc(quotaRpc, { p_session_id: sessionId });
+    let { data, error } = await supabase.rpc(quotaRpc, { p_session_id: sessionId });
+    // TANDEM AUDIT C3 — GROWTH_SOFT_GATE_ENABLED on but voice_check_quota_v2 absent
+    // (migration not yet applied, or rolled back). This is NOT P0002, so without
+    // this branch it would hit decideQuotaGate's degraded path → one cold-start
+    // grace turn then DENY → every live session bricks at its 2nd turn, fleet-wide,
+    // surfacing only as a soft (non-paging) error. Fall back to v1 for this call:
+    // the hard 150% fuse is still enforced; only the graceful 100% gate is lost
+    // until the migration lands. Log FATAL so the misordered deploy is visible.
+    if (error && softGateEnabled && isMissingFunction(error)) {
+      const nowMs = Date.now();
+      if (nowMs - _missingFnLastWarnedMs > MISSING_FN_WARN_TTL_MS) {
+        _missingFnLastWarnedMs = nowMs;
+        console.error(`[voice_check_quota] FATAL: voice_check_quota_v2 missing while GROWTH_SOFT_GATE_ENABLED=1 (migration 20260615000004 not applied?) — degrading soft gate OFF, hard fuse stays on (throttled 5m)`);
+        captureException(new Error('voice_check_quota_v2 missing while soft gate enabled'), {
+          level: 'fatal', op: 'voice_check_quota_v2_missing', sessionId,
+        });
+      }
+      softActuallyOn = false;
+      ({ data, error } = await supabase.rpc('voice_check_quota', { p_session_id: sessionId }));
+    }
     if (error) throw error;
     const row = Array.isArray(data) ? data[0] : data;
     if (!row) throw new Error(`${quotaRpc} returned no row`);
@@ -897,7 +944,7 @@ async function checkQuotaOk(sessionId) {
     }
   }
   const { gate, nextCache } = decideQuotaGate({
-    rpc, priorCache: quotaCache.get(sessionId), softGateEnabled, ledgerOn,
+    rpc, priorCache: quotaCache.get(sessionId), softGateEnabled: softActuallyOn, ledgerOn,
   });
   quotaCache.set(sessionId, nextCache);
   return gate;
@@ -3156,6 +3203,11 @@ wss.on('connection', async (ws, req) => {
               type: 'tier_exhausted',
               remaining_seconds: gate.remaining_seconds ?? 0,
               cap_period: gate.cap_period ?? null,
+              // C4 — drives the overlay's buy-vs-wait copy. true ⇒ the user drained
+              // a durable wallet (purchased/earned minutes) that waiting won't refresh.
+              wallet_exhausted: gate.wallet_exhausted ?? false,
+              // M-A — which meter tripped (systemA|systemB|both), for telemetry only.
+              trip: gate.trip ?? null,
               op: 'turn_start',
             }));
           }

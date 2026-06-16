@@ -157,6 +157,12 @@ BEGIN
     RAISE EXCEPTION 'user % not found', p_user_id USING ERRCODE = 'P0002';
   END IF;
 
+  -- TANDEM AUDIT S3: the day/week/month bucket a turn books to is derived from
+  -- profiles.timezone in THREE places (here, voice_usage_record_v2, and
+  -- monthly_window_start). They agree only if tz is STABLE for a session's
+  -- duration — which we assume (a user changing their tz mid-conversation is
+  -- not a supported case; the worst outcome is a single turn booked to an
+  -- adjacent bucket, never lost or double-counted).
   v_day      := (now() AT TIME ZONE v_tz)::date;
   v_week_mon := date_trunc('week', v_day)::date;
   v_mstart   := public.monthly_window_start(p_user_id);

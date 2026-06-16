@@ -329,25 +329,33 @@ describe('session-reducer — soft gate (Phase 2)', () => {
   }
 
   it('tier_exhausted: listening → ready (mic stops), raises the flag + capPeriod', () => {
-    const s = reduce(listening(), { kind: 'tier_exhausted', remainingSeconds: 0, capPeriod: 'weekly' });
+    const s = reduce(listening(), { kind: 'tier_exhausted', remainingSeconds: 0, capPeriod: 'weekly', walletExhausted: false });
     expect(s.phase).toBe('ready');        // mic only streams in 'listening'
     expect(s.tierExhausted).toBe(true);
     expect(s.tierExhaustedCapPeriod).toBe('weekly');
+    expect(s.tierExhaustedWalletExhausted).toBe(false); // pure free user → "wait" copy
     expect(s.errorMessage).toBeNull();    // NOT an error
     expect(isPipeWarm(s)).toBe(true);     // pipes stay warm
   });
 
+  it('tier_exhausted: walletExhausted propagates (drives the C4 buy-vs-wait copy)', () => {
+    const s = reduce(listening(), { kind: 'tier_exhausted', remainingSeconds: 0, capPeriod: 'daily', walletExhausted: true });
+    expect(s.tierExhausted).toBe(true);
+    expect(s.tierExhaustedWalletExhausted).toBe(true); // drained wallet → "buy" copy
+  });
+
   it('mic_started clears the soft-gate flag (optimistic resume)', () => {
-    let s = reduce(listening(), { kind: 'tier_exhausted', remainingSeconds: 0, capPeriod: 'daily' });
+    let s = reduce(listening(), { kind: 'tier_exhausted', remainingSeconds: 0, capPeriod: 'daily', walletExhausted: true });
     expect(s.tierExhausted).toBe(true);
     s = reduce(s, { kind: 'mic_started' });
     expect(s.phase).toBe('listening');
     expect(s.tierExhausted).toBe(false);
     expect(s.tierExhaustedCapPeriod).toBeNull();
+    expect(s.tierExhaustedWalletExhausted).toBe(false); // cleared on resume
   });
 
   it('closed_ack (the 4015 idle-kill close) preserves tierExhausted so the upsell persists', () => {
-    let s = reduce(listening(), { kind: 'tier_exhausted', remainingSeconds: 0, capPeriod: 'monthly' });
+    let s = reduce(listening(), { kind: 'tier_exhausted', remainingSeconds: 0, capPeriod: 'monthly', walletExhausted: false });
     s = reduce(s, { kind: 'closed_ack' });
     expect(s.phase).toBe('closed');
     expect(s.tierExhausted).toBe(true);   // overlay stays after the graceful close
@@ -356,22 +364,23 @@ describe('session-reducer — soft gate (Phase 2)', () => {
 
   it('tier_exhausted is a no-op once closing/closed', () => {
     const s = reduce(listening(), { kind: 'user_close' }); // closing
-    const after = reduce(s, { kind: 'tier_exhausted', remainingSeconds: 0, capPeriod: 'daily' });
+    const after = reduce(s, { kind: 'tier_exhausted', remainingSeconds: 0, capPeriod: 'daily', walletExhausted: false });
     expect(after.tierExhausted).toBe(false);
     expect(after.phase).toBe('closing');
   });
 
   it('unknown capPeriod coerces to null', () => {
-    const s = reduce(listening(), { kind: 'tier_exhausted', remainingSeconds: 0, capPeriod: 'bogus' });
+    const s = reduce(listening(), { kind: 'tier_exhausted', remainingSeconds: 0, capPeriod: 'bogus', walletExhausted: false });
     expect(s.tierExhausted).toBe(true);
     expect(s.tierExhaustedCapPeriod).toBeNull();
   });
 
   it('rollover_complete clears a stale soft-gate flag', () => {
-    let s = reduce(listening(), { kind: 'tier_exhausted', remainingSeconds: 0, capPeriod: 'weekly' });
+    let s = reduce(listening(), { kind: 'tier_exhausted', remainingSeconds: 0, capPeriod: 'weekly', walletExhausted: true });
     s = reduce(s, { kind: 'rollover_complete', newSessionId: 'sess-2', tier: 'free', avatarStatus: 'minted', maxSessionSeconds: 900 });
     expect(s.tierExhausted).toBe(false);
     expect(s.tierExhaustedCapPeriod).toBeNull();
+    expect(s.tierExhaustedWalletExhausted).toBe(false); // cleared on fresh segment
   });
 });
 
