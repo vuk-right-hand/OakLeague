@@ -89,6 +89,19 @@ body { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
 /* Respect reduced-motion: keep the button, drop the pulse (a11y). */
 @media (prefers-reduced-motion: reduce) { .oak-share-fab { animation: none; } }
 
+/* Ask CTA (feed hook-panel + long-form viewer) — the PRIMARY conversion button.
+   Vivid red + a strong scale/ring pulse to pull maximum attention into Ask
+   sessions. The red background is set INLINE on each button; this class only adds
+   the animation, so the inline styles need no !important. */
+.oak-ask-pulse { animation: oak-ask-pulse 1.5s ease-out infinite; }
+@keyframes oak-ask-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(255,45,85,0.65); transform: scale(1); }
+  70%  { box-shadow: 0 0 0 16px rgba(255,45,85,0); transform: scale(1.06); }
+  100% { box-shadow: 0 0 0 0 rgba(255,45,85,0); transform: scale(1); }
+}
+/* Respect reduced-motion: keep the bold red button, drop the pulse (a11y). */
+@media (prefers-reduced-motion: reduce) { .oak-ask-pulse { animation: none; } }
+
 .oak-comments { margin-top: 20px; }
 .oak-comments-title { font-size: 15px; font-weight: 700; margin-bottom: 12px; }
 .oak-comment-list { list-style: none; padding: 0; display: flex; flex-direction: column; gap: 16px; margin-top: 16px; }

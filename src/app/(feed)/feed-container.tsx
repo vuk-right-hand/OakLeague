@@ -10,6 +10,7 @@ import {
   useFeedImpressionTracker,
 } from './feed-impression-context';
 import { recordFeedEvent } from '@/lib/feed/client-events';
+import { MinutesMeter } from '@/lib/feed/minutes-meter';
 import type { FeedPageResponse } from '@/types/feed';
 
 type Props = {
@@ -336,6 +337,20 @@ function FeedContainerInner({
         <WelcomeOverlay
           welcome={welcome}
           onVisibilityChange={setWelcomeOpen}
+        />
+      )}
+      {/* Phase 3 — persistent minutes meter. Mounted ONCE here (not per hook-panel)
+          so it doesn't flicker on every vertical swipe. Self-hides for anon (the
+          route 401s) and when GROWTH_METER_ENABLED is off; gated on isAuthenticated
+          to skip the pointless 401 for signed-out users. */}
+      {isAuthenticated && (
+        <MinutesMeter
+          style={{
+            position: 'fixed',
+            top: 'calc(env(safe-area-inset-top, 0px) + 26px)',
+            right: 12,
+            zIndex: 30,
+          }}
         />
       )}
       <div

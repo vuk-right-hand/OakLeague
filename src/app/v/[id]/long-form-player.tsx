@@ -8,6 +8,7 @@ import { recordFeedEvent } from '@/lib/feed/client-events';
 import { captureSafe } from '@/lib/posthog-safe-capture';
 import { useDeviceId } from '@/lib/feed/device-id';
 import { AskErrorPill } from '@/lib/feed/ask-error-pill';
+import { MinutesMeter } from '@/lib/feed/minutes-meter';
 import { EnterPrivateRoomOverlay } from '@/components/session/EnterPrivateRoomOverlay';
 import { holdEnterRoomBeat } from '@/lib/session/enter-timing';
 import { preloadAvatarSdk } from '@/lib/avatar/simli-bridge';
@@ -471,6 +472,12 @@ export function LongFormPlayer({
           }}
         />
 
+        {/* Phase 3 — minutes meter (top-right; pointerEvents:none so it never
+            blocks the native video controls). Self-hides for anon / flag-off. */}
+        {isAuthenticated && (
+          <MinutesMeter style={{ position: 'absolute', top: 16, right: 16, zIndex: 3 }} />
+        )}
+
         {/* "Tap for sound" overlay — only when the muted-fallback fired
             (audit C5). Click captures the gesture and re-asserts unmuted
             playback inside the same call stack so iOS Safari accepts it. */}
@@ -507,17 +514,20 @@ export function LongFormPlayer({
             type="button"
             onClick={onAsk}
             disabled={asking}
+            // Pulsating RED Ask CTA — same maximum-attention treatment as the feed
+            // (drive Ask-session entry). Pulse only while idle; red background inline.
+            className={asking ? undefined : 'oak-ask-pulse'}
             style={{
               position: 'absolute',
               right: 16,
               bottom: 80,
               padding: '12px 18px',
               borderRadius: 22,
-              background: 'rgba(255,255,255,0.18)',
-              border: '1px solid rgba(255,255,255,0.45)',
+              background: '#ff2d55',
+              border: '1px solid rgba(255,255,255,0.85)',
               color: '#fff',
               fontSize: 14,
-              fontWeight: 600,
+              fontWeight: 700,
               opacity: asking ? 0.6 : 1,
               zIndex: 2,
               cursor: 'pointer',

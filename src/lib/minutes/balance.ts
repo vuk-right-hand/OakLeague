@@ -47,6 +47,17 @@ export async function getBalance(userId: string): Promise<MinutesBalance | null>
   const row = (Array.isArray(data) ? data[0] : data) as Record<string, unknown> | null;
   if (!row) return null;
 
+  // M5 — voice_balance_check ALWAYS returns a non-null cap_period (initialised
+  // 'daily', only ever reassigned). A null here while a balance row exists means an
+  // RPC schema regression that would silently drop the meter's reset + period copy
+  // fleet-wide; page on it rather than degrade quietly.
+  if (row.cap_period == null) {
+    Sentry.captureException(new Error('voice_balance_check returned null cap_period with a balance row'), {
+      level: 'warning',
+      extra: { op: 'getBalance', user_id: userId },
+    });
+  }
+
   const num = (v: unknown): number => (v == null ? 0 : Number(v));
   const numOrNull = (v: unknown): number | null => (v == null ? null : Number(v));
 
