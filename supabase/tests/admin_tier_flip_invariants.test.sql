@@ -107,8 +107,8 @@ BEGIN
 
   RETURN NEXT is(
     (SELECT daily_limit_s FROM public.daily_quotas WHERE user_id = v_user AND quota_date = v_qdate),
-    14400,
-    '5c: daily_quotas.daily_limit_s re-applied to boardroom (14400)'
+    48000,
+    '5c: daily_quotas.daily_limit_s re-applied to boardroom (48000, Phase-6 monthly model)'
   );
 
   SELECT count(*) INTO v_audit_count
