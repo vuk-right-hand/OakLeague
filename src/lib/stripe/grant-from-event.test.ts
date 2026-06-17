@@ -88,6 +88,24 @@ describe('invoiceStateFromInvoice', () => {
     expect(st.currentPeriodStart).toBe(iso(1700000000));
     expect(st.currentPeriodEnd).toBe(iso(1702592000));
   });
+
+  // Audit C1 (CONFIRMED LIVE) — only a true cycle renewal may advance the metering
+  // window; prorations / plan-changes / manual invoices must NOT (they'd re-key the
+  // monthly counter mid-period and re-grant the allowance).
+  it('marks isRenewal=true ONLY for billing_reason=subscription_cycle', () => {
+    const base = { customer: 'cus_1', subscription: 'sub_1', lines: { data: [{ period: { start: 1700000000, end: 1702592000 } }] } };
+    expect(invoiceStateFromInvoice({ ...base, billing_reason: 'subscription_cycle' }).isRenewal).toBe(true);
+    expect(invoiceStateFromInvoice({ ...base, billing_reason: 'subscription_cycle' }).billingReason).toBe('subscription_cycle');
+  });
+  it('marks isRenewal=false for prorations / updates / manual / missing reason', () => {
+    const base = { customer: 'cus_1', subscription: 'sub_1', lines: { data: [{ period: { start: 1700000000, end: 1702592000 } }] } };
+    for (const reason of ['subscription_update', 'subscription_create', 'manual', 'upcoming']) {
+      expect(invoiceStateFromInvoice({ ...base, billing_reason: reason }).isRenewal).toBe(false);
+    }
+    // No billing_reason at all (fail safe → not a renewal).
+    expect(invoiceStateFromInvoice(base).isRenewal).toBe(false);
+    expect(invoiceStateFromInvoice(base).billingReason).toBeNull();
+  });
 });
 
 describe('interpretEvent', () => {

@@ -79,6 +79,36 @@ COMMENT ON TABLE public.stripe_customers IS
   'Per-user Stripe subscription state. price_id+tier map each SKU to its tier; '
   'current_period_start drives the paid monthly-allowance boundary (monthly_window_start). Service-role only.';
 
+-- ── 2b. stripe_unmapped_events — paid-but-unmapped dead-letter (audit C3) ──
+-- A subscription/invoice event can arrive for a Stripe customer we never mapped
+-- to a user: a sub created in the Stripe dashboard or via a payment link (which
+-- bypass our checkout route's customer pre-create), or a hard out-of-order event
+-- with no usable metadata. The webhook MUST NOT silently 200-drop it — that's a
+-- paid user stuck on free with no recovery path (the reconcile cron can't help:
+-- there's no stripe_customers row to act on). We record it here + alert; an admin
+-- resolves it (link the customer to a user, set resolved_at). Operational policy:
+-- subscriptions should only ever be created by our checkout route.
+CREATE TABLE public.stripe_unmapped_events (
+  event_id           text        PRIMARY KEY,
+  type               text        NOT NULL,
+  stripe_customer_id text,
+  subscription_id    text,
+  received_at        timestamptz NOT NULL DEFAULT now(),
+  resolved_at        timestamptz,
+  note               text        CHECK (note IS NULL OR length(note) <= 500)
+);
+CREATE INDEX stripe_unmapped_open_idx ON public.stripe_unmapped_events (received_at)
+  WHERE resolved_at IS NULL;
+
+ALTER TABLE public.stripe_unmapped_events ENABLE ROW LEVEL SECURITY;
+-- Service-role only. Zero policies.
+GRANT ALL ON TABLE public.stripe_unmapped_events TO service_role;
+
+COMMENT ON TABLE public.stripe_unmapped_events IS
+  'Dead-letter for Stripe subscription/invoice events whose customer never mapped to a user '
+  '(dashboard/payment-link sub, or out-of-order event w/ no metadata). Webhook records + alerts '
+  'instead of silently dropping a paid-but-unmapped sub. Admin resolves (resolved_at). Service-role only.';
+
 -- ── 3. tier_default_voice_caps — paid tiers gain a binding MONTHLY cap ─────
 -- premium/boardroom: daily = monthly (uncapped days), weekly NULL, monthly binds.
 -- free: UNCHANGED (300/900/NULL) — the free monthly model is a separate follow-up.
@@ -175,6 +205,10 @@ BEGIN
 
   -- Mirror today's daily_quotas limit (preserve seconds_used; the latch trigger
   -- only re-fires on usage growth, so RAISING the cap here cannot retro-latch).
+  -- NOTE (hardening audit M4): a subscription event (incl. a past_due dunning
+  -- re-assert) AUTHORITATIVELY resets caps to the tier default. A manual admin cap
+  -- edit is therefore EPHEMERAL — the next sub event for that user overwrites it.
+  -- Durable per-user overrides would need a separate "admin cap pin" column.
   v_qdate := (now() AT TIME ZONE v_tz)::date;
   UPDATE public.daily_quotas
      SET tier_snapshot = p_new_tier, daily_limit_s = v_caps.daily
@@ -189,6 +223,66 @@ GRANT  EXECUTE ON FUNCTION public.set_profile_tier_from_subscription(uuid, profi
 COMMENT ON FUNCTION public.set_profile_tier_from_subscription(uuid, profile_tier) IS
   'Webhook tier flip (service-role only). Sets tier + tier-default caps; does NOT block on an '
   'active session (sub events must not fail mid-call). The stripe_events row is the audit trail.';
+
+-- ── 5b. stripe_apply_subscription_state — ATOMIC customer-upsert + tier flip ──
+-- Audit M1: the webhook used to upsert stripe_customers and THEN flip the tier as
+-- two separate round-trips. A crash between them leaves stripe_customers.tier=premium
+-- with profiles.tier=free — a PAID user stuck on FREE until the daily reconcile cron
+-- (up to ~24h). Fold both into ONE function body (one transaction) so they commit or
+-- roll back together; drift becomes structurally impossible for the checkout +
+-- subscription paths. Reuses set_profile_tier_from_subscription for the flip so the
+-- tier+caps+daily_quotas mirror logic stays single-sourced. Service-role only.
+CREATE FUNCTION public.stripe_apply_subscription_state(
+  p_user_id              uuid,
+  p_stripe_customer_id   text,
+  p_subscription_id      text,
+  p_price_id             text,
+  p_customer_tier        profile_tier,   -- the SKU's tier (stored on the customer row)
+  p_status               text,
+  p_current_period_start timestamptz,
+  p_current_period_end   timestamptz,
+  p_effective_tier       profile_tier    -- what profiles.tier becomes (paid tier when entitled, else free)
+) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE
+  v_jwt_role text;
+BEGIN
+  v_jwt_role := current_setting('request.jwt.claims', true)::jsonb ->> 'role';
+  IF v_jwt_role IS DISTINCT FROM 'service_role' THEN
+    RAISE EXCEPTION 'stripe_apply_subscription_state is service-role only' USING ERRCODE = '42501';
+  END IF;
+
+  INSERT INTO public.stripe_customers
+    (user_id, stripe_customer_id, subscription_id, price_id, tier, status,
+     current_period_start, current_period_end, updated_at)
+  VALUES
+    (p_user_id, p_stripe_customer_id, p_subscription_id, p_price_id, p_customer_tier, p_status,
+     p_current_period_start, p_current_period_end, now())
+  ON CONFLICT (user_id) DO UPDATE SET
+    stripe_customer_id   = EXCLUDED.stripe_customer_id,
+    subscription_id      = EXCLUDED.subscription_id,
+    price_id             = EXCLUDED.price_id,
+    tier                 = EXCLUDED.tier,
+    status               = EXCLUDED.status,
+    current_period_start = EXCLUDED.current_period_start,
+    current_period_end   = EXCLUDED.current_period_end,
+    updated_at           = now();
+
+  -- Same transaction → the flip can't be lost relative to the upsert.
+  PERFORM public.set_profile_tier_from_subscription(p_user_id, p_effective_tier);
+END;$$;
+
+REVOKE EXECUTE ON FUNCTION public.stripe_apply_subscription_state(
+  uuid, text, text, text, profile_tier, text, timestamptz, timestamptz, profile_tier)
+  FROM public, anon, authenticated;
+GRANT  EXECUTE ON FUNCTION public.stripe_apply_subscription_state(
+  uuid, text, text, text, profile_tier, text, timestamptz, timestamptz, profile_tier)
+  TO service_role;
+
+COMMENT ON FUNCTION public.stripe_apply_subscription_state(
+  uuid, text, text, text, profile_tier, text, timestamptz, timestamptz, profile_tier) IS
+  'Atomic (one-txn) stripe_customers upsert + profiles tier flip for the webhook checkout/'
+  'subscription paths (audit M1 — eliminates the paid-but-free crash-drift window). Service-role only.';
 
 -- ── 6. monthly_window_start — prefer the active billing period ─────────────
 -- An active subscriber meters against their billing anniversary (avoids the

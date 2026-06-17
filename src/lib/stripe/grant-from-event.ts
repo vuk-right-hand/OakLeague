@@ -5,10 +5,17 @@
 // (retrieve subscription, RPC tier-flip, upsert). Keeping this pure makes the
 // price→tier mapping and the field extraction unit-testable with fixture payloads.
 //
-// Version-tolerant: the endpoint is pinned to Stripe API 2020-08-27 (subscription
-// current_period_* + item price are top-level; invoice.subscription is a direct
-// id; invoice.lines.data[].period carries the renewal window), but we read each
-// path defensively with fallbacks so a version bump can't silently break parsing.
+// Version-tolerant by design — DO NOT assume a single API shape. Our SDK is pinned
+// to 2026-05-27.dahlia (client.ts), where Stripe (Basil 2025-03-31+) MOVED
+// subscription.current_period_start/end OFF the subscription onto
+// items.data[].current_period_*, and DEPRECATED invoice.subscription in favor of
+// invoice.parent.subscription_details.subscription. The Stripe webhook ENDPOINT may
+// render events at a DIFFERENT version than the SDK uses for retrieve(), so we read
+// BOTH locations for the period and NEVER key user-mapping off subscription id —
+// mapping is always by `customer` (top-level on every version). subStateFromSubscription
+// reads top-level current_period_* first, then the item fallback; invoiceStateFromInvoice
+// reads the LINE-ITEM period. Keep it shape-agnostic so neither a version bump nor an
+// endpoint/ SDK version skew can silently break parsing.
 
 export type ProfileTier = 'free' | 'premium' | 'boardroom';
 
@@ -30,7 +37,9 @@ function idOf(v: unknown): string | null {
   return o ? str(o.id) : null;
 }
 
-/** price_id → tier via the pinned env SKUs. Unknown price ⇒ null (ignored upstream). */
+/** price_id → tier via the pinned env SKUs. Unknown price ⇒ null. Callers handle it:
+ *  the webhook stores the customer row + alerts 'stripe_unknown_price' (never silently
+ *  dropped, never downgrades a paying user to free on an unrecognized SKU). */
 export function tierForPrice(priceId: string | null | undefined): ProfileTier | null {
   if (!priceId) return null;
   if (priceId === process.env.STRIPE_PRICE_EVANGELIST) return 'premium';
@@ -89,6 +98,16 @@ export interface InvoiceState {
   subscriptionId: string | null;
   currentPeriodStart: string | null;
   currentPeriodEnd: string | null;
+  // Whole-unit audit C1 (CONFIRMED LIVE) — Stripe fires invoice.paid not only on a
+  // clean renewal but also on prorations / plan-changes / mid-cycle updates
+  // (billing_reason='subscription_update'|'subscription_create'|'manual'), whose
+  // line-item period can start MID-billing-period. The webhook must NOT advance
+  // stripe_customers.current_period_start on those — monthly_window_start keys the
+  // monthly avatar-talk counter off it, so advancing it re-keys voice_usage_monthly
+  // to a fresh 0-used row and RE-GRANTS the whole monthly allowance early (a direct
+  // COGS leak). Only a true cycle renewal legitimately opens a new metering window.
+  billingReason: string | null;
+  isRenewal: boolean;
 }
 
 /** Renewal window from an invoice — period comes from the LINE ITEM, not invoice-level (R2-M5). */
@@ -112,11 +131,20 @@ export function invoiceStateFromInvoice(invoice: unknown): InvoiceState {
     if (!subId) subId = idOf(l.subscription);
     if (end) break;
   }
+  const billingReason = str(inv.billing_reason);
   return {
     customerId: idOf(inv.customer),
     subscriptionId: subId,
     currentPeriodStart: start,
     currentPeriodEnd: end,
+    billingReason,
+    // 'subscription_cycle' is the ONLY periodic-renewal reason that opens a new
+    // billing window. Every other reason — subscription_create, subscription_update
+    // (proration/plan-change), subscription_threshold (usage thresholds; N/A to our
+    // fixed-price tiers, but it must NOT advance the window if a usage SKU is ever
+    // added), manual, upcoming, null — must leave the metering boundary where it is.
+    // Fail safe: any unknown reason ⇒ NOT a renewal.
+    isRenewal: billingReason === 'subscription_cycle',
   };
 }
 

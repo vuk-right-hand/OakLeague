@@ -58,6 +58,12 @@ export async function POST(req: NextRequest) {
     if (!customerId) {
       const customer = await stripe().customers.create({ metadata: { user_id: userId } });
       customerId = customer.id;
+      // INTENTIONALLY RETAINED (hardening audit M3): this row is keyed by user_id
+      // (PK) so there is at most ONE per user. If the user abandons checkout it
+      // persists with status='incomplete' (monthly_window_start ignores non-entitled
+      // statuses → calendar month, safe) and is REUSED on the next attempt (no
+      // duplicate Stripe customer). Do NOT add a reconcile pass that deletes
+      // 'incomplete' rows — that would break customer reuse on re-checkout.
       await admin.from('stripe_customers').upsert(
         { user_id: userId, stripe_customer_id: customerId, status: 'incomplete', updated_at: new Date().toISOString() },
         { onConflict: 'user_id' },

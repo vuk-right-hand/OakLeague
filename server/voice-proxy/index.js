@@ -864,6 +864,29 @@ async function endSession(sessionId, reason) {
 //   graceUsed: true after we've consumed the cold-start free turn.
 const quotaCache = new Map();
 
+// Growth & Minutes Economy whole-unit audit C4 — the wallet DRAW
+// (voice_usage_record_v2) is the only path that debits a paid/earned wallet. It
+// runs fire-and-forget at turn-end; a SUSTAINED draw outage (Postgres pressure,
+// pool exhaustion) would leave the wallet undebited while the soft gate's READ
+// keeps reporting balance → free minutes up to the 4h absolute COGS ceiling. We
+// can't un-hear a turn that already played, but we CAN bound the leak: count
+// consecutive draw failures per session and fail the WS closed once it crosses a
+// small threshold (so an outage costs ~1 turn, not hours). Only armed when the
+// ledger is on (nothing to leak when there are no wallet draws). Reset on the
+// first success; cleared in teardown alongside quotaCache.
+const walletDrawFailures = new Map(); // sessionId → { consec, total }
+// Trip on EITHER a short consecutive streak (clean outage) OR a higher cumulative
+// count (a FLAPPING RPC that alternates fail/succeed never builds a consecutive
+// streak — hardening audit M5 — so the cumulative cap bounds that case too).
+const WALLET_DRAW_FAIL_FATAL_THRESHOLD = Math.max(
+  1,
+  Number(process.env.WALLET_DRAW_FAIL_FATAL_THRESHOLD ?? 2),
+);
+const WALLET_DRAW_FAIL_CUMULATIVE_CAP = Math.max(
+  WALLET_DRAW_FAIL_FATAL_THRESHOLD,
+  Number(process.env.WALLET_DRAW_FAIL_CUMULATIVE_CAP ?? 5),
+);
+
 // TANDEM AUDIT C3 — distinguish "the RPC function does not exist" (PostgREST
 // PGRST202 / Postgres 42883 / schema-cache miss) from a real runtime error. Used
 // to degrade the soft gate to v1 instead of bricking when GROWTH_SOFT_GATE_ENABLED
@@ -1410,6 +1433,8 @@ wss.on('connection', async (ws, req) => {
     clearInterval(heartbeatInterval);
     if (heygenHeartbeatInterval) clearInterval(heygenHeartbeatInterval);
     quotaCache.delete(sessionId);
+    walletDrawFailures.delete(sessionId); // audit C4
+
     sessionToWs.delete(sessionId);
     wsRegistry.delete(sessionId);
     dropCogsSession(sessionId);
@@ -3679,11 +3704,38 @@ wss.on('connection', async (ws, req) => {
           userId, sessionId, turnNumber,
           seconds: assistantSeconds,
           turnStartedAt,
-        }).catch((e) => {
-          // Non-fatal: counter undercount for this turn. System A's
-          // 150% latch (now correctly anchored to profile cap after
-          // 20260510000001) is the backstop.
+        }).then(() => {
+          // A successful draw clears the CONSECUTIVE streak but keeps the cumulative
+          // total (audit C4/M5 — a flapping RPC must still trip on cumulative).
+          if (process.env.GROWTH_LEDGER_ENABLED === '1') {
+            const s = walletDrawFailures.get(sessionId);
+            if (s) s.consec = 0;
+          }
+        }).catch(async (e) => {
+          // Counter undercount for this turn. When the ledger is OFF there is no
+          // wallet to leak — System A's 150% latch (anchored to the profile cap
+          // after 20260510000001) is the backstop, so stay non-fatal.
           captureException(e, { level: 'warning', op: 'voice_usage_record', sessionId });
+          // Whole-unit audit C4 — when the ledger is ON the draw is MONEY. A
+          // sustained outage would otherwise grant free wallet minutes up to the
+          // 4h absolute ceiling (the soft gate's READ can't tell the WRITE failed).
+          // Bound it: fail the session closed on EITHER a short consecutive streak
+          // (clean outage — tolerates one transient blip) OR a higher cumulative
+          // count this session (a FLAPPING RPC that never builds a streak, M5).
+          if (process.env.GROWTH_LEDGER_ENABLED === '1') {
+            const s = walletDrawFailures.get(sessionId) || { consec: 0, total: 0 };
+            s.consec += 1; s.total += 1;
+            walletDrawFailures.set(sessionId, s);
+            if (s.consec >= WALLET_DRAW_FAIL_FATAL_THRESHOLD || s.total >= WALLET_DRAW_FAIL_CUMULATIVE_CAP) {
+              captureException(e, {
+                level: 'fatal', op: 'voice_usage_record_v2_sustained_fail',
+                sessionId, consecutiveFailures: s.consec, totalFailures: s.total,
+              });
+              try { ws.send(JSON.stringify({ type: 'error', code: 'wallet_draw_unavailable', op: 'turn_end' })); } catch {}
+              await teardown('wallet_draw_unavailable');
+              closeWs(ws, 4006, 'wallet_draw_unavailable');
+            }
+          }
         });
       } else if (msg.type === 'cancel') {
         // R3-M1 / R4-S1 — set the relay-loop flag SYNCHRONOUSLY before any

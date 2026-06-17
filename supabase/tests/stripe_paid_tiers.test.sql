@@ -4,7 +4,7 @@
 -- upsert, and the lapse-reconcile. Growth & Minutes Economy Phase 6 (migration
 -- 20260616000002).
 BEGIN;
-SELECT plan(23);
+SELECT plan(28);
 
 CREATE FUNCTION pg_temp.run() RETURNS SETOF text LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -116,6 +116,46 @@ BEGIN
   PERFORM public.stripe_subscription_reconcile();
   RETURN NEXT is((SELECT tier FROM public.profiles WHERE id = v_user5), 'premium'::profile_tier,
                  '23: reconcile re-asserts a drifted paid tier (free → premium)');
+
+  -- ── M1: stripe_apply_subscription_state — ATOMIC upsert + flip in one call ──
+  PERFORM public.stripe_apply_subscription_state(
+    v_user5, 'cus5b', 'sub5b', 'price_x', 'boardroom'::profile_tier, 'active',
+    now() - interval '1 day', now() + interval '29 days', 'boardroom'::profile_tier);
+  RETURN NEXT ok(
+    (SELECT tier = 'boardroom' AND voice_daily_cap_seconds = 48000 AND voice_monthly_cap_seconds = 48000
+       FROM public.profiles WHERE id = v_user5)
+    AND (SELECT tier = 'boardroom' AND status = 'active' AND stripe_customer_id = 'cus5b'
+       FROM public.stripe_customers WHERE user_id = v_user5),
+    '24: stripe_apply_subscription_state atomically upserts customer + flips tier+caps');
+
+  -- effective='free' (terminal): profile revoked to free, customer SKU tier retained
+  PERFORM public.stripe_apply_subscription_state(
+    v_user5, 'cus5b', 'sub5b', 'price_x', 'boardroom'::profile_tier, 'canceled',
+    now() - interval '40 days', now() - interval '10 days', 'free'::profile_tier);
+  RETURN NEXT ok(
+    (SELECT tier = 'free' FROM public.profiles WHERE id = v_user5)
+    AND (SELECT tier = 'boardroom' AND status = 'canceled' FROM public.stripe_customers WHERE user_id = v_user5),
+    '25: apply effective=free revokes profile tier but keeps the customer SKU tier');
+
+  -- service-role guard
+  PERFORM set_config('request.jwt.claims', '{"role":"authenticated"}', true);
+  RETURN NEXT throws_ok(
+    format($q$ SELECT public.stripe_apply_subscription_state(%L,'c','s','p','premium'::profile_tier,'active',now(),now(),'premium'::profile_tier) $q$, v_user5),
+    '42501', NULL, '26: stripe_apply_subscription_state is service-role only');
+  PERFORM set_config('request.jwt.claims', '{"role":"service_role"}', true);
+
+  -- ── C3: stripe_unmapped_events dead-letter — RLS lockdown + PK dedup ────────
+  -- Service-role-only model = RLS enabled + ZERO policies (matches stripe_events /
+  -- stripe_customers). RLS — not the table grant — is the gate: a residual default
+  -- SELECT grant to authenticated is harmless when no policy lets any row through.
+  RETURN NEXT ok(
+    (SELECT relrowsecurity FROM pg_class WHERE oid = 'public.stripe_unmapped_events'::regclass)
+    AND NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'public' AND tablename = 'stripe_unmapped_events'),
+    '27: stripe_unmapped_events RLS enabled + zero policies (service-role only)');
+  INSERT INTO public.stripe_unmapped_events (event_id, type) VALUES ('evt_dl', 'customer.subscription.created');
+  RETURN NEXT throws_ok(
+    $q$ INSERT INTO public.stripe_unmapped_events (event_id, type) VALUES ('evt_dl', 'x') $q$,
+    '23505', NULL, '28: stripe_unmapped_events PK dedup (duplicate event_id rejected)');
 END;
 $fn$;
 
