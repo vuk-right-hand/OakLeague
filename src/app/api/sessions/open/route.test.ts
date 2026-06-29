@@ -123,7 +123,7 @@ vi.mock('next/server', async () => {
 type RpcCall = { name: string; args: unknown };
 
 let rpcCalls: RpcCall[] = [];
-let capRpcResult: { data: unknown; error: unknown } = { data: [{ remaining_seconds: 9999, daily_used: 0, daily_cap: 300, weekly_used: 0, weekly_cap: 900, monthly_used: null, monthly_cap: null }], error: null };
+let capRpcResult: { data: unknown; error: unknown } = { data: [{ remaining_seconds: 9999, allowance_remaining: 9999, daily_used: 0, daily_cap: 300, weekly_used: 0, weekly_cap: 900, monthly_used: null, monthly_cap: null }], error: null };
 let sessionOpenResult: { data: unknown; error: unknown } = { data: [{ session_id: 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb', tier: 'free', daily_limit_remaining_s: 600 }], error: null };
 let sessionCloseResult: { data: unknown; error: unknown } = { data: null, error: null };
 let rateLimitResult: { data: unknown; error: unknown } = { data: true, error: null };
@@ -170,11 +170,21 @@ function makeSb() {
 function makeAdmin() {
   return {
     rpc: vi.fn(async (name: string, args: unknown) => {
-      // voice_usage_ticket_check is called via admin (service-role) because
-      // the migration REVOKEs EXECUTE from `authenticated` (auditor C1).
-      if (name === 'voice_usage_ticket_check') {
+      // Growth & Minutes Economy Phase 1: the pre-mint gate now calls the UNIFIED
+      // voice_balance_check (free allowance + wallet) via admin (service-role) —
+      // it REVOKEs EXECUTE from `authenticated` (R1-S3). The route reads
+      // remaining_seconds (= effective_remaining) AND allowance_remaining (the
+      // ledger-OFF gate value — NOT NULL from the real RPC; tandem-audit S5 dropped
+      // the route's fallback to remaining_seconds, so mocks MUST set it) plus
+      // wallet_remaining / daily_cap_eff / cap_period (default 0/undefined absent).
+      if (name === 'voice_balance_check') {
         rpcCalls.push({ name, args });
         return capRpcResult;
+      }
+      // Fuse-anchor write (R2-C1) after session_open — non-fatal no-op in tests.
+      if (name === 'voice_fuse_anchor_apply') {
+        rpcCalls.push({ name, args });
+        return { data: null, error: null };
       }
       if (name === 'rate_limit_hit') return rateLimitResult;
       return { data: null, error: null };
@@ -293,7 +303,7 @@ function makeReq(body: unknown = {
 describe('/api/sessions/open — pre-mint cap RPC (use-session-pipe rewire R2-C1)', () => {
   beforeEach(() => {
     rpcCalls = [];
-    capRpcResult = { data: [{ remaining_seconds: 9999, daily_used: 0, daily_cap: 300, weekly_used: 0, weekly_cap: 900, monthly_used: null, monthly_cap: null }], error: null };
+    capRpcResult = { data: [{ remaining_seconds: 9999, allowance_remaining: 9999, daily_used: 0, daily_cap: 300, weekly_used: 0, weekly_cap: 900, monthly_used: null, monthly_cap: null }], error: null };
     sessionOpenResult = { data: [{ session_id: 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb', tier: 'free', daily_limit_remaining_s: 600 }], error: null };
     rateLimitResult = { data: true, error: null };
     mockMintVoiceTicket.mockReset();
@@ -305,7 +315,7 @@ describe('/api/sessions/open — pre-mint cap RPC (use-session-pipe rewire R2-C1
   it('returns 429 daily_cap_hit when remaining_seconds=0, BEFORE session_open', async () => {
     mockCaptureServerSafe.mockClear();
     capRpcResult = {
-      data: [{ remaining_seconds: 0, daily_used: 300, daily_cap: 300, weekly_used: 800, weekly_cap: 900, monthly_used: null, monthly_cap: null }],
+      data: [{ remaining_seconds: 0, allowance_remaining: 0, daily_used: 300, daily_cap: 300, weekly_used: 800, weekly_cap: 900, monthly_used: null, monthly_cap: null }],
       error: null,
     };
     const res = await POST(makeReq());
@@ -317,7 +327,7 @@ describe('/api/sessions/open — pre-mint cap RPC (use-session-pipe rewire R2-C1
     expect(body.weekly_used).toBe(800);
     // session_open MUST NOT have been called — Vuk's nit: avoid orphan-row.
     const names = rpcCalls.map((c) => c.name);
-    expect(names).toContain('voice_usage_ticket_check');
+    expect(names).toContain('voice_balance_check');
     expect(names).not.toContain('session_open');
     expect(names).not.toContain('session_close');
     // Whole-build audit C4: telemetry fires so we can measure conversion.
@@ -357,7 +367,7 @@ describe('/api/sessions/open — pre-mint cap RPC (use-session-pipe rewire R2-C1
   it('coerces numeric strings from supabase-js (auditor S1)', async () => {
     // supabase-js deserialises `numeric` as string; route must coerce.
     capRpcResult = {
-      data: [{ remaining_seconds: '0', daily_used: '300', daily_cap: 300, weekly_used: '800', weekly_cap: 900, monthly_used: null, monthly_cap: null }],
+      data: [{ remaining_seconds: '0', allowance_remaining: '0', daily_used: '300', daily_cap: 300, weekly_used: '800', weekly_cap: 900, monthly_used: null, monthly_cap: null }],
       error: null,
     };
     const res = await POST(makeReq());
@@ -371,14 +381,14 @@ describe('/api/sessions/open — pre-mint cap RPC (use-session-pipe rewire R2-C1
 
   it('proceeds to session_open when remaining_seconds > 0', async () => {
     capRpcResult = {
-      data: [{ remaining_seconds: 600, daily_used: 0, daily_cap: 300, weekly_used: 0, weekly_cap: 900, monthly_used: null, monthly_cap: null }],
+      data: [{ remaining_seconds: 600, allowance_remaining: 600, daily_used: 0, daily_cap: 300, weekly_used: 0, weekly_cap: 900, monthly_used: null, monthly_cap: null }],
       error: null,
     };
     const res = await POST(makeReq());
     // Whatever the downstream outcome, the cap gate let the request through.
     expect(res.status).not.toBe(429);
     const names = rpcCalls.map((c) => c.name);
-    expect(names).toContain('voice_usage_ticket_check');
+    expect(names).toContain('voice_balance_check');
     expect(names).toContain('session_open');
   });
 });
@@ -386,7 +396,7 @@ describe('/api/sessions/open — pre-mint cap RPC (use-session-pipe rewire R2-C1
 describe('/api/sessions/open — voice-ticket mint is fatal (use-session-pipe rewire)', () => {
   beforeEach(() => {
     rpcCalls = [];
-    capRpcResult = { data: [{ remaining_seconds: 9999, daily_used: 0, daily_cap: 300, weekly_used: 0, weekly_cap: 900, monthly_used: null, monthly_cap: null }], error: null };
+    capRpcResult = { data: [{ remaining_seconds: 9999, allowance_remaining: 9999, daily_used: 0, daily_cap: 300, weekly_used: 0, weekly_cap: 900, monthly_used: null, monthly_cap: null }], error: null };
     sessionOpenResult = { data: [{ session_id: 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb', tier: 'free', daily_limit_remaining_s: 600 }], error: null };
     rateLimitResult = { data: true, error: null };
     sessionCloseResult = { data: null, error: null };
@@ -487,7 +497,7 @@ describe('/api/sessions/open — voice-ticket mint is fatal (use-session-pipe re
 describe('/api/sessions/open — brain wire-up gates (R3 audit C1 + M1)', () => {
   beforeEach(() => {
     rpcCalls = [];
-    capRpcResult = { data: [{ remaining_seconds: 9999, daily_used: 0, daily_cap: 300, weekly_used: 0, weekly_cap: 900, monthly_used: null, monthly_cap: null }], error: null };
+    capRpcResult = { data: [{ remaining_seconds: 9999, allowance_remaining: 9999, daily_used: 0, daily_cap: 300, weekly_used: 0, weekly_cap: 900, monthly_used: null, monthly_cap: null }], error: null };
     sessionOpenResult = { data: [{ session_id: 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb', tier: 'free', daily_limit_remaining_s: 600 }], error: null };
     rateLimitResult = { data: true, error: null };
     sessionCloseResult = { data: null, error: null };

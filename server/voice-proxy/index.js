@@ -22,6 +22,11 @@
 //                                    (R4-M6: only 3.1 Live verified for transcription)
 //   4011 tts_reconnecting        — turn_start during Cartesia reconnect window (R4-M2)
 //   4012 backpressure            — user WS bufferedAmount > 2 MB (R3-C2)
+//   4013 brain_unset_with_tts    — useTtsLayer with brain_status unset/errored (decoupled)
+//   4014 tts_no_voice/fish_unprov — TTS layer on but no voice id / Fish env unprovisioned
+//   4015 tier_exhausted          — Phase 2 soft gate: server-owned idle kill after 100%
+//                                    (delay = SOFT_GATE_IDLE_KILL_MS, default 25000)
+//                                   mid-session exhaustion with no rescuing action (R2-C4)
 //   1008 quota_exceeded          — kill-switch or degraded-and-unknown at turn_start
 //   1011 internal_error          — unhandled
 //   1000 normal_closure          — client initiated
@@ -859,13 +864,88 @@ async function endSession(sessionId, reason) {
 //   graceUsed: true after we've consumed the cold-start free turn.
 const quotaCache = new Map();
 
+// Growth & Minutes Economy whole-unit audit C4 — the wallet DRAW
+// (voice_usage_record_v2) is the only path that debits a paid/earned wallet. It
+// runs fire-and-forget at turn-end; a SUSTAINED draw outage (Postgres pressure,
+// pool exhaustion) would leave the wallet undebited while the soft gate's READ
+// keeps reporting balance → free minutes up to the 4h absolute COGS ceiling. We
+// can't un-hear a turn that already played, but we CAN bound the leak: count
+// consecutive draw failures per session and fail the WS closed once it crosses a
+// small threshold (so an outage costs ~1 turn, not hours). Only armed when the
+// ledger is on (nothing to leak when there are no wallet draws). Reset on the
+// first success; cleared in teardown alongside quotaCache.
+const walletDrawFailures = new Map(); // sessionId → { consec, total }
+// Trip on EITHER a short consecutive streak (clean outage) OR a higher cumulative
+// count (a FLAPPING RPC that alternates fail/succeed never builds a consecutive
+// streak — hardening audit M5 — so the cumulative cap bounds that case too).
+const WALLET_DRAW_FAIL_FATAL_THRESHOLD = Math.max(
+  1,
+  Number(process.env.WALLET_DRAW_FAIL_FATAL_THRESHOLD ?? 2),
+);
+const WALLET_DRAW_FAIL_CUMULATIVE_CAP = Math.max(
+  WALLET_DRAW_FAIL_FATAL_THRESHOLD,
+  Number(process.env.WALLET_DRAW_FAIL_CUMULATIVE_CAP ?? 5),
+);
+
+// TANDEM AUDIT C3 — distinguish "the RPC function does not exist" (PostgREST
+// PGRST202 / Postgres 42883 / schema-cache miss) from a real runtime error. Used
+// to degrade the soft gate to v1 instead of bricking when GROWTH_SOFT_GATE_ENABLED
+// is flipped before migration 20260615000004 lands (or after it's rolled back).
+// Intentionally CODE-FIRST (PGRST202/42883 are the authoritative signals); the
+// message-substring check is a last-resort backstop. Do NOT loosen it — a column/
+// table "does not exist" (42703/42P01) omits "function" so it won't false-match.
+function isMissingFunction(err) {
+  const code = err?.code || '';
+  if (code === 'PGRST202' || code === '42883') return true;
+  const msg = String(err?.message || '').toLowerCase();
+  return msg.includes('could not find the function')
+    || (msg.includes('function') && msg.includes('does not exist'));
+}
+// TANDEM AUDIT M-B — dedupe the missing-function FATAL. checkQuotaOk runs on every
+// turn_start, so without this a misordered deploy (soft flag on before migration)
+// would emit one fatal Sentry event PER TURN, fleet-wide — a pager storm + quota
+// burn at the worst moment. Emit at most once per 5 min (mirrors the brain-not-
+// ready dedupe). The DEGRADE itself still happens every call; only the noise is throttled.
+let _missingFnLastWarnedMs = 0;
+const MISSING_FN_WARN_TTL_MS = 5 * 60 * 1000;
+
 async function checkQuotaOk(sessionId) {
+  const softGateEnabled = process.env.GROWTH_SOFT_GATE_ENABLED === '1';
+  const ledgerOn = process.env.GROWTH_LEDGER_ENABLED === '1';
+  // Phase 2: voice_check_quota_v2 returns the unified balance for the soft gate.
+  // Gated so the proxy can deploy before the migration lands / the flag flips; v1
+  // is byte-identical for the System-A fuse fields the hard path reads.
+  const quotaRpc = softGateEnabled ? 'voice_check_quota_v2' : 'voice_check_quota';
+  // softActuallyOn tracks whether the soft branch is live for THIS call. It drops
+  // to false if we fall back to v1 (function missing) so decideQuotaGate degrades
+  // cleanly to pre-Phase-2 "hard fuse only" rather than evaluating the soft branch
+  // against a v1 row that lacks the balance fields.
+  let softActuallyOn = softGateEnabled;
   let rpc;
   try {
-    const { data, error } = await supabase.rpc('voice_check_quota', { p_session_id: sessionId });
+    let { data, error } = await supabase.rpc(quotaRpc, { p_session_id: sessionId });
+    // TANDEM AUDIT C3 — GROWTH_SOFT_GATE_ENABLED on but voice_check_quota_v2 absent
+    // (migration not yet applied, or rolled back). This is NOT P0002, so without
+    // this branch it would hit decideQuotaGate's degraded path → one cold-start
+    // grace turn then DENY → every live session bricks at its 2nd turn, fleet-wide,
+    // surfacing only as a soft (non-paging) error. Fall back to v1 for this call:
+    // the hard 150% fuse is still enforced; only the graceful 100% gate is lost
+    // until the migration lands. Log FATAL so the misordered deploy is visible.
+    if (error && softGateEnabled && isMissingFunction(error)) {
+      const nowMs = Date.now();
+      if (nowMs - _missingFnLastWarnedMs > MISSING_FN_WARN_TTL_MS) {
+        _missingFnLastWarnedMs = nowMs;
+        console.error(`[voice_check_quota] FATAL: voice_check_quota_v2 missing while GROWTH_SOFT_GATE_ENABLED=1 (migration 20260615000004 not applied?) — degrading soft gate OFF, hard fuse stays on (throttled 5m)`);
+        captureException(new Error('voice_check_quota_v2 missing while soft gate enabled'), {
+          level: 'fatal', op: 'voice_check_quota_v2_missing', sessionId,
+        });
+      }
+      softActuallyOn = false;
+      ({ data, error } = await supabase.rpc('voice_check_quota', { p_session_id: sessionId }));
+    }
     if (error) throw error;
     const row = Array.isArray(data) ? data[0] : data;
-    if (!row) throw new Error('voice_check_quota returned no row');
+    if (!row) throw new Error(`${quotaRpc} returned no row`);
     rpc = { row, error: null };
   } catch (e) {
     const code = e?.code || '';
@@ -886,7 +966,9 @@ async function checkQuotaOk(sessionId) {
       rpc = { row: null, error: e };
     }
   }
-  const { gate, nextCache } = decideQuotaGate({ rpc, priorCache: quotaCache.get(sessionId) });
+  const { gate, nextCache } = decideQuotaGate({
+    rpc, priorCache: quotaCache.get(sessionId), softGateEnabled: softActuallyOn, ledgerOn,
+  });
   quotaCache.set(sessionId, nextCache);
   return gate;
 }
@@ -906,7 +988,16 @@ async function checkQuotaOk(sessionId) {
 async function recordVoiceUsage({ userId, sessionId, turnNumber, seconds, turnStartedAt }) {
   if (!Number.isFinite(seconds) || seconds < 0) return;
   if (!turnNumber || turnNumber <= 0) return;
-  const { error } = await supabase.rpc('voice_usage_record', {
+  // Growth & Minutes Economy Phase 1: voice_usage_record_v2 ALSO writes the
+  // monthly counter (voice_usage_monthly) and draws the durable wallet for the
+  // slice of this turn beyond the free allowance. Drop-in — identical args.
+  // Gated behind GROWTH_LEDGER_ENABLED so the proxy can deploy before the
+  // migration lands / the flag flips; v1 is byte-identical for the daily+weekly
+  // counters. Behavior is neutral until grants exist (empty wallet ⇒ zero draw).
+  const recordRpc = process.env.GROWTH_LEDGER_ENABLED === '1'
+    ? 'voice_usage_record_v2'
+    : 'voice_usage_record';
+  const { error } = await supabase.rpc(recordRpc, {
     p_user_id: userId,
     p_session_id: sessionId,
     p_turn_number: turnNumber,
@@ -1218,6 +1309,35 @@ wss.on('connection', async (ws, req) => {
   // the same anchor). Reset at every turn_start.
   let turnStartedAt = null;
 
+  // Phase 2 soft gate: SERVER-owned idle teardown on a 100% mid-session
+  // exhaustion. IMPORTANT (audit C1) — the proxy does NOT hold the Simli room:
+  // the avatar RTC is browser↔Simli, established by the CLIENT-side bridge. So
+  // this teardown releases the PROXY-side legs (the Gemini Live WS + the TTS WS)
+  // and writes cogs; it does NOT directly end Simli. Simli is bounded by its own
+  // maxIdleTime/maxSessionLength set at mint (= maxAvatarSeconds). On a responsive
+  // client the 4015 close drives the React unmount that closes the Simli bridge;
+  // on a frozen/backgrounded tab Simli self-ends at its idle timeout. This timer's
+  // job is prompt proxy-side cleanup + nudging a live client to release the
+  // avatar — NOT a server-side Simli kill (which the proxy cannot do here).
+  let softGateIdleTimer = null;
+  const clearSoftGateIdleTimer = () => {
+    if (softGateIdleTimer) { clearTimeout(softGateIdleTimer); softGateIdleTimer = null; }
+  };
+  const armSoftGateIdleKill = () => {
+    clearSoftGateIdleTimer();
+    const ms = _envPosInt('SOFT_GATE_IDLE_KILL_MS', 25000); // S1
+    softGateIdleTimer = setTimeout(() => {
+      softGateIdleTimer = null;
+      if (closed) return; // M5: another path already tore this connection down.
+      Promise.resolve(teardown('tier_exhausted')).catch(() => {}).finally(() => {
+        // M5: closeWs is already a no-op on a closed socket, but guard readyState
+        // so a future close-without-teardown path can't double-close a replaced ws.
+        try { if (ws.readyState === ws.OPEN) closeWs(ws, 4015, 'tier_exhausted'); }
+        catch { /* no-op */ }
+      });
+    }, ms);
+  };
+
   // Post-build audit C3 — HeyGen LiveAvatar Lite heartbeat.
   // Server drops the WS at ~120s of voice silence (Phase 0 §9). The
   // bridge can't fire keep-alive (browser doesn't have the privileged
@@ -1274,6 +1394,7 @@ wss.on('connection', async (ws, req) => {
   const teardown = async (reason) => {
     if (closed) return;
     closed = true;
+    clearSoftGateIdleTimer(); // Phase 2: cancel any pending soft-gate idle kill.
     // MEMORY_BREADTH_PLAN U1b (audit R1-M4) — capture EVERYTHING the
     // fire-and-forget extraction needs into locals BEFORE any state
     // cleanup below. transcriptSnapshot() returns a copy, so the
@@ -1312,6 +1433,8 @@ wss.on('connection', async (ws, req) => {
     clearInterval(heartbeatInterval);
     if (heygenHeartbeatInterval) clearInterval(heygenHeartbeatInterval);
     quotaCache.delete(sessionId);
+    walletDrawFailures.delete(sessionId); // audit C4
+
     sessionToWs.delete(sessionId);
     wsRegistry.delete(sessionId);
     dropCogsSession(sessionId);
@@ -3086,7 +3209,36 @@ wss.on('connection', async (ws, req) => {
     try { msg = JSON.parse(data.toString()); } catch { return; }
     try {
       if (msg.type === 'turn_start') {
+        // R2-M6 — clear any pending soft-gate idle kill SYNCHRONOUSLY, before the
+        // awaited gate, so a turn the user just rescued (bought/earned minutes)
+        // can't be torn down by the timer firing during the await.
+        clearSoftGateIdleTimer();
         const gate = await checkQuotaOk(sessionId);
+        // Phase 2 soft gate: exhausted at 100% but NOT hard-killed. Keep the WS +
+        // the warm Simli/Gemini pipes open, tell the client to upsell, arm the
+        // server-owned idle kill. Do NOT teardown, do NOT consume a turn (so the
+        // rescued next turn numbers correctly). Hard kill still trumps (below).
+        if (gate.soft) {
+          // Audit M1 — guard the send (the socket may be CLOSING after a
+          // navigate-away race) and arm the idle kill REGARDLESS of send success:
+          // the timer is the safety net and must not be skipped by a throwing
+          // best-effort notify.
+          if (ws.readyState === ws.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'tier_exhausted',
+              remaining_seconds: gate.remaining_seconds ?? 0,
+              cap_period: gate.cap_period ?? null,
+              // C4 — drives the overlay's buy-vs-wait copy. true ⇒ the user drained
+              // a durable wallet (purchased/earned minutes) that waiting won't refresh.
+              wallet_exhausted: gate.wallet_exhausted ?? false,
+              // M-A — which meter tripped (systemA|systemB|both), for telemetry only.
+              trip: gate.trip ?? null,
+              op: 'turn_start',
+            }));
+          }
+          armSoftGateIdleKill();
+          return;
+        }
         if (!gate.ok) {
           ws.send(JSON.stringify({ type: 'error', code: gate.reason, op: 'turn_start' }));
           await teardown(gate.reason);
@@ -3552,11 +3704,38 @@ wss.on('connection', async (ws, req) => {
           userId, sessionId, turnNumber,
           seconds: assistantSeconds,
           turnStartedAt,
-        }).catch((e) => {
-          // Non-fatal: counter undercount for this turn. System A's
-          // 150% latch (now correctly anchored to profile cap after
-          // 20260510000001) is the backstop.
+        }).then(() => {
+          // A successful draw clears the CONSECUTIVE streak but keeps the cumulative
+          // total (audit C4/M5 — a flapping RPC must still trip on cumulative).
+          if (process.env.GROWTH_LEDGER_ENABLED === '1') {
+            const s = walletDrawFailures.get(sessionId);
+            if (s) s.consec = 0;
+          }
+        }).catch(async (e) => {
+          // Counter undercount for this turn. When the ledger is OFF there is no
+          // wallet to leak — System A's 150% latch (anchored to the profile cap
+          // after 20260510000001) is the backstop, so stay non-fatal.
           captureException(e, { level: 'warning', op: 'voice_usage_record', sessionId });
+          // Whole-unit audit C4 — when the ledger is ON the draw is MONEY. A
+          // sustained outage would otherwise grant free wallet minutes up to the
+          // 4h absolute ceiling (the soft gate's READ can't tell the WRITE failed).
+          // Bound it: fail the session closed on EITHER a short consecutive streak
+          // (clean outage — tolerates one transient blip) OR a higher cumulative
+          // count this session (a FLAPPING RPC that never builds a streak, M5).
+          if (process.env.GROWTH_LEDGER_ENABLED === '1') {
+            const s = walletDrawFailures.get(sessionId) || { consec: 0, total: 0 };
+            s.consec += 1; s.total += 1;
+            walletDrawFailures.set(sessionId, s);
+            if (s.consec >= WALLET_DRAW_FAIL_FATAL_THRESHOLD || s.total >= WALLET_DRAW_FAIL_CUMULATIVE_CAP) {
+              captureException(e, {
+                level: 'fatal', op: 'voice_usage_record_v2_sustained_fail',
+                sessionId, consecutiveFailures: s.consec, totalFailures: s.total,
+              });
+              try { ws.send(JSON.stringify({ type: 'error', code: 'wallet_draw_unavailable', op: 'turn_end' })); } catch {}
+              await teardown('wallet_draw_unavailable');
+              closeWs(ws, 4006, 'wallet_draw_unavailable');
+            }
+          }
         });
       } else if (msg.type === 'cancel') {
         // R3-M1 / R4-S1 — set the relay-loop flag SYNCHRONOUSLY before any

@@ -20,6 +20,7 @@ export default async function AdminLayout({ children }: { children: React.ReactN
         <strong>OakLeague Admin</strong>
         <nav style={{ display: 'flex', gap: 16, fontSize: 14, flexWrap: 'wrap' }}>
           <a href="/admin/cogs">COGS</a>
+          <a href="/admin/minutes">Minutes</a>
           <a href="/admin/users">Users</a>
           <a href="/admin/algo">Algo</a>
           <a href="/admin/creators">Creators</a>

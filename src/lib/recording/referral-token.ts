@@ -20,10 +20,31 @@
 //    (CURRENT + NEXT) so an emergency rotation does not break in-flight
 //    minted tokens during the overlap window.
 
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHmac, createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 
 // Crockford base32 alphabet — excludes I, L, O, U.
 const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+
+/** Derive the (deviceFp, ipPrefix) fraud fingerprint from request headers.
+ *  LOAD-BEARING (audit M4): the SAME derivation MUST run at token MINT
+ *  (/api/recording/open-check) and at CREDIT (/api/sessions/open) time, or the
+ *  sock-puppet guard in recording_referral_credit_first_session_v2 silently stops
+ *  matching and every self-referral gets the recruiter bump. Also used by the /r
+ *  landing redemption. Centralised here so the three handlers can never drift.
+ *  ipPrefix = /24 (v4) or first 4 groups (v6); deviceFp = first 32 hex of
+ *  sha256(ua | accept-language | ipPrefix). DO NOT fork this logic inline. */
+export function deriveDeviceFingerprint(
+  ua: string,
+  accept: string,
+  xff: string,
+): { deviceFp: string; ipPrefix: string } {
+  const ip = xff.split(',')[0]?.trim() ?? '';
+  const ipPrefix = ip.includes('.')
+    ? ip.split('.').slice(0, 3).join('.')
+    : ip.split(':').slice(0, 4).join(':');
+  const deviceFp = createHash('sha256').update(`${ua}|${accept}|${ipPrefix}`).digest('hex').slice(0, 32);
+  return { deviceFp, ipPrefix };
+}
 
 /** Mint a fresh plaintext + its CURRENT-secret HMAC. The plaintext is
  *  sent to the client once and never stored. */

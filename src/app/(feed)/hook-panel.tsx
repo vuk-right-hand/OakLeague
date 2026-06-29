@@ -586,6 +586,10 @@ export function HookPanel({
       <button
         type="button"
         disabled={asking}
+        // Pulsating RED Ask CTA — maximum attention to drive Ask-session entry.
+        // Only the ACTIVE, idle button animates (off-screen panels + the in-flight
+        // "…" state don't pulse). Red background is inline; the class adds the pulse.
+        className={shouldPlay && !asking ? 'oak-ask-pulse' : undefined}
         onClick={async (e) => {
           e.stopPropagation();
           if (asking) return;
@@ -727,11 +731,11 @@ export function HookPanel({
           minWidth: isAuthenticated ? undefined : 0,
           padding: isAuthenticated ? 0 : '0 16px',
           borderRadius: 28,
-          background: 'rgba(255,255,255,0.15)',
-          border: '1px solid rgba(255,255,255,0.4)',
+          background: '#ff2d55',
+          border: '1px solid rgba(255,255,255,0.85)',
           color: '#fff',
-          fontSize: isAuthenticated ? 12 : 13,
-          fontWeight: 600,
+          fontSize: isAuthenticated ? 13 : 13,
+          fontWeight: 700,
           opacity: asking ? 0.6 : 1,
           zIndex: 2,
           whiteSpace: 'nowrap',
@@ -757,7 +761,9 @@ export function HookPanel({
         <div
           style={{
             position: 'absolute',
-            right: 76,
+            // right:80 (was 76) — small daylight so the Ask button's scale(1.06)
+            // pulse doesn't crowd the React button (audit S3).
+            right: 80,
             bottom: 100,
             zIndex: 2,
             display: 'flex',

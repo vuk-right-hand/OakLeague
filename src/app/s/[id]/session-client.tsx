@@ -171,11 +171,13 @@ function LiveSession(props: LiveProps) {
   }, [props.envelope.session_id, props.envelope.tier, props.envelope.avatar_status, props.creatorId, props.hookId]);
 
   useEffect(() => {
-    if (pipe.state.phase === 'closed') {
+    // Phase 2 — when the soft gate is up, do NOT auto-return to the feed on the
+    // 4015 idle-kill close; the in-session upsell overlay owns the next action.
+    if (pipe.state.phase === 'closed' && !pipe.state.tierExhausted) {
       const t = window.setTimeout(() => router.push('/'), 1500);
       return () => window.clearTimeout(t);
     }
-  }, [pipe.state.phase, router]);
+  }, [pipe.state.phase, pipe.state.tierExhausted, router]);
 
   // R4-YC-Day — black-square watcher. The most-likely demo-day failure
   // is iOS PWA autoplay across LTE↔WiFi handoff during Simli mint:
@@ -529,7 +531,25 @@ function LiveSession(props: LiveProps) {
             }}
           />
         )}
-        {phase === 'closed' && (
+        {/* Growth & Minutes Economy Phase 2 — answer-end soft gate. Out of minutes
+            at 100% mid-session → an in-session upsell instead of a hard kill. Takes
+            precedence over the closed overlay: a 4015 idle-kill flips phase to
+            'closed' but tierExhausted stays true, so the upsell persists. */}
+        {pipe.state.tierExhausted && (
+          <InSessionUpsell
+            capPeriod={pipe.state.tierExhaustedCapPeriod}
+            walletExhausted={pipe.state.tierExhaustedWalletExhausted}
+            // Audit S4 — router.push to /upgrade is pre-purchase (no tier change
+            // yet) so window.location.href isn't required here. It relies on the
+            // route change UNMOUNTING /s/[id], which runs use-session-pipe's
+            // cleanup (closes the proxy WS + the client-side Simli bridge). If
+            // /upgrade is ever made an intercepting/parallel modal that does NOT
+            // unmount this page, switch to window.location.href to force teardown.
+            onGetMore={() => { router.push('/upgrade?source=in_session'); }}
+            onEnd={() => void handleEndSession('user_ended')}
+          />
+        )}
+        {phase === 'closed' && !pipe.state.tierExhausted && (
           <OverlayCenter
             label={friendlyErrorLabel(pipe.state.errorMessage)}
             sublabel="Returning to feed…"
@@ -596,6 +616,7 @@ function LiveSession(props: LiveProps) {
         <MicButton
           phase={phase}
           micActive={pipe.micActive}
+          disabled={pipe.state.tierExhausted}
           onPressStart={() => pipe.startMic()}
           onPressEnd={() => pipe.stopMic()}
         />
@@ -607,18 +628,23 @@ function LiveSession(props: LiveProps) {
 function MicButton({
   phase,
   micActive,
+  disabled,
   onPressStart,
   onPressEnd,
 }: {
   phase: string;
   micActive: boolean;
+  disabled?: boolean;
   onPressStart: () => void;
   onPressEnd: () => void;
 }) {
   // Mic is enabled in ready/listening/speaking — deliberately NOT in 'thinking'
   // (P0-1: the mic is inert while the brain works; the dots carry the feedback,
-  // and barge resumes the instant the answer is 'speaking').
-  const enabled = phase === 'ready' || phase === 'listening' || phase === 'speaking';
+  // and barge resumes the instant the answer is 'speaking'). Phase-2 audit M3:
+  // also dead while the soft-gate upsell is up (tierExhausted) — the only
+  // affordances then are "Get more minutes" / "End", so a soft-gated tap can't
+  // fire a dead turn (no minutes) or re-arm the idle kill.
+  const enabled = (phase === 'ready' || phase === 'listening' || phase === 'speaking') && !disabled;
   // 2026-05-13 — `active` derives from the physical mic state (pipe.micActive),
   // NOT phase === 'listening'. We run MANUAL VAD, so the user's turn ends when
   // `stopMic` fires `mic_stopped` (phase → 'thinking'); the mic can be
@@ -728,6 +754,88 @@ function OverlayCenter({
           {action.label}
         </button>
       )}
+    </div>
+  );
+}
+
+// Growth & Minutes Economy Phase 2 — answer-end soft-gate upsell. Shown when the
+// user hit 100% of their minutes mid-session. NOT an error overlay; the pipes stay
+// warm until the server idle-kills (WS 4015) or the user picks an action. v1 CTAs:
+// buy (redirect + re-open per §12.7) and end. The "invite a friend (+min)" CTA is
+// added in Phase 4, when the referral grant is wired — no dead-end CTA before then.
+function InSessionUpsell({
+  capPeriod,
+  walletExhausted,
+  onGetMore,
+  onEnd,
+}: {
+  capPeriod: 'daily' | 'weekly' | 'monthly' | null;
+  walletExhausted: boolean;
+  onGetMore: () => void;
+  onEnd: () => void;
+}) {
+  const period =
+    capPeriod === 'weekly' ? 'this week'
+    : capPeriod === 'monthly' ? 'this month'
+    : capPeriod === 'daily' ? 'today'
+    : 'right now';
+  const refreshWhen =
+    capPeriod === 'weekly' ? 'at the start of next week'
+    : capPeriod === 'monthly' ? 'next month'
+    : capPeriod === 'daily' ? 'tomorrow'
+    : null;
+  // TANDEM AUDIT C4 — the copy must NOT tell a wallet user their minutes "refresh
+  // tomorrow": the soft gate fires only when free AND wallet are BOTH spent, and a
+  // drained durable wallet (purchased/earned) does NOT come back by waiting — only
+  // the free allowance does. So a wallet user is led to buy; a pure free user is
+  // told (truthfully) to wait. The headline drops the period qualifier for wallet
+  // users ("…today" wrongly implies a daily reset of the whole balance).
+  const headline = walletExhausted ? 'You’re out of minutes' : `You’re out of minutes ${period}`;
+  const subline = walletExhausted
+    ? (refreshWhen
+        ? `Top up to keep going — your free minutes refresh ${refreshWhen}.`
+        : 'Top up to keep the conversation going.')
+    : (refreshWhen
+        ? `Your minutes refresh ${refreshWhen}.`
+        : 'Top up to keep the conversation going.');
+  return (
+    <div
+      role="dialog"
+      aria-label="Out of minutes"
+      style={{
+        position: 'absolute', inset: 0, zIndex: 5,
+        display: 'flex', flexDirection: 'column',
+        alignItems: 'center', justifyContent: 'center',
+        background: 'rgba(0,0,0,0.78)', padding: 24, textAlign: 'center',
+      }}
+    >
+      <div style={{ fontSize: 18, fontWeight: 700, color: '#fff', marginBottom: 8 }}>
+        {headline}
+      </div>
+      <div style={{ fontSize: 13.5, color: 'rgba(255,255,255,0.75)', maxWidth: 300, marginBottom: 22 }}>
+        {subline}
+      </div>
+      <button
+        type="button"
+        onClick={onGetMore}
+        style={{
+          background: '#fff', color: '#000', border: 'none', borderRadius: 24,
+          padding: '12px 24px', fontSize: 15, fontWeight: 700, marginBottom: 12,
+        }}
+      >
+        Get more minutes
+      </button>
+      <button
+        type="button"
+        onClick={onEnd}
+        style={{
+          background: 'transparent', color: 'rgba(255,255,255,0.85)',
+          border: '1px solid rgba(255,255,255,0.4)', borderRadius: 24,
+          padding: '10px 22px', fontSize: 14, fontWeight: 600,
+        }}
+      >
+        End session
+      </button>
     </div>
   );
 }

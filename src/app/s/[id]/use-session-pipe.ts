@@ -271,6 +271,10 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
   const sessionIdRef = useRef<string>(args.envelope.session_id);
   const closedRef = useRef<boolean>(false);
   const rollingOverRef = useRef<boolean>(false);
+  // TANDEM AUDIT M5 — set the instant the proxy soft-gates (tier_exhausted control
+  // msg), so onClose recognizes a terminal out-of-minutes session even when the OS
+  // reports the close as 1006 (iOS background kill) rather than the server's 4015.
+  const tierExhaustedRef = useRef<boolean>(false);
   const lipsyncLatencyRef = useRef<number | null>(null);
   // FISH_AUDIO_PHASE_1 §6 round-3 C4 (audit M3) — ref-mirror of the
   // ttsProviderSwitching reducer flag. We can't read reducer state inside
@@ -818,6 +822,30 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
           }
         },
         onWarning: (code) => { captureSafe('proxy_warning', { code, session_id: sessionIdRef.current }); },
+        onTierExhausted: (remainingSeconds, capPeriod, walletExhausted, trip) => {
+          // Growth & Minutes Economy Phase 2 — out of minutes at 100% mid-session.
+          // NOT an error: the reducer stops the mic + raises the in-session upsell.
+          tierExhaustedRef.current = true; // M5 — onClose reads this on a 1006 kill
+          captureSafe('tier_exhausted', {
+            remaining_seconds: remainingSeconds,
+            cap_period: capPeriod,
+            wallet_exhausted: walletExhausted,
+            // M-A — 'systemA' means the mic+assistant COGS line cut a user who still
+            // had assistant-second entitlement (watch this rate for paid users).
+            trip,
+            session_id: sessionIdRef.current,
+          });
+          // TANDEM AUDIT M3 — the session is terminal (recovery is re-entry-only),
+          // and the upsell overlay covers the avatar, so the warm Simli/avatar room
+          // is now pure COGS bleed. Close it NOW rather than waiting for the up-to-
+          // maxSessionLength provider idle timeout (we can't tighten maxIdleTime —
+          // a long user mic-turn legitimately idles the avatar). close() books the
+          // final minute accrual. The proxy WS stays open for the server 4015 kill;
+          // the mic is disabled, so no further turns need the avatar.
+          try { bridgeRef.current?.close(); } catch { /* already closed */ }
+          bridgeRef.current = null;
+          dispatchRef({ kind: 'tier_exhausted', remainingSeconds, capPeriod, walletExhausted });
+        },
         onTtsReconnecting: () => {
           // R3-Missing-6 — Cartesia-down state. Avatar stays visible;
           // session-client overlays a "Voice catching up…" banner.
@@ -871,10 +899,22 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
           });
           // eslint-disable-next-line no-console
           console.warn(`[reconnect-overlay] trigger=ws_closed code=${code} reason=${safeReason ?? ''} clean=${wasClean}`);
-          dispatchRef({ kind: 'ws_closed', wasClean });
-          if (code === 4002) {
-            // session_already_active = R4-C1 eviction by another tab. Fatal.
-            dispatchRef({ kind: 'fatal_error', message: 'session_evicted' });
+          if (code === 4015 || tierExhaustedRef.current) {
+            // Phase 2 — server-owned soft-gate idle kill (4015). Session is
+            // terminally out of minutes; the in-session upsell overlay
+            // (tierExhausted) stays. Do NOT route to 'reconnecting' (no tap-to-
+            // reconnect — they must buy or earn minutes), just close gracefully.
+            // M5 — also take this path when tierExhaustedRef is already set: an iOS
+            // background kill surfaces the close as 1006, not the server's 4015, so
+            // gating on the code alone would wrongly offer tap-to-reconnect on a
+            // zero-minute session.
+            dispatchRef({ kind: 'closed_ack' });
+          } else {
+            dispatchRef({ kind: 'ws_closed', wasClean });
+            if (code === 4002) {
+              // session_already_active = R4-C1 eviction by another tab. Fatal.
+              dispatchRef({ kind: 'fatal_error', message: 'session_evicted' });
+            }
           }
         },
       });
@@ -1080,6 +1120,26 @@ export function useSessionPipe(args: UseSessionPipeArgs): PipeHandle {
       return null;
     }
     if (!r.ok) {
+      // TANDEM AUDIT M1 — the rollover route refuses to mint a dead segment when
+      // the user is already out of minutes (409 tier_exhausted): the old session
+      // is gone (15-min cap) AND there's no balance for a new one. Treat exactly
+      // like the per-turn soft gate — raise the in-session upsell, NOT a generic
+      // rollover_failed error overlay (no tap-to-reconnect; they must buy/earn).
+      if (r.status === 409) {
+        let exhausted = false;
+        let capPeriod: 'daily' | 'weekly' | 'monthly' | null = null;
+        let walletExhausted = false;
+        try {
+          const b = (await r.json()) as { error?: string; cap_period?: 'daily' | 'weekly' | 'monthly' | null; wallet_exhausted?: boolean };
+          exhausted = b?.error === 'tier_exhausted';
+          capPeriod = b?.cap_period ?? null;
+          walletExhausted = b?.wallet_exhausted === true; // M-D — buy-vs-wait copy at the rollover boundary
+        } catch { /* fall through to rollover_failed */ }
+        if (exhausted) {
+          dispatchRef({ kind: 'tier_exhausted', remainingSeconds: 0, capPeriod, walletExhausted });
+          return null;
+        }
+      }
       dispatchRef({ kind: 'rollover_failed', message: `rollover_${r.status}` });
       return null;
     }

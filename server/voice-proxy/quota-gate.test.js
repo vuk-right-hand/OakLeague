@@ -17,7 +17,9 @@ test('healthy RPC + healthy quota → allow, cache snapshot', () => {
   });
   assert.equal(out.gate.ok, true);
   assert.equal(out.gate.reason, '');
-  assert.deepEqual(out.nextCache.healthy, { fired: false, over150: false });
+  // C3 grew healthy to also carry the soft-exhaustion snapshot; assert the hard fields.
+  assert.equal(out.nextCache.healthy.fired, false);
+  assert.equal(out.nextCache.healthy.over150, false);
   assert.equal(out.nextCache.graceUsed, false);
 });
 
@@ -98,7 +100,8 @@ test('RPC recovers after grace → healthy snapshot overrides graceUsed', () => 
     rpc: { row: { kill_switch_fired_at: null, over_150_pct: false }, error: null },
     priorCache: afterGrace.nextCache,
   });
-  assert.deepEqual(afterRecover.nextCache.healthy, { fired: false, over150: false });
+  assert.equal(afterRecover.nextCache.healthy.fired, false);
+  assert.equal(afterRecover.nextCache.healthy.over150, false);
   assert.equal(afterRecover.nextCache.graceUsed, true, 'graceUsed carries forward (spent once)');
 
   const afterFailAgain = decideQuotaGate({
@@ -148,4 +151,178 @@ test('B1: fatal RPC even when prior snapshot is healthy → still deny + fatal',
   assert.equal(out.gate.ok, false);
   assert.equal(out.gate.fatal, true);
   assert.equal(out.gate.reason, 'quota_state_inconsistent');
+});
+
+// ── Phase 2: answer-end soft gate (Growth & Minutes Economy) ───────────────
+
+const softRow = (over) => ({
+  rpc: { row: {
+    kill_switch_fired_at: null,
+    over_150_pct: false,
+    remaining_seconds: over.eff,
+    allowance_remaining: over.allow,
+    cap_period: over.cap ?? 'daily',
+    // C1 System-A fuse fields — default UNDEFINED (NaN ⇒ trip inert, mirrors a v1
+    // row) unless a test sets them. had_wallet defaults false (pure free user).
+    seconds_used: over.usedA,
+    daily_limit_s: over.limitA,
+    had_wallet: over.hadWallet ?? false,
+  }, error: null },
+  priorCache: undefined,
+  softGateEnabled: over.soft ?? true,
+  ledgerOn: over.ledger ?? true,
+});
+
+test('soft gate OFF (flag unset) + exhausted → still allow (inert)', () => {
+  const out = decideQuotaGate(softRow({ eff: 0, allow: 0, soft: false }));
+  assert.equal(out.gate.ok, true);
+  assert.equal(out.gate.soft, undefined);
+});
+
+test('soft gate ON + effective exhausted (ledgerOn) → soft deny, not hard', () => {
+  const out = decideQuotaGate(softRow({ eff: 0, allow: 0, cap: 'weekly' }));
+  assert.equal(out.gate.ok, false);
+  assert.equal(out.gate.soft, true);
+  assert.equal(out.gate.reason, 'tier_exhausted');
+  assert.equal(out.gate.remaining_seconds, 0);
+  assert.equal(out.gate.cap_period, 'weekly');
+});
+
+test('soft gate ON + balance remaining → allow', () => {
+  const out = decideQuotaGate(softRow({ eff: 120, allow: 120 }));
+  assert.equal(out.gate.ok, true);
+  assert.equal(out.gate.soft, undefined);
+});
+
+test('soft gate ON + HARD (over150) trumps soft even at 0 balance', () => {
+  const out = decideQuotaGate({
+    rpc: { row: { kill_switch_fired_at: null, over_150_pct: true, remaining_seconds: 0, allowance_remaining: 0, cap_period: 'daily' }, error: null },
+    priorCache: undefined, softGateEnabled: true, ledgerOn: true,
+  });
+  assert.equal(out.gate.ok, false);
+  assert.equal(out.gate.soft, undefined, 'hard kill is not a soft gate');
+  assert.equal(out.gate.reason, 'kill_switch_fired');
+});
+
+test('C1 co-gate: ledger OFF uses allowance — wallet does NOT rescue', () => {
+  // Free pool exhausted but wallet has 500s. With the ledger flag OFF (proxy
+  // not drawing the wallet), the soft gate must fire on allowance so we never
+  // grant minutes the proxy isn't decrementing.
+  const out = decideQuotaGate(softRow({ eff: 500, allow: 0, ledger: false }));
+  assert.equal(out.gate.ok, false);
+  assert.equal(out.gate.soft, true);
+});
+
+test('C1 co-gate: ledger ON uses effective — wallet rescues', () => {
+  const out = decideQuotaGate(softRow({ eff: 500, allow: 0, ledger: true }));
+  assert.equal(out.gate.ok, true);
+  assert.equal(out.gate.soft, undefined);
+});
+
+test('soft exhaustion IS cached for the degraded fail-closed path (C3)', () => {
+  const out = decideQuotaGate(softRow({ eff: 0, allow: 0, cap: 'daily' }));
+  assert.equal(out.nextCache.healthy.fired, false);
+  assert.equal(out.nextCache.healthy.over150, false);
+  assert.equal(out.nextCache.healthy.softExhausted, true);
+  assert.equal(out.nextCache.healthy.softCapPeriod, 'daily');
+});
+
+test('C3: degraded RPC + cached soft-exhausted → fail CLOSED (re-soft-gate, no free turn)', () => {
+  const healthy = decideQuotaGate(softRow({ eff: 0, allow: 0, cap: 'weekly' }));
+  assert.equal(healthy.gate.soft, true);
+  const degraded = decideQuotaGate({
+    rpc: { row: null, error: new Error('brownout') },
+    priorCache: healthy.nextCache, softGateEnabled: true, ledgerOn: true,
+  });
+  assert.equal(degraded.gate.ok, false);
+  assert.equal(degraded.gate.soft, true);
+  assert.equal(degraded.gate.reason, 'tier_exhausted');
+  assert.equal(degraded.gate.cap_period, 'weekly');
+});
+
+test('C3: degraded RPC + cached NOT-exhausted → allow (degraded), unchanged', () => {
+  const healthy = decideQuotaGate(softRow({ eff: 120, allow: 120 }));
+  const degraded = decideQuotaGate({
+    rpc: { row: null, error: new Error('brownout') },
+    priorCache: healthy.nextCache, softGateEnabled: true, ledgerOn: true,
+  });
+  assert.equal(degraded.gate.ok, true);
+  assert.equal(degraded.gate.reason, 'quota_check_degraded');
+});
+
+// ── TANDEM AUDIT C1: System-A 100% soft trip (mic+assistant meter) ─────────────
+// daily_quotas.seconds_used counts mic+assistant; the balance counts assistant-
+// only. A chatty user can drive System A to the 150% HARD line before System B
+// reaches 100%. Tripping the SOFT gate at System-A 100% (the route anchored it a
+// mic-turn above the entitlement) guarantees the graceful upsell precedes the
+// hard kill for ANY mic:assistant ratio.
+
+test('C1 System-A 100%: balance remains but seconds_used >= daily_limit_s → soft deny', () => {
+  const out = decideQuotaGate(softRow({ eff: 120, allow: 120, usedA: 600, limitA: 600 }));
+  assert.equal(out.gate.ok, false);
+  assert.equal(out.gate.soft, true);
+  assert.equal(out.gate.reason, 'tier_exhausted');
+  assert.equal(out.gate.remaining_seconds, 0, 'System-A-only trip reports 0 remaining');
+  assert.equal(out.gate.trip, 'systemA', 'M-A telemetry: COGS-line cut, not entitlement');
+});
+
+test('M-A trip discriminator: systemB (entitlement) vs both', () => {
+  const b = decideQuotaGate(softRow({ eff: 0, allow: 0 }));            // only System B
+  assert.equal(b.gate.trip, 'systemB');
+  const both = decideQuotaGate(softRow({ eff: 0, allow: 0, usedA: 600, limitA: 600 }));
+  assert.equal(both.gate.trip, 'both');
+});
+
+test('C1 System-A under 100% + balance remaining → allow (no premature trip)', () => {
+  const out = decideQuotaGate(softRow({ eff: 120, allow: 120, usedA: 400, limitA: 600 }));
+  assert.equal(out.gate.ok, true);
+  assert.equal(out.gate.soft, undefined);
+});
+
+test('C1 System-A 100% is SOFT, distinct from the 150% hard kill', () => {
+  const out = decideQuotaGate(softRow({ eff: 120, allow: 120, usedA: 600, limitA: 600 }));
+  assert.equal(out.gate.reason, 'tier_exhausted'); // NOT kill_switch_fired
+});
+
+test('C1 System-A trip is inert when the soft gate is OFF', () => {
+  const out = decideQuotaGate(softRow({ eff: 120, allow: 120, usedA: 600, limitA: 600, soft: false }));
+  assert.equal(out.gate.ok, true);
+  assert.equal(out.gate.soft, undefined);
+});
+
+test('C1 System-A trip inert without _v2 fields (v1 row) — no NaN trip', () => {
+  // v1 voice_check_quota omits seconds_used/daily_limit_s → Number(undefined)=NaN.
+  const out = decideQuotaGate(softRow({ eff: 120, allow: 120 }));
+  assert.equal(out.gate.ok, true);
+});
+
+// ── TANDEM AUDIT C4: wallet_exhausted drives the buy-vs-wait overlay copy ───────
+
+test('C4 wallet_exhausted: had_wallet + ledgerOn + exhausted → true', () => {
+  const out = decideQuotaGate(softRow({ eff: 0, allow: 0, hadWallet: true }));
+  assert.equal(out.gate.soft, true);
+  assert.equal(out.gate.wallet_exhausted, true);
+});
+
+test('C4 wallet_exhausted: ledger OFF suppresses the wallet signal (proxy not drawing it)', () => {
+  const out = decideQuotaGate(softRow({ eff: 0, allow: 0, hadWallet: true, ledger: false }));
+  assert.equal(out.gate.soft, true);
+  assert.equal(out.gate.wallet_exhausted, false);
+});
+
+test('C4 wallet_exhausted: pure free user (no wallet) → false ("wait" copy)', () => {
+  const out = decideQuotaGate(softRow({ eff: 0, allow: 0, hadWallet: false }));
+  assert.equal(out.gate.soft, true);
+  assert.equal(out.gate.wallet_exhausted, false);
+});
+
+test('C4 wallet_exhausted survives the degraded fail-closed path (cached)', () => {
+  const healthy = decideQuotaGate(softRow({ eff: 0, allow: 0, hadWallet: true }));
+  assert.equal(healthy.nextCache.healthy.softWalletExhausted, true);
+  const degraded = decideQuotaGate({
+    rpc: { row: null, error: new Error('brownout') },
+    priorCache: healthy.nextCache, softGateEnabled: true, ledgerOn: true,
+  });
+  assert.equal(degraded.gate.soft, true);
+  assert.equal(degraded.gate.wallet_exhausted, true);
 });
